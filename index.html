@@ -48,12 +48,13 @@
     <link rel="stylesheet" href="./static/css/bulma.min.css">
     <link rel="stylesheet" href="./static/css/bulma-carousel.min.css">
     <link rel="stylesheet" href="./static/css/bulma-slider.min.css">
-    <link rel="stylesheet" href="./static/css/fontawesome.all.min.css">
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/css/fontawesome.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
     <link rel="stylesheet" href="./static/css/index.css">
 
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
-    <script defer src="./static/js/fontawesome.all.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.1.0/js/all.min.js"></script>
     <script src="./static/js/bulma-carousel.min.js"></script>
     <script src="./static/js/bulma-slider.min.js"></script>
 </head>
@@ -120,7 +121,7 @@
                               <a href="https://arxiv.org/abs/2508.21060"
                                  class="external-link button is-normal is-rounded is-dark">
                                 <span class="icon">
-                                  <i class="fas fa-file-pdf"></i>
+                                  <i class="fa-solid fa-file-pdf"></i>
                                 </span>
                                 <span>Paper</span>
                               </a>
@@ -130,38 +131,42 @@
                               <a href="https://github.com/ethz-vlg/mvtracker"
                                  class="external-link button is-normal is-rounded is-dark">
                                 <span class="icon">
-                                  <i class="fab fa-github"></i>
+                                  <i class="fa-brands fa-github"></i>
                                 </span>
                                 <span>Code</span>
                               </a>
                             </span>
-                            <!-- Demo Link (placeholder) -->
+
+                            <!-- Video/Presentation Link -->
                             <span class="link-block">
-                              <a class="external-link button is-normal is-rounded is-dark"
-                                 style="pointer-events: none; opacity: 0.7;">
-                                <span>🤗 Demo</span>
+                              <a href="https://youtu.be/OobWw_sHN7A"
+                                 class="external-link button is-normal is-rounded is-dark">
+                                <span class="icon">
+                                  <i class="fa-solid fa-video"></i>
+                                </span>
+                                <span>Oral</span>
                               </a>
                             </span>
 
-                            <!-- Video/Presentation Link (placeholder) -->
+                            <!-- Slides Link -->
                             <span class="link-block">
-                              <a class="external-link button is-normal is-rounded is-dark"
-                                 style="pointer-events: none; opacity: 0.7;">
+                              <a href="https://huggingface.co/ethz-vlg/mvtracker-rrd/resolve/main/assets/mvtracker_slides.key"
+                                 class="external-link button is-normal is-rounded is-dark">
                                 <span class="icon">
-                                  <i class="fas fa-video"></i>
+                                  <i class="fa-solid fa-file-powerpoint"></i>
                                 </span>
-                                <span>Video</span>
+                                <span>Slides</span>
                               </a>
                             </span>
 
-                            <!-- Slides Link (placeholder) -->
+                            <!-- Poster Link -->
                             <span class="link-block">
-                              <a class="external-link button is-normal is-rounded is-dark"
-                                 style="pointer-events: none; opacity: 0.7;">
+                              <a href="https://huggingface.co/ethz-vlg/mvtracker-rrd/resolve/main/assets/mvtracker_poster.pdf"
+                                 class="external-link button is-normal is-rounded is-dark">
                                 <span class="icon">
-                                  <i class="fas fa-file-powerpoint"></i>
+                                  <i class="fa-solid fa-chalkboard"></i>
                                 </span>
-                                <span>Slides (coming soon…)</span>
+                                <span>Poster</span>
                               </a>
                             </span>
                         </div>
@@ -617,8 +622,10 @@
                         <a href="https://github.com/henry123-boy/SpaTracker" target="_blank">SpatialTracker</a>
                         and
                         <a href="https://github.com/facebookresearch/tapvid" target="_blank">TAPIP3D</a>,
-                        MVTracker leverages the multi-view information and produces view-consistent trajectories with less jitter.
-                        Compared to triplane and optimization-based baselines, our learned prior yields more precise tracks and fewer
+                        MVTracker leverages the multi-view information and produces view-consistent trajectories with
+                        less jitter.
+                        Compared to triplane and optimization-based baselines, our learned prior yields more precise
+                        tracks and fewer
                         failures.
                         <span style="color:red;">Red lines</span> indicate distance to ground truth;
                         dark-colored points are predicted as not visible in any view.
