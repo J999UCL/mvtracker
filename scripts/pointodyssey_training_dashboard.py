@@ -187,6 +187,8 @@ class TensorBoardScalarReader:
     def __init__(self, event_dir: Path):
         self.event_dir = event_dir
         self._signature: tuple[tuple[str, int, int], ...] = ()
+        self._event_names: tuple[str, ...] = ()
+        self._accumulator: Any = None
         self._cached: dict[str, list[dict[str, float | int]]] = {}
         self.error: str | None = None
 
@@ -211,15 +213,17 @@ class TensorBoardScalarReader:
         try:
             from tensorboard.backend.event_processing import event_accumulator
 
-            accumulator = event_accumulator.EventAccumulator(
-                str(self.event_dir),
-                size_guidance={event_accumulator.SCALARS: 0},
-            )
-            accumulator.Reload()
+            event_names = tuple(item[0] for item in signature)
+            if self._accumulator is None or event_names != self._event_names:
+                self._accumulator = event_accumulator.EventAccumulator(
+                    str(self.event_dir),
+                    size_guidance={event_accumulator.SCALARS: 0},
+                )
+            self._accumulator.Reload()
             output: dict[str, list[dict[str, float | int]]] = {}
-            for tag in sorted(accumulator.Tags().get("scalars", [])):
+            for tag in sorted(self._accumulator.Tags().get("scalars", [])):
                 by_step: dict[int, dict[str, float | int]] = {}
-                for event in accumulator.Scalars(tag):
+                for event in self._accumulator.Scalars(tag):
                     value = finite_float(event.value)
                     if value is None:
                         continue
@@ -233,6 +237,7 @@ class TensorBoardScalarReader:
             self.error = f"cannot read TensorBoard scalars from {self.event_dir}: {exc}"
             return self._cached
         self._signature = signature
+        self._event_names = event_names
         self._cached = output
         self.error = None
         return output
@@ -977,6 +982,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         event_dir=event_dir,
         gpu_history=gpu_history,
     )
+    state.snapshot()
     server = ThreadingHTTPServer(
         (args.host, args.port),
         make_handler(state, args.stream_interval_seconds),
