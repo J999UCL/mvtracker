@@ -39,6 +39,22 @@ class NumpyEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
+def _evaluation_setting_for_dataset(dataset_name: str, no_tracking_labels: bool) -> str:
+    if "kubric" in dataset_name or dataset_name.startswith(
+        "pointodyssey-multiview-"
+    ):
+        return "kubric-multiview"
+    if "panoptic-multiview" in dataset_name:
+        return "panoptic-multiview"
+    if "dex-ycb" in dataset_name:
+        return "dexycb-multiview"
+    if "tapvid2d" in dataset_name:
+        return "tapvid2d"
+    if no_tracking_labels:
+        return "no-tracking-labels"
+    raise NotImplementedError(f"No evaluation setting for dataset {dataset_name!r}.")
+
+
 def kmeans_sample(pts, count):
     """
     Given (N, 3) torch tensor of 3D points, return (count, 3) tensor of kmeans centers.
@@ -529,18 +545,9 @@ class Evaluator:
             assert "strided" not in dataset_name, "Strided evaluation is not supported yet."
 
             # Determine the evaluation setting
-            if "kubric" in dataset_name:
-                evaluation_setting = "kubric-multiview"
-            elif "panoptic-multiview" in dataset_name:
-                evaluation_setting = "panoptic-multiview"
-            elif "dex-ycb" in dataset_name:
-                evaluation_setting = "dexycb-multiview"
-            elif "tapvid2d" in dataset_name:
-                evaluation_setting = "tapvid2d"
-            elif no_tracking_labels:
-                evaluation_setting = "no-tracking-labels"
-            else:
-                raise NotImplementedError
+            evaluation_setting = _evaluation_setting_for_dataset(
+                dataset_name, no_tracking_labels
+            )
 
             # Invert the intrinsics and extrinsics matrices
             intrs_inv = torch.inverse(intrs.float()).type(intrs.dtype)

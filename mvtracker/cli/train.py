@@ -431,6 +431,10 @@ def main(cfg: DictConfig):
             eval_dataset = KubricMultiViewDataset(**kubric_kwargs)
         elif dataset_name.startswith("kubric-multiview-v3"):
             eval_dataset = KubricMultiViewDataset.from_name(dataset_name, cfg.datasets.root, cfg)
+        elif dataset_name.startswith("pointodyssey-multiview-"):
+            eval_dataset = PointOdysseyMultiViewDataset.from_name(
+                dataset_name, cfg.datasets.root, cfg
+            )
         elif dataset_name.startswith("panoptic-multiview"):
             eval_dataset = PanopticStudioMultiViewDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("dex-ycb-multiview"):

@@ -10,7 +10,8 @@ datasets:
     name: pointodyssey-multiview-training
     traj_per_sample: 256
   eval:
-    names: []
+    names:
+      - pointodyssey-multiview-validation
 
 trainer:
   gradient_accumulation_steps: 8

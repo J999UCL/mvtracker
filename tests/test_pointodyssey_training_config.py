@@ -20,6 +20,16 @@ class PointOdysseyTrainingConfigTests(unittest.TestCase):
 
         self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 8)
 
+    def test_pointodyssey_registers_only_the_validation_split_for_evaluation(self):
+        config = yaml.safe_load(
+            (self.config_root / "experiment" / "pointodyssey.yaml").read_text()
+        )
+
+        self.assertEqual(
+            config["datasets"]["eval"]["names"],
+            ["pointodyssey-multiview-validation"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
