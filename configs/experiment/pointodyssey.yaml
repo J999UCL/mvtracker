@@ -8,7 +8,7 @@ restore_ckpt_path: ./checkpoints/mvtracker_200000_june2025.pth
 datasets:
   train:
     name: pointodyssey-multiview-training
-    traj_per_sample: 512
+    traj_per_sample: 256
   eval:
     names: []
 
