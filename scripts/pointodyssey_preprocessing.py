@@ -49,15 +49,17 @@ else:
     )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 OUTPUT_HEIGHT = 384
 OUTPUT_WIDTH = 512
 JPEG_QUALITY = 95
 LONG_CHUNK_LENGTH = 120
 PROJECTION_TOLERANCE_PX = 0.01
+DEPTH_TRACK_TOLERANCE_METRES = 0.05
 RIGID_DETERMINANT_TOLERANCE = 1e-3
 SCALE_X = OUTPUT_WIDTH / SOURCE_WIDTH
 SCALE_Y = OUTPUT_HEIGHT / SOURCE_HEIGHT
+
 
 @dataclass(frozen=True)
 class SceneSpec:
@@ -365,6 +367,100 @@ def _project_points(
         x = intrinsics[0, 0] * camera[..., 0] / z + intrinsics[0, 2]
         y = intrinsics[1, 1] * camera[..., 1] / z + intrinsics[1, 2]
     return np.stack((x, y), axis=-1).astype(np.float32, copy=False), z
+
+
+def _depth_track_consistency_masks(
+    depth_frame: np.ndarray,
+    projected_xy: np.ndarray,
+    camera_z: np.ndarray,
+    candidate_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return within-tolerance and any-valid-depth masks for candidate tracks."""
+    depth_frame = np.asarray(depth_frame)
+    projected_xy = np.asarray(projected_xy)
+    camera_z = np.asarray(camera_z)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if depth_frame.ndim != 2 or depth_frame.shape != (OUTPUT_HEIGHT, OUTPUT_WIDTH):
+        raise ValueError(
+            f"depth frame must be 2-D with shape {(OUTPUT_HEIGHT, OUTPUT_WIDTH)}, "
+            f"got ndim={depth_frame.ndim} and shape={depth_frame.shape}"
+        )
+    if depth_frame.dtype != np.dtype(np.float32):
+        raise ValueError(f"depth frame must have dtype float32, got {depth_frame.dtype}")
+    if projected_xy.shape != (*candidate_mask.shape, 2):
+        raise ValueError(
+            "projected coordinates must have candidate-mask shape plus a final xy axis; "
+            f"got {projected_xy.shape} and {candidate_mask.shape}"
+        )
+    if camera_z.shape != candidate_mask.shape:
+        raise ValueError(
+            f"camera-Z shape must match candidate mask; got {camera_z.shape} and "
+            f"{candidate_mask.shape}"
+        )
+
+    consistent_mask = np.zeros(candidate_mask.shape, dtype=bool)
+    any_valid_depth_mask = np.zeros(candidate_mask.shape, dtype=bool)
+    internally_valid_candidates = (
+        candidate_mask
+        & np.isfinite(projected_xy).all(axis=-1)
+        & np.isfinite(camera_z)
+        & (camera_z > 0.0)
+        & (projected_xy[..., 0] >= -0.5)
+        & (projected_xy[..., 0] < OUTPUT_WIDTH - 0.5)
+        & (projected_xy[..., 1] >= -0.5)
+        & (projected_xy[..., 1] < OUTPUT_HEIGHT - 0.5)
+    )
+    candidate_ids = np.flatnonzero(internally_valid_candidates.reshape(-1))
+    if not candidate_ids.size:
+        return consistent_mask, any_valid_depth_mask
+
+    flat_xy = projected_xy.reshape(-1, 2)
+    flat_camera_z = camera_z.reshape(-1)
+    selected_xy = flat_xy[candidate_ids]
+    selected_camera_z = flat_camera_z[candidate_ids]
+    center_x = np.floor(selected_xy[:, 0] + 0.5).astype(np.int64)
+    center_y = np.floor(selected_xy[:, 1] + 0.5).astype(np.int64)
+    accepted = np.zeros(candidate_ids.shape, dtype=bool)
+    any_valid = np.zeros(candidate_ids.shape, dtype=bool)
+    for offset_y in (-1, 0, 1):
+        sample_y = center_y + offset_y
+        for offset_x in (-1, 0, 1):
+            sample_x = center_x + offset_x
+            inside = (
+                (sample_x >= 0)
+                & (sample_x < OUTPUT_WIDTH)
+                & (sample_y >= 0)
+                & (sample_y < OUTPUT_HEIGHT)
+            )
+            if not inside.any():
+                continue
+            positions = np.flatnonzero(inside)
+            sampled_depth = depth_frame[sample_y[positions], sample_x[positions]]
+            valid_depth = np.isfinite(sampled_depth) & (sampled_depth > 0.0)
+            any_valid[positions] |= valid_depth
+            accepted[positions] |= valid_depth & (
+                np.abs(sampled_depth - selected_camera_z[positions])
+                <= DEPTH_TRACK_TOLERANCE_METRES
+            )
+    consistent_mask.reshape(-1)[candidate_ids] = accepted
+    any_valid_depth_mask.reshape(-1)[candidate_ids] = any_valid
+    return consistent_mask, any_valid_depth_mask
+
+
+def _depth_track_consistency_mask(
+    depth_frame: np.ndarray,
+    projected_xy: np.ndarray,
+    camera_z: np.ndarray,
+    candidate_mask: np.ndarray,
+) -> np.ndarray:
+    """Keep candidates matching finite positive resized depth in a 3x3 neighbourhood."""
+    consistent_mask, _any_valid_depth_mask = _depth_track_consistency_masks(
+        depth_frame,
+        projected_xy,
+        camera_z,
+        candidate_mask,
+    )
+    return consistent_mask
 
 
 def _validate_source_queries(
@@ -696,19 +792,18 @@ def _convert_source_group(
                 & (projected_xy[..., 1] >= -0.5)
                 & (projected_xy[..., 1] < OUTPUT_HEIGHT - 0.5)
             )
-            output_visibility = source_visibility & finite_tracks & finite_projection & (camera_z > 0.0) & inside
+            geometric_visibility = (
+                source_visibility
+                & finite_tracks
+                & finite_projection
+                & (camera_z > 0.0)
+                & inside
+            )
+            output_visibility = geometric_visibility.copy()
+            any_valid_depth_visibility = np.zeros_like(geometric_visibility)
 
             np.save(output_view / "intrinsics.npy", np.ascontiguousarray(resized_k))
             np.save(output_view / "extrinsics_w2c.npy", extrinsics_chunk)
-            np.save(output_view / "visibility.npy", np.ascontiguousarray(output_visibility))
-
-            before = int(source_visibility.sum())
-            after = int(output_visibility.sum())
-            scene_stats[(spec.split, spec.scene_id)]["views"][str(view)] = {
-                "visibility_true_before_gating": before,
-                "visibility_true_after_gating": after,
-                "visibility_removed_by_gating": before - after,
-            }
 
             depth_output = np.lib.format.open_memmap(
                 output_view / "depth.npy",
@@ -730,13 +825,61 @@ def _convert_source_group(
                     first_negative_frame = source_frame
                 nonfinite_count += int(nonfinite.sum())
                 negative_count += int(negative.sum())
-                depth_output[local_frame] = cv2.resize(
+                resized_depth_frame = cv2.resize(
                     source_depth_frame,
                     (OUTPUT_WIDTH, OUTPUT_HEIGHT),
                     interpolation=cv2.INTER_NEAREST,
                 )
+                depth_output[local_frame] = resized_depth_frame
+                depth_consistent, any_valid_depth = _depth_track_consistency_masks(
+                    resized_depth_frame,
+                    projected_xy[local_frame],
+                    camera_z[local_frame],
+                    geometric_visibility[local_frame],
+                )
+                any_valid_depth_visibility[local_frame] = any_valid_depth
+                output_visibility[local_frame] &= depth_consistent
             depth_output.flush()
             del depth_output
+            np.save(output_view / "visibility.npy", np.ascontiguousarray(output_visibility))
+
+            before = int(source_visibility.sum())
+            after_geometry = int(geometric_visibility.sum())
+            after_depth_consistency = int(output_visibility.sum())
+            rejected_no_valid_depth = int(
+                (geometric_visibility & ~any_valid_depth_visibility).sum()
+            )
+            rejected_residual_over_tolerance = int(
+                (
+                    geometric_visibility
+                    & any_valid_depth_visibility
+                    & ~output_visibility
+                ).sum()
+            )
+            if (
+                after_depth_consistency
+                + rejected_no_valid_depth
+                + rejected_residual_over_tolerance
+                != after_geometry
+            ):
+                raise AssertionError("depth-consistency visibility counts do not reconcile")
+            scene_stats[(spec.split, spec.scene_id)]["views"][str(view)] = {
+                "visibility_true_before_gating": before,
+                "visibility_true_after_geometric_gating": after_geometry,
+                "visibility_removed_by_geometric_gating": before - after_geometry,
+                "depth_consistency_candidate_count": after_geometry,
+                "depth_consistency_tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
+                "visibility_rejected_no_valid_depth": rejected_no_valid_depth,
+                "visibility_rejected_residual_over_tolerance": (
+                    rejected_residual_over_tolerance
+                ),
+                "visibility_true_after_depth_consistency_gating": after_depth_consistency,
+                "visibility_removed_by_depth_consistency_gating": (
+                    after_geometry - after_depth_consistency
+                ),
+                "visibility_true_after_gating": after_depth_consistency,
+                "visibility_removed_by_gating": before - after_depth_consistency,
+            }
             if nonfinite_count:
                 recorder.record(
                     spec,
@@ -810,6 +953,27 @@ def _scene_metadata(
                 "invalid_value": 0.0,
                 "clipped": False,
                 "resize_interpolation": "cv2.INTER_NEAREST",
+            },
+            "visibility": {
+                "format": "npy",
+                "dtype": "bool",
+                "geometric_gate": (
+                    "source-visible, finite track and projection, positive camera-Z, "
+                    "inside resized pixel-center bounds"
+                ),
+                "depth_track_consistency": {
+                    "depth_source": "exact resized float32 optical-Z frame written to depth.npy",
+                    "nearest_pixel_rule": "floor(coordinate + 0.5)",
+                    "neighborhood": (
+                        "in-bounds samples from the 3x3 around nearest pixel; "
+                        "out-of-bounds offsets are skipped"
+                    ),
+                    "acceptance": (
+                        "at least one finite positive depth with "
+                        "abs(depth-camera_z) <= tolerance_metres"
+                    ),
+                    "tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
+                },
             },
             "intrinsic_scale_xy": [SCALE_X, SCALE_Y],
         },
