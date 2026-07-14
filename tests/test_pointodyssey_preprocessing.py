@@ -15,6 +15,72 @@ import numpy as np
 from scripts import pointodyssey_preprocessing as preprocessing
 
 
+def _minimal_v5_scene_stats(
+    frame_count,
+    views,
+    *,
+    depth_candidate_counts=None,
+    depth_failure_counts=None,
+):
+    candidates = list(depth_candidate_counts or [0] * frame_count)
+    failures = list(depth_failure_counts or [0] * frame_count)
+    for view_stats in views.values():
+        view_stats.setdefault(
+            "depth_consistency_candidate_count_by_frame",
+            list(candidates),
+        )
+        view_stats.setdefault(
+            "depth_consistency_failure_count_by_frame",
+            list(failures),
+        )
+        view_stats.setdefault("depth_consistency_candidate_count", sum(candidates))
+        view_stats.setdefault("depth_consistency_failure_count", sum(failures))
+    depth_invalid = preprocessing._depth_invalid_frame_indices(candidates, failures)
+    rgb_invalid = sorted(
+        {
+            frame
+            for view_stats in views.values()
+            for frame in view_stats["rgb"]["invalid_frame_indices"]
+        }
+    )
+    invalid = sorted(set(rgb_invalid) | set(depth_invalid))
+    total, excluded, legal = preprocessing._window_start_counts(frame_count, invalid)
+    per_frame = [
+        {
+            "frame": frame,
+            "candidate_count": candidate_count,
+            "failure_count": failure_count,
+            "failure_fraction": (
+                failure_count / candidate_count if candidate_count else None
+            ),
+        }
+        for frame, (candidate_count, failure_count) in enumerate(
+            zip(candidates, failures)
+        )
+    ]
+    return {
+        "views": views,
+        "depth_track_consistency": {
+            "candidate_count": sum(candidates),
+            "failure_count": sum(failures),
+            "invalid_frame_count": len(depth_invalid),
+            "invalid_frame_indices": depth_invalid,
+            "per_frame": per_frame,
+        },
+        "window_exclusion": {
+            "window_length": preprocessing.WINDOW_LENGTH,
+            "invalid_frame_indices": invalid,
+            "reasons": {
+                "rgb_decode": rgb_invalid,
+                "depth_track_majority_mismatch": depth_invalid,
+            },
+            "total_start_count": total,
+            "excluded_start_count": excluded,
+            "legal_start_count": legal,
+        },
+    }
+
+
 class SplitPlanTests(unittest.TestCase):
     def test_approved_split_ids_chunks_and_counts(self):
         specs = preprocessing.build_scene_specs()
@@ -75,6 +141,119 @@ class SplitPlanTests(unittest.TestCase):
                 "og_parking_lot": "000061",
             },
         )
+
+
+class DepthFrameExclusionTests(unittest.TestCase):
+    def test_depth_frame_majority_rule_is_strict_and_ignores_zero_candidates(self):
+        self.assertEqual(
+            preprocessing._depth_invalid_frame_indices(
+                [10, 10, 10, 0, 100],
+                [6, 5, 1, 0, 51],
+            ),
+            [0, 4],
+        )
+
+    def test_window_counts_remove_every_start_intersecting_invalid_frames(self):
+        self.assertEqual(
+            preprocessing._window_start_counts(30, [0, 23, 29]),
+            (7, 7, 0),
+        )
+        self.assertEqual(
+            preprocessing._window_start_counts(48, [24]),
+            (25, 24, 1),
+        )
+
+    def test_frame_majority_is_aggregated_across_views(self):
+        spec = preprocessing.SceneSpec(
+            "train", "000000", "raw", "synthetic", "synthetic", 0, 48, 48, 30
+        )
+        view_0_candidates = [0] * 48
+        view_0_failures = [0] * 48
+        view_1_candidates = [0] * 48
+        view_1_failures = [0] * 48
+        view_0_candidates[47], view_0_failures[47] = 4, 2
+        view_1_candidates[47], view_1_failures[47] = 4, 3
+        scene_candidates = [a + b for a, b in zip(view_0_candidates, view_1_candidates)]
+        scene_failures = [a + b for a, b in zip(view_0_failures, view_1_failures)]
+        views = {
+            "0": {
+                "rgb": {"invalid_frame_indices": []},
+                "depth_consistency_candidate_count_by_frame": view_0_candidates,
+                "depth_consistency_failure_count_by_frame": view_0_failures,
+                "depth_consistency_candidate_count": 4,
+                "depth_consistency_failure_count": 2,
+            },
+            "1": {
+                "rgb": {"invalid_frame_indices": []},
+                "depth_consistency_candidate_count_by_frame": view_1_candidates,
+                "depth_consistency_failure_count_by_frame": view_1_failures,
+                "depth_consistency_candidate_count": 4,
+                "depth_consistency_failure_count": 3,
+            },
+        }
+        stats = _minimal_v5_scene_stats(
+            48,
+            views,
+            depth_candidate_counts=scene_candidates,
+            depth_failure_counts=scene_failures,
+        )
+        metadata = preprocessing._scene_metadata(
+            spec,
+            preprocessing.ValidationRecorder(ignore_failures=False),
+            stats,
+        )
+
+        with mock.patch.object(preprocessing, "VIEW_IDS", (0, 1)):
+            preprocessing._validate_scene_metadata_contract(metadata, spec)
+        self.assertEqual(
+            metadata["output"]["depth_track_consistency"]["invalid_frame_indices"],
+            [47],
+        )
+
+    def test_scene_contract_rejects_zero_legal_windows(self):
+        spec = preprocessing.SceneSpec(
+            "train", "000000", "raw", "synthetic", "synthetic", 0, 24, 24, 30
+        )
+        views = {"0": {"rgb": {"invalid_frame_indices": [0]}}}
+        stats = _minimal_v5_scene_stats(24, views)
+        metadata = preprocessing._scene_metadata(
+            spec,
+            preprocessing.ValidationRecorder(ignore_failures=False),
+            stats,
+        )
+        with self.assertRaisesRegex(ValueError, "no legal 24-frame windows"):
+            preprocessing._validate_scene_metadata_contract(metadata, spec)
+
+    def test_scene_contract_enforces_exact_sorted_reason_union(self):
+        spec = preprocessing.SceneSpec(
+            "train", "000000", "raw", "synthetic", "synthetic", 0, 48, 48, 30
+        )
+        candidates = [0] * 48
+        failures = [0] * 48
+        candidates[47] = 4
+        failures[47] = 3
+        views = {"0": {"rgb": {"invalid_frame_indices": [0]}}}
+        stats = _minimal_v5_scene_stats(
+            48,
+            views,
+            depth_candidate_counts=candidates,
+            depth_failure_counts=failures,
+        )
+        metadata = preprocessing._scene_metadata(
+            spec,
+            preprocessing.ValidationRecorder(ignore_failures=False),
+            stats,
+        )
+        with mock.patch.object(preprocessing, "VIEW_IDS", (0,)):
+            preprocessing._validate_scene_metadata_contract(metadata, spec)
+            malformed = json.loads(json.dumps(metadata))
+            malformed["output"]["window_exclusion"]["invalid_frame_indices"] = [
+                0,
+                1,
+                47,
+            ]
+            with self.assertRaisesRegex(ValueError, "exact reason union"):
+                preprocessing._validate_scene_metadata_contract(malformed, spec)
 
     def test_intrinsics_use_approved_anisotropic_scaling(self):
         intrinsics = np.asarray([1920.0, 1080.0, 960.0, 540.0], dtype=np.float32)
@@ -814,16 +993,17 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             source_sequence="synthetic",
             environment_family="synthetic",
             source_frame_start=0,
-            source_frame_end=4,
-            source_frame_count=4,
+            source_frame_end=24,
+            source_frame_count=24,
             source_fps=30,
         )
-        stats = {
-            "views": {
+        stats = _minimal_v5_scene_stats(
+            24,
+            {
                 "0": {"rgb": {"invalid_frame_indices": [1, 3]}},
                 "1": {"rgb": {"invalid_frame_indices": [0, 1]}},
-            }
-        }
+            },
+        )
 
         metadata = preprocessing._scene_metadata(
             spec,
@@ -833,6 +1013,10 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             metadata["output"]["rgb"]["invalid_frame_indices"],
+            [0, 1, 3],
+        )
+        self.assertEqual(
+            metadata["output"]["window_exclusion"]["invalid_frame_indices"],
             [0, 1, 3],
         )
 
@@ -924,6 +1108,8 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             OUTPUT_WIDTH=4,
             SCALE_X=0.5,
             SCALE_Y=0.5,
+            WINDOW_LENGTH=1,
+            DEPTH_FRAME_FAILURE_FRACTION=1.0,
         ):
             with mock.patch.object(
                 preprocessing,
@@ -967,7 +1153,7 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         persisted_visibility = np.load(output_view / "visibility.npy")
         np.testing.assert_array_equal(
             persisted_visibility,
-            np.asarray([[True, False, False, False]], dtype=bool),
+            np.asarray([[True, True, True, False]], dtype=bool),
         )
         view_stats = scene_stats[("train", "000000")]["views"]["0"]
         expected_visibility_stats = {
@@ -975,21 +1161,20 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             "visibility_true_after_geometric_gating": 3,
             "visibility_removed_by_geometric_gating": 1,
             "depth_consistency_candidate_count": 3,
+            "depth_consistency_failure_count": 2,
+            "depth_consistency_candidate_count_by_frame": [3],
+            "depth_consistency_failure_count_by_frame": [2],
             "depth_consistency_tolerance_metres": 0.05,
-            "visibility_rejected_no_valid_depth": 1,
-            "visibility_rejected_residual_over_tolerance": 1,
-            "visibility_true_after_depth_consistency_gating": 1,
-            "visibility_removed_by_depth_consistency_gating": 2,
-            "visibility_true_after_gating": 1,
-            "visibility_removed_by_gating": 3,
+            "depth_consistency_no_valid_depth_count": 1,
+            "depth_consistency_residual_over_tolerance_count": 1,
+            "visibility_true_saved": 3,
         }
         for key, expected in expected_visibility_stats.items():
             self.assertEqual(view_stats[key], expected, key)
         self.assertEqual(
-            view_stats["visibility_true_after_depth_consistency_gating"]
-            + view_stats["visibility_rejected_no_valid_depth"]
-            + view_stats["visibility_rejected_residual_over_tolerance"],
-            view_stats["depth_consistency_candidate_count"],
+            view_stats["depth_consistency_no_valid_depth_count"]
+            + view_stats["depth_consistency_residual_over_tolerance_count"],
+            view_stats["depth_consistency_failure_count"],
         )
         self.assertEqual(
             view_stats["prepared_depth"],
@@ -1043,6 +1228,23 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(scene["rgb_all_views"]["written_file_count"], 1)
         self.assertEqual(scene["rgb_all_views"]["source_decode_failure_count"], 0)
         self.assertEqual(scene["rgb_all_views"]["placeholder_file_count"], 0)
+        self.assertEqual(
+            scene["depth_track_consistency"],
+            {
+                "candidate_count": 3,
+                "failure_count": 2,
+                "invalid_frame_count": 0,
+                "invalid_frame_indices": [],
+                "per_frame": [
+                    {
+                        "frame": 0,
+                        "candidate_count": 3,
+                        "failure_count": 2,
+                        "failure_fraction": 2 / 3,
+                    }
+                ],
+            },
+        )
         self.assertEqual(
             scene["io_counts"]["source"],
             {
@@ -1102,8 +1304,8 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             source_sequence="synthetic_corrupt_rgb",
             environment_family="synthetic",
             source_frame_start=0,
-            source_frame_end=1,
-            source_frame_count=1,
+            source_frame_end=2,
+            source_frame_count=2,
             source_fps=30,
         )
         source_scene = (
@@ -1115,7 +1317,10 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         source_view.mkdir(parents=True)
         np.save(
             source_scene / "tracks_xyz.npy",
-            np.asarray([[[0.0, 0.0, 1.0]]], dtype=np.float32),
+            np.asarray(
+                [[[0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0]]],
+                dtype=np.float32,
+            ),
         )
         np.save(
             source_scene / "queries_xytv.npy",
@@ -1127,12 +1332,17 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         )
         np.save(
             source_view / "extrinsics_w2c.npy",
-            np.eye(4, dtype=np.float32)[None],
+            np.repeat(np.eye(4, dtype=np.float32)[None], 2, axis=0),
         )
-        np.save(source_view / "visibility.npy", np.ones((1, 1), dtype=bool))
-        np.save(source_view / "depth.npy", np.ones((1, 2, 2), dtype=np.float32))
-        jpeg_objects = np.empty((1,), dtype=object)
+        np.save(source_view / "visibility.npy", np.ones((2, 1), dtype=bool))
+        np.save(source_view / "depth.npy", np.ones((2, 2, 2), dtype=np.float32))
+        jpeg_objects = np.empty((2,), dtype=object)
         jpeg_objects[0] = np.frombuffer(b"not-a-jpeg", dtype=np.uint8).copy()
+        encoded_ok, encoded_image = cv2.imencode(
+            ".jpg", np.full((2, 2, 3), 127, dtype=np.uint8)
+        )
+        self.assertTrue(encoded_ok)
+        jpeg_objects[1] = encoded_image.reshape(-1)
         np.save(source_view / "images_jpeg_bytes.npy", jpeg_objects)
 
         recorder = preprocessing.ValidationRecorder(ignore_failures=False)
@@ -1147,6 +1357,7 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             OUTPUT_WIDTH=2,
             SCALE_X=1.0,
             SCALE_Y=1.0,
+            WINDOW_LENGTH=1,
         ), mock.patch.object(preprocessing, "_validate_source_queries"):
             preprocessing._prepare_scene_roots(build_root, [spec])
             progress = preprocessing.ProgressReporter(
@@ -1212,18 +1423,18 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             progress_snapshot["statistics"]["tracks"],
             {
                 "track_id_slots": 1,
-                "track_samples": 1,
-                "coordinate_values": 3,
-                "finite_coordinate_values": 3,
+                "track_samples": 2,
+                "coordinate_values": 6,
+                "finite_coordinate_values": 6,
                 "nonfinite_coordinate_values": 0,
             },
         )
         self.assertEqual(
             progress_snapshot["statistics"]["depth"],
             {
-                "values": 4,
-                "finite": 4,
-                "positive": 4,
+                "values": 8,
+                "finite": 8,
+                "positive": 8,
                 "zero": 0,
                 "negative": 0,
                 "nonfinite": 0,
@@ -1234,19 +1445,24 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(
             progress_snapshot["statistics"]["visibility"],
             {
-                "before_gating": 1,
-                "after_geometric_gating": 1,
+                "before_gating": 2,
+                "after_geometric_gating": 2,
                 "rejected_no_valid_depth": 0,
                 "rejected_residual_over_tolerance": 0,
-                "accepted": 1,
+                "accepted": 2,
             },
         )
-        output_jpeg_bytes = (build_root / "train" / "000000" / "view_0" / "rgba_00000.jpg").stat().st_size
+        output_jpeg_bytes = sum(
+            path.stat().st_size
+            for path in (build_root / "train" / "000000" / "view_0").glob(
+                "rgba_*.jpg"
+            )
+        )
         self.assertEqual(
             progress_snapshot["statistics"]["rgb"],
             {
-                "source_frames": 1,
-                "output_frames": 1,
+                "source_frames": 2,
+                "output_frames": 2,
                 "output_bytes": output_jpeg_bytes,
                 "invalid_frames": 1,
             },
@@ -1254,19 +1470,19 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(
             progress_snapshot["statistics"]["io"],
             {
-                "source_scene_frames": 1,
-                "source_camera_frames": 1,
+                "source_scene_frames": 2,
+                "source_camera_frames": 2,
                 "source_files": 7,
-                "output_scene_frames": 1,
-                "output_camera_frames": 1,
-                "output_files": 7,
+                "output_scene_frames": 2,
+                "output_camera_frames": 2,
+                "output_files": 8,
             },
         )
-        self.assertEqual(progress_snapshot["progress"]["camera_frames"]["completed"], 1)
-        self.assertEqual(progress_snapshot["progress"]["jpegs"]["completed"], 1)
+        self.assertEqual(progress_snapshot["progress"]["camera_frames"]["completed"], 2)
+        self.assertEqual(progress_snapshot["progress"]["jpegs"]["completed"], 2)
         self.assertEqual(
             progress_snapshot["progress"]["validated_jpegs"]["completed"],
-            1,
+            2,
         )
         self.assertEqual(
             metadata["output"]["rgb"]["decode_failure_placeholder"],
@@ -1303,12 +1519,10 @@ class StatisticsAggregationTests(unittest.TestCase):
             "visibility_true_after_geometric_gating": 3,
             "visibility_removed_by_geometric_gating": 1,
             "depth_consistency_candidate_count": 3,
-            "visibility_rejected_no_valid_depth": 1,
-            "visibility_rejected_residual_over_tolerance": 1,
-            "visibility_true_after_depth_consistency_gating": 1,
-            "visibility_removed_by_depth_consistency_gating": 2,
-            "visibility_true_after_gating": 1,
-            "visibility_removed_by_gating": 3,
+            "depth_consistency_failure_count": 2,
+            "depth_consistency_no_valid_depth_count": 1,
+            "depth_consistency_residual_over_tolerance_count": 1,
+            "visibility_true_saved": 3,
         }
         scene_stats = {
             ("train", "000000"): {
@@ -1337,6 +1551,31 @@ class StatisticsAggregationTests(unittest.TestCase):
                     "output_bytes": 123,
                     "source_decode_failure_count": 0,
                     "placeholder_file_count": 0,
+                },
+                "depth_track_consistency": {
+                    "candidate_count": 3,
+                    "failure_count": 2,
+                    "invalid_frame_count": 1,
+                    "invalid_frame_indices": [0],
+                    "per_frame": [
+                        {
+                            "frame": 0,
+                            "candidate_count": 3,
+                            "failure_count": 2,
+                            "failure_fraction": 2 / 3,
+                        }
+                    ],
+                },
+                "window_exclusion": {
+                    "window_length": 24,
+                    "invalid_frame_indices": [0],
+                    "reasons": {
+                        "rgb_decode": [],
+                        "depth_track_majority_mismatch": [0],
+                    },
+                    "total_start_count": 0,
+                    "excluded_start_count": 0,
+                    "legal_start_count": 0,
                 },
                 "views": {
                     "0": {
@@ -1444,6 +1683,70 @@ class StatisticsAggregationTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            statistics["depth_track_consistency"],
+            {
+                "candidate_count": 3,
+                "failure_count": 2,
+                "invalid_frame_count": 1,
+                "scenes_with_invalid_depth_count": 1,
+                "invalid_scene_frames": [
+                    {
+                        "split": "train",
+                        "scene_id": "000000",
+                        "layout": "raw",
+                        "source_sequence": "synthetic",
+                        "invalid_frame_indices": [0],
+                    }
+                ],
+                "tolerance_metres": 0.05,
+                "frame_failure_fraction_threshold": 0.5,
+                "scenes": [
+                    {
+                        "split": "train",
+                        "scene_id": "000000",
+                        "layout": "raw",
+                        "source_sequence": "synthetic",
+                        "candidate_count": 3,
+                        "failure_count": 2,
+                        "invalid_frame_indices": [0],
+                        "per_frame": [
+                            {
+                                "frame": 0,
+                                "candidate_count": 3,
+                                "failure_count": 2,
+                                "failure_fraction": 2 / 3,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        self.assertEqual(
+            statistics["window_exclusion"],
+            {
+                "window_length": 24,
+                "invalid_scene_frame_count": 1,
+                "scenes_with_invalid_frames_count": 1,
+                "total_start_count": 0,
+                "excluded_start_count": 0,
+                "legal_start_count": 0,
+                "scenes": [
+                    {
+                        "split": "train",
+                        "scene_id": "000000",
+                        "invalid_frame_indices": [0],
+                        "reasons": {
+                            "rgb_decode": [],
+                            "depth_track_majority_mismatch": [0],
+                        },
+                        "total_start_count": 0,
+                        "excluded_start_count": 0,
+                        "legal_start_count": 0,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(
             statistics["io_counts"],
             {
                 "source_sequence_count": 1,
@@ -1524,7 +1827,7 @@ class ValidationPolicyTests(unittest.TestCase):
         recorder.record(self._spec(), "synthetic", float("nan"), "finite")
         report = preprocessing._report([self._spec()], recorder)
         scene_metadata = preprocessing._scene_metadata(
-            self._spec(), recorder, {"views": {}}
+            self._spec(), recorder, _minimal_v5_scene_stats(1, {})
         )
 
         encoded = json.dumps(report, allow_nan=False)

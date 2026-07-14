@@ -54,13 +54,15 @@ else:
     )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OUTPUT_HEIGHT = 384
 OUTPUT_WIDTH = 512
 JPEG_QUALITY = 95
 LONG_CHUNK_LENGTH = 120
 PROJECTION_TOLERANCE_PX = 0.01
 DEPTH_TRACK_TOLERANCE_METRES = 0.05
+WINDOW_LENGTH = 24
+DEPTH_FRAME_FAILURE_FRACTION = 0.5
 RIGID_DETERMINANT_TOLERANCE = 1e-3
 SCALE_X = OUTPUT_WIDTH / SOURCE_WIDTH
 SCALE_Y = OUTPUT_HEIGHT / SOURCE_HEIGHT
@@ -71,6 +73,71 @@ JPEG_VALIDATION_BATCH_FILES = 32
 PROGRESS_SCHEMA_VERSION = 1
 PROGRESS_UPDATE_INTERVAL_SECONDS = 1.0
 PROGRESS_TERMINAL_INTERVAL_SECONDS = 5.0
+
+
+def _sorted_unique_frame_indices(
+    frame_indices: Iterable[int],
+    frame_count: int,
+    *,
+    label: str,
+) -> list[int]:
+    raw_values = list(frame_indices)
+    if any(
+        isinstance(frame, bool) or not isinstance(frame, (int, np.integer))
+        for frame in raw_values
+    ):
+        raise ValueError(f"{label} must contain only integers")
+    values = [int(frame) for frame in raw_values]
+    if values != sorted(set(values)):
+        raise ValueError(f"{label} must be sorted and unique")
+    if any(frame < 0 or frame >= frame_count for frame in values):
+        raise ValueError(f"{label} contains an out-of-range frame")
+    return values
+
+
+def _depth_invalid_frame_indices(
+    candidate_counts: Sequence[int],
+    failure_counts: Sequence[int],
+) -> list[int]:
+    if len(candidate_counts) != len(failure_counts):
+        raise ValueError("depth candidate and failure count lengths differ")
+    invalid: list[int] = []
+    for frame, (candidate_count, failure_count) in enumerate(
+        zip(candidate_counts, failure_counts)
+    ):
+        candidates = int(candidate_count)
+        failures = int(failure_count)
+        if candidates < 0 or failures < 0 or failures > candidates:
+            raise ValueError("invalid per-frame depth consistency counts")
+        if candidates > 0 and failures / candidates > DEPTH_FRAME_FAILURE_FRACTION:
+            invalid.append(frame)
+    return invalid
+
+
+def _window_start_counts(
+    frame_count: int,
+    invalid_frame_indices: Sequence[int],
+    *,
+    window_length: int | None = None,
+) -> tuple[int, int, int]:
+    if window_length is None:
+        window_length = WINDOW_LENGTH
+    if window_length <= 0:
+        raise ValueError("window length must be positive")
+    invalid_frames = _sorted_unique_frame_indices(
+        invalid_frame_indices,
+        frame_count,
+        label="invalid frame indices",
+    )
+    total = max(0, frame_count - window_length + 1)
+    excluded_starts: set[int] = set()
+    for frame in invalid_frames:
+        first = max(0, frame - window_length + 1)
+        last = min(frame, total - 1)
+        if first <= last:
+            excluded_starts.update(range(first, last + 1))
+    excluded = len(excluded_starts)
+    return total, excluded, total - excluded
 
 
 @dataclass(frozen=True)
@@ -418,6 +485,10 @@ class ProgressReporter:
                 "camera_frames": "depth camera frames fully processed",
                 "output_bytes": "encoded output JPEG bytes written",
                 "source_files": "distinct logical source assets opened per source sequence",
+                "visibility": (
+                    "depth-track failure counters are diagnostics only; saved visibility "
+                    "is source visibility after geometric gating and is never depth-gated"
+                ),
             },
             "statistics": {
                 section: dict(values) for section, values in self._statistics.items()
@@ -1425,6 +1496,8 @@ def _convert_source_group(
                 "rgb_decode_resize_encode_write": 0.0,
             },
             "views": {},
+            "depth_track_candidate_count_by_frame": [0] * spec.frame_count,
+            "depth_track_failure_count_by_frame": [0] * spec.frame_count,
         }
 
     for view in VIEW_IDS:
@@ -1521,7 +1594,6 @@ def _convert_source_group(
                 & (camera_z > 0.0)
                 & inside
             )
-            output_visibility = geometric_visibility.copy()
             projection_seconds = time.perf_counter() - projection_start
 
             np.save(output_view / "intrinsics.npy", np.ascontiguousarray(resized_k))
@@ -1556,6 +1628,8 @@ def _convert_source_group(
             prepared_depth_finite_max: float | None = None
             rejected_no_valid_depth = 0
             rejected_residual_over_tolerance = 0
+            depth_candidate_count_by_frame = [0] * spec.frame_count
+            depth_failure_count_by_frame = [0] * spec.frame_count
             for local_frame, source_frame in enumerate(range(start, end)):
                 source_depth_frame = np.asarray(source_depth[source_frame], dtype=np.float32)
                 nonfinite = ~np.isfinite(source_depth_frame)
@@ -1619,30 +1693,50 @@ def _convert_source_group(
                     camera_z[local_frame],
                     geometric_visibility[local_frame],
                 )
-                output_visibility[local_frame] &= depth_consistent
                 frame_candidates = geometric_visibility[local_frame]
-                rejected_no_valid_depth += int((frame_candidates & ~any_valid_depth).sum())
-                rejected_residual_over_tolerance += int(
+                frame_no_valid_depth = int(
+                    (frame_candidates & ~any_valid_depth).sum()
+                )
+                frame_residual_over_tolerance = int(
                     (frame_candidates & any_valid_depth & ~depth_consistent).sum()
                 )
+                frame_candidate_count = int(frame_candidates.sum())
+                frame_failure_count = (
+                    frame_no_valid_depth + frame_residual_over_tolerance
+                )
+                depth_candidate_count_by_frame[local_frame] = frame_candidate_count
+                depth_failure_count_by_frame[local_frame] = frame_failure_count
+                rejected_no_valid_depth += frame_no_valid_depth
+                rejected_residual_over_tolerance += frame_residual_over_tolerance
+                scene_key = (spec.split, spec.scene_id)
+                scene_stats[scene_key]["depth_track_candidate_count_by_frame"][
+                    local_frame
+                ] += frame_candidate_count
+                scene_stats[scene_key]["depth_track_failure_count_by_frame"][
+                    local_frame
+                ] += frame_failure_count
                 if progress is not None:
                     progress.advance("camera_frames")
             depth_output.flush()
             del depth_output
-            np.save(output_view / "visibility.npy", np.ascontiguousarray(output_visibility))
+            np.save(
+                output_view / "visibility.npy",
+                np.ascontiguousarray(geometric_visibility),
+            )
             if progress is not None:
                 progress.add_statistics("io", output_files=4)
             depth_seconds = time.perf_counter() - depth_start
 
             before = int(source_visibility.sum())
             after_geometry = int(geometric_visibility.sum())
-            after_depth_consistency = int(output_visibility.sum())
-            if (
-                after_depth_consistency
-                + rejected_no_valid_depth
-                + rejected_residual_over_tolerance
-                != after_geometry
-            ):
+            depth_failure_count = (
+                rejected_no_valid_depth + rejected_residual_over_tolerance
+            )
+            if sum(depth_candidate_count_by_frame) != after_geometry:
+                raise AssertionError("per-frame depth candidate counts do not reconcile")
+            if sum(depth_failure_count_by_frame) != depth_failure_count:
+                raise AssertionError("per-frame depth failure counts do not reconcile")
+            if depth_failure_count > after_geometry:
                 raise AssertionError("depth-consistency visibility counts do not reconcile")
             prepared_depth_pixel_count = spec.frame_count * OUTPUT_HEIGHT * OUTPUT_WIDTH
             if (
@@ -1660,7 +1754,7 @@ def _convert_source_group(
                     after_geometric_gating=after_geometry,
                     rejected_no_valid_depth=rejected_no_valid_depth,
                     rejected_residual_over_tolerance=rejected_residual_over_tolerance,
-                    accepted=after_depth_consistency,
+                    accepted=after_geometry - depth_failure_count,
                 )
 
             view_stats = {
@@ -1684,17 +1778,19 @@ def _convert_source_group(
                 "visibility_true_after_geometric_gating": after_geometry,
                 "visibility_removed_by_geometric_gating": before - after_geometry,
                 "depth_consistency_candidate_count": after_geometry,
+                "depth_consistency_failure_count": depth_failure_count,
+                "depth_consistency_candidate_count_by_frame": (
+                    depth_candidate_count_by_frame
+                ),
+                "depth_consistency_failure_count_by_frame": (
+                    depth_failure_count_by_frame
+                ),
                 "depth_consistency_tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
-                "visibility_rejected_no_valid_depth": rejected_no_valid_depth,
-                "visibility_rejected_residual_over_tolerance": (
+                "depth_consistency_no_valid_depth_count": rejected_no_valid_depth,
+                "depth_consistency_residual_over_tolerance_count": (
                     rejected_residual_over_tolerance
                 ),
-                "visibility_true_after_depth_consistency_gating": after_depth_consistency,
-                "visibility_removed_by_depth_consistency_gating": (
-                    after_geometry - after_depth_consistency
-                ),
-                "visibility_true_after_gating": after_depth_consistency,
-                "visibility_removed_by_gating": before - after_depth_consistency,
+                "visibility_true_saved": after_geometry,
                 "rgb": {
                     "source_frame_count": spec.frame_count,
                     "output_frame_count": 0,
@@ -1906,6 +2002,67 @@ def _convert_source_group(
                 for item in view_values
             ),
         }
+        candidate_counts = [
+            int(value)
+            for value in stats["depth_track_candidate_count_by_frame"]
+        ]
+        failure_counts = [
+            int(value)
+            for value in stats["depth_track_failure_count_by_frame"]
+        ]
+        depth_invalid_frames = _depth_invalid_frame_indices(
+            candidate_counts,
+            failure_counts,
+        )
+        rgb_invalid_frames = sorted(
+            {
+                int(frame)
+                for item in view_values
+                for frame in item["rgb"]["invalid_frame_indices"]
+            }
+        )
+        invalid_frames = sorted(set(rgb_invalid_frames) | set(depth_invalid_frames))
+        total_starts, excluded_starts, legal_starts = _window_start_counts(
+            spec.frame_count,
+            invalid_frames,
+            window_length=WINDOW_LENGTH,
+        )
+        if legal_starts == 0:
+            raise ValueError(
+                f"{spec.split}/{spec.scene_id} has no legal {WINDOW_LENGTH}-frame windows"
+            )
+        stats["depth_track_consistency"] = {
+            "candidate_count": sum(candidate_counts),
+            "failure_count": sum(failure_counts),
+            "invalid_frame_count": len(depth_invalid_frames),
+            "invalid_frame_indices": depth_invalid_frames,
+            "per_frame": [
+                {
+                    "frame": frame,
+                    "candidate_count": candidates,
+                    "failure_count": failures,
+                    "failure_fraction": (
+                        failures / candidates if candidates > 0 else None
+                    ),
+                }
+                for frame, (candidates, failures) in enumerate(
+                    zip(candidate_counts, failure_counts)
+                )
+            ],
+        }
+        stats["window_exclusion"] = {
+            "window_length": WINDOW_LENGTH,
+            "invalid_frame_indices": invalid_frames,
+            "reasons": {
+                "rgb_decode": rgb_invalid_frames,
+                "depth_track_majority_mismatch": depth_invalid_frames,
+            },
+            "total_start_count": total_starts,
+            "excluded_start_count": excluded_starts,
+            "legal_start_count": legal_starts,
+        }
+        del stats["depth_track_candidate_count_by_frame"]
+        del stats["depth_track_failure_count_by_frame"]
         planned_scene_files = 2 + sum(
             int(item["planned_view_regular_file_count"]) for item in view_values
         )
@@ -1955,8 +2112,15 @@ def _scene_metadata(
             for frame in view_stats["rgb"]["invalid_frame_indices"]
         }
     )
-    if any(frame < 0 or frame >= spec.frame_count for frame in invalid_rgb_frame_indices):
-        raise AssertionError("scene invalid RGB frame index is outside the scene")
+    _sorted_unique_frame_indices(
+        invalid_rgb_frame_indices,
+        spec.frame_count,
+        label="scene invalid RGB frame indices",
+    )
+    depth_track_consistency = stats["depth_track_consistency"]
+    window_exclusion = stats["window_exclusion"]
+    if window_exclusion["reasons"]["rgb_decode"] != invalid_rgb_frame_indices:
+        raise AssertionError("scene RGB invalid frames do not match exclusion reasons")
     return {
         "schema_version": SCHEMA_VERSION,
         "format": "pointodyssey_mvtracker_preprocessed",
@@ -2007,20 +2171,36 @@ def _scene_metadata(
                     "source-visible, finite track and projection, positive camera-Z, "
                     "inside resized pixel-center bounds"
                 ),
-                "depth_track_consistency": {
-                    "depth_source": "exact resized float32 optical-Z frame written to depth.npy",
-                    "nearest_pixel_rule": "floor(coordinate + 0.5)",
-                    "neighborhood": (
-                        "in-bounds samples from the 3x3 around nearest pixel; "
-                        "out-of-bounds offsets are skipped"
-                    ),
-                    "acceptance": (
-                        "at least one finite positive depth with "
-                        "abs(depth-camera_z) <= tolerance_metres"
-                    ),
-                    "tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
-                },
+                "depth_gated": False,
             },
+            "depth_track_consistency": {
+                "depth_source": (
+                    "exact resized float32 optical-Z frame written to depth.npy"
+                ),
+                "nearest_pixel_rule": "floor(coordinate + 0.5)",
+                "neighborhood": (
+                    "in-bounds finite positive samples from the 3x3 around nearest "
+                    "pixel; out-of-bounds offsets are skipped"
+                ),
+                "observation_failure": (
+                    "no valid positive depth in the 3x3 neighborhood or no sample "
+                    "with abs(depth-camera_z) <= tolerance_metres"
+                ),
+                "tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
+                "frame_failure_fraction_threshold": (
+                    DEPTH_FRAME_FAILURE_FRACTION
+                ),
+                "frame_failure_rule": (
+                    "candidate_count > 0 and failure_count / candidate_count > "
+                    "frame_failure_fraction_threshold"
+                ),
+                "zero_candidate_failure_fraction": None,
+                "invalid_frame_indices": depth_track_consistency[
+                    "invalid_frame_indices"
+                ],
+                "per_frame": depth_track_consistency["per_frame"],
+            },
+            "window_exclusion": window_exclusion,
             "intrinsic_scale_xy": [SCALE_X, SCALE_Y],
         },
         "validation": {
@@ -2051,6 +2231,148 @@ def _write_scene_metadata(
             progress.add_statistics("io", output_files=1)
 
 
+def _validate_scene_metadata_contract(
+    metadata: dict[str, Any],
+    spec: SceneSpec,
+) -> None:
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"{spec.split}/{spec.scene_id} scene metadata is not schema v{SCHEMA_VERSION}"
+        )
+    output = metadata["output"]
+    if int(output["frame_count"]) != spec.frame_count:
+        raise ValueError("scene metadata frame count does not match split plan")
+    if output["visibility"].get("depth_gated") is not False:
+        raise ValueError("schema v5 visibility must not be depth-gated")
+
+    rgb_invalid = _sorted_unique_frame_indices(
+        output["rgb"]["invalid_frame_indices"],
+        spec.frame_count,
+        label="RGB invalid frame indices",
+    )
+    depth_diagnostics = output["depth_track_consistency"]
+    if float(depth_diagnostics["tolerance_metres"]) != DEPTH_TRACK_TOLERANCE_METRES:
+        raise ValueError("depth consistency tolerance does not match schema v5")
+    if (
+        float(depth_diagnostics["frame_failure_fraction_threshold"])
+        != DEPTH_FRAME_FAILURE_FRACTION
+    ):
+        raise ValueError("depth frame threshold does not match schema v5")
+    if depth_diagnostics["zero_candidate_failure_fraction"] is not None:
+        raise ValueError("zero-candidate depth frames must use a null failure fraction")
+    per_frame = depth_diagnostics["per_frame"]
+    if len(per_frame) != spec.frame_count:
+        raise ValueError("depth consistency diagnostics must contain one entry per frame")
+    candidate_counts: list[int] = []
+    failure_counts: list[int] = []
+    for expected_frame, item in enumerate(per_frame):
+        if int(item["frame"]) != expected_frame:
+            raise ValueError("depth consistency frame indices must be contiguous")
+        candidates = int(item["candidate_count"])
+        failures = int(item["failure_count"])
+        if candidates < 0 or failures < 0 or failures > candidates:
+            raise ValueError("invalid per-frame depth consistency counts")
+        expected_fraction = failures / candidates if candidates else None
+        if item["failure_fraction"] != expected_fraction:
+            raise ValueError("depth consistency failure fraction does not reconcile")
+        candidate_counts.append(candidates)
+        failure_counts.append(failures)
+    expected_depth_invalid = _depth_invalid_frame_indices(
+        candidate_counts,
+        failure_counts,
+    )
+    depth_invalid = _sorted_unique_frame_indices(
+        depth_diagnostics["invalid_frame_indices"],
+        spec.frame_count,
+        label="depth invalid frame indices",
+    )
+    if depth_invalid != expected_depth_invalid:
+        raise ValueError("depth invalid frames do not match strict majority rule")
+
+    exclusion = output["window_exclusion"]
+    reasons = exclusion["reasons"]
+    expected_reason_names = {"rgb_decode", "depth_track_majority_mismatch"}
+    if set(reasons) != expected_reason_names:
+        raise ValueError("window-exclusion reasons do not match schema v5")
+    reason_rgb = _sorted_unique_frame_indices(
+        reasons["rgb_decode"],
+        spec.frame_count,
+        label="RGB exclusion reason frames",
+    )
+    reason_depth = _sorted_unique_frame_indices(
+        reasons["depth_track_majority_mismatch"],
+        spec.frame_count,
+        label="depth exclusion reason frames",
+    )
+    if reason_rgb != rgb_invalid or reason_depth != depth_invalid:
+        raise ValueError("window-exclusion reason frames do not match diagnostics")
+    invalid_frames = _sorted_unique_frame_indices(
+        exclusion["invalid_frame_indices"],
+        spec.frame_count,
+        label="window-exclusion invalid frame indices",
+    )
+    if invalid_frames != sorted(set(reason_rgb) | set(reason_depth)):
+        raise ValueError("window-exclusion invalid frames are not the exact reason union")
+    if int(exclusion["window_length"]) != WINDOW_LENGTH:
+        raise ValueError("window-exclusion length does not match preprocessing contract")
+    total, excluded, legal = _window_start_counts(
+        spec.frame_count,
+        invalid_frames,
+        window_length=WINDOW_LENGTH,
+    )
+    recorded_counts = (
+        int(exclusion["total_start_count"]),
+        int(exclusion["excluded_start_count"]),
+        int(exclusion["legal_start_count"]),
+    )
+    if recorded_counts != (total, excluded, legal):
+        raise ValueError("window start counts do not reconcile")
+    if legal == 0:
+        raise ValueError(
+            f"{spec.split}/{spec.scene_id} has no legal {WINDOW_LENGTH}-frame windows"
+        )
+
+    statistics = metadata["statistics"]
+    stats_depth = statistics["depth_track_consistency"]
+    if stats_depth["per_frame"] != per_frame:
+        raise ValueError("statistics depth diagnostics differ from output metadata")
+    if stats_depth["invalid_frame_indices"] != depth_invalid:
+        raise ValueError("statistics depth invalid frames do not reconcile")
+    if int(stats_depth["candidate_count"]) != sum(candidate_counts):
+        raise ValueError("statistics depth candidate count does not reconcile")
+    if int(stats_depth["failure_count"]) != sum(failure_counts):
+        raise ValueError("statistics depth failure count does not reconcile")
+    if int(stats_depth["invalid_frame_count"]) != len(depth_invalid):
+        raise ValueError("statistics depth invalid-frame count does not reconcile")
+    if statistics["window_exclusion"] != exclusion:
+        raise ValueError("statistics window exclusion differs from output metadata")
+    view_statistics = statistics["views"]
+    if set(view_statistics) != {str(view) for view in VIEW_IDS}:
+        raise ValueError("scene statistics do not contain the required views")
+    aggregate_candidates = [0] * spec.frame_count
+    aggregate_failures = [0] * spec.frame_count
+    for view_stats in view_statistics.values():
+        view_candidates = view_stats[
+            "depth_consistency_candidate_count_by_frame"
+        ]
+        view_failures = view_stats["depth_consistency_failure_count_by_frame"]
+        if len(view_candidates) != spec.frame_count or len(view_failures) != spec.frame_count:
+            raise ValueError("view depth diagnostics must contain one count per frame")
+        if int(view_stats["depth_consistency_candidate_count"]) != sum(
+            int(value) for value in view_candidates
+        ):
+            raise ValueError("view depth candidate counts do not reconcile")
+        if int(view_stats["depth_consistency_failure_count"]) != sum(
+            int(value) for value in view_failures
+        ):
+            raise ValueError("view depth failure counts do not reconcile")
+        for frame in range(spec.frame_count):
+            aggregate_candidates[frame] += int(view_candidates[frame])
+            aggregate_failures[frame] += int(view_failures[frame])
+    if aggregate_candidates != candidate_counts or aggregate_failures != failure_counts:
+        raise ValueError("scene depth counts do not equal the sum across views")
+
+
 def _validate_output_tree(
     build_root: Path,
     specs: Sequence[SceneSpec],
@@ -2079,7 +2401,10 @@ def _validate_output_tree(
     validated_rgb_file_count = 0
     for spec in specs:
         scene_dir = _output_scene_dir(build_root, spec)
-        _require_file(scene_dir / "scene.json")
+        scene_metadata_path = _require_file(scene_dir / "scene.json")
+        with scene_metadata_path.open("r", encoding="utf-8") as handle:
+            scene_metadata = json.load(handle)
+        _validate_scene_metadata_contract(scene_metadata, spec)
         _require_array(scene_dir / "tracks_3d.npy", (spec.frame_count, POINT_COUNT, 3), np.float32)
         expected_output_file_count += 2 + len(VIEW_IDS) * (4 + spec.frame_count)
         for view in VIEW_IDS:
@@ -2096,7 +2421,19 @@ def _validate_output_tree(
             _require_array(view_dir / "depth.npy", (spec.frame_count, OUTPUT_HEIGHT, OUTPUT_WIDTH), np.float32)
             _require_array(view_dir / "intrinsics.npy", (3, 3), np.float32)
             _require_array(view_dir / "extrinsics_w2c.npy", (spec.frame_count, 3, 4), np.float32)
-            _require_array(view_dir / "visibility.npy", (spec.frame_count, POINT_COUNT), np.bool_)
+            visibility = _require_array(
+                view_dir / "visibility.npy",
+                (spec.frame_count, POINT_COUNT),
+                np.bool_,
+            )
+            view_stats = scene_metadata["statistics"]["views"][str(view)]
+            saved_visibility_count = int(visibility.sum())
+            if saved_visibility_count != int(view_stats["visibility_true_saved"]):
+                raise ValueError("saved visibility count does not match scene statistics")
+            if saved_visibility_count != int(
+                view_stats["visibility_true_after_geometric_gating"]
+            ):
+                raise ValueError("saved visibility is not geometric-only visibility")
             expected_jpegs = [f"rgba_{frame:05d}.jpg" for frame in range(spec.frame_count)]
             actual_jpegs = sorted(path.name for path in view_dir.glob("rgba_*.jpg"))
             expected_rgb_file_count += len(expected_jpegs)
@@ -2184,12 +2521,10 @@ def _aggregate_scene_statistics(
         "visibility_true_after_geometric_gating",
         "visibility_removed_by_geometric_gating",
         "depth_consistency_candidate_count",
-        "visibility_rejected_no_valid_depth",
-        "visibility_rejected_residual_over_tolerance",
-        "visibility_true_after_depth_consistency_gating",
-        "visibility_removed_by_depth_consistency_gating",
-        "visibility_true_after_gating",
-        "visibility_removed_by_gating",
+        "depth_consistency_failure_count",
+        "depth_consistency_no_valid_depth_count",
+        "depth_consistency_residual_over_tolerance_count",
+        "visibility_true_saved",
     )
     track_totals = {field: 0 for field in track_fields}
     depth_totals = {field: 0 for field in depth_count_fields}
@@ -2207,6 +2542,12 @@ def _aggregate_scene_statistics(
     scene_accounted_stage_total = 0.0
     decode_failures: list[dict[str, Any]] = []
     invalid_scene_frames: list[dict[str, Any]] = []
+    depth_invalid_scene_frames: list[dict[str, Any]] = []
+    depth_consistency_scenes: list[dict[str, Any]] = []
+    window_exclusion_scenes: list[dict[str, Any]] = []
+    total_window_start_count = 0
+    excluded_window_start_count = 0
+    legal_window_start_count = 0
     finite_min: float | None = None
     finite_max: float | None = None
     for spec in specs:
@@ -2249,6 +2590,53 @@ def _aggregate_scene_statistics(
                     "invalid_frame_indices": sorted(scene_invalid_rgb_frames),
                 }
             )
+        scene_depth_consistency = stats["depth_track_consistency"]
+        scene_depth_invalid_frames = scene_depth_consistency[
+            "invalid_frame_indices"
+        ]
+        depth_consistency_scenes.append(
+            {
+                "split": spec.split,
+                "scene_id": spec.scene_id,
+                "layout": spec.layout,
+                "source_sequence": spec.source_sequence,
+                "candidate_count": scene_depth_consistency["candidate_count"],
+                "failure_count": scene_depth_consistency["failure_count"],
+                "invalid_frame_indices": scene_depth_invalid_frames,
+                "per_frame": scene_depth_consistency["per_frame"],
+            }
+        )
+        if scene_depth_invalid_frames:
+            depth_invalid_scene_frames.append(
+                {
+                    "split": spec.split,
+                    "scene_id": spec.scene_id,
+                    "layout": spec.layout,
+                    "source_sequence": spec.source_sequence,
+                    "invalid_frame_indices": scene_depth_invalid_frames,
+                }
+            )
+        scene_exclusion = stats["window_exclusion"]
+        total_window_start_count += int(scene_exclusion["total_start_count"])
+        excluded_window_start_count += int(
+            scene_exclusion["excluded_start_count"]
+        )
+        legal_window_start_count += int(scene_exclusion["legal_start_count"])
+        window_exclusion_scenes.append(
+            {
+                "split": spec.split,
+                "scene_id": spec.scene_id,
+                "invalid_frame_indices": scene_exclusion[
+                    "invalid_frame_indices"
+                ],
+                "reasons": scene_exclusion["reasons"],
+                "total_start_count": scene_exclusion["total_start_count"],
+                "excluded_start_count": scene_exclusion[
+                    "excluded_start_count"
+                ],
+                "legal_start_count": scene_exclusion["legal_start_count"],
+            }
+        )
         source_io = stats["io_counts"]["source"]
         output_io = stats["io_counts"]["output"]
         source_chunk_frame_count += int(source_io["source_chunk_frame_count"])
@@ -2299,25 +2687,20 @@ def _aggregate_scene_statistics(
 
     before = visibility_totals["visibility_true_before_gating"]
     after_geometry = visibility_totals["visibility_true_after_geometric_gating"]
-    after_depth = visibility_totals[
-        "visibility_true_after_depth_consistency_gating"
+    no_depth = visibility_totals["depth_consistency_no_valid_depth_count"]
+    residual = visibility_totals[
+        "depth_consistency_residual_over_tolerance_count"
     ]
-    no_depth = visibility_totals["visibility_rejected_no_valid_depth"]
-    residual = visibility_totals["visibility_rejected_residual_over_tolerance"]
     if before != after_geometry + visibility_totals["visibility_removed_by_geometric_gating"]:
         raise AssertionError("root geometric-visibility counts do not reconcile")
     if visibility_totals["depth_consistency_candidate_count"] != after_geometry:
         raise AssertionError("root depth-consistency candidate counts do not reconcile")
-    if after_geometry != after_depth + no_depth + residual:
-        raise AssertionError("root depth-consistency rejection counts do not reconcile")
-    if visibility_totals["visibility_removed_by_depth_consistency_gating"] != (
-        no_depth + residual
-    ):
-        raise AssertionError("root depth-consistency removed counts do not reconcile")
-    if visibility_totals["visibility_true_after_gating"] != after_depth:
-        raise AssertionError("root final visibility aliases do not reconcile")
-    if visibility_totals["visibility_removed_by_gating"] != before - after_depth:
-        raise AssertionError("root total visibility-removed counts do not reconcile")
+    if visibility_totals["depth_consistency_failure_count"] != no_depth + residual:
+        raise AssertionError("root depth-consistency failure counts do not reconcile")
+    if visibility_totals["depth_consistency_failure_count"] > after_geometry:
+        raise AssertionError("root depth failures exceed candidates")
+    if visibility_totals["visibility_true_saved"] != after_geometry:
+        raise AssertionError("saved visibility must equal geometric visibility")
 
     planned_tree_files = output_validation[
         "planned_temporary_tree_file_count_before_root_report"
@@ -2409,6 +2792,38 @@ def _aggregate_scene_statistics(
         "visibility": {
             **visibility_totals,
             "depth_consistency_tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
+        },
+        "depth_track_consistency": {
+            "candidate_count": visibility_totals[
+                "depth_consistency_candidate_count"
+            ],
+            "failure_count": visibility_totals[
+                "depth_consistency_failure_count"
+            ],
+            "invalid_frame_count": sum(
+                len(item["invalid_frame_indices"])
+                for item in depth_invalid_scene_frames
+            ),
+            "scenes_with_invalid_depth_count": len(depth_invalid_scene_frames),
+            "invalid_scene_frames": depth_invalid_scene_frames,
+            "tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
+            "frame_failure_fraction_threshold": DEPTH_FRAME_FAILURE_FRACTION,
+            "scenes": depth_consistency_scenes,
+        },
+        "window_exclusion": {
+            "window_length": WINDOW_LENGTH,
+            "invalid_scene_frame_count": sum(
+                len(item["invalid_frame_indices"])
+                for item in window_exclusion_scenes
+            ),
+            "scenes_with_invalid_frames_count": sum(
+                bool(item["invalid_frame_indices"])
+                for item in window_exclusion_scenes
+            ),
+            "total_start_count": total_window_start_count,
+            "excluded_start_count": excluded_window_start_count,
+            "legal_start_count": legal_window_start_count,
+            "scenes": window_exclusion_scenes,
         },
         "io_counts": {
             "source_sequence_count": source_sequence_count,

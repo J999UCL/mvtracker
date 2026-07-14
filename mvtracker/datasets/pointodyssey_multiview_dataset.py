@@ -21,12 +21,15 @@ _SPLITS = {
     "validation": "validation",
     "test": "test",
 }
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _FORMAT_NAME = "pointodyssey_mvtracker_preprocessed"
 _VIEW_IDS = (0, 1, 2, 3)
 _HEIGHT = 384
 _WIDTH = 512
 _POINT_COUNT = 2600
+_WINDOW_LENGTH = 24
+_DEPTH_TRACK_TOLERANCE_METRES = 0.05
+_DEPTH_FRAME_FAILURE_FRACTION = 0.5
 
 
 def _require_dict(value: Any, context: str) -> dict[str, Any]:
@@ -38,6 +41,44 @@ def _require_dict(value: Any, context: str) -> dict[str, Any]:
 def _require_value(value: Any, expected: Any, context: str) -> None:
     if value != expected:
         raise ValueError(f"{context} must be {expected!r}, got {value!r}.")
+
+
+def _require_frame_indices(value: Any, frame_count: int, context: str) -> list[int]:
+    if not isinstance(value, list) or any(
+        isinstance(frame, bool) or not isinstance(frame, int)
+        for frame in value
+    ):
+        raise ValueError(f"{context} must be a list of integers.")
+    if value != sorted(set(value)):
+        raise ValueError(f"{context} must be sorted and unique.")
+    if any(frame < 0 or frame >= frame_count for frame in value):
+        raise ValueError(f"{context} values must be in [0, {frame_count}).")
+    return value
+
+
+def _require_nonnegative_int(value: Any, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{context} must be a non-negative integer.")
+    return value
+
+
+def _window_start_counts(
+    frame_count: int,
+    window_length: int,
+    invalid_frame_indices: list[int],
+) -> tuple[int, int, int]:
+    total_start_count = max(0, frame_count - window_length + 1)
+    excluded_starts: set[int] = set()
+    for frame in invalid_frame_indices:
+        first_affected_start = max(0, frame - window_length + 1)
+        last_affected_start = min(frame, frame_count - window_length)
+        excluded_starts.update(range(first_affected_start, last_affected_start + 1))
+    excluded_start_count = len(excluded_starts)
+    return (
+        total_start_count,
+        excluded_start_count,
+        total_start_count - excluded_start_count,
+    )
 
 
 def _load_npy(path: Path, expected_shape: tuple[int, ...], expected_dtype: np.dtype) -> np.ndarray:
@@ -225,22 +266,11 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
 
         rgb_metadata = _require_dict(output.get("rgb"), f"{metadata_path}: output.rgb")
         _require_value(rgb_metadata.get("format"), "jpeg", f"{metadata_path}: output.rgb.format")
-        invalid_frame_indices = rgb_metadata.get("invalid_frame_indices")
-        if not isinstance(invalid_frame_indices, list) or any(
-            isinstance(frame, bool) or not isinstance(frame, int)
-            for frame in invalid_frame_indices
-        ):
-            raise ValueError(
-                f"{metadata_path}: output.rgb.invalid_frame_indices must be a list of integers."
-            )
-        if invalid_frame_indices != sorted(set(invalid_frame_indices)):
-            raise ValueError(
-                f"{metadata_path}: output.rgb.invalid_frame_indices must be sorted and unique."
-            )
-        if any(frame < 0 or frame >= frame_count for frame in invalid_frame_indices):
-            raise ValueError(
-                f"{metadata_path}: invalid RGB frame indices must be in [0, {frame_count})."
-            )
+        invalid_rgb_frame_indices = _require_frame_indices(
+            rgb_metadata.get("invalid_frame_indices"),
+            frame_count,
+            f"{metadata_path}: output.rgb.invalid_frame_indices",
+        )
 
         depth_metadata = _require_dict(output.get("depth"), f"{metadata_path}: output.depth")
         _require_value(depth_metadata.get("format"), "npy", f"{metadata_path}: output.depth.format")
@@ -252,6 +282,164 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
         )
         _require_value(depth_metadata.get("invalid_value"), 0.0, f"{metadata_path}: output.depth.invalid_value")
         _require_value(depth_metadata.get("clipped"), False, f"{metadata_path}: output.depth.clipped")
+
+        depth_track_metadata = _require_dict(
+            output.get("depth_track_consistency"),
+            f"{metadata_path}: output.depth_track_consistency",
+        )
+        _require_value(
+            depth_track_metadata.get("tolerance_metres"),
+            _DEPTH_TRACK_TOLERANCE_METRES,
+            f"{metadata_path}: output.depth_track_consistency.tolerance_metres",
+        )
+        _require_value(
+            depth_track_metadata.get("frame_failure_fraction_threshold"),
+            _DEPTH_FRAME_FAILURE_FRACTION,
+            (
+                f"{metadata_path}: output.depth_track_consistency."
+                "frame_failure_fraction_threshold"
+            ),
+        )
+        per_frame = depth_track_metadata.get("per_frame")
+        if not isinstance(per_frame, list) or len(per_frame) != frame_count:
+            raise ValueError(
+                f"{metadata_path}: output.depth_track_consistency.per_frame must "
+                f"contain exactly {frame_count} entries."
+            )
+        expected_invalid_depth_frames = []
+        for expected_frame, item in enumerate(per_frame):
+            item = _require_dict(
+                item,
+                (
+                    f"{metadata_path}: output.depth_track_consistency."
+                    f"per_frame[{expected_frame}]"
+                ),
+            )
+            _require_value(
+                item.get("frame"),
+                expected_frame,
+                (
+                    f"{metadata_path}: output.depth_track_consistency."
+                    f"per_frame[{expected_frame}].frame"
+                ),
+            )
+            candidate_count = _require_nonnegative_int(
+                item.get("candidate_count"),
+                (
+                    f"{metadata_path}: output.depth_track_consistency."
+                    f"per_frame[{expected_frame}].candidate_count"
+                ),
+            )
+            failure_count = _require_nonnegative_int(
+                item.get("failure_count"),
+                (
+                    f"{metadata_path}: output.depth_track_consistency."
+                    f"per_frame[{expected_frame}].failure_count"
+                ),
+            )
+            if failure_count > candidate_count:
+                raise ValueError(
+                    f"{metadata_path}: output.depth_track_consistency."
+                    f"per_frame[{expected_frame}].failure_count cannot exceed "
+                    "candidate_count."
+                )
+            expected_fraction = (
+                failure_count / candidate_count if candidate_count else None
+            )
+            _require_value(
+                item.get("failure_fraction"),
+                expected_fraction,
+                (
+                    f"{metadata_path}: output.depth_track_consistency."
+                    f"per_frame[{expected_frame}].failure_fraction"
+                ),
+            )
+            if (
+                candidate_count > 0
+                and failure_count / candidate_count > _DEPTH_FRAME_FAILURE_FRACTION
+            ):
+                expected_invalid_depth_frames.append(expected_frame)
+        invalid_depth_frame_indices = _require_frame_indices(
+            depth_track_metadata.get("invalid_frame_indices"),
+            frame_count,
+            f"{metadata_path}: output.depth_track_consistency.invalid_frame_indices",
+        )
+        if invalid_depth_frame_indices != expected_invalid_depth_frames:
+            raise ValueError(
+                f"{metadata_path}: output.depth_track_consistency.invalid_frame_indices "
+                "must exactly match the strict majority rule in per_frame."
+            )
+
+        window_exclusion = _require_dict(
+            output.get("window_exclusion"),
+            f"{metadata_path}: output.window_exclusion",
+        )
+        _require_value(
+            window_exclusion.get("window_length"),
+            _WINDOW_LENGTH,
+            f"{metadata_path}: output.window_exclusion.window_length",
+        )
+        invalid_frame_indices = _require_frame_indices(
+            window_exclusion.get("invalid_frame_indices"),
+            frame_count,
+            f"{metadata_path}: output.window_exclusion.invalid_frame_indices",
+        )
+        reasons = _require_dict(
+            window_exclusion.get("reasons"),
+            f"{metadata_path}: output.window_exclusion.reasons",
+        )
+        expected_reason_names = {"rgb_decode", "depth_track_majority_mismatch"}
+        if set(reasons) != expected_reason_names:
+            raise ValueError(
+                f"{metadata_path}: output.window_exclusion.reasons must contain exactly "
+                f"{sorted(expected_reason_names)}."
+            )
+        rgb_reason_frames = _require_frame_indices(
+            reasons["rgb_decode"],
+            frame_count,
+            f"{metadata_path}: output.window_exclusion.reasons.rgb_decode",
+        )
+        depth_reason_frames = _require_frame_indices(
+            reasons["depth_track_majority_mismatch"],
+            frame_count,
+            (
+                f"{metadata_path}: output.window_exclusion.reasons."
+                "depth_track_majority_mismatch"
+            ),
+        )
+        if rgb_reason_frames != invalid_rgb_frame_indices:
+            raise ValueError(
+                f"{metadata_path}: rgb_decode reasons must exactly match "
+                "output.rgb.invalid_frame_indices."
+            )
+        if depth_reason_frames != invalid_depth_frame_indices:
+            raise ValueError(
+                f"{metadata_path}: depth_track_majority_mismatch reasons must exactly match "
+                "output.depth_track_consistency.invalid_frame_indices."
+            )
+        expected_invalid_frame_indices = sorted(
+            set(invalid_rgb_frame_indices) | set(invalid_depth_frame_indices)
+        )
+        if invalid_frame_indices != expected_invalid_frame_indices:
+            raise ValueError(
+                f"{metadata_path}: output.window_exclusion.invalid_frame_indices must be "
+                "the exact sorted union of RGB and depth-track invalid frame indices."
+            )
+
+        expected_start_counts = _window_start_counts(
+            frame_count,
+            _WINDOW_LENGTH,
+            invalid_frame_indices,
+        )
+        for field, expected in zip(
+            ("total_start_count", "excluded_start_count", "legal_start_count"),
+            expected_start_counts,
+        ):
+            actual = _require_nonnegative_int(
+                window_exclusion.get(field),
+                f"{metadata_path}: output.window_exclusion.{field}",
+            )
+            _require_value(actual, expected, f"{metadata_path}: output.window_exclusion.{field}")
 
         visibility_metadata = _require_dict(
             output.get("visibility"),
@@ -266,6 +454,11 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
             visibility_metadata.get("dtype"),
             "bool",
             f"{metadata_path}: output.visibility.dtype",
+        )
+        _require_value(
+            visibility_metadata.get("depth_gated"),
+            False,
+            f"{metadata_path}: output.visibility.depth_gated",
         )
 
         expected_view_names = [f"view_{view}" for view in _VIEW_IDS]
@@ -318,5 +511,5 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
         return {
             "tracks_3d": torch.from_numpy(tracks_3d),
             "views": views,
-            "invalid_rgb_frame_indices": invalid_frame_indices,
+            "invalid_frame_indices": invalid_frame_indices,
         }

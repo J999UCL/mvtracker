@@ -116,7 +116,9 @@ class BenchmarkTests(unittest.TestCase):
         contracts = {
             "000003": {
                 "frame_count": 120,
-                "invalid_rgb_frame_indices": [50],
+                "invalid_frame_indices": [50],
+                "legal_start_count": 73,
+                "excluded_start_count": 24,
             }
         }
         metadata = {
@@ -135,7 +137,7 @@ class BenchmarkTests(unittest.TestCase):
             contracts=contracts,
         )
 
-        self.assertIn("sample window intersects an invalid RGB frame", failures)
+        self.assertIn("sample window intersects an invalid frame", failures)
 
     def test_clean_lane_requires_every_requested_sample(self):
         clean = {

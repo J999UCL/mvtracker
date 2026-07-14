@@ -129,6 +129,8 @@ def load_scene_contracts(dataset_root: Path) -> dict[str, dict[str, Any]]:
     prepared_root = dataset_root / "PointOdyssey_MVTracker"
     report_path = prepared_root / "validation_report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("schema_version") != 5:
+        raise ValueError("PointOdyssey validation_report.json must use schema version 5")
     if report.get("status") != "completed" or report.get("failures") != []:
         raise ValueError("PointOdyssey validation_report.json is not clean and completed")
 
@@ -144,12 +146,15 @@ def load_scene_contracts(dataset_root: Path) -> dict[str, dict[str, Any]]:
     contracts = {}
     for scene_root in scene_roots:
         metadata = json.loads((scene_root / "scene.json").read_text(encoding="utf-8"))
+        window_exclusion = metadata["output"]["window_exclusion"]
         contracts[scene_root.name] = {
             "frame_count": int(metadata["output"]["frame_count"]),
-            "invalid_rgb_frame_indices": [
+            "invalid_frame_indices": [
                 int(frame)
-                for frame in metadata["output"]["rgb"]["invalid_frame_indices"]
+                for frame in window_exclusion["invalid_frame_indices"]
             ],
+            "legal_start_count": int(window_exclusion["legal_start_count"]),
+            "excluded_start_count": int(window_exclusion["excluded_start_count"]),
         }
     return contracts
 
@@ -313,9 +318,9 @@ def validate_provenance(
     contract = contracts[scene_name]
     if end - start != 24 or start < 0 or end > int(contract["frame_count"]):
         failures.append("sample window is not a legal 24-frame interval")
-    invalid = set(int(frame) for frame in contract["invalid_rgb_frame_indices"])
+    invalid = set(int(frame) for frame in contract["invalid_frame_indices"])
     if any(start <= frame < end for frame in invalid):
-        failures.append("sample window intersects an invalid RGB frame")
+        failures.append("sample window intersects an invalid frame")
     return failures
 
 
@@ -715,6 +720,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     dataset_root = args.dataset_root.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     contracts = load_scene_contracts(dataset_root)
+    prepared_window_exclusion = {
+        "scene_count": len(contracts),
+        "scenes_with_excluded_starts": sum(
+            int(contract["excluded_start_count"] > 0)
+            for contract in contracts.values()
+        ),
+        "legal_start_count": sum(
+            contract["legal_start_count"] for contract in contracts.values()
+        ),
+        "excluded_start_count": sum(
+            contract["excluded_start_count"] for contract in contracts.values()
+        ),
+    }
     output_dir.mkdir(parents=True, exist_ok=False)
 
     tail_count = max(args.worker_counts) * PREFETCH_FACTOR
@@ -751,6 +769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "seed": args.seed,
             "cache_state": "system page cache is not dropped",
         },
+        "prepared_window_exclusion": prepared_window_exclusion,
     }
     _atomic_json(output_dir / "run_config.json", run_config)
     summary: dict[str, Any] = {

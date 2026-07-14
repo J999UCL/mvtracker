@@ -127,7 +127,7 @@ class PreparedSceneTests(unittest.TestCase):
 
     def _metadata(self):
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "format": "pointodyssey_mvtracker_preprocessed",
             "split": "train",
             "scene_id": "000000",
@@ -146,9 +146,40 @@ class PreparedSceneTests(unittest.TestCase):
                     "invalid_value": 0.0,
                     "clipped": False,
                 },
+                "depth_track_consistency": {
+                    "tolerance_metres": 0.05,
+                    "frame_failure_fraction_threshold": 0.5,
+                    "invalid_frame_indices": [0],
+                    "per_frame": [
+                        {
+                            "frame": 0,
+                            "candidate_count": 2,
+                            "failure_count": 2,
+                            "failure_fraction": 1.0,
+                        },
+                        {
+                            "frame": 1,
+                            "candidate_count": 2,
+                            "failure_count": 1,
+                            "failure_fraction": 0.5,
+                        },
+                    ],
+                },
+                "window_exclusion": {
+                    "window_length": 24,
+                    "invalid_frame_indices": [0, 1],
+                    "reasons": {
+                        "rgb_decode": [1],
+                        "depth_track_majority_mismatch": [0],
+                    },
+                    "total_start_count": 0,
+                    "excluded_start_count": 0,
+                    "legal_start_count": 0,
+                },
                 "visibility": {
                     "format": "npy",
                     "dtype": "bool",
+                    "depth_gated": False,
                 },
             },
         }
@@ -180,8 +211,8 @@ class PreparedSceneTests(unittest.TestCase):
     def test_reads_exact_prepared_contract(self):
         datapoint = loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(self.scene_path)
 
-        self.assertEqual(set(datapoint), {"tracks_3d", "views", "invalid_rgb_frame_indices"})
-        self.assertEqual(datapoint["invalid_rgb_frame_indices"], [1])
+        self.assertEqual(set(datapoint), {"tracks_3d", "views", "invalid_frame_indices"})
+        self.assertEqual(datapoint["invalid_frame_indices"], [0, 1])
         self.assertEqual(datapoint["tracks_3d"].dtype, torch.float32)
         np.testing.assert_array_equal(datapoint["tracks_3d"].numpy(), self.tracks)
         self.assertEqual(len(datapoint["views"]), 4)
@@ -213,6 +244,72 @@ class PreparedSceneTests(unittest.TestCase):
         (self.scene_path / "scene.json").write_text(json.dumps(metadata), encoding="utf-8")
 
         with self.assertRaisesRegex(ValueError, "schema_version"):
+            loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(self.scene_path)
+
+    def test_window_exclusion_must_be_exact_component_union(self):
+        metadata = self._metadata()
+        metadata["output"]["window_exclusion"]["invalid_frame_indices"] = [1]
+        (self.scene_path / "scene.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "exact sorted union"):
+            loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(self.scene_path)
+
+    def test_window_exclusion_reasons_must_match_component_lists(self):
+        metadata = self._metadata()
+        metadata["output"]["window_exclusion"]["reasons"]["rgb_decode"] = []
+        (self.scene_path / "scene.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "rgb_decode reasons must exactly match"):
+            loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(self.scene_path)
+
+    def test_window_exclusion_indices_must_be_sorted_unique_and_in_range(self):
+        invalid_lists_and_messages = (
+            ([1, 0], "sorted and unique"),
+            ([0, 0, 1], "sorted and unique"),
+            ([0, 2], r"must be in \[0, 2\)"),
+        )
+        for invalid_frames, message in invalid_lists_and_messages:
+            with self.subTest(invalid_frames=invalid_frames):
+                metadata = self._metadata()
+                metadata["output"]["window_exclusion"][
+                    "invalid_frame_indices"
+                ] = invalid_frames
+                (self.scene_path / "scene.json").write_text(
+                    json.dumps(metadata),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(
+                        self.scene_path
+                    )
+
+    def test_window_exclusion_counts_are_strict(self):
+        metadata = self._metadata()
+        metadata["output"]["window_exclusion"]["legal_start_count"] = 1
+        (self.scene_path / "scene.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "legal_start_count"):
+            loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(self.scene_path)
+
+    def test_exactly_half_depth_failures_do_not_invalidate_frame(self):
+        metadata = self._metadata()
+        metadata["output"]["depth_track_consistency"][
+            "invalid_frame_indices"
+        ] = [0, 1]
+        metadata["output"]["window_exclusion"]["reasons"][
+            "depth_track_majority_mismatch"
+        ] = [0, 1]
+        (self.scene_path / "scene.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "strict majority rule"):
+            loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(self.scene_path)
+
+    def test_visibility_must_not_be_depth_gated(self):
+        metadata = self._metadata()
+        metadata["output"]["visibility"]["depth_gated"] = True
+        (self.scene_path / "scene.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "output.visibility.depth_gated"):
             loader.PointOdysseyMultiViewDataset.getitem_raw_datapoint(self.scene_path)
 
     def test_missing_rgb_frame_is_fatal(self):

@@ -42,13 +42,13 @@ def _legal_contiguous_window_starts(n_frames, seq_len, invalid_frame_indices=())
     invalid_frame_indices = list(invalid_frame_indices)
     if any(isinstance(frame_idx, bool) or not isinstance(frame_idx, (int, np.integer))
            for frame_idx in invalid_frame_indices):
-        raise ValueError("Invalid RGB frame indices must be integers.")
+        raise ValueError("Invalid frame indices must be integers.")
     invalid_frame_indices = [int(frame_idx) for frame_idx in invalid_frame_indices]
     if len(set(invalid_frame_indices)) != len(invalid_frame_indices):
-        raise ValueError("Invalid RGB frame indices must be unique.")
+        raise ValueError("Invalid frame indices must be unique.")
     if any(frame_idx < 0 or frame_idx >= n_frames for frame_idx in invalid_frame_indices):
         raise ValueError(
-            f"Invalid RGB frame indices must be in [0, {n_frames}), got {invalid_frame_indices}."
+            f"Invalid frame indices must be in [0, {n_frames}), got {invalid_frame_indices}."
         )
 
     if n_frames < seq_len:
@@ -494,7 +494,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             name += f"-t{self.seq_len}"
         if self.sample_vis_1st_frame:
             name += f"-sample_vis_1st_frame"
-        return name + "--v2"  # v2: inclusive starts excluding invalid-RGB windows
+        return name + "--v3"  # v3: generic invalid-frame window exclusions
 
     def __len__(self):
         return self.virtual_len
@@ -557,17 +557,17 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
 
         traj3d_world = datapoint["tracks_3d"].numpy()
         views = datapoint["views"]
-        invalid_rgb_frame_indices = datapoint.get("invalid_rgb_frame_indices", ())
+        invalid_frame_indices = datapoint.get("invalid_frame_indices", ())
         legal_start_indices = _legal_contiguous_window_starts(
             n_frames=traj3d_world.shape[0],
             seq_len=self.seq_len,
-            invalid_frame_indices=invalid_rgb_frame_indices,
+            invalid_frame_indices=invalid_frame_indices,
         )
         if len(legal_start_indices) == 0:
             scene_path = os.path.join(self.data_root, self.seq_names[index])
             raise ValueError(
                 f"No valid {self.seq_len}-frame windows remain in scene {scene_path}; "
-                f"invalid RGB frame indices: {list(invalid_rgb_frame_indices)}."
+                f"invalid frame indices: {list(invalid_frame_indices)}."
             )
 
         # Take a random depth type, if enabled
@@ -1227,7 +1227,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         else:
             raise ValueError("No camera data found: neither views.npz nor cameras.npz exist.")
 
-        invalid_rgb_frame_indices = []
+        invalid_frame_indices = []
         scene_metadata_path = os.path.join(scene_path, "scene.json")
         if os.path.isfile(scene_metadata_path):
             scene_metadata = read_json(scene_metadata_path)
@@ -1239,8 +1239,8 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             rgb_metadata = output_metadata.get("rgb", {})
             if not isinstance(rgb_metadata, dict):
                 raise ValueError(f"{scene_metadata_path}: 'output.rgb' must be an object.")
-            invalid_rgb_frame_indices = rgb_metadata.get("invalid_frame_indices", [])
-            if not isinstance(invalid_rgb_frame_indices, list):
+            invalid_frame_indices = rgb_metadata.get("invalid_frame_indices", [])
+            if not isinstance(invalid_frame_indices, list):
                 raise ValueError(
                     f"{scene_metadata_path}: 'output.rgb.invalid_frame_indices' must be a list."
                 )
@@ -1363,7 +1363,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             "camera_positions": camera_positions,
             "lookat_positions": lookat_positions,
             "views": views_data,
-            "invalid_rgb_frame_indices": invalid_rgb_frame_indices,
+            "invalid_frame_indices": invalid_frame_indices,
         }
 
         return datapoint

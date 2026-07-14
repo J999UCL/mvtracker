@@ -1,10 +1,12 @@
 import ast
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 
 def _load_window_start_helper():
@@ -87,6 +89,15 @@ def _load_kubric_method(method_name):
 
 
 _kubric_getitem = _load_kubric_method("__getitem__")
+_kubric_getitem_helper = _load_kubric_method("_getitem_helper")
+_kubric_getitem_helper.__globals__.update({
+    "np": np,
+    "os": os,
+    "time": time,
+    "torch": torch,
+    "_legal_contiguous_window_starts": _legal_contiguous_window_starts,
+})
+_kubric_cache_key = _load_kubric_method("_cache_key")
 
 
 class LegalContiguousWindowStartsTests(unittest.TestCase):
@@ -170,6 +181,43 @@ class LegalContiguousWindowStartsTests(unittest.TestCase):
 
         self.assertEqual(starts.dtype, np.int64)
         self.assertEqual(starts.size, 0)
+
+    def test_dataset_raises_when_no_legal_window_remains(self):
+        class DatasetStub:
+            data_root = "/prepared"
+            seq_names = ["000000"]
+            seq_len = 24
+            seed = 7
+            add_index_to_seed = True
+
+            @staticmethod
+            def getitem_raw_datapoint(_scene_path):
+                return {
+                    "tracks_3d": torch.zeros((30, 1, 3), dtype=torch.float32),
+                    "views": [],
+                    "invalid_frame_indices": [6],
+                }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "No valid 24-frame windows remain.*invalid frame indices: \\[6\\]",
+        ):
+            _kubric_getitem_helper(DatasetStub(), 0)
+
+
+class CacheKeyTests(unittest.TestCase):
+    def test_cache_key_uses_generic_invalid_frame_contract_version(self):
+        class DatasetStub:
+            seed = 1
+            ratio_dynamic = 0.5
+            ratio_very_dynamic = 0.25
+            views_to_return = None
+            traj_per_sample = 256
+            num_views = 4
+            seq_len = 24
+            sample_vis_1st_frame = False
+
+        self.assertTrue(_kubric_cache_key(DatasetStub()).endswith("--v3"))
 
 
 class VirtualDatasetIndexTests(unittest.TestCase):
