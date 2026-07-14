@@ -1,47 +1,32 @@
 #!/usr/bin/env python3
-"""Benchmark the real PointOdyssey MV-Tracker training loader.
-
-The benchmark is intentionally separate from training.  It runs one serial
-health pass over every prepared training scene, then compares a fixed virtual-
-index schedule across worker counts. Full resource metrics use psutil over
-Linux procfs, which is available on the target UCL machines.
-"""
+"""Benchmark the prepared PointOdyssey MV-Tracker training loader."""
 
 from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import json
-import math
-import multiprocessing
 import os
 import platform
 import random
-import queue as queue_module
-import signal
-import socket
-import subprocess
 import sys
-import threading
 import time
 import traceback
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 
-FORMAT_NAME = "pointodyssey_loader_benchmark"
-SCHEMA_VERSION = 1
+EXPECTED_SCENES = 78
 DEFAULT_WORKERS = (0, 2, 4, 8)
-DEFAULT_EXPECTED_SCENES = 78
-DEFAULT_SCHEDULE_SEED = 20260714
+DEFAULT_SEED = 20260714
+PREFETCH_FACTOR = 4
 MIB = 1024 * 1024
 
 
 class FixedIndexSampler:
-    """Yield a precomputed virtual-index schedule unchanged."""
+    """Yield one fixed virtual-index schedule."""
 
     def __init__(self, indices: Sequence[int]) -> None:
         self.indices = tuple(int(index) for index in indices)
@@ -53,75 +38,25 @@ class FixedIndexSampler:
         return len(self.indices)
 
 
-class JsonlWriter:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.handle = path.open("x", encoding="utf-8")
-
-    def write(self, event: dict[str, Any]) -> None:
-        self.handle.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
-        self.handle.flush()
-
-    def close(self) -> None:
-        self.handle.close()
-
-
-def _positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return parsed
-
-
-def _nonnegative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("value must be non-negative")
-    return parsed
-
-
-def _positive_float(value: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed) or parsed <= 0.0:
-        raise argparse.ArgumentTypeError("value must be finite and positive")
-    return parsed
-
-
-def _worker_counts(values: Sequence[str]) -> tuple[int, ...]:
-    counts = tuple(int(value) for value in values)
-    if any(count < 0 for count in counts):
-        raise argparse.ArgumentTypeError("worker counts must be non-negative")
-    if len(set(counts)) != len(counts):
-        raise argparse.ArgumentTypeError("worker counts must be unique")
-    if not counts:
-        raise argparse.ArgumentTypeError("at least one worker count is required")
-    return counts
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset-root",
         type=Path,
         required=True,
-        help="Parent containing PointOdyssey_MVTracker (for mallard-l: /tmp/thakwani).",
+        help="Parent containing PointOdyssey_MVTracker, e.g. /tmp/thakwani.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--worker-counts",
         nargs="+",
-        default=[str(value) for value in DEFAULT_WORKERS],
-        metavar="N",
+        type=int,
+        default=list(DEFAULT_WORKERS),
     )
-    parser.add_argument("--expected-scenes", type=_positive_int, default=DEFAULT_EXPECTED_SCENES)
-    parser.add_argument("--warmup-samples", type=_nonnegative_int, default=32)
-    parser.add_argument("--measured-scene-repeats", type=_positive_int, default=2)
-    parser.add_argument("--confirmation-warmup", type=_nonnegative_int, default=32)
-    parser.add_argument("--confirmation-samples", type=_nonnegative_int, default=256)
-    parser.add_argument("--schedule-seed", type=int, default=DEFAULT_SCHEDULE_SEED)
-    parser.add_argument("--monitor-interval", type=_positive_float, default=0.1)
-    parser.add_argument("--child-timeout-seconds", type=_positive_float, default=7200.0)
-    parser.add_argument("--progress-every", type=_positive_int, default=8)
+    parser.add_argument("--warmup-samples", type=int, default=32)
+    parser.add_argument("--samples-per-worker", type=int, default=156)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--progress-every", type=int, default=8)
     parser.add_argument(
         "--wandb-mode",
         choices=("online", "offline", "disabled"),
@@ -131,72 +66,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args(argv)
-    try:
-        args.worker_counts = _worker_counts(args.worker_counts)
-    except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
-        parser.error(str(exc))
+    if (
+        not args.worker_counts
+        or any(workers < 0 for workers in args.worker_counts)
+        or len(set(args.worker_counts)) != len(args.worker_counts)
+    ):
+        parser.error("worker counts must be unique non-negative integers")
+    if args.warmup_samples < 0 or args.samples_per_worker <= 0 or args.progress_every <= 0:
+        parser.error("warmup must be non-negative; samples and progress must be positive")
     return args
 
 
 def build_balanced_schedule(
-    real_len: int,
     count: int,
     *,
     repeat_offset: int,
     seed: int,
+    scene_count: int = EXPECTED_SCENES,
 ) -> list[int]:
-    """Build a deterministic, near-balanced virtual-index schedule."""
-    if real_len <= 0 or count < 0 or repeat_offset < 0:
-        raise ValueError("real_len must be positive; count and repeat_offset must be non-negative")
+    """Return distinct virtual indices whose scene IDs are near-balanced."""
     rng = random.Random(seed)
-    schedule: list[int] = []
+    result: list[int] = []
     repeat = repeat_offset
-    while len(schedule) < count:
-        scenes = list(range(real_len))
+    while len(result) < count:
+        scenes = list(range(scene_count))
         rng.shuffle(scenes)
-        schedule.extend(scene + repeat * real_len for scene in scenes)
+        result.extend(scene + repeat * scene_count for scene in scenes)
         repeat += 1
-    return schedule[:count]
+    return result[:count]
 
 
-def percentile(values: Sequence[float], q: float) -> float | None:
-    if not values:
-        return None
-    if not 0.0 <= q <= 1.0:
-        raise ValueError("q must be in [0, 1]")
-    ordered = sorted(float(value) for value in values)
-    position = (len(ordered) - 1) * q
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
-    if lower == upper:
-        return ordered[lower]
-    weight = position - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-
-def summarize_temporal_diversity(metadata: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def summarize_diversity(metadata: Sequence[dict[str, Any]]) -> dict[str, Any]:
     starts_by_scene: dict[str, list[int]] = defaultdict(list)
-    pairs: list[tuple[str, int]] = []
     for item in metadata:
-        scene_name = str(item["scene_name"])
-        start = int(item["window_start"])
-        starts_by_scene[scene_name].append(start)
-        pairs.append((scene_name, start))
-
-    distinct_counts = sorted(len(set(starts)) for starts in starts_by_scene.values())
-    total = len(pairs)
-    unique_pairs = len(set(pairs))
+        starts_by_scene[str(item["scene_name"])].append(int(item["window_start"]))
+    pairs = [
+        (scene, start)
+        for scene, starts in starts_by_scene.items()
+        for start in starts
+    ]
     return {
-        "observations": total,
+        "observations": len(pairs),
         "unique_scenes": len(starts_by_scene),
-        "unique_scene_start_pairs": unique_pairs,
-        "repeated_scene_start_observations": total - unique_pairs,
-        "scene_start_repeat_fraction": (total - unique_pairs) / total if total else None,
-        "distinct_starts_per_scene": {
-            "minimum": min(distinct_counts) if distinct_counts else None,
-            "median": percentile(distinct_counts, 0.5),
-            "maximum": max(distinct_counts) if distinct_counts else None,
-        },
+        "unique_scene_start_pairs": len(set(pairs)),
         "starts_by_scene": {
             scene: sorted(starts)
             for scene, starts in sorted(starts_by_scene.items())
@@ -212,225 +124,94 @@ def _atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-def _git_metadata(repo_root: Path) -> dict[str, Any]:
-    def run(*command: str) -> str:
-        completed = subprocess.run(
-            command,
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return completed.stdout.strip()
-
-    return {
-        "sha": run("git", "rev-parse", "HEAD"),
-        "dirty": bool(run("git", "status", "--porcelain")),
-        "branch": run("git", "branch", "--show-current"),
-    }
-
-
-def _required_scene_files(scene_root: Path) -> list[Path]:
-    metadata = json.loads((scene_root / "scene.json").read_text(encoding="utf-8"))
-    frame_count = int(metadata["output"]["frame_count"])
-    files = [scene_root / "scene.json", scene_root / "tracks_3d.npy"]
-    for view in range(4):
-        view_root = scene_root / f"view_{view}"
-        files.extend(
-            view_root / name
-            for name in (
-                "depth.npy",
-                "intrinsics.npy",
-                "extrinsics_w2c.npy",
-                "visibility.npy",
-            )
-        )
-        files.extend(view_root / f"rgba_{frame:05d}.jpg" for frame in range(frame_count))
-    missing = [str(path) for path in files if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"required prepared files are missing: {missing[:10]}")
-    return files
-
-
-def dataset_tree_fingerprint(root: Path) -> dict[str, Any]:
-    """Fingerprint names and stat metadata without reading dataset contents."""
-    digest = hashlib.sha256()
-    entry_count = 0
-    regular_file_count = 0
-    regular_file_bytes = 0
-    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        stat = path.lstat()
-        relative = path.relative_to(root).as_posix()
-        if path.is_symlink():
-            kind = "symlink"
-            size = stat.st_size
-        elif path.is_dir():
-            kind = "directory"
-            size = 0
-        elif path.is_file():
-            kind = "file"
-            size = stat.st_size
-            regular_file_count += 1
-            regular_file_bytes += size
-        else:
-            kind = "other"
-            size = stat.st_size
-        digest.update(
-            f"{kind}\0{relative}\0{size}\0{stat.st_mtime_ns}\n".encode("utf-8")
-        )
-        entry_count += 1
-    return {
-        "sha256": digest.hexdigest(),
-        "entry_count": entry_count,
-        "regular_file_count": regular_file_count,
-        "regular_file_bytes": regular_file_bytes,
-        "semantics": "relative path, entry type, byte size, and mtime_ns; file contents are not read",
-    }
-
-
-def preflight_dataset(dataset_root: Path, expected_scenes: int) -> dict[str, Any]:
+def load_scene_contracts(dataset_root: Path) -> dict[str, dict[str, Any]]:
     prepared_root = dataset_root / "PointOdyssey_MVTracker"
-    train_root = prepared_root / "train"
     report_path = prepared_root / "validation_report.json"
-    if not report_path.is_file():
-        raise FileNotFoundError(report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if report.get("status") != "completed" or report.get("failures") != []:
-        raise ValueError("prepared validation report is not a clean completed report")
+        raise ValueError("PointOdyssey validation_report.json is not clean and completed")
+
+    train_root = prepared_root / "train"
     scene_roots = sorted(
         (path for path in train_root.iterdir() if path.is_dir() and path.name.isdigit()),
         key=lambda path: int(path.name),
     )
-    expected_names = [f"{index:06d}" for index in range(expected_scenes)]
-    actual_names = [path.name for path in scene_roots]
-    if actual_names != expected_names:
-        raise ValueError(f"training scenes do not match {expected_names[0]}..{expected_names[-1]}")
-    scene_bytes: dict[str, int] = {}
-    scene_contracts: dict[str, dict[str, Any]] = {}
+    expected_names = [f"{index:06d}" for index in range(EXPECTED_SCENES)]
+    if [path.name for path in scene_roots] != expected_names:
+        raise ValueError("prepared training split must contain scenes 000000 through 000077")
+
+    contracts = {}
     for scene_root in scene_roots:
-        files = _required_scene_files(scene_root)
         metadata = json.loads((scene_root / "scene.json").read_text(encoding="utf-8"))
-        frame_count = int(metadata["output"]["frame_count"])
-        invalid_frames = [int(frame) for frame in metadata["output"]["rgb"]["invalid_frame_indices"]]
-        scene_bytes[scene_root.name] = sum(path.stat().st_size for path in files)
-        scene_contracts[scene_root.name] = {
-            "frame_count": frame_count,
-            "invalid_rgb_frame_indices": invalid_frames,
-            "decoded_camera_frames_per_sample": frame_count * 4,
+        contracts[scene_root.name] = {
+            "frame_count": int(metadata["output"]["frame_count"]),
+            "invalid_rgb_frame_indices": [
+                int(frame)
+                for frame in metadata["output"]["rgb"]["invalid_frame_indices"]
+            ],
         }
-    return {
-        "prepared_root": str(prepared_root),
-        "train_root": str(train_root),
-        "report_path": str(report_path),
-        "scene_names": actual_names,
-        "scene_bytes": scene_bytes,
-        "scene_contracts": scene_contracts,
-        "tree_fingerprint_before": dataset_tree_fingerprint(train_root),
-    }
+    return contracts
 
 
-class ProcfsMonitor:
-    """Poll aggregate RSS and I/O for the benchmark process and loader workers."""
+class ResourceTracker:
+    """Take lightweight process-tree RSS and I/O snapshots."""
 
-    def __init__(self, root_pid: int, interval: float) -> None:
-        if not Path("/proc/self/stat").is_file():
-            raise RuntimeError("full benchmark metrics require Linux procfs")
+    def __init__(self) -> None:
         import psutil
 
         self.psutil = psutil
-        self.root_pid = root_pid
-        self.interval = interval
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
-        self.baseline: dict[tuple[int, int], dict[str, int]] = {}
-        self.latest: dict[tuple[int, int], dict[str, int]] = {}
-        self.baseline_rss_bytes = 0
+        self.root = psutil.Process(os.getpid())
+        self.first: dict[int, dict[str, int]] = {}
+        self.last: dict[int, dict[str, int]] = {}
         self.peak_rss_bytes = 0
-        self.peak_process_count = 0
-        self.observed_pids: set[int] = set()
+        self.sample()
+        self.first = {pid: dict(value) for pid, value in self.last.items()}
+        self.baseline_rss_bytes = self.peak_rss_bytes
 
-    def _snapshot(self) -> dict[tuple[int, int], dict[str, int]]:
-        psutil = self.psutil
+    def sample(self) -> None:
         try:
-            root = psutil.Process(self.root_pid)
-            processes = [root, *root.children(recursive=True)]
-        except psutil.Error:
-            return {}
-        snapshot: dict[tuple[int, int], dict[str, int]] = {}
+            processes = [self.root, *self.root.children(recursive=True)]
+        except self.psutil.Error:
+            return
+        rss = 0
         for process in processes:
             try:
                 with process.oneshot():
-                    identity = (process.pid, int(process.create_time() * 1_000_000))
-                    rss_bytes = int(process.memory_info().rss)
                     io = process.io_counters()
-                snapshot[identity] = {
-                    "rss_bytes": rss_bytes,
-                    "read_bytes": int(io.read_bytes),
-                    "rchar": int(io.read_chars),
-                }
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    values = {
+                        "read_bytes": int(io.read_bytes),
+                        "read_chars": int(io.read_chars),
+                    }
+                    rss += int(process.memory_info().rss)
+            except self.psutil.Error:
                 continue
-        return snapshot
-
-    def _sample(self, *, establish_baseline: bool = False) -> None:
-        snapshot = self._snapshot()
-        if establish_baseline:
-            self.baseline = {identity: dict(values) for identity, values in snapshot.items()}
-            self.baseline_rss_bytes = sum(
-                values["rss_bytes"] for values in snapshot.values()
-            )
-        for identity, values in snapshot.items():
-            if identity not in self.baseline:
-                self.baseline[identity] = {
-                    **values,
-                    "read_bytes": 0,
-                    "rchar": 0,
-                }
-            self.latest[identity] = dict(values)
-            self.observed_pids.add(identity[0])
-        self.peak_rss_bytes = max(
-            self.peak_rss_bytes,
-            sum(values["rss_bytes"] for values in snapshot.values()),
-        )
-        self.peak_process_count = max(self.peak_process_count, len(snapshot))
-
-    def start(self) -> None:
-        self._sample(establish_baseline=True)
-
-        def poll() -> None:
-            while not self.stop_event.wait(self.interval):
-                self._sample()
-
-        self.thread = threading.Thread(target=poll, name="procfs-monitor", daemon=True)
-        self.thread.start()
+            self.first.setdefault(process.pid, {"read_bytes": 0, "read_chars": 0})
+            self.last[process.pid] = values
+        self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
 
     def stop(self) -> dict[str, Any]:
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join()
-        self._sample()
-        read_bytes = 0
-        rchar = 0
-        for identity, latest in self.latest.items():
-            baseline = self.baseline[identity]
-            read_bytes += max(0, latest["read_bytes"] - baseline["read_bytes"])
-            rchar += max(0, latest["rchar"] - baseline["rchar"])
+        self.sample()
+        read_bytes = sum(
+            max(0, value["read_bytes"] - self.first[pid]["read_bytes"])
+            for pid, value in self.last.items()
+        )
+        read_chars = sum(
+            max(0, value["read_chars"] - self.first[pid]["read_chars"])
+            for pid, value in self.last.items()
+        )
         return {
             "baseline_process_tree_rss_bytes": self.baseline_rss_bytes,
-            "peak_process_tree_rss_bytes": self.peak_rss_bytes,
-            "peak_rss_increase_bytes": max(
-                0,
-                self.peak_rss_bytes - self.baseline_rss_bytes,
+            "sampled_peak_process_tree_rss_bytes": self.peak_rss_bytes,
+            "sampled_peak_rss_increase_bytes": max(
+                0, self.peak_rss_bytes - self.baseline_rss_bytes
             ),
             "physical_read_bytes": read_bytes,
-            "read_characters": rchar,
-            "observed_pids": sorted(self.observed_pids),
-            "observed_process_count": len(self.observed_pids),
-            "peak_process_count": self.peak_process_count,
-            "peak_descendant_count": max(0, self.peak_process_count - 1),
-            "rss_semantics": "sum of per-process VmRSS; shared pages may be counted more than once",
-            "physical_read_semantics": "psutil read_bytes over the process tree; page-cache hits may report zero",
-            "read_characters_semantics": "psutil read_chars includes reads satisfied from page cache and non-dataset files",
+            "read_characters": read_chars,
+            "semantics": (
+                "RSS is sampled at progress updates and may miss brief peaks; shared pages may "
+                "be double-counted and allocator memory can persist between lanes; physical reads "
+                "are page-cache dependent; read_characters includes cached and non-dataset reads"
+            ),
         }
 
 
@@ -438,15 +219,17 @@ def _load_runtime(dataset_root: Path):
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from omegaconf import OmegaConf
-    from torchdata.stateful_dataloader import StatefulDataLoader
 
     import cv2
     import numpy as np
     import torch
     import torchvision
+    from omegaconf import OmegaConf
+    from torchdata.stateful_dataloader import StatefulDataLoader
 
-    from mvtracker.datasets.pointodyssey_multiview_dataset import PointOdysseyMultiViewDataset
+    from mvtracker.datasets.pointodyssey_multiview_dataset import (
+        PointOdysseyMultiViewDataset,
+    )
     from mvtracker.datasets.utils import collate_fn
 
     config = OmegaConf.merge(
@@ -454,339 +237,33 @@ def _load_runtime(dataset_root: Path):
         OmegaConf.load(repo_root / "configs" / "experiment" / "pointodyssey.yaml"),
     )
     config.datasets.root = str(dataset_root)
-    fabric_stub = SimpleNamespace(world_size=1)
     dataset = PointOdysseyMultiViewDataset.from_name(
         config.datasets.train.name,
         str(dataset_root),
         training_args=config,
-        fabric=fabric_stub,
+        fabric=SimpleNamespace(world_size=1),
     )
-    versions = {
-        "python": platform.python_version(),
-        "torch": torch.__version__,
-        "torchvision": torchvision.__version__,
-        "numpy": np.__version__,
-        "opencv": cv2.__version__,
-        "cuda_available": bool(torch.cuda.is_available()),
-        "cuda_device_count": int(torch.cuda.device_count()),
-    }
+    if dataset.real_len != EXPECTED_SCENES:
+        raise ValueError(f"loader found {dataset.real_len} scenes, expected {EXPECTED_SCENES}")
+    if bool(config.reproducibility.deterministic):
+        raise ValueError("benchmark expects current training behavior in_order=False")
     return SimpleNamespace(
         config=config,
         dataset=dataset,
         torch=torch,
         StatefulDataLoader=StatefulDataLoader,
         collate_fn=collate_fn,
-        versions=versions,
-    )
-
-
-def _tensor_bytes(sample: Any) -> int:
-    fields = (
-        "video",
-        "videodepth",
-        "segmentation",
-        "trajectory",
-        "trajectory_3d",
-        "visibility",
-        "valid",
-        "intrs",
-        "extrs",
-        "query_points_3d",
-    )
-    total = 0
-    for field in fields:
-        tensor = getattr(sample, field, None)
-        if tensor is not None:
-            total += int(tensor.numel() * tensor.element_size())
-    return total
-
-
-def _validate_sample(sample: Any, torch: Any, *, batched: bool, full_scan: bool) -> dict[str, Any]:
-    offset = 1 if batched else 0
-    video = sample.video
-    depth = sample.videodepth
-    segmentation = sample.segmentation
-    trajectory = sample.trajectory
-    trajectory_3d = sample.trajectory_3d
-    visibility = sample.visibility
-    valid = sample.valid
-    intrs = sample.intrs
-    extrs = sample.extrs
-    queries = sample.query_points_3d
-    expected_prefix = (1,) if batched else ()
-    n_tracks = int(queries.shape[offset])
-    expected = {
-        "video": expected_prefix + (4, 24, 3, 384, 512),
-        "videodepth": expected_prefix + (4, 24, 1, 384, 512),
-        "segmentation": expected_prefix + (4, 24, 1, 384, 512),
-        "trajectory": expected_prefix + (4, 24, n_tracks, 3),
-        "trajectory_3d": expected_prefix + (24, n_tracks, 3),
-        "visibility": expected_prefix + (4, 24, n_tracks),
-        "valid": expected_prefix + (24, n_tracks),
-        "intrs": expected_prefix + (4, 24, 3, 3),
-        "extrs": expected_prefix + (4, 24, 3, 4),
-        "query_points_3d": expected_prefix + (n_tracks, 4),
-    }
-    actual = {
-        "video": tuple(video.shape),
-        "videodepth": tuple(depth.shape),
-        "segmentation": tuple(segmentation.shape),
-        "trajectory": tuple(trajectory.shape),
-        "trajectory_3d": tuple(trajectory_3d.shape),
-        "visibility": tuple(visibility.shape),
-        "valid": tuple(valid.shape),
-        "intrs": tuple(intrs.shape),
-        "extrs": tuple(extrs.shape),
-        "query_points_3d": tuple(queries.shape),
-    }
-    failures = [f"{name} shape {actual[name]} != {shape}" for name, shape in expected.items() if actual[name] != shape]
-    expected_dtypes = {
-        "video": torch.float32,
-        "videodepth": torch.float32,
-        "segmentation": torch.float32,
-        "trajectory": torch.float32,
-        "trajectory_3d": torch.float32,
-        "visibility": torch.bool,
-        "valid": torch.float32,
-        "intrs": torch.float32,
-        "extrs": torch.float32,
-        "query_points_3d": torch.float32,
-    }
-    for name, expected_dtype in expected_dtypes.items():
-        actual_dtype = getattr(sample, name).dtype
-        if actual_dtype != expected_dtype:
-            failures.append(f"{name} dtype {actual_dtype} != {expected_dtype}")
-
-    stats: dict[str, Any] = {
-        "shapes": {name: list(shape) for name, shape in actual.items()},
-        "dtypes": {
-            name: str(getattr(sample, name).dtype)
-            for name in actual
+        versions={
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "torchvision": torchvision.__version__,
+            "numpy": np.__version__,
+            "opencv": cv2.__version__,
         },
-        "pinned": {
-            name: bool(getattr(sample, name).is_pinned())
-            for name in actual
-        },
-        "track_count": n_tracks,
-        "tensor_bytes": _tensor_bytes(sample),
-    }
-    if full_scan and not failures:
-        finite_fields = (
-            video,
-            depth,
-            segmentation,
-            trajectory,
-            trajectory_3d,
-            valid,
-            intrs,
-            extrs,
-            queries,
-        )
-        if not all(bool(torch.isfinite(tensor).all()) for tensor in finite_fields):
-            failures.append("one or more floating tensors contain nonfinite values")
-        if float(video.min()) < 0.0 or float(video.max()) > 255.0:
-            failures.append("video values are outside [0, 255]")
-        if float(depth.min()) < 0.0:
-            failures.append("depth contains negative values")
-        query_times = queries[..., 0]
-        if not bool((query_times == query_times.round()).all()):
-            failures.append("query times are not integer-valued")
-        if float(query_times.min()) < 0.0 or float(query_times.max()) > 23.0:
-            failures.append("query times are outside [0, 23]")
-        if batched:
-            times = query_times[0].long()
-            expected_xyz = trajectory_3d[0, times, torch.arange(n_tracks), :]
-            query_xyz = queries[0, :, 1:]
-        else:
-            times = query_times.long()
-            expected_xyz = trajectory_3d[times, torch.arange(n_tracks), :]
-            query_xyz = queries[:, 1:]
-        if not bool(torch.allclose(query_xyz, expected_xyz, atol=1e-4, rtol=1e-5)):
-            failures.append("query XYZ does not match trajectory_3d at query time")
-        valid_depth_ratio = float((depth > 0.0).float().mean())
-        if valid_depth_ratio < 0.1:
-            failures.append("valid depth ratio is below 0.1")
-        stats.update(
-            {
-                "video_min": float(video.min()),
-                "video_max": float(video.max()),
-                "depth_min": float(depth.min()),
-                "depth_max": float(depth.max()),
-                "valid_depth_ratio": valid_depth_ratio,
-                "visibility_true": int(visibility.sum()),
-                "valid_true": int(valid.sum()),
-            }
-        )
-    return {"failures": failures, "statistics": stats}
-
-
-def _metadata_from_sample(sample: Any, *, batched: bool) -> dict[str, Any]:
-    metadata = sample.sample_metadata
-    if batched:
-        if not isinstance(metadata, list) or len(metadata) != 1:
-            raise ValueError("collated sample metadata must be a one-item list")
-        metadata = metadata[0]
-    if not isinstance(metadata, dict):
-        raise ValueError("sample metadata is missing")
-    return dict(metadata)
-
-
-def _validate_provenance(
-    metadata: dict[str, Any],
-    *,
-    expected_gotit: bool,
-    expected_virtual_index: int | None,
-    allowed_virtual_indices: set[int],
-    scene_contracts: dict[str, dict[str, Any]],
-    real_len: int,
-    seed_base: int,
-) -> list[str]:
-    failures: list[str] = []
-    required = ("virtual_index", "scene_index", "scene_name", "gotit")
-    missing = [key for key in required if key not in metadata]
-    if missing:
-        return [f"sample metadata is missing {missing}"]
-    virtual_index = int(metadata["virtual_index"])
-    scene_index = int(metadata["scene_index"])
-    scene_name = str(metadata["scene_name"])
-    if virtual_index not in allowed_virtual_indices:
-        failures.append(f"virtual index {virtual_index} is outside the requested schedule")
-    if expected_virtual_index is not None and virtual_index != expected_virtual_index:
-        failures.append(
-            f"returned virtual index {virtual_index} != requested {expected_virtual_index}"
-        )
-    expected_scene_index = virtual_index % real_len
-    expected_scene_name = f"{expected_scene_index:06d}"
-    if scene_index != expected_scene_index:
-        failures.append(f"scene index {scene_index} != virtual_index % {real_len}")
-    if scene_name != expected_scene_name:
-        failures.append(f"scene name {scene_name!r} != {expected_scene_name!r}")
-    if scene_name not in scene_contracts:
-        failures.append(f"scene name {scene_name!r} has no preflight contract")
-        return failures
-    metadata_gotit = bool(metadata["gotit"])
-    if metadata_gotit != expected_gotit:
-        failures.append(
-            f"metadata gotit={metadata_gotit} != loader gotit={expected_gotit}"
-        )
-    if not expected_gotit:
-        return failures
-
-    success_required = (
-        "seed",
-        "window_start",
-        "window_end_exclusive",
-        "selected_views",
     )
-    missing = [key for key in success_required if key not in metadata]
-    if missing:
-        return failures + [f"successful sample metadata is missing {missing}"]
-    if int(metadata["seed"]) != seed_base + virtual_index:
-        failures.append(
-            f"seed {metadata['seed']} != {seed_base} + virtual index {virtual_index}"
-        )
-    start = int(metadata["window_start"])
-    end = int(metadata["window_end_exclusive"])
-    contract = scene_contracts[scene_name]
-    frame_count = int(contract["frame_count"])
-    if end - start != 24:
-        failures.append(f"window [{start}, {end}) does not contain 24 frames")
-    if start < 0 or end > frame_count:
-        failures.append(f"window [{start}, {end}) is outside [0, {frame_count})")
-    invalid_frames = set(int(frame) for frame in contract["invalid_rgb_frame_indices"])
-    intersecting = sorted(frame for frame in invalid_frames if start <= frame < end)
-    if intersecting:
-        failures.append(f"window includes invalid RGB frames {intersecting}")
-    selected_views = sorted(int(view) for view in metadata["selected_views"])
-    if selected_views != [0, 1, 2, 3]:
-        failures.append(f"selected views {selected_views} != [0, 1, 2, 3]")
-    return failures
 
 
-def _coverage_child(payload: dict[str, Any], queue: Any) -> None:
-    os.setsid()
-    writer = JsonlWriter(Path(payload["events_path"]))
-    try:
-        runtime = _load_runtime(Path(payload["dataset_root"]))
-        _seed_process(int(payload["schedule_seed"]), runtime.torch)
-        dataset = runtime.dataset
-        expected_scenes = int(payload["expected_scenes"])
-        if dataset.real_len != expected_scenes:
-            raise ValueError(f"loader discovered {dataset.real_len} scenes, expected {expected_scenes}")
-        successes = gotit_false = exceptions = invariant_failures = 0
-        scenes_seen: set[str] = set()
-        allowed_virtual_indices = set(range(expected_scenes))
-        started = time.perf_counter()
-        for scene_index in range(expected_scenes):
-            event: dict[str, Any] = {"kind": "coverage", "scene_index": scene_index}
-            item_start = time.perf_counter()
-            try:
-                sample, gotit = dataset[scene_index]
-                event["latency_seconds"] = time.perf_counter() - item_start
-                event["gotit"] = bool(gotit)
-                metadata = _metadata_from_sample(sample, batched=False)
-                event["sample_metadata"] = metadata
-                scenes_seen.add(str(metadata["scene_name"]))
-                provenance_failures = _validate_provenance(
-                    metadata,
-                    expected_gotit=bool(gotit),
-                    expected_virtual_index=scene_index,
-                    allowed_virtual_indices=allowed_virtual_indices,
-                    scene_contracts=payload["scene_contracts"],
-                    real_len=expected_scenes,
-                    seed_base=int(dataset.seed),
-                )
-                if gotit:
-                    validation = _validate_sample(sample, runtime.torch, batched=False, full_scan=True)
-                    validation["failures"].extend(provenance_failures)
-                    event["validation"] = validation
-                    successes += 1
-                    invariant_failures += int(bool(validation["failures"]))
-                else:
-                    gotit_false += 1
-                    event["provenance_failures"] = provenance_failures
-                    invariant_failures += int(bool(provenance_failures))
-            except BaseException as exc:
-                exceptions += 1
-                event.update(
-                    {
-                        "gotit": None,
-                        "latency_seconds": time.perf_counter() - item_start,
-                        "error": repr(exc),
-                        "traceback": traceback.format_exc(),
-                    }
-                )
-            writer.write(event)
-            if (scene_index + 1) % int(payload["progress_every"]) == 0 or scene_index + 1 == expected_scenes:
-                print(
-                    "POINTODYSSEY_LOADER_COVERAGE "
-                    f"completed={scene_index + 1}/{expected_scenes} successes={successes} "
-                    f"gotit_false={gotit_false} exceptions={exceptions} "
-                    f"invariant_failures={invariant_failures}",
-                    flush=True,
-                )
-        result = {
-            "status": "completed",
-            "attempted": expected_scenes,
-            "successes": successes,
-            "gotit_false": gotit_false,
-            "exceptions": exceptions,
-            "invariant_failures": invariant_failures,
-            "unique_scenes": len(scenes_seen),
-            "all_scenes_seen": len(scenes_seen) == expected_scenes,
-            "wall_seconds": time.perf_counter() - started,
-            "schedule_seed": int(payload["schedule_seed"]),
-            "software": runtime.versions,
-        }
-        queue.put(result)
-    except BaseException as exc:
-        queue.put({"status": "error", "error": repr(exc), "traceback": traceback.format_exc()})
-        raise
-    finally:
-        writer.close()
-
-
-def _seed_process(seed: int, torch: Any) -> None:
+def _seed(seed: int, torch: Any) -> None:
     import numpy as np
 
     random.seed(seed)
@@ -794,12 +271,241 @@ def _seed_process(seed: int, torch: Any) -> None:
     torch.manual_seed(seed)
 
 
-def _make_loader(
+def _metadata(sample: Any, *, batched: bool) -> dict[str, Any]:
+    value = sample.sample_metadata
+    if batched:
+        if not isinstance(value, list) or len(value) != 1:
+            raise ValueError("collated sample metadata must contain one item")
+        value = value[0]
+    if not isinstance(value, dict):
+        raise ValueError("sample metadata is missing")
+    return value
+
+
+def validate_provenance(
+    metadata: dict[str, Any],
+    *,
+    gotit: bool,
+    allowed_indices: set[int],
+    contracts: dict[str, dict[str, Any]],
+) -> list[str]:
+    failures = []
+    required = ("virtual_index", "scene_index", "scene_name", "gotit")
+    if any(key not in metadata for key in required):
+        return ["sample metadata is incomplete"]
+    virtual_index = int(metadata["virtual_index"])
+    scene_index = int(metadata["scene_index"])
+    scene_name = str(metadata["scene_name"])
+    if virtual_index not in allowed_indices:
+        failures.append("virtual index is outside the benchmark schedule")
+    if scene_index != virtual_index % EXPECTED_SCENES:
+        failures.append("scene index does not match virtual index")
+    if scene_name != f"{scene_index:06d}" or scene_name not in contracts:
+        failures.append("scene name does not match scene index")
+    if bool(metadata["gotit"]) != gotit:
+        failures.append("metadata gotit disagrees with loader gotit")
+    if not gotit or scene_name not in contracts:
+        return failures
+
+    start = int(metadata.get("window_start", -1))
+    end = int(metadata.get("window_end_exclusive", -1))
+    contract = contracts[scene_name]
+    if end - start != 24 or start < 0 or end > int(contract["frame_count"]):
+        failures.append("sample window is not a legal 24-frame interval")
+    invalid = set(int(frame) for frame in contract["invalid_rgb_frame_indices"])
+    if any(start <= frame < end for frame in invalid):
+        failures.append("sample window intersects an invalid RGB frame")
+    return failures
+
+
+def validate_sample(
+    sample: Any,
+    torch: Any,
+    *,
+    batched: bool,
+    full: bool,
+) -> dict[str, Any]:
+    prefix = (1,) if batched else ()
+    queries = sample.query_points_3d
+    track_count = int(queries.shape[1 if batched else 0])
+    tensors = {
+        "video": sample.video,
+        "videodepth": sample.videodepth,
+        "segmentation": sample.segmentation,
+        "trajectory": sample.trajectory,
+        "trajectory_3d": sample.trajectory_3d,
+        "visibility": sample.visibility,
+        "valid": sample.valid,
+        "intrs": sample.intrs,
+        "extrs": sample.extrs,
+        "query_points_3d": queries,
+    }
+    expected_shapes = {
+        "video": prefix + (4, 24, 3, 384, 512),
+        "videodepth": prefix + (4, 24, 1, 384, 512),
+        "segmentation": prefix + (4, 24, 1, 384, 512),
+        "trajectory": prefix + (4, 24, track_count, 3),
+        "trajectory_3d": prefix + (24, track_count, 3),
+        "visibility": prefix + (4, 24, track_count),
+        "valid": prefix + (24, track_count),
+        "intrs": prefix + (4, 24, 3, 3),
+        "extrs": prefix + (4, 24, 3, 4),
+        "query_points_3d": prefix + (track_count, 4),
+    }
+    expected_dtypes = {
+        name: torch.float32
+        for name in tensors
+        if name != "visibility"
+    }
+    expected_dtypes["visibility"] = torch.bool
+    failures = [
+        f"{name} shape {tuple(tensors[name].shape)} != {shape}"
+        for name, shape in expected_shapes.items()
+        if tuple(tensors[name].shape) != shape
+    ]
+    failures.extend(
+        f"{name} dtype {tensor.dtype} != {expected_dtypes[name]}"
+        for name, tensor in tensors.items()
+        if tensor.dtype != expected_dtypes[name]
+    )
+
+    statistics = {
+        "track_count": track_count,
+        "shapes": {
+            name: list(tensor.shape)
+            for name, tensor in tensors.items()
+        },
+        "visibility_true": int(sample.visibility.sum()),
+        "visibility_total": int(sample.visibility.numel()),
+    }
+    if full and not failures:
+        floating = [
+            tensor
+            for name, tensor in tensors.items()
+            if name != "visibility"
+        ]
+        if not all(bool(torch.isfinite(tensor).all()) for tensor in floating):
+            failures.append("one or more returned tensors contain nonfinite values")
+        query_times = queries[..., 0]
+        if (
+            not bool((query_times == query_times.round()).all())
+            or float(query_times.min()) < 0
+            or float(query_times.max()) > 23
+        ):
+            failures.append("query times are not integers in [0, 23]")
+        else:
+            if batched:
+                times = query_times[0].long()
+                expected_xyz = sample.trajectory_3d[
+                    0, times, torch.arange(track_count), :
+                ]
+                query_xyz = queries[0, :, 1:]
+            else:
+                times = query_times.long()
+                expected_xyz = sample.trajectory_3d[
+                    times, torch.arange(track_count), :
+                ]
+                query_xyz = queries[:, 1:]
+            if not bool(
+                torch.allclose(query_xyz, expected_xyz, atol=1e-4, rtol=1e-5)
+            ):
+                failures.append("query XYZ does not match trajectory_3d at query time")
+        statistics["finite"] = not any("nonfinite" in failure for failure in failures)
+        statistics["valid_depth_ratio"] = float(
+            (sample.videodepth > 0).float().mean()
+        )
+    return {"failures": failures, "statistics": statistics}
+
+
+def run_coverage(
+    runtime: Any,
+    contracts: dict[str, dict[str, Any]],
+    *,
+    seed: int,
+    progress_every: int,
+) -> dict[str, Any]:
+    _seed(seed, runtime.torch)
+    records = []
+    allowed = set(range(EXPECTED_SCENES))
+    successes = gotit_false = exceptions = invariant_failures = 0
+    visibility_true = visibility_total = 0
+    track_counts = []
+    for scene_index in range(EXPECTED_SCENES):
+        record: dict[str, Any] = {"scene_index": scene_index}
+        try:
+            sample, gotit = runtime.dataset[scene_index]
+            record["gotit"] = bool(gotit)
+            metadata = _metadata(sample, batched=False)
+            record["metadata"] = metadata
+            failures = validate_provenance(
+                metadata,
+                gotit=bool(gotit),
+                allowed_indices=allowed,
+                contracts=contracts,
+            )
+            if int(metadata["virtual_index"]) != scene_index:
+                failures.append("coverage returned the wrong virtual index")
+            if gotit:
+                validation = validate_sample(
+                    sample,
+                    runtime.torch,
+                    batched=False,
+                    full=True,
+                )
+                failures.extend(validation["failures"])
+                record["statistics"] = validation["statistics"]
+                stats = validation["statistics"]
+                track_counts.append(int(stats["track_count"]))
+                visibility_true += int(stats["visibility_true"])
+                visibility_total += int(stats["visibility_total"])
+                successes += 1
+            else:
+                gotit_false += 1
+            record["failures"] = failures
+            invariant_failures += int(bool(failures))
+        except Exception as exc:
+            exceptions += 1
+            record["error"] = repr(exc)
+            record["traceback"] = traceback.format_exc()
+        records.append(record)
+        if (scene_index + 1) % progress_every == 0 or scene_index == EXPECTED_SCENES - 1:
+            print(
+                "POINTODYSSEY_COVERAGE "
+                f"{scene_index + 1}/{EXPECTED_SCENES} success={successes} "
+                f"gotit_false={gotit_false} exceptions={exceptions} "
+                f"invariants={invariant_failures}",
+                flush=True,
+            )
+        if "sample" in locals():
+            del sample
+    return {
+        "attempted": EXPECTED_SCENES,
+        "successes": successes,
+        "gotit_false": gotit_false,
+        "exceptions": exceptions,
+        "invariant_failures": invariant_failures,
+        "all_78_scenes_load": (
+            successes == EXPECTED_SCENES
+            and gotit_false == 0
+            and exceptions == 0
+            and invariant_failures == 0
+        ),
+        "track_count_min": min(track_counts) if track_counts else None,
+        "track_count_max": max(track_counts) if track_counts else None,
+        "visibility_true": visibility_true,
+        "visibility_total": visibility_total,
+        "visibility_ratio": (
+            visibility_true / visibility_total if visibility_total else None
+        ),
+        "records": records,
+    }
+
+
+def make_loader(
     runtime: Any,
     indices: Sequence[int],
-    workers: int,
     *,
-    in_order: bool,
+    workers: int,
     seed: int,
 ):
     kwargs = {
@@ -811,676 +517,340 @@ def _make_loader(
         "pin_memory": True,
         "collate_fn": runtime.collate_fn,
         "drop_last": True,
-        "in_order": in_order,
-        "persistent_workers": False,
+        "in_order": False,
         "generator": runtime.torch.Generator().manual_seed(seed),
     }
     if workers > 0:
-        kwargs["prefetch_factor"] = 4
+        kwargs["prefetch_factor"] = PREFETCH_FACTOR
     return runtime.StatefulDataLoader(**kwargs)
 
 
-def _trial_child(payload: dict[str, Any], queue: Any) -> None:
-    os.setsid()
-    writer = JsonlWriter(Path(payload["events_path"]))
-    loader = iterator = None
+def run_lane(
+    runtime: Any,
+    contracts: dict[str, dict[str, Any]],
+    *,
+    workers: int,
+    warmup_indices: Sequence[int],
+    measured_indices: Sequence[int],
+    tail_indices: Sequence[int],
+    seed: int,
+    progress_every: int,
+) -> dict[str, Any]:
+    _seed(seed, runtime.torch)
+    all_indices = list(warmup_indices) + list(measured_indices) + list(tail_indices)
+    allowed = set(all_indices)
+    loader = make_loader(runtime, all_indices, workers=workers, seed=seed)
+    tracker = ResourceTracker()
+    monitor_started = time.perf_counter()
+    iterator = iter(loader)
+    returned_indices: set[int] = set()
+    warmup_failures = 0
+    lane_error = None
+    returned = successes = gotit_false = invariant_failures = 0
+    track_counts: list[int] = []
+    visibility_true = visibility_total = 0
+    successful_metadata: list[dict[str, Any]] = []
+    measured_started = None
     try:
-        runtime = _load_runtime(Path(payload["dataset_root"]))
-        _seed_process(int(payload["schedule_seed"]), runtime.torch)
-        if runtime.dataset.real_len != int(payload["expected_scenes"]):
-            raise ValueError("loader scene count changed after preflight")
-        workers = int(payload["workers"])
-        in_order = bool(payload["in_order"])
-        configured_in_order = bool(runtime.config.reproducibility.deterministic)
-        if in_order != configured_in_order:
-            raise ValueError(
-                f"benchmark in_order={in_order} does not match training in_order={configured_in_order}"
-            )
-        warmup_indices = list(payload["warmup_indices"])
-        measured_indices = list(payload["measured_indices"])
-        tail_indices = list(payload["tail_indices"])
-        indices = warmup_indices + measured_indices + tail_indices
-        allowed_virtual_indices = set(indices)
-        scene_contracts = payload["scene_contracts"]
-        loader = _make_loader(
-            runtime,
-            indices,
-            workers,
-            in_order=in_order,
-            seed=int(payload["schedule_seed"]),
-        )
-
-        monitor = ProcfsMonitor(os.getpid(), float(payload["monitor_interval"]))
-        resource_started = time.perf_counter()
-        monitor.start()
-        iterator_started = time.perf_counter()
-        iterator = iter(loader)
-        iterator_creation_seconds = time.perf_counter() - iterator_started
-
-        first_next_wait_seconds = None
-        time_to_first_batch_seconds = None
-        warmup_gotit_false = warmup_invariant_failures = 0
-        returned_virtual_indices: set[int] = set()
-        for warmup_ordinal, virtual_index in enumerate(warmup_indices):
-            started = time.perf_counter()
+        for _ in warmup_indices:
             batch, gotit = next(iterator)
-            latency = time.perf_counter() - started
-            if first_next_wait_seconds is None:
-                first_next_wait_seconds = latency
-                time_to_first_batch_seconds = time.perf_counter() - iterator_started
-            warmup_gotit_false += int(not bool(gotit[0]))
-            metadata = _metadata_from_sample(batch, batched=True)
-            provenance_failures = _validate_provenance(
+            metadata = _metadata(batch, batched=True)
+            failures = validate_provenance(
                 metadata,
-                expected_gotit=bool(gotit[0]),
-                expected_virtual_index=virtual_index if in_order else None,
-                allowed_virtual_indices=allowed_virtual_indices,
-                scene_contracts=scene_contracts,
-                real_len=int(payload["expected_scenes"]),
-                seed_base=int(runtime.dataset.seed),
+                gotit=bool(gotit[0]),
+                allowed_indices=allowed,
+                contracts=contracts,
             )
-            actual_virtual_index = int(metadata["virtual_index"])
-            if actual_virtual_index in returned_virtual_indices:
-                provenance_failures.append(
-                    f"virtual index {actual_virtual_index} was returned more than once"
-                )
-            returned_virtual_indices.add(actual_virtual_index)
-            warmup_invariant_failures += int(bool(provenance_failures))
+            virtual_index = int(metadata["virtual_index"])
+            if virtual_index in returned_indices:
+                failures.append("duplicate virtual index")
+            returned_indices.add(virtual_index)
+            warmup_failures += int(not bool(gotit[0]) or bool(failures))
 
-        latencies: list[float] = []
-        metadata_items: list[dict[str, Any]] = []
-        events: list[dict[str, Any]] = []
-        successes = gotit_false = invariant_failures = 0
-        tensor_bytes = logical_scene_bytes = decoded_camera_frames = 0
-        pinned_video_samples = pinned_depth_samples = 0
-        trial_error: dict[str, Any] | None = None
         measured_started = time.perf_counter()
-        for measured_index, virtual_index in enumerate(measured_indices):
-            event: dict[str, Any] = {
-                "kind": "trial_sample",
-                "workers": workers,
-                "in_order": in_order,
-                "ordinal": measured_index,
-                "virtual_index_expected": int(virtual_index) if in_order else None,
-            }
-            item_started = time.perf_counter()
-            try:
-                batch, gotit = next(iterator)
-                latency = time.perf_counter() - item_started
-                if first_next_wait_seconds is None:
-                    first_next_wait_seconds = latency
-                    time_to_first_batch_seconds = time.perf_counter() - iterator_started
-                latencies.append(latency)
-                event["loader_wait_seconds"] = latency
-                event["gotit"] = bool(gotit[0])
-                metadata = _metadata_from_sample(batch, batched=True)
-                event["sample_metadata"] = metadata
-                provenance_failures = _validate_provenance(
-                    metadata,
-                    expected_gotit=bool(gotit[0]),
-                    expected_virtual_index=virtual_index if in_order else None,
-                    allowed_virtual_indices=allowed_virtual_indices,
-                    scene_contracts=scene_contracts,
-                    real_len=int(payload["expected_scenes"]),
-                    seed_base=int(runtime.dataset.seed),
+        for ordinal in range(len(measured_indices)):
+            batch, gotit = next(iterator)
+            returned += 1
+            metadata = _metadata(batch, batched=True)
+            failures = validate_provenance(
+                metadata,
+                gotit=bool(gotit[0]),
+                allowed_indices=allowed,
+                contracts=contracts,
+            )
+            virtual_index = int(metadata["virtual_index"])
+            if virtual_index in returned_indices:
+                failures.append("duplicate virtual index")
+            returned_indices.add(virtual_index)
+            if gotit[0]:
+                successes += 1
+                validation = validate_sample(
+                    batch, runtime.torch, batched=True, full=False
                 )
-                actual_virtual_index = int(metadata["virtual_index"])
-                if actual_virtual_index in returned_virtual_indices:
-                    provenance_failures.append(
-                        f"virtual index {actual_virtual_index} was returned more than once"
-                    )
-                returned_virtual_indices.add(actual_virtual_index)
+                failures.extend(validation["failures"])
+                stats = validation["statistics"]
+                track_counts.append(int(stats["track_count"]))
+                visibility_true += int(stats["visibility_true"])
+                visibility_total += int(stats["visibility_total"])
                 if "window_start" in metadata:
-                    metadata_items.append(metadata)
-                scene_name = str(metadata["scene_name"])
-                logical_scene_bytes += int(payload["scene_bytes"][scene_name])
-                decoded_camera_frames += int(
-                    scene_contracts[scene_name]["decoded_camera_frames_per_sample"]
-                )
-                if gotit[0]:
-                    validation = _validate_sample(batch, runtime.torch, batched=True, full_scan=False)
-                    validation["failures"].extend(provenance_failures)
-                    event["validation"] = validation
-                    successes += 1
-                    invariant_failures += int(bool(validation["failures"]))
-                    tensor_bytes += int(validation["statistics"]["tensor_bytes"])
-                    pinned_video_samples += int(validation["statistics"]["pinned"]["video"])
-                    pinned_depth_samples += int(validation["statistics"]["pinned"]["videodepth"])
-                else:
-                    gotit_false += 1
-                    event["provenance_failures"] = provenance_failures
-                    invariant_failures += int(bool(provenance_failures))
-                events.append(event)
-            except BaseException as exc:
-                trial_error = {"error": repr(exc), "traceback": traceback.format_exc()}
-                event.update(trial_error)
-                events.append(event)
-                break
-            if (measured_index + 1) % int(payload["progress_every"]) == 0:
+                    successful_metadata.append(metadata)
+            else:
+                gotit_false += 1
+            invariant_failures += int(bool(failures))
+            completed = ordinal + 1
+            if completed % progress_every == 0 or completed == len(measured_indices):
+                tracker.sample()
                 elapsed = time.perf_counter() - measured_started
                 print(
-                    "POINTODYSSEY_LOADER_TRIAL "
-                    f"workers={payload['workers']} completed={measured_index + 1}/"
-                    f"{len(payload['measured_indices'])} successes={successes} "
-                    f"gotit_false={gotit_false} samples_per_second={(measured_index + 1) / elapsed:.3f}",
+                    "POINTODYSSEY_BENCHMARK "
+                    f"workers={workers} {completed}/{len(measured_indices)} "
+                    f"success={successes} gotit_false={gotit_false} "
+                    f"invariants={invariant_failures} "
+                    f"samples_per_second={completed / elapsed:.3f}",
                     flush=True,
                 )
-        wall_seconds = time.perf_counter() - measured_started
-        resources = monitor.stop()
-        resource_wall_seconds = time.perf_counter() - resource_started
-        for event in events:
-            writer.write(event)
-        returned = len(latencies)
-        attempted = len(events)
-        exception_failures = int(trial_error is not None)
-        result = {
-            "status": "error" if trial_error else "completed",
-            "workers": workers,
-            "in_order": in_order,
-            "schedule_seed": int(payload["schedule_seed"]),
-            "warmup_samples": len(warmup_indices),
-            "warmup_gotit_false": warmup_gotit_false,
-            "warmup_invariant_failures": warmup_invariant_failures,
-            "tail_samples_queued": len(tail_indices),
-            "requested_measured_samples": len(measured_indices),
-            "attempted_measured_samples": attempted,
-            "returned_measured_samples": returned,
-            "successes": successes,
-            "gotit_false": gotit_false,
-            "exception_failures": exception_failures,
-            "sample_success_rate": successes / attempted if attempted else None,
-            "sample_failure_rate": (
-                (gotit_false + exception_failures) / attempted if attempted else None
+    except Exception as exc:
+        lane_error = {"error": repr(exc), "traceback": traceback.format_exc()}
+
+    measured_seconds = (
+        time.perf_counter() - measured_started
+        if measured_started is not None
+        else 0.0
+    )
+    resources = tracker.stop()
+    monitor_seconds = time.perf_counter() - monitor_started
+    del iterator, loader
+    gc.collect()
+    requested = len(measured_indices)
+    resources.update(
+        {
+            "monitor_seconds": monitor_seconds,
+            "physical_read_mib_per_second": (
+                resources["physical_read_bytes"] / MIB / monitor_seconds
+                if monitor_seconds
+                else None
             ),
-            "sample_rate_semantics": (
-                "success means gotit=True; failure means gotit=False or a loader exception; "
-                "tensor/provenance invariant failures are reported separately"
+            "read_characters_mib_per_second": (
+                resources["read_characters"] / MIB / monitor_seconds
+                if monitor_seconds
+                else None
             ),
-            "invariant_failures": invariant_failures,
-            "wall_seconds": wall_seconds,
-            "attempted_samples_per_second": attempted / wall_seconds if wall_seconds else None,
-            "returned_samples_per_second": returned / wall_seconds if wall_seconds else None,
-            "successful_samples_per_second": successes / wall_seconds if wall_seconds else None,
-            "returned_camera_frames_per_second": successes * 4 * 24 / wall_seconds if wall_seconds else None,
-            "returned_sample_source_camera_frames": decoded_camera_frames,
-            "returned_sample_source_camera_frames_per_measured_second": (
-                decoded_camera_frames / wall_seconds if wall_seconds else None
-            ),
-            "iterator_creation_seconds": iterator_creation_seconds,
-            "first_next_wait_seconds": first_next_wait_seconds,
-            "time_to_first_batch_seconds": time_to_first_batch_seconds,
-            "loader_wait_seconds": {
-                "total": sum(latencies),
-                "p50": percentile(latencies, 0.50),
-                "p90": percentile(latencies, 0.90),
-                "p95": percentile(latencies, 0.95),
-                "p99": percentile(latencies, 0.99),
-                "maximum": max(latencies) if latencies else None,
-            },
-            "tensor_bytes": tensor_bytes,
-            "tensor_mib_per_second": tensor_bytes / MIB / wall_seconds if wall_seconds else None,
-            "logical_prepared_bytes": logical_scene_bytes,
-            "logical_prepared_mib_per_second": logical_scene_bytes / MIB / wall_seconds if wall_seconds else None,
-            "logical_prepared_rate_semantics": (
-                "sum of whole prepared-scene file sizes associated with returned measured samples, "
-                "divided by measured delivery time; this is not physical disk traffic"
-            ),
-            "pin_memory": {
-                "configured": True,
-                "video_samples_pinned": pinned_video_samples,
-                "depth_samples_pinned": pinned_depth_samples,
-                "successful_samples": successes,
-            },
-            "timed_validation_level": (
-                "per-sample tensor shapes/dtypes, query count, visibility dtype, provenance, and pin state; "
-                "the serial coverage pass performs full tensor finiteness/value/query checks"
-            ),
-            "temporal_diversity": summarize_temporal_diversity(metadata_items),
-            "resources": resources,
-            "resource_monitor_wall_seconds": resource_wall_seconds,
-            "resource_measurement_scope": (
-                "iterator startup, warmup, measured delivery, and speculative tail prefetch; "
-                "worker shutdown is excluded"
-            ),
-            "software": runtime.versions,
-            "error": trial_error,
+            "scope": "iterator startup, warmup, measured samples, and tail prefetch",
         }
-        result["resources"]["physical_read_mib_per_second_full_run"] = (
-            resources["physical_read_bytes"] / MIB / resource_wall_seconds
-            if resource_wall_seconds
-            else None
-        )
-        result["resources"]["read_characters_mib_per_second_full_run"] = (
-            resources["read_characters"] / MIB / resource_wall_seconds
-            if resource_wall_seconds
-            else None
-        )
-        queue.put(result)
-    except BaseException as exc:
-        queue.put({"status": "error", "workers": payload.get("workers"), "error": repr(exc), "traceback": traceback.format_exc()})
-        raise
-    finally:
-        writer.close()
-        del iterator, loader
-        gc.collect()
+    )
+    return {
+        "workers": workers,
+        "requested_samples": requested,
+        "returned_samples": returned,
+        "successes": successes,
+        "gotit_false": gotit_false,
+        "exceptions": int(lane_error is not None),
+        "invariant_failures": invariant_failures,
+        "warmup_failures": warmup_failures,
+        "measured_seconds": measured_seconds,
+        "samples_per_second": (
+            successes / measured_seconds if measured_seconds else None
+        ),
+        "sample_success_rate": successes / requested,
+        "sample_failure_rate": (requested - successes) / requested,
+        "scene_temporal_diversity": summarize_diversity(successful_metadata),
+        "track_count_min": min(track_counts) if track_counts else None,
+        "track_count_max": max(track_counts) if track_counts else None,
+        "visibility_true": visibility_true,
+        "visibility_total": visibility_total,
+        "visibility_ratio": (
+            visibility_true / visibility_total if visibility_total else None
+        ),
+        "resources": resources,
+        "error": lane_error,
+    }
 
 
-def _run_child(
-    target: Any,
-    payload: dict[str, Any],
-    *,
-    timeout_seconds: float,
-) -> dict[str, Any]:
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue()
-    process = context.Process(target=target, args=(payload, result_queue))
-    process.start()
-    result = None
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if result is None:
-            try:
-                result = result_queue.get(timeout=min(1.0, max(0.01, deadline - time.monotonic())))
-            except queue_module.Empty:
-                pass
-        if result is not None and not process.is_alive():
-            break
-        if result is None and not process.is_alive():
-            break
-    timed_out = process.is_alive() and time.monotonic() >= deadline
-    if timed_out:
-        group_signalled = False
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            group_signalled = True
-        except ProcessLookupError:
-            if process.is_alive():
-                process.terminate()
-        process.join(timeout=30.0)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            if process.is_alive():
-                process.kill()
-        process.join(timeout=30.0)
-        result = {
-            "status": "error",
-            "error": f"child exceeded timeout of {timeout_seconds:.1f} seconds",
-            "timed_out": True,
-            "process_group_signalled": group_signalled,
-        }
-    else:
-        process.join()
-    if result is None:
-        try:
-            result = result_queue.get(timeout=1.0)
-        except queue_module.Empty:
-            result = {
-                "status": "error",
-                "error": f"child exited with code {process.exitcode} without returning a result",
-            }
-    result["child_exit_code"] = process.exitcode
-    if process.exitcode != 0 and result.get("status") != "error":
-        result["status"] = "error"
-        result["error"] = f"child exited with code {process.exitcode}"
-    return result
-
-
-def _wandb_init(args: argparse.Namespace, config: dict[str, Any]):
-    if args.wandb_mode == "disabled":
-        return None
-    import wandb
-
-    return wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name or args.output_dir.name,
-        mode=args.wandb_mode,
-        config=config,
-        job_type="loader-benchmark",
+def _lane_is_clean(lane: dict[str, Any]) -> bool:
+    return bool(
+        lane["returned_samples"] == lane["requested_samples"]
+        and lane["successes"] == lane["requested_samples"]
+        and lane["gotit_false"] == 0
+        and lane["exceptions"] == 0
+        and lane["invariant_failures"] == 0
+        and lane["warmup_failures"] == 0
     )
 
 
-def _wandb_log(run: Any, prefix: str, result: dict[str, Any]) -> None:
+def _wandb_log_lane(run: Any, lane: dict[str, Any]) -> None:
     if run is None:
         return
-    metrics = {
-        f"{prefix}/successful_samples_per_second": result.get("successful_samples_per_second"),
-        f"{prefix}/returned_samples_per_second": result.get("returned_samples_per_second"),
-        f"{prefix}/attempted_samples_per_second": result.get("attempted_samples_per_second"),
-        f"{prefix}/sample_success_rate": result.get("sample_success_rate"),
-        f"{prefix}/sample_failure_rate": result.get("sample_failure_rate"),
-        f"{prefix}/gotit_false": result.get("gotit_false"),
-        f"{prefix}/exception_failures": result.get("exception_failures"),
-        f"{prefix}/invariant_failures": result.get("invariant_failures"),
-        f"{prefix}/loader_wait_p50_seconds": (result.get("loader_wait_seconds") or {}).get("p50"),
-        f"{prefix}/loader_wait_p95_seconds": (result.get("loader_wait_seconds") or {}).get("p95"),
-        f"{prefix}/logical_prepared_mib_per_second": result.get("logical_prepared_mib_per_second"),
-        f"{prefix}/source_camera_frames_per_measured_second": result.get(
-            "returned_sample_source_camera_frames_per_measured_second"
-        ),
-        f"{prefix}/time_to_first_batch_seconds": result.get("time_to_first_batch_seconds"),
-        f"{prefix}/video_samples_pinned": (result.get("pin_memory") or {}).get(
-            "video_samples_pinned"
-        ),
-        f"{prefix}/depth_samples_pinned": (result.get("pin_memory") or {}).get(
-            "depth_samples_pinned"
-        ),
-        f"{prefix}/unique_scene_start_pairs": (
-            result.get("temporal_diversity") or {}
-        ).get("unique_scene_start_pairs"),
-    }
-    resources = result.get("resources") or {}
-    metrics[f"{prefix}/peak_process_tree_rss_gib"] = resources.get("peak_process_tree_rss_bytes", 0) / (1024 ** 3)
-    metrics[f"{prefix}/physical_read_mib_per_second_full_run"] = resources.get(
-        "physical_read_mib_per_second_full_run"
+    prefix = f"workers_{lane['workers']}"
+    run.log(
+        {
+            f"{prefix}/samples_per_second": lane["samples_per_second"],
+            f"{prefix}/sample_success_rate": lane["sample_success_rate"],
+            f"{prefix}/sample_failure_rate": lane["sample_failure_rate"],
+            f"{prefix}/invariant_failures": lane["invariant_failures"],
+            f"{prefix}/unique_scenes": lane["scene_temporal_diversity"]["unique_scenes"],
+            f"{prefix}/unique_scene_start_pairs": lane[
+                "scene_temporal_diversity"
+            ]["unique_scene_start_pairs"],
+            f"{prefix}/sampled_peak_rss_gib": lane["resources"][
+                "sampled_peak_process_tree_rss_bytes"
+            ]
+            / (1024 ** 3),
+            f"{prefix}/sampled_peak_rss_increase_gib": lane["resources"][
+                "sampled_peak_rss_increase_bytes"
+            ]
+            / (1024 ** 3),
+            f"{prefix}/physical_read_mib_per_second": lane["resources"][
+                "physical_read_mib_per_second"
+            ],
+            f"{prefix}/read_characters_mib_per_second": lane["resources"][
+                "read_characters_mib_per_second"
+            ],
+        }
     )
-    metrics[f"{prefix}/peak_descendant_count"] = resources.get("peak_descendant_count")
-    run.log({key: value for key, value in metrics.items() if value is not None})
-
-
-def _trial_is_clean(trial: dict[str, Any]) -> bool:
-    return bool(
-        trial.get("status") == "completed"
-        and trial.get("gotit_false") == 0
-        and trial.get("warmup_gotit_false") == 0
-        and trial.get("invariant_failures") == 0
-        and trial.get("warmup_invariant_failures") == 0
-        and trial.get("exception_failures") == 0
-        and trial.get("successes") == trial.get("requested_measured_samples")
-        and trial.get("attempted_measured_samples") == trial.get("requested_measured_samples")
-        and trial.get("returned_measured_samples") == trial.get("requested_measured_samples")
-    )
-
-
-def _all_trials_clean(
-    trials: Sequence[dict[str, Any]],
-    worker_counts: Sequence[int],
-    *,
-    expected_in_order: bool,
-) -> bool:
-    if len(trials) != len(worker_counts):
-        return False
-    return all(
-        int(trial.get("workers", -1)) == int(workers)
-        and trial.get("in_order") is expected_in_order
-        and _trial_is_clean(trial)
-        for trial, workers in zip(trials, worker_counts)
-    )
-
-
-def _best_trial(trials: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
-    eligible = [
-        trial
-        for trial in trials
-        if _trial_is_clean(trial)
-    ]
-    if not eligible:
-        return None
-    return max(eligible, key=lambda trial: float(trial["successful_samples_per_second"]))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if platform.system() != "Linux" or not Path("/proc/self/io").is_file():
-        raise RuntimeError("PointOdyssey loader resource benchmarking requires Linux procfs")
     dataset_root = args.dataset_root.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
-    repo_root = Path(__file__).resolve().parents[1]
-
-    preflight = preflight_dataset(dataset_root, args.expected_scenes)
-    train_root = Path(preflight["train_root"])
-    if output_dir == train_root or train_root in output_dir.parents:
-        raise ValueError("--output-dir must be outside the prepared training tree")
+    contracts = load_scene_contracts(dataset_root)
     output_dir.mkdir(parents=True, exist_ok=False)
-    measured_count = args.expected_scenes * args.measured_scene_repeats
+
+    tail_count = max(args.worker_counts) * PREFETCH_FACTOR
     warmup_indices = build_balanced_schedule(
-        args.expected_scenes,
         args.warmup_samples,
         repeat_offset=100,
-        seed=args.schedule_seed,
+        seed=args.seed,
     )
     measured_indices = build_balanced_schedule(
-        args.expected_scenes,
-        measured_count,
+        args.samples_per_worker,
         repeat_offset=200,
-        seed=args.schedule_seed + 1,
+        seed=args.seed + 1,
     )
-    sweep_tail_count = max(args.worker_counts) * 4
-    sweep_tail_indices = build_balanced_schedule(
-        args.expected_scenes,
-        sweep_tail_count,
+    tail_indices = build_balanced_schedule(
+        tail_count,
         repeat_offset=300,
-        seed=args.schedule_seed + 100,
+        seed=args.seed + 2,
     )
     run_config = {
-        "format": FORMAT_NAME,
-        "schema_version": SCHEMA_VERSION,
-        "created_at_unix": time.time(),
-        "host": socket.gethostname(),
-        "platform": platform.platform(),
         "dataset_root": str(dataset_root),
         "output_dir": str(output_dir),
-        "git": _git_metadata(repo_root),
-        "environment": {
-            key: os.environ.get(key)
-            for key in (
-                "OMP_NUM_THREADS",
-                "MKL_NUM_THREADS",
-                "OPENBLAS_NUM_THREADS",
-                "NUMEXPR_NUM_THREADS",
-                "CUDA_VISIBLE_DEVICES",
-            )
-        },
         "settings": {
-            "coverage_scenes": args.expected_scenes,
-            "worker_counts": list(args.worker_counts),
+            "worker_counts": args.worker_counts,
             "batch_size": 1,
             "sequence_length": 24,
             "views": 4,
+            "in_order": False,
             "pin_memory": True,
-            "prefetch_factor_when_workers_positive": 4,
-            "persistent_workers": False,
-            "worker_sweep_in_order": False,
-            "worker_sweep_semantics": (
-                "matches current training; actual returned provenance is authoritative "
-                "because worker completion order may differ"
-            ),
-            "confirmation_in_order": False,
+            "prefetch_factor": PREFETCH_FACTOR,
             "warmup_samples": args.warmup_samples,
-            "measured_scene_repeats": args.measured_scene_repeats,
-            "measured_samples_per_worker": measured_count,
-            "worker_sweep_tail_samples": sweep_tail_count,
-            "worker_sweep_tail_semantics": (
-                "same fixed tail for every lane; keeps the largest configured worker x 4-prefetch queue "
-                "saturated through the timed boundary"
-            ),
-            "confirmation_warmup": args.confirmation_warmup,
-            "confirmation_samples": args.confirmation_samples,
-            "schedule_seed": args.schedule_seed,
-            "monitor_interval_seconds": args.monitor_interval,
-            "child_timeout_seconds": args.child_timeout_seconds,
-            "cache_state": "uncontrolled warm cache; system caches are not dropped",
-            "augmentation_profile": "exact configs/train.yaml + configs/experiment/pointodyssey.yaml",
-            "coverage_validation": "full tensor shapes/dtypes/finiteness/value/query/provenance checks",
-            "timed_validation": "lightweight shapes/dtypes/query count/visibility dtype/provenance/pin checks",
+            "measured_samples_per_worker": args.samples_per_worker,
+            "tail_samples": tail_count,
+            "seed": args.seed,
+            "cache_state": "system page cache is not dropped",
         },
-        "preflight": preflight,
     }
     _atomic_json(output_dir / "run_config.json", run_config)
-
     summary: dict[str, Any] = {
-        "format": FORMAT_NAME,
-        "schema_version": SCHEMA_VERSION,
         "status": "running",
         "run_config": run_config,
         "coverage": None,
-        "trials": [],
-        "confirmation": None,
+        "lanes": [],
     }
     _atomic_json(output_dir / "summary.json", summary)
+
     wandb_run = None
     try:
-        wandb_run = _wandb_init(args, run_config)
-        coverage = _run_child(
-            _coverage_child,
-            {
-                "dataset_root": str(dataset_root),
-                "events_path": str(output_dir / "coverage_samples.jsonl"),
-                "expected_scenes": args.expected_scenes,
-                "progress_every": args.progress_every,
-                "scene_contracts": preflight["scene_contracts"],
-                "schedule_seed": args.schedule_seed,
-            },
-            timeout_seconds=args.child_timeout_seconds,
+        runtime = _load_runtime(dataset_root)
+        summary["software"] = runtime.versions
+        if args.wandb_mode != "disabled":
+            import wandb
+
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name or output_dir.name,
+                mode=args.wandb_mode,
+                config=run_config,
+                job_type="loader-benchmark",
+            )
+
+        summary["coverage"] = run_coverage(
+            runtime,
+            contracts,
+            seed=args.seed,
+            progress_every=args.progress_every,
         )
-        summary["coverage"] = coverage
         _atomic_json(output_dir / "summary.json", summary)
         if wandb_run is not None:
             wandb_run.log(
                 {
-                    "coverage/successes": coverage.get("successes", 0),
-                    "coverage/gotit_false": coverage.get("gotit_false", 0),
-                    "coverage/exceptions": coverage.get("exceptions", 0),
-                    "coverage/invariant_failures": coverage.get("invariant_failures", 0),
+                    "coverage/all_78_scenes_load": int(
+                        summary["coverage"]["all_78_scenes_load"]
+                    ),
+                    "coverage/successes": summary["coverage"]["successes"],
+                    "coverage/gotit_false": summary["coverage"]["gotit_false"],
+                    "coverage/exceptions": summary["coverage"]["exceptions"],
+                    "coverage/invariant_failures": summary["coverage"][
+                        "invariant_failures"
+                    ],
                 }
             )
 
         for workers in args.worker_counts:
             print(
-                f"POINTODYSSEY_LOADER_TRIAL_START workers={workers} "
-                f"warmup={len(warmup_indices)} measured={len(measured_indices)} "
-                f"tail={len(sweep_tail_indices)} in_order=false",
+                "POINTODYSSEY_BENCHMARK_START "
+                f"workers={workers} warmup={len(warmup_indices)} "
+                f"measured={len(measured_indices)} tail={len(tail_indices)}",
                 flush=True,
             )
-            result = _run_child(
-                _trial_child,
-                {
-                    "dataset_root": str(dataset_root),
-                    "events_path": str(output_dir / f"workers_{workers}_samples.jsonl"),
-                    "expected_scenes": args.expected_scenes,
-                    "workers": workers,
-                    "in_order": False,
-                    "warmup_indices": warmup_indices,
-                    "measured_indices": measured_indices,
-                    "tail_indices": sweep_tail_indices,
-                    "scene_bytes": preflight["scene_bytes"],
-                    "scene_contracts": preflight["scene_contracts"],
-                    "schedule_seed": args.schedule_seed,
-                    "monitor_interval": args.monitor_interval,
-                    "progress_every": args.progress_every,
-                },
-                timeout_seconds=args.child_timeout_seconds,
+            lane = run_lane(
+                runtime,
+                contracts,
+                workers=workers,
+                warmup_indices=warmup_indices,
+                measured_indices=measured_indices,
+                tail_indices=tail_indices,
+                seed=args.seed,
+                progress_every=args.progress_every,
             )
-            summary["trials"].append(result)
+            summary["lanes"].append(lane)
             _atomic_json(output_dir / "summary.json", summary)
-            _wandb_log(wandb_run, f"workers_{workers}", result)
+            _wandb_log_lane(wandb_run, lane)
 
-        best = _best_trial(summary["trials"])
-        if best is not None and args.confirmation_samples > 0:
-            confirmation_workers = int(best["workers"])
-            confirmation_warmup = build_balanced_schedule(
-                args.expected_scenes,
-                args.confirmation_warmup,
-                repeat_offset=1000,
-                seed=args.schedule_seed + 2,
-            )
-            confirmation_measured = build_balanced_schedule(
-                args.expected_scenes,
-                args.confirmation_samples,
-                repeat_offset=2000,
-                seed=args.schedule_seed + 3,
-            )
-            confirmation_tail = build_balanced_schedule(
-                args.expected_scenes,
-                sweep_tail_count,
-                repeat_offset=3000,
-                seed=args.schedule_seed + 4,
-            )
-            print(
-                "POINTODYSSEY_LOADER_CONFIRMATION_START "
-                f"workers={confirmation_workers} warmup={len(confirmation_warmup)} "
-                f"measured={len(confirmation_measured)} tail={len(confirmation_tail)} "
-                "in_order=false",
-                flush=True,
-            )
-            summary["confirmation"] = _run_child(
-                _trial_child,
-                {
-                    "dataset_root": str(dataset_root),
-                    "events_path": str(output_dir / "confirmation_samples.jsonl"),
-                    "expected_scenes": args.expected_scenes,
-                    "workers": confirmation_workers,
-                    "in_order": False,
-                    "warmup_indices": confirmation_warmup,
-                    "measured_indices": confirmation_measured,
-                    "tail_indices": confirmation_tail,
-                    "scene_bytes": preflight["scene_bytes"],
-                    "scene_contracts": preflight["scene_contracts"],
-                    "schedule_seed": args.schedule_seed + 2,
-                    "monitor_interval": args.monitor_interval,
-                    "progress_every": args.progress_every,
-                },
-                timeout_seconds=args.child_timeout_seconds,
-            )
-            _atomic_json(output_dir / "summary.json", summary)
-            _wandb_log(wandb_run, "confirmation", summary["confirmation"])
-
-        tree_fingerprint_after = dataset_tree_fingerprint(train_root)
-        summary["tree_fingerprint_after"] = tree_fingerprint_after
-        summary["dataset_tree_unchanged"] = (
-            tree_fingerprint_after == preflight["tree_fingerprint_before"]
-        )
-        coverage_clean = (
-            coverage.get("status") == "completed"
-            and coverage.get("successes") == args.expected_scenes
-            and coverage.get("gotit_false") == 0
-            and coverage.get("exceptions") == 0
-            and coverage.get("invariant_failures") == 0
-            and coverage.get("all_scenes_seen") is True
-        )
-        trials_clean = _all_trials_clean(
-            summary["trials"],
-            args.worker_counts,
-            expected_in_order=False,
-        )
-        summary["best_worker_count"] = int(best["workers"]) if best is not None else None
-        confirmation_clean = (
-            summary["confirmation"] is None
-            or (
-                summary["confirmation"].get("status") == "completed"
-                and summary["confirmation"].get("in_order") is False
-                and summary["confirmation"].get("workers") == summary["best_worker_count"]
-                and _trial_is_clean(summary["confirmation"])
-            )
+        clean_lanes = [lane for lane in summary["lanes"] if _lane_is_clean(lane)]
+        summary["best_worker_count"] = (
+            max(clean_lanes, key=lambda lane: lane["samples_per_second"])["workers"]
+            if clean_lanes
+            else None
         )
         summary["status"] = (
             "completed"
-            if coverage_clean and trials_clean and confirmation_clean and summary["dataset_tree_unchanged"]
+            if summary["coverage"]["all_78_scenes_load"]
+            and len(clean_lanes) == len(args.worker_counts)
             else "failed"
         )
         summary["finished_at_unix"] = time.time()
         _atomic_json(output_dir / "summary.json", summary)
-        print(
-            "POINTODYSSEY_LOADER_BENCHMARK_DONE "
-            f"status={summary['status']} best_workers={summary['best_worker_count']} "
-            f"output={output_dir}",
-            flush=True,
-        )
         if wandb_run is not None:
             wandb_run.log(
                 {
                     "benchmark/completed": int(summary["status"] == "completed"),
                     "benchmark/best_worker_count": summary["best_worker_count"],
-                    "benchmark/dataset_tree_unchanged": int(summary["dataset_tree_unchanged"]),
                 }
             )
+        print(
+            "POINTODYSSEY_BENCHMARK_DONE "
+            f"status={summary['status']} best_workers={summary['best_worker_count']} "
+            f"output={output_dir}",
+            flush=True,
+        )
         return 0 if summary["status"] == "completed" else 1
-    except BaseException as exc:
+    except Exception as exc:
         summary["status"] = "error"
-        summary["finished_at_unix"] = time.time()
         summary["error"] = repr(exc)
         summary["traceback"] = traceback.format_exc()
+        summary["finished_at_unix"] = time.time()
         _atomic_json(output_dir / "summary.json", summary)
         raise
     finally:
