@@ -44,7 +44,7 @@ else:
     )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LAYOUT_ORDER = ("raw", "long", "short")
 SAMPLE_COUNTS = {"raw": 8, "short": 8, "long": 24}
 TEMPORAL_OFFSETS = (-2, -1, 0, 1, 2)
@@ -622,6 +622,7 @@ def audit(source_root: Path, output_path: Path) -> None:
         "sampled_sources": sampled_sources,
         "layout_summaries": layout_summaries,
         "paired_temporal_layout_summaries": paired_layout_summaries,
+        "paired_temporal_sequence_view_summaries": _sequence_summaries(paired_buckets),
         "temporal_offset_comparison": _temporal_comparison(paired_layout_summaries),
         "known_good_raw_long_reference": _known_good_reference(buckets),
         "sequence_view_summaries": _sequence_summaries(buckets),
