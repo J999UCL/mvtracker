@@ -544,6 +544,40 @@ class TrainingDashboardState:
                 "visibility": scalars.get("live_visibility_loss", []),
                 "flow": scalars.get("live_flow_loss", []),
             }
+            baseline = {
+                "stationary": scalars.get(
+                    "baseline/stationary_trajectory_loss",
+                    [],
+                ),
+                "model_ratio": scalars.get(
+                    "baseline/model_to_stationary_ratio",
+                    [],
+                ),
+            }
+            gradients = {
+                "pre_clip": scalars.get("optimization/grad_norm_pre_clip", []),
+                "post_clip": scalars.get("optimization/grad_norm_post_clip", []),
+                "microbatch_mean": scalars.get(
+                    "optimization/microbatch_grad_norm_mean",
+                    [],
+                ),
+                "cosine_mean": scalars.get(
+                    "optimization/microbatch_grad_cosine_mean",
+                    [],
+                ),
+                "cosine_min": scalars.get(
+                    "optimization/microbatch_grad_cosine_min",
+                    [],
+                ),
+                "clip_coefficient": scalars.get(
+                    "optimization/clip_coefficient",
+                    [],
+                ),
+                "clipped_fraction": scalars.get(
+                    "optimization/clipped_step_fraction",
+                    [],
+                ),
+            }
             log_timing = {
                 key: [
                     {"step": int(row["step"]), "value": float(row[key])}
@@ -624,6 +658,8 @@ class TrainingDashboardState:
                 ),
                 "series": {
                     "losses": losses,
+                    "baseline": baseline,
+                    "gradients": gradients,
                     "learning_rate": scalars.get("learning_rate", []),
                     "timing": timing,
                     "validation": validation,
@@ -728,7 +764,15 @@ INDEX_HTML = r"""<!doctype html>
     <div class="grid-3" style="margin-top:22px">
       <div class="chart-panel"><h3>Total loss</h3><div class="chart-wrap compact"><canvas id="loss-total"></canvas></div></div>
       <div class="chart-panel"><h3>Visibility loss</h3><div class="chart-wrap compact"><canvas id="loss-visibility"></canvas></div></div>
-      <div class="chart-panel"><h3>Flow loss</h3><div class="chart-wrap compact"><canvas id="loss-flow"></canvas></div></div>
+      <div class="chart-panel"><h3>3D trajectory loss</h3><div class="chart-wrap compact"><canvas id="loss-flow"></canvas></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Trajectory baseline</h2>
+    <div class="grid-2">
+      <div class="chart-panel"><h3>Model versus stationary prediction</h3><div class="chart-wrap"><canvas id="stationary-baseline"></canvas></div><div class="chart-note">Stationary means holding every track at its query coordinate for the entire clip, scored with the exact training trajectory loss.</div></div>
+      <div class="chart-panel"><h3>Model / stationary loss</h3><div class="chart-wrap"><canvas id="stationary-ratio"></canvas></div><div class="chart-note">Below 1.0 means the model beats the no-motion baseline.</div></div>
     </div>
   </section>
 
@@ -746,6 +790,11 @@ INDEX_HTML = r"""<!doctype html>
     <div class="grid-2">
       <div class="chart-panel"><h3>Step timing</h3><div class="chart-wrap"><canvas id="step-timing"></canvas></div><div class="chart-note">Total, blocked dataloader time, forward, and backward/update.</div></div>
       <div class="chart-panel"><h3>Learning-rate schedule</h3><div class="chart-wrap"><canvas id="learning-rate"></canvas></div></div>
+    </div>
+    <div class="grid-3" style="margin-top:22px">
+      <div class="chart-panel"><h3>Gradient norms</h3><div class="chart-wrap compact"><canvas id="gradient-norms"></canvas></div></div>
+      <div class="chart-panel"><h3>Microbatch gradient agreement</h3><div class="chart-wrap compact"><canvas id="gradient-cosine"></canvas></div><div class="chart-note">Cosine of each microbatch gradient against the running accumulator; negative values indicate cancellation.</div></div>
+      <div class="chart-panel"><h3>Gradient clipping</h3><div class="chart-wrap compact"><canvas id="gradient-clipping"></canvas></div><div class="chart-note">Coefficient 1 means unchanged; clipped fraction is cumulative.</div></div>
     </div>
   </section>
 
@@ -780,17 +829,28 @@ const fmt=new Intl.NumberFormat(undefined,{maximumFractionDigits:2});
 const pct=value=>value==null?'—':`${Number(value).toFixed(2)}%`;
 const seconds=value=>value==null?'—':`${Number(value).toFixed(2)} s`;
 const line=(label,stroke,extra={})=>({label,data:[],borderColor:stroke,backgroundColor:stroke,pointBackgroundColor:stroke,pointBorderColor:stroke,borderWidth:2,pointRadius:2,pointHoverRadius:4,tension:.18,fill:false,...extra});
+const alphaColor=(hex,alpha)=>{
+  const match=/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  return match?`rgba(${parseInt(match[1],16)},${parseInt(match[2],16)},${parseInt(match[3],16)},${alpha})`:hex;
+};
+const rawLoss=(label,stroke)=>line(`${label} raw`,alphaColor(stroke,.22),{borderWidth:1,pointRadius:2,pointHoverRadius:4,tension:0});
+const emaLoss=(label,stroke)=>line(`${label} EMA`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18});
 function options(xTitle,yTitle,extra={}){
   return {responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:180},interaction:{mode:'index',intersect:false},plugins:{legend:{display:extra.legend!==false,position:'bottom',labels:{color:palette.text,usePointStyle:true,boxWidth:8}},tooltip:{enabled:true,backgroundColor:palette.panel,titleColor:palette.text,bodyColor:palette.text,borderColor:palette.border,borderWidth:1}},scales:{x:{type:'linear',grid:{color:palette.border},ticks:{color:palette.muted,maxTicksLimit:10},title:{display:true,text:xTitle,color:palette.muted}},y:{min:extra.min,max:extra.max,grid:{color:palette.border},ticks:{color:palette.muted,callback:extra.tickCallback},title:{display:true,text:yTitle,color:palette.muted}},...(extra.scales||{})}};
 }
 const charts={
-  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:[line('Total',palette.s1),line('Visibility',palette.s2),line('Flow',palette.s3)]},options:options('Optimizer step','Loss')}),
-  total:new Chart(document.getElementById('loss-total'),{type:'line',data:{datasets:[line('Total',palette.s1)]},options:options('Optimizer step','Loss',{legend:false})}),
-  visibility:new Chart(document.getElementById('loss-visibility'),{type:'line',data:{datasets:[line('Visibility',palette.s2)]},options:options('Optimizer step','Loss',{legend:false})}),
-  flow:new Chart(document.getElementById('loss-flow'),{type:'line',data:{datasets:[line('Flow',palette.s3)]},options:options('Optimizer step','Loss',{legend:false})}),
+  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:[rawLoss('Total',palette.s1),emaLoss('Total',palette.s1),rawLoss('Visibility',palette.s2),emaLoss('Visibility',palette.s2),rawLoss('Trajectory',palette.s3),emaLoss('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
+  total:new Chart(document.getElementById('loss-total'),{type:'line',data:{datasets:[rawLoss('Total',palette.s1),emaLoss('Total',palette.s1)]},options:options('Optimizer step','Loss')}),
+  visibility:new Chart(document.getElementById('loss-visibility'),{type:'line',data:{datasets:[rawLoss('Visibility',palette.s2),emaLoss('Visibility',palette.s2)]},options:options('Optimizer step','Loss')}),
+  flow:new Chart(document.getElementById('loss-flow'),{type:'line',data:{datasets:[rawLoss('Trajectory',palette.s3),emaLoss('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
+  stationary:new Chart(document.getElementById('stationary-baseline'),{type:'line',data:{datasets:[line('Model trajectory',palette.s1),line('Stationary baseline',palette.s4)]},options:options('Optimizer step','Trajectory loss')}),
+  stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[line('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0})}),
   validation:new Chart(document.getElementById('validation'),{type:'line',data:{datasets:[line('Validation',palette.s1)]},options:options('Optimizer step','Score',{legend:false})}),
   timing:new Chart(document.getElementById('step-timing'),{type:'line',data:{datasets:[line('Total',palette.s1),line('Data wait',palette.s2),line('Forward',palette.s3),line('Backward',palette.s4)]},options:options('Optimizer step','Seconds')}),
   learningRate:new Chart(document.getElementById('learning-rate'),{type:'line',data:{datasets:[line('Learning rate',palette.s1)]},options:options('Optimizer step','Learning rate',{legend:false,tickCallback:value=>Number(value).toExponential(1)})}),
+  gradientNorms:new Chart(document.getElementById('gradient-norms'),{type:'line',data:{datasets:[line('Pre-clip',palette.s1),line('Post-clip',palette.s2),line('Microbatch mean',palette.s3)]},options:options('Optimizer step','Global L2 norm',{min:0})}),
+  gradientCosine:new Chart(document.getElementById('gradient-cosine'),{type:'line',data:{datasets:[line('Mean cosine',palette.s1),line('Minimum cosine',palette.s5)]},options:options('Optimizer step','Cosine similarity',{min:-1,max:1})}),
+  gradientClipping:new Chart(document.getElementById('gradient-clipping'),{type:'line',data:{datasets:[line('Clip coefficient',palette.s1),line('Clipped fraction',palette.s4)]},options:options('Optimizer step','Fraction',{min:0,max:1})}),
   rejection:new Chart(document.getElementById('rejection-rate'),{type:'line',data:{datasets:[line('Rejected',palette.s1)]},options:options('Optimizer step','Rejected attempts (%)',{min:0,max:100,legend:false})}),
   tracks:new Chart(document.getElementById('track-count'),{type:'line',data:{datasets:[line('Mean',palette.s1),line('Maximum',palette.s2,{borderDash:[5,4],pointRadius:0}),line('Minimum',palette.s3,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Tracks')}),
   scenes:new Chart(document.getElementById('scene-coverage'),{type:'line',data:{datasets:[line('Seen',palette.s1)]},options:options('Optimizer step','Unique scenes',{min:0})}),
@@ -799,6 +859,8 @@ const charts={
   gpuThermal:new Chart(document.getElementById('gpu-thermal'),{type:'line',data:{datasets:[line('Power',palette.s3),line('Temperature',palette.s4,{yAxisID:'temp'})]},options:options('Elapsed time (min)','Power (W)',{scales:{temp:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Temperature (°C)',color:palette.muted}}}})})
 };
 const points=series=>(series||[]).map(point=>({x:Number(point.step),y:Number(point.value)}));
+const emaPoints=(series,alpha=.15)=>{let average=null;return points(series).map(point=>{average=average==null?point.y:(alpha*point.y+(1-alpha)*average);return{x:point.x,y:average};});};
+const parityPoints=series=>points(series).map(point=>({x:point.x,y:1}));
 const pipePoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.step),y:Number(point[key])}));
 const gpuPoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.elapsed_seconds)/60,y:Number(point[key])}));
 function update(chart,datasets){datasets.forEach((data,index)=>{chart.data.datasets[index].data=data;});chart.update(reduced?'none':undefined);}
@@ -818,11 +880,18 @@ function render(state){
   text('latest-message',state.latest_log_message||'Waiting for training log…');
 
   const losses=state.series?.losses||{};
-  update(charts.combined,[points(losses.total),points(losses.visibility),points(losses.flow)]);
-  update(charts.total,[points(losses.total)]); update(charts.visibility,[points(losses.visibility)]); update(charts.flow,[points(losses.flow)]);
+  update(charts.combined,[points(losses.total),emaPoints(losses.total),points(losses.visibility),emaPoints(losses.visibility),points(losses.flow),emaPoints(losses.flow)]);
+  update(charts.total,[points(losses.total),emaPoints(losses.total)]); update(charts.visibility,[points(losses.visibility),emaPoints(losses.visibility)]); update(charts.flow,[points(losses.flow),emaPoints(losses.flow)]);
+  const baseline=state.series?.baseline||{};
+  update(charts.stationary,[points(losses.flow),points(baseline.stationary)]);
+  update(charts.stationaryRatio,[points(baseline.model_ratio),parityPoints(baseline.model_ratio)]);
   const timing=state.series?.timing||{};
   update(charts.timing,[points(timing.total),points(timing.data),points(timing.fwd),points(timing.bwd)]);
   update(charts.learningRate,[points(state.series?.learning_rate)]);
+  const gradients=state.series?.gradients||{};
+  update(charts.gradientNorms,[points(gradients.pre_clip),points(gradients.post_clip),points(gradients.microbatch_mean)]);
+  update(charts.gradientCosine,[points(gradients.cosine_mean),points(gradients.cosine_min)]);
+  update(charts.gradientClipping,[points(gradients.clip_coefficient),points(gradients.clipped_fraction)]);
   const pipeline=state.series?.pipeline||[];
   update(charts.rejection,[pipePoints(pipeline,'rejection_percent')]);
   update(charts.tracks,[pipePoints(pipeline,'tracks_mean'),pipePoints(pipeline,'tracks_max'),pipePoints(pipeline,'tracks_min')]);

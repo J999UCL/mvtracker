@@ -212,10 +212,18 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
         prepared_split = _SPLITS[requested_split]
         if requested_split == "training" and training_args.modes.debug:
             prepared_split = "validation"
+        prepared_directory = "PointOdyssey_MVTracker"
+        if training_args is not None:
+            datasets_config = getattr(training_args, "datasets", None)
+            if datasets_config is not None:
+                prepared_directory = datasets_config.get(
+                    "pointodyssey_prepared_dir",
+                    prepared_directory,
+                )
         kwargs.update({
             "data_root": os.path.join(
                 dataset_root,
-                "PointOdyssey_MVTracker",
+                prepared_directory,
                 prepared_split,
             ),
             "num_views": 4,

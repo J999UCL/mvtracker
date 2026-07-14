@@ -399,6 +399,28 @@ class FromNameTests(unittest.TestCase):
             str(Path("/datasets") / "PointOdyssey_MVTracker" / "validation"),
         )
 
+    def test_prepared_directory_can_select_the_v5_publication(self):
+        with mock.patch.object(
+            loader.KubricMultiViewDataset,
+            "from_name",
+            return_value=self._base_kwargs(),
+        ):
+            kwargs = loader.PointOdysseyMultiViewDataset.from_name(
+                "pointodyssey-multiview-training",
+                "/datasets",
+                training_args=SimpleNamespace(
+                    modes=SimpleNamespace(debug=False),
+                    datasets={"pointodyssey_prepared_dir": "PointOdyssey_MVTracker_v5"},
+                ),
+                fabric=object(),
+                just_return_kwargs=True,
+            )
+
+        self.assertEqual(
+            kwargs["data_root"],
+            str(Path("/datasets") / "PointOdyssey_MVTracker_v5" / "train"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -186,6 +186,12 @@ class DashboardStateTests(unittest.TestCase):
                     "live_total_loss": [{"step": 0, "value": 0.3, "wall_time": 1.0}],
                     "live_flow_loss": [{"step": 0, "value": 0.1, "wall_time": 1.0}],
                     "live_visibility_loss": [{"step": 0, "value": 0.2, "wall_time": 1.0}],
+                    "baseline/stationary_trajectory_loss": [
+                        {"step": 0, "value": 0.5, "wall_time": 1.0}
+                    ],
+                    "optimization/grad_norm_pre_clip": [
+                        {"step": 0, "value": 2.0, "wall_time": 1.0}
+                    ],
                     "timing/step": [{"step": 1, "value": 2.0, "wall_time": 1.0}],
                 },
                 error=None,
@@ -196,6 +202,8 @@ class DashboardStateTests(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["accepted_samples"], 1)
             self.assertEqual(snapshot["series"]["pipeline"][0]["tracks_mean"], 64)
             self.assertEqual(snapshot["series"]["gpu"][0]["utilization_percent"], 100)
+            self.assertEqual(snapshot["series"]["baseline"]["stationary"][0]["value"], 0.5)
+            self.assertEqual(snapshot["series"]["gradients"]["pre_clip"][0]["value"], 2.0)
 
 
 class DashboardHTTPTests(unittest.TestCase):
@@ -229,9 +237,14 @@ class DashboardHTTPTests(unittest.TestCase):
             "loss-total",
             "loss-visibility",
             "loss-flow",
+            "stationary-baseline",
+            "stationary-ratio",
             "validation",
             "step-timing",
             "learning-rate",
+            "gradient-norms",
+            "gradient-cosine",
+            "gradient-clipping",
             "rejection-rate",
             "track-count",
             "scene-coverage",
@@ -241,6 +254,8 @@ class DashboardHTTPTests(unittest.TestCase):
         ):
             self.assertIn(f'id="{chart_id}"', html)
         self.assertIn("new EventSource('/api/stream')", html)
+        self.assertIn("emaPoints", html)
+        self.assertIn("rawLoss", html)
         self.assertNotIn("setInterval", html)
 
     def test_state_endpoint_is_uncached_json(self):

@@ -13,6 +13,7 @@ from mvtracker.datasets.generic_scene_dataset import GenericSceneDataset
 from torch.utils.tensorboard import SummaryWriter
 import gpustat
 import json
+import statistics
 import threading
 import warnings
 from pathlib import Path
@@ -57,6 +58,129 @@ def _scale_microbatch_loss(loss, gradient_accumulation_steps):
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
     return loss / gradient_accumulation_steps
+
+
+def _global_gradient_l2_norm(parameters):
+    """Return the global FP32 L2 norm without changing gradients."""
+    per_parameter_norms = [
+        parameter.grad.detach().float().norm(2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not per_parameter_norms:
+        return torch.tensor(0.0)
+    return torch.stack(per_parameter_norms).norm(2)
+
+
+class _MicrobatchGradientDiagnostics:
+    """Measure individual microbatch gradients without storing full copies.
+
+    Leaf hooks see the incoming gradient before PyTorch adds it to an existing
+    accumulated ``parameter.grad``. This lets us compute the exact dot product
+    between the current microbatch and the running accumulator using scalar
+    reductions instead of another model-sized gradient buffer.
+    """
+
+    def __init__(self, parameters, enabled=True):
+        self.parameters = [parameter for parameter in parameters if parameter.requires_grad]
+        self.enabled = bool(enabled)
+        self.active = False
+        self.current_squared_norm_terms = []
+        self.accumulator_dot_terms = []
+        self.previous_accumulator_norm = None
+        self.handles = []
+        if self.enabled:
+            for parameter in self.parameters:
+                self.handles.append(parameter.register_hook(self._hook_for(parameter)))
+
+    def _hook_for(self, parameter):
+        def hook(gradient):
+            if not self.active:
+                return gradient
+            gradient_fp32 = gradient.detach().float()
+            self.current_squared_norm_terms.append(gradient_fp32.square().sum())
+            if parameter.grad is not None:
+                previous = parameter.grad.detach().float()
+                self.accumulator_dot_terms.append((previous * gradient_fp32).sum())
+            return gradient
+
+        return hook
+
+    def begin(self):
+        if not self.enabled:
+            return
+        self.current_squared_norm_terms = []
+        self.accumulator_dot_terms = []
+        self.previous_accumulator_norm = _global_gradient_l2_norm(self.parameters).detach()
+        self.active = True
+
+    def finish(self, unscale_factor=1.0):
+        if not self.enabled:
+            return None
+        self.active = False
+        if not self.current_squared_norm_terms:
+            return None
+
+        current_squared_norm = torch.stack(self.current_squared_norm_terms).sum()
+        current_norm = current_squared_norm.sqrt()
+        cosine = None
+        previous_norm = self.previous_accumulator_norm
+        if (
+            previous_norm is not None
+            and previous_norm.item() > 0.0
+            and self.accumulator_dot_terms
+            and current_norm.item() > 0.0
+        ):
+            dot = torch.stack(self.accumulator_dot_terms).sum()
+            cosine = float((dot / (previous_norm * current_norm)).clamp(-1, 1).item())
+
+        return {
+            # Backward receives loss / accumulation_steps. Undo that scale so
+            # this is the norm of the microbatch's own mean loss gradient.
+            "norm": float(current_norm.item() * unscale_factor),
+            "cosine_to_running_accumulator": cosine,
+        }
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+
+def _create_torch_profiler(cfg, experiment_path, global_rank):
+    profiler_cfg = cfg.trainer.get("profiler", {})
+    if not profiler_cfg or not bool(profiler_cfg.get("enabled", False)):
+        return None
+
+    trace_dir = Path(experiment_path) / "profiler" / f"rank_{global_rank}"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_trace_handler = torch.profiler.tensorboard_trace_handler(str(trace_dir))
+
+    def trace_ready(profiler):
+        tensorboard_trace_handler(profiler)
+        sort_key = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
+        summary = profiler.key_averages().table(sort_by=sort_key, row_limit=100)
+        summary_path = trace_dir / f"summary_step_{profiler.step_num:06d}.txt"
+        summary_path.write_text(summary + "\n", encoding="utf-8")
+        logging.info("Wrote torch.profiler trace and summary to %s", trace_dir)
+
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return torch.profiler.profile(
+        activities=activities,
+        schedule=torch.profiler.schedule(
+            wait=int(profiler_cfg.get("wait", 0)),
+            warmup=int(profiler_cfg.get("warmup", 1)),
+            active=int(profiler_cfg.get("active", 2)),
+            repeat=int(profiler_cfg.get("repeat", 1)),
+        ),
+        on_trace_ready=trace_ready,
+        record_shapes=bool(profiler_cfg.get("record_shapes", True)),
+        profile_memory=bool(profiler_cfg.get("profile_memory", True)),
+        with_stack=bool(profiler_cfg.get("with_stack", False)),
+        with_flops=bool(profiler_cfg.get("with_flops", True)),
+    )
 
 
 def fetch_optimizer(trainer_cfg, model):
@@ -169,6 +293,36 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
     xyz_loss = sequence_loss_3d(coord_predictions, traj_gts, vis_gts, valids_gts, gamma) * track_upscaling_factor
     vis_loss = balanced_ce_loss(vis_predictions, vis_gts, valids_gts)
 
+    # Directly comparable no-motion baseline: keep every track at its queried
+    # world-space coordinate for the full clip, then evaluate it with the exact
+    # same sliding windows, valid masks, refinement weights, and Z scaling as
+    # the model trajectory loss.
+    with torch.no_grad():
+        query_xyz_sorted = query_points_3d[:, sort_inds, 1:]
+        stationary_predictions = []
+        for window_predictions, window_gt in zip(coord_predictions, traj_gts):
+            window_track_count = window_gt.shape[2]
+            stationary = query_xyz_sorted[:, None, :window_track_count].expand(
+                -1,
+                window_gt.shape[1],
+                -1,
+                -1,
+            )
+            stationary_predictions.append(
+                [stationary.clone() for _ in window_predictions]
+            )
+        stationary_xyz_loss = (
+            sequence_loss_3d(
+                stationary_predictions,
+                traj_gts,
+                vis_gts,
+                valids_gts,
+                gamma,
+            )
+            * track_upscaling_factor
+        )
+        model_to_stationary_ratio = xyz_loss.detach() / stationary_xyz_loss.clamp_min(1e-12)
+
     # Compute 3DPT metrics
     # eval_3dpt_results_dict = evaluate_3dpt(
     #     gt_tracks=gt_trajectories_3d_worldspace[0].cpu().numpy(),
@@ -226,6 +380,10 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
         "visibility": {
             "loss": vis_loss * cfg.trainer.visibility_loss_weight,
             "predictions": pred_visibilities[0].detach(),
+        },
+        "metrics": {
+            "baseline/stationary_trajectory_loss": stationary_xyz_loss.item(),
+            "baseline/model_to_stationary_ratio": model_to_stationary_ratio.item(),
         },
         # "metrics": {
         #     k: v
@@ -607,6 +765,10 @@ def main(cfg: DictConfig):
     model.cuda()
     optimizer, scheduler = fetch_optimizer(cfg.trainer, model)
     model, optimizer = fabric.setup(model, optimizer)
+    gradient_diagnostics = _MicrobatchGradientDiagnostics(
+        model.parameters(),
+        enabled=bool(cfg.trainer.get("gradient_diagnostics", True)),
+    )
 
     folder_ckpts = [
         f
@@ -660,7 +822,17 @@ def main(cfg: DictConfig):
         run_test_eval(cfg, evaluator, model, eval_dataloaders, tb_writer, total_steps - 1)
         fabric.barrier()
         if cfg.modes.eval_only:
+            gradient_diagnostics.close()
             return
+
+    torch_profiler = _create_torch_profiler(
+        cfg,
+        cfg.experiment_path,
+        fabric.global_rank,
+    )
+    if torch_profiler is not None:
+        logging.info("Starting torch.profiler for successful training microbatches")
+        torch_profiler.start()
 
     total_durations = deque()
     dataloader_durations = deque()
@@ -693,6 +865,8 @@ def main(cfg: DictConfig):
     should_keep_training = total_steps < cfg.trainer.num_steps
     total_batches_loaded = 0
     total_batches_failed = 0
+    clipped_optimizer_steps = 0
+    diagnostic_optimizer_steps = 0
     if fabric.global_rank == 0:
         tqdm_total_steps = tqdm(
             total=cfg.trainer.num_steps,
@@ -746,6 +920,8 @@ def main(cfg: DictConfig):
         accumulated_loss_value = 0.0
         accumulated_component_losses = {}
         accumulated_metrics = {}
+        microbatch_gradient_norms = []
+        microbatch_gradient_cosines = []
 
         while i_batch < n_batches and total_steps < cfg.trainer.num_steps:
             if accumulation_started_at is None:
@@ -779,7 +955,8 @@ def main(cfg: DictConfig):
                 continue
 
             i_batch += 1
-            dataclass_to_cuda_(batch)
+            with torch.profiler.record_function("train/host_to_device"):
+                dataclass_to_cuda_(batch)
             assert model.training
 
             start_time_2 = time.time()
@@ -800,25 +977,26 @@ def main(cfg: DictConfig):
             )
 
             try:
-                output = forward_batch_multi_view(
-                    batch=batch,
-                    model=model,
-                    cfg=cfg,
-                    step=total_steps,
-                    train_iters=train_iters,
-                    gamma=cfg.trainer.gamma,
-                    save_debug_logs=(
-                            is_final_microbatch
-                            and (
-                                ((total_steps % cfg.trainer.viz_freq) == (cfg.trainer.viz_freq - 1))
-                                or (total_steps in [0, 10, 100, cfg.trainer.num_steps - 1])
-                            )
-                    ),
-                    debug_logs_path=os.path.join(
-                        cfg.experiment_path,
-                        f'forward_pass__train_step-{total_steps}_global_rank-{fabric.global_rank}'
-                    ),
-                )
+                with torch.profiler.record_function("train/model_and_loss_forward"):
+                    output = forward_batch_multi_view(
+                        batch=batch,
+                        model=model,
+                        cfg=cfg,
+                        step=total_steps,
+                        train_iters=train_iters,
+                        gamma=cfg.trainer.gamma,
+                        save_debug_logs=(
+                                is_final_microbatch
+                                and (
+                                    ((total_steps % cfg.trainer.viz_freq) == (cfg.trainer.viz_freq - 1))
+                                    or (total_steps in [0, 10, 100, cfg.trainer.num_steps - 1])
+                                )
+                        ),
+                        debug_logs_path=os.path.join(
+                            cfg.experiment_path,
+                            f'forward_pass__train_step-{total_steps}_global_rank-{fabric.global_rank}'
+                        ),
+                    )
             except Exception as e:
                 logging.critical(f"Forward pass crashed at step {total_steps}: {e}")
 
@@ -873,12 +1051,24 @@ def main(cfg: DictConfig):
             accumulated_sync_duration += start_time_4 - start_time_3
 
             backward_started_at = time.time()
-            fabric.backward(
-                _scale_microbatch_loss(loss, gradient_accumulation_steps)
+            gradient_diagnostics.begin()
+            with torch.profiler.record_function("train/backward"):
+                fabric.backward(
+                    _scale_microbatch_loss(loss, gradient_accumulation_steps)
+                )
+            microbatch_gradient = gradient_diagnostics.finish(
+                unscale_factor=gradient_accumulation_steps,
             )
+            if microbatch_gradient is not None:
+                microbatch_gradient_norms.append(microbatch_gradient["norm"])
+                cosine = microbatch_gradient["cosine_to_running_accumulator"]
+                if cosine is not None:
+                    microbatch_gradient_cosines.append(cosine)
             accumulated_bwd_duration += time.time() - backward_started_at
             microbatches_accumulated += 1
             if microbatches_accumulated < gradient_accumulation_steps:
+                if torch_profiler is not None:
+                    torch_profiler.step()
                 continue
 
             mean_loss_value = accumulated_loss_value / gradient_accumulation_steps
@@ -922,10 +1112,71 @@ def main(cfg: DictConfig):
                         print(f"{prefix} {name} grad_fn: {param.grad_fn}")
                 logging.info(f"{prefix} LR at step {total_steps}: {scheduler.get_last_lr()}")
             optimizer_update_started_at = time.time()
-            fabric.clip_gradients(model, optimizer, clip_val=cfg.trainer.grad_clip)
-            optimizer.step()
-            scheduler.step()
+            with torch.profiler.record_function("train/gradient_clip_and_optimizer"):
+                pre_clip_gradient_norm = float(
+                    _global_gradient_l2_norm(model.parameters()).item()
+                )
+                fabric.clip_gradients(model, optimizer, clip_val=cfg.trainer.grad_clip)
+                post_clip_gradient_norm = float(
+                    _global_gradient_l2_norm(model.parameters()).item()
+                )
+                clip_coefficient = (
+                    post_clip_gradient_norm / pre_clip_gradient_norm
+                    if pre_clip_gradient_norm > 0.0
+                    else 1.0
+                )
+                was_clipped = pre_clip_gradient_norm > float(cfg.trainer.grad_clip)
+                clipped_optimizer_steps += int(was_clipped)
+                diagnostic_optimizer_steps += 1
+                clipped_step_fraction = (
+                    clipped_optimizer_steps / float(diagnostic_optimizer_steps)
+                )
+                optimizer.step()
+                scheduler.step()
             accumulated_bwd_duration += time.time() - optimizer_update_started_at
+
+            microbatch_gradient_norm_mean = (
+                statistics.fmean(microbatch_gradient_norms)
+                if microbatch_gradient_norms
+                else None
+            )
+            microbatch_gradient_cosine_mean = (
+                statistics.fmean(microbatch_gradient_cosines)
+                if microbatch_gradient_cosines
+                else None
+            )
+            microbatch_gradient_cosine_min = (
+                min(microbatch_gradient_cosines)
+                if microbatch_gradient_cosines
+                else None
+            )
+            logging.info(
+                "[optimizer:%06d] loss=%.8f grad_pre=%.8f grad_post=%.8f "
+                "clip_coeff=%.8f clipped=%d clipped_fraction=%.6f "
+                "micro_grad_mean=%s micro_grad_cos_mean=%s micro_grad_cos_min=%s",
+                total_steps,
+                mean_loss_value,
+                pre_clip_gradient_norm,
+                post_clip_gradient_norm,
+                clip_coefficient,
+                int(was_clipped),
+                clipped_step_fraction,
+                (
+                    f"{microbatch_gradient_norm_mean:.8f}"
+                    if microbatch_gradient_norm_mean is not None
+                    else "n/a"
+                ),
+                (
+                    f"{microbatch_gradient_cosine_mean:.8f}"
+                    if microbatch_gradient_cosine_mean is not None
+                    else "n/a"
+                ),
+                (
+                    f"{microbatch_gradient_cosine_min:.8f}"
+                    if microbatch_gradient_cosine_min is not None
+                    else "n/a"
+                ),
+            )
 
             dataloader_duration = accumulated_dataloader_duration
             fwd_duration = accumulated_fwd_duration
@@ -971,6 +1222,53 @@ def main(cfg: DictConfig):
                 if len(output) > 1:
                     tb_writer.add_scalar(f"live_total_loss", mean_loss_value, total_steps)
                 tb_writer.add_scalar(f"learning_rate", optimizer.param_groups[0]["lr"], total_steps)
+                tb_writer.add_scalar(
+                    "optimization/grad_norm_pre_clip",
+                    pre_clip_gradient_norm,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "optimization/grad_norm_post_clip",
+                    post_clip_gradient_norm,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "optimization/clip_coefficient",
+                    clip_coefficient,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "optimization/clipped_step_fraction",
+                    clipped_step_fraction,
+                    total_steps,
+                )
+                if microbatch_gradient_norms:
+                    tb_writer.add_scalar(
+                        "optimization/microbatch_grad_norm_mean",
+                        microbatch_gradient_norm_mean,
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/microbatch_grad_norm_min",
+                        min(microbatch_gradient_norms),
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/microbatch_grad_norm_max",
+                        max(microbatch_gradient_norms),
+                        total_steps,
+                    )
+                if microbatch_gradient_cosines:
+                    tb_writer.add_scalar(
+                        "optimization/microbatch_grad_cosine_mean",
+                        microbatch_gradient_cosine_mean,
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/microbatch_grad_cosine_min",
+                        microbatch_gradient_cosine_min,
+                        total_steps,
+                    )
 
             if total_steps % cfg.trainer.save_ckpt_freq == 0:
                 ckpt_iter = "0" * (6 - len(str(total_steps))) + str(total_steps)
@@ -1104,6 +1402,11 @@ def main(cfg: DictConfig):
             accumulated_loss_value = 0.0
             accumulated_component_losses = {}
             accumulated_metrics = {}
+            microbatch_gradient_norms = []
+            microbatch_gradient_cosines = []
+
+            if torch_profiler is not None:
+                torch_profiler.step()
 
             if total_steps >= cfg.trainer.num_steps:
                 should_keep_training = False
@@ -1115,6 +1418,10 @@ def main(cfg: DictConfig):
     if fabric.global_rank == 0:
         tqdm_total_steps.close()
     logging.info("FINISHED TRAINING")
+
+    if torch_profiler is not None:
+        torch_profiler.stop()
+    gradient_diagnostics.close()
 
     save_path = f"{cfg.experiment_path}/model_final.pth"
     logging.info(f"Saving file {save_path}")

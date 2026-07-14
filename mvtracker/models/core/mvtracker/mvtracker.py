@@ -185,7 +185,8 @@ class MVTracker(nn.Module):
     def fnet_fwd(self, rgbs_normalized, image_features=None):
         b, v, t, _, h, w = rgbs_normalized.shape
         rgbs_normalized = rgbs_normalized.reshape(-1, 3, h, w)
-        return self.fnet(rgbs_normalized)
+        with torch.profiler.record_function("mvtracker/cnn_feature_encoder"):
+            return self.fnet(rgbs_normalized)
 
     def init_stats(self):
         self.stats_pyramid = defaultdict(list)
@@ -295,15 +296,16 @@ class MVTracker(nn.Module):
 
         fcorr_fns = {}
         for lvl in range(self.corr_n_levels):
-            pc = init_pointcloud_from_rgbd(
-                fmaps=fmaps,
-                depths=depths,
-                intrs=intrs,
-                extrs=extrs,
-                stride=self.stride,
-                level=lvl,
-                return_validity_mask=self.corr_filter_invalid_depth or save_rerun_logs,
-            )
+            with torch.profiler.record_function("mvtracker/build_pointcloud_pyramid"):
+                pc = init_pointcloud_from_rgbd(
+                    fmaps=fmaps,
+                    depths=depths,
+                    intrs=intrs,
+                    extrs=extrs,
+                    stride=self.stride,
+                    level=lvl,
+                    return_validity_mask=self.corr_filter_invalid_depth or save_rerun_logs,
+                )
             if self.corr_filter_invalid_depth or save_rerun_logs:
                 pc_xyz, pc_fvec, pc_valid = pc
             else:
@@ -354,18 +356,19 @@ class MVTracker(nn.Module):
             fcorrs = []
             for lvl in range(self.corr_n_levels):
                 fcorr_fn = fcorr_fns[lvl]
-                fcorrs_level = (
-                    fcorr_fn
-                    .corr_sample(
-                        targets=ffeats.reshape(B * S, N, self.latent_dim),
-                        coords_world_xyz=coords.reshape(B * S, N, 3),
-                        save_debug_logs=False,
-                        debug_logs_path=debug_logs_path,
-                        debug_logs_prefix=debug_logs_prefix + f"__iter_{it}__pyramid_level_{lvl}",
-                        save_rerun_logs=save_rerun_logs,
+                with torch.profiler.record_function("mvtracker/knn_and_correlation"):
+                    fcorrs_level = (
+                        fcorr_fn
+                        .corr_sample(
+                            targets=ffeats.reshape(B * S, N, self.latent_dim),
+                            coords_world_xyz=coords.reshape(B * S, N, 3),
+                            save_debug_logs=False,
+                            debug_logs_path=debug_logs_path,
+                            debug_logs_prefix=debug_logs_prefix + f"__iter_{it}__pyramid_level_{lvl}",
+                            save_rerun_logs=save_rerun_logs,
+                        )
+                        .reshape(B, S, N, -1)
                     )
-                    .reshape(B, S, N, -1)
-                )
                 fcorrs.append(fcorrs_level)
                 if self.stats_pyramid is not None:
                     self.stats_pyramid[(lvl, it)] += [
@@ -386,7 +389,8 @@ class MVTracker(nn.Module):
             x = transformer_input + pos_embed + times_embed
             x = rearrange(x, "(b n) t d -> b n t d", b=B)
 
-            delta = self.updateformer(x)
+            with torch.profiler.record_function("mvtracker/update_transformer"):
+                delta = self.updateformer(x)
             delta = rearrange(delta, " b n t d -> (b n) t d")
 
             d_coord = delta[:, :, :3].reshape(B, N, S, 3).permute(0, 2, 1, 3)
@@ -555,11 +559,12 @@ class MVTracker(nn.Module):
                 new_seq_t0 = w_idx_start + self.S // 2
             new_seq_t1 = w_idx_start + self.S
 
-            _depths_seq_new = nn.functional.interpolate(
-                input=depths[:, :, new_seq_t0:new_seq_t1].to(device).reshape(-1, 1, height, width),
-                scale_factor=1.0 / self.stride,
-                mode="nearest",
-            ).reshape(batch_size, num_views, -1, 1, strided_height, strided_width)
+            with torch.profiler.record_function("mvtracker/downsample_depth"):
+                _depths_seq_new = nn.functional.interpolate(
+                    input=depths[:, :, new_seq_t0:new_seq_t1].to(device).reshape(-1, 1, height, width),
+                    scale_factor=1.0 / self.stride,
+                    mode="nearest",
+                ).reshape(batch_size, num_views, -1, 1, strided_height, strided_width)
             depths_seq = smart_cat(depths_seq, _depths_seq_new, dim=2)
 
             _fmaps_seq_new = self.fnet_fwd(
@@ -605,13 +610,14 @@ class MVTracker(nn.Module):
 
             # Compute the feature vector initialization for the new query points
             if p_idx_end - p_idx_start > 0:
-                rgbd_xyz, rgbd_fvec = init_pointcloud_from_rgbd(
-                    fmaps=_fmaps_seq_new,
-                    depths=_depths_seq_new,
-                    intrs=intrs[:, :, new_seq_t0:new_seq_t1],
-                    extrs=extrs[:, :, new_seq_t0:new_seq_t1],
-                    stride=self.stride,
-                )
+                with torch.profiler.record_function("mvtracker/query_feature_pointcloud"):
+                    rgbd_xyz, rgbd_fvec = init_pointcloud_from_rgbd(
+                        fmaps=_fmaps_seq_new,
+                        depths=_depths_seq_new,
+                        intrs=intrs[:, :, new_seq_t0:new_seq_t1],
+                        extrs=extrs[:, :, new_seq_t0:new_seq_t1],
+                        stride=self.stride,
+                    )
 
                 new_num_frames = _fmaps_seq_new.shape[2]
                 rgbd_xyz = rgbd_xyz.reshape(batch_size, new_num_frames, num_views, strided_height * strided_width, 3)
@@ -634,8 +640,12 @@ class MVTracker(nn.Module):
                     rgbd_fvec_current = rgbd_fvec[batch_idx, t - new_seq_t0].reshape(-1, self.latent_dim)
 
                     k = 1
-                    neighbor_dists, neighbor_indices = knn(k, rgbd_xyz_current[None],
-                                                           query_points_world[None])
+                    with torch.profiler.record_function("mvtracker/query_feature_knn"):
+                        neighbor_dists, neighbor_indices = knn(
+                            k,
+                            rgbd_xyz_current[None],
+                            query_points_world[None],
+                        )
                     assert k == 1, "If k > 1, the code below should be modified to handle multiple neighbors -- how to combine the features of multiple neighbors?"
                     neighbor_xyz = rgbd_xyz_current[neighbor_indices[0, :, 0]]
                     neighbor_fvec = rgbd_fvec_current[neighbor_indices[0, :, 0]]

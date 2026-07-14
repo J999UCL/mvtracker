@@ -6,6 +6,7 @@ experiment_path: ./logs/pointodyssey
 restore_ckpt_path: ./checkpoints/mvtracker_200000_june2025.pth
 
 datasets:
+  pointodyssey_prepared_dir: PointOdyssey_MVTracker_v5
   train:
     name: pointodyssey-multiview-training
     traj_per_sample: 256

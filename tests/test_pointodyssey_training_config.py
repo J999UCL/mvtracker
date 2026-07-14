@@ -19,6 +19,10 @@ class PointOdysseyTrainingConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 8)
+        self.assertEqual(
+            config["datasets"]["pointodyssey_prepared_dir"],
+            "PointOdyssey_MVTracker_v5",
+        )
 
     def test_pointodyssey_one_hour_pilot_settings(self):
         config = yaml.safe_load(
@@ -46,6 +50,27 @@ class PointOdysseyTrainingConfigTests(unittest.TestCase):
             config["datasets"]["eval"]["names"],
             ["pointodyssey-multiview-validation"],
         )
+
+    def test_pointodyssey_overfit_repeats_one_unaugmented_sample(self):
+        config = yaml.safe_load(
+            (self.config_root / "experiment" / "pointodyssey_overfit.yaml").read_text()
+        )
+
+        self.assertEqual(config["datasets"]["train"]["traj_per_sample"], 64)
+        self.assertEqual(config["datasets"]["train"]["num_workers"], 0)
+        self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 1)
+        self.assertEqual(config["augmentations"]["probability"], 0.0)
+        self.assertTrue(config["modes"]["tune_per_scene"])
+        self.assertFalse(config["modes"]["validate_at_start"])
+        for key in (
+            "rgb",
+            "depth",
+            "cropping",
+            "variable_trajpersample",
+            "scene_transform",
+            "camera_params_noise",
+        ):
+            self.assertFalse(config["augmentations"][key])
 
 
 if __name__ == "__main__":

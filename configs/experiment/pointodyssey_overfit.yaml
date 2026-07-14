@@ -1,0 +1,42 @@
+# @package _global_
+defaults:
+  - pointodyssey
+
+experiment_path: ./logs/pointodyssey-overfit-v5
+
+datasets:
+  pointodyssey_prepared_dir: PointOdyssey_MVTracker_v5
+  train:
+    traj_per_sample: 64
+    num_workers: 0
+  eval:
+    names: []
+
+trainer:
+  num_steps: 120
+  eval_freq: 1000
+  viz_freq: 1000
+  save_ckpt_freq: 1000
+  gradient_accumulation_steps: 1
+
+augmentations:
+  probability: 0.0
+  rgb: false
+  depth: false
+  variable_depth_type: false
+  variable_num_views: false
+  cropping: false
+  variable_vggt_crop_size: false
+  variable_trajpersample: false
+  scene_transform: false
+  camera_params_noise: false
+  normalize_scene_following_vggt: false
+
+modes:
+  tune_per_scene: true
+  validate_at_start: false
+
+logging:
+  log_wandb: true
+  wandb_project: mvtracker-pointodyssey
+  tags: [pointodyssey, v5, fixed-sample-overfit]
