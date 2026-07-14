@@ -39,6 +39,10 @@ class Datapoint:
     query_points: Optional[torch.Tensor] = None  # TapVID evaluation format
     query_points_3d: Optional[torch.Tensor] = None  # TapVID evaluation format
 
+    # Non-tensor provenance used by loader diagnostics and benchmarks. Training
+    # code may ignore this field; it does not affect sampling or model inputs.
+    sample_metadata: Optional[Any] = None
+
     trajectory: Optional[torch.Tensor] = None  # B, S, N, 2
     visibility: Optional[torch.Tensor] = None  # B, S, N
     trajectory_3d: Optional[torch.Tensor] = None  # B, S, 4, 4
@@ -105,6 +109,7 @@ def collate_fn(batch):
         if batch[0][0].query_points_3d is not None
         else None
     )
+    sample_metadata = [b.sample_metadata for b, _ in batch]
 
     track_upscaling_factor = batch[0][0].track_upscaling_factor
 
@@ -132,6 +137,7 @@ def collate_fn(batch):
             extrs=extrs,
             query_points=query_points,
             query_points_3d=query_points_3d,
+            sample_metadata=sample_metadata,
             track_upscaling_factor=track_upscaling_factor,
             novel_video=novel_video,
             novel_intrs=novel_intrs,

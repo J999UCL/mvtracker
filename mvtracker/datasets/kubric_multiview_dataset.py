@@ -55,6 +55,15 @@ def _legal_contiguous_window_starts(n_frames, seq_len, invalid_frame_indices=())
     return starts[legal]
 
 
+def _track_cache_file(data_root, scene_name, cache_name, enabled):
+    """Return the cache file path, creating its directory only when enabled."""
+    if not enabled:
+        return None
+    cache_root = os.path.join(data_root, scene_name, "cache")
+    os.makedirs(cache_root, exist_ok=True)
+    return os.path.join(cache_root, f"{cache_name}.npz")
+
+
 class KubricMultiViewDataset(torch.utils.data.Dataset):
 
     @staticmethod
@@ -495,6 +504,12 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                 trajectory=torch.zeros((self.seq_len, traj_per_sample, 2)),
                 visibility=torch.zeros((self.seq_len, traj_per_sample)),
                 valid=torch.zeros((self.seq_len, traj_per_sample)),
+                sample_metadata={
+                    "virtual_index": virtual_index,
+                    "scene_index": scene_index,
+                    "scene_name": self.seq_names[scene_index],
+                    "gotit": False,
+                },
             )
 
         return sample, gotit
@@ -797,6 +812,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             assert np.allclose(traj3d_camera, traj_3d_repro, atol=0.1)
 
         # If the video is too long, randomly crop self.seq_len frames
+        start_ind = 0
         if self.seq_len < n_frames:
             start_ind = int(rnd_np.choice(legal_start_indices))
             rgbs = rgbs[:, start_ind: start_ind + self.seq_len]
@@ -890,12 +906,15 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             novel_extrs = torch.from_numpy(novel_extrs).float()
 
         # Track selection
-        cache_root = os.path.join(self.data_root, self.seq_names[index], "cache")
-        os.makedirs(cache_root, exist_ok=True)
-        cache_file = os.path.join(cache_root, f"{self.cache_name}.npz")
+        cache_file = _track_cache_file(
+            self.data_root,
+            self.seq_names[index],
+            self.cache_name,
+            self.use_cached_tracks,
+        )
 
         # Check if we can use cached tracks
-        use_cache = bool(self.use_cached_tracks) and os.path.isfile(cache_file)
+        use_cache = cache_file is not None and os.path.isfile(cache_file)
         if use_cache:
             cache = np.load(cache_file)
             visible_inds_sampled = torch.from_numpy(cache["track_indices"])
@@ -986,6 +1005,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
 
             # Cache the selected tracks and query points
             if self.use_cached_tracks:
+                assert cache_file is not None
                 logging.warn(f"Caching tracks for {self.seq_names[index]} at {os.path.abspath(cache_file)}")
                 np.savez_compressed(
                     cache_file,
@@ -1123,6 +1143,16 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             extrs=extrs_trans,
             query_points=None,
             query_points_3d=query_points_trans,
+            sample_metadata={
+                "virtual_index": int(seed_index),
+                "scene_index": int(index),
+                "scene_name": self.seq_names[index],
+                "seed": int(seed),
+                "window_start": int(start_ind),
+                "window_end_exclusive": int(start_ind + self.seq_len),
+                "selected_views": [int(view) for view in views_to_return],
+                "gotit": True,
+            },
             track_upscaling_factor=1 / scale,
 
             novel_video=novel_rgbs,

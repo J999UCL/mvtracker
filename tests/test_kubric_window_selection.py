@@ -1,4 +1,6 @@
 import ast
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -28,6 +30,28 @@ def _load_window_start_helper():
 
 
 _legal_contiguous_window_starts = _load_window_start_helper()
+
+
+def _load_top_level_function(function_name, namespace):
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "mvtracker"
+        / "datasets"
+        / "kubric_multiview_dataset.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(source_path))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+    return namespace[function_name]
+
+
+_track_cache_file = _load_top_level_function("_track_cache_file", {"os": os})
 
 
 def _load_kubric_method(method_name):
@@ -166,6 +190,35 @@ class VirtualDatasetIndexTests(unittest.TestCase):
         self.assertEqual(first_sample, 5)
         self.assertEqual(repeated_sample, 5)
         self.assertEqual(dataset.calls, [(5, 5), (5, 83)])
+
+
+class TrackCachePathTests(unittest.TestCase):
+    def test_disabled_cache_does_not_create_a_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = _track_cache_file(
+                temporary_directory,
+                "000000",
+                "tracks",
+                enabled=False,
+            )
+
+            self.assertIsNone(result)
+            self.assertFalse((Path(temporary_directory) / "000000" / "cache").exists())
+
+    def test_enabled_cache_creates_the_expected_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            scene_root = Path(temporary_directory) / "000000"
+            scene_root.mkdir()
+
+            result = _track_cache_file(
+                temporary_directory,
+                "000000",
+                "tracks",
+                enabled=True,
+            )
+
+            self.assertEqual(result, str(scene_root / "cache" / "tracks.npz"))
+            self.assertTrue((scene_root / "cache").is_dir())
 
 
 if __name__ == "__main__":
