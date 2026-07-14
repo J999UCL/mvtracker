@@ -53,7 +53,7 @@ else:
     )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 OUTPUT_HEIGHT = 384
 OUTPUT_WIDTH = 512
 JPEG_QUALITY = 95
@@ -112,6 +112,9 @@ class RGBFrameJob:
 class RGBFrameResult:
     output_path: str
     encoded_jpeg: bytes
+    source_frame: int
+    local_frame: int
+    source_decode_error: str | None
 
 
 @dataclass(frozen=True)
@@ -201,33 +204,68 @@ def _initialize_process_worker() -> None:
     cv2.setNumThreads(1)
 
 
+def _black_placeholder_jpeg_bytes(height: int, width: int, quality: int) -> bytes:
+    """Encode the deterministic black JPEG used only for invalid RGB frames."""
+    placeholder = np.zeros((height, width, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        placeholder,
+        [cv2.IMWRITE_JPEG_QUALITY, quality],
+    )
+    if not ok:
+        raise RuntimeError("failed to encode black JPEG placeholder")
+    return encoded.tobytes()
+
+
 def _transcode_rgb_batch(batch: tuple[RGBFrameJob, ...]) -> tuple[RGBFrameResult, ...]:
     """Decode, resize, and encode one ordered batch without writing files."""
     results: list[RGBFrameResult] = []
     for job in batch:
         try:
             encoded = np.frombuffer(job.encoded_jpeg, dtype=np.uint8)
-            decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            source_decode_error: str | None = None
+            try:
+                decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            except cv2.error as exc:
+                decoded = None
+                source_decode_error = f"cv2.imdecode failed: {exc}"
             if decoded is None:
-                raise ValueError("source JPEG cannot be decoded")
-            expected_source_shape = (job.source_height, job.source_width, 3)
-            if decoded.shape != expected_source_shape:
-                raise ValueError(
-                    f"source JPEG decodes to {decoded.shape}, expected {expected_source_shape}"
+                if source_decode_error is None:
+                    source_decode_error = "cv2.imdecode returned no image"
+                encoded_output = _black_placeholder_jpeg_bytes(
+                    job.output_height,
+                    job.output_width,
+                    job.jpeg_quality,
                 )
-            resized = cv2.resize(
-                decoded,
-                (job.output_width, job.output_height),
-                interpolation=cv2.INTER_LINEAR,
+            else:
+                expected_source_shape = (job.source_height, job.source_width, 3)
+                if decoded.shape != expected_source_shape:
+                    raise ValueError(
+                        f"source JPEG decodes to {decoded.shape}, "
+                        f"expected {expected_source_shape}"
+                    )
+                resized = cv2.resize(
+                    decoded,
+                    (job.output_width, job.output_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                ok, jpeg = cv2.imencode(
+                    ".jpg",
+                    resized,
+                    [cv2.IMWRITE_JPEG_QUALITY, job.jpeg_quality],
+                )
+                if not ok:
+                    raise RuntimeError("failed to encode resized JPEG")
+                encoded_output = jpeg.tobytes()
+            results.append(
+                RGBFrameResult(
+                    output_path=job.output_path,
+                    encoded_jpeg=encoded_output,
+                    source_frame=job.source_frame,
+                    local_frame=job.local_frame,
+                    source_decode_error=source_decode_error,
+                )
             )
-            ok, jpeg = cv2.imencode(
-                ".jpg",
-                resized,
-                [cv2.IMWRITE_JPEG_QUALITY, job.jpeg_quality],
-            )
-            if not ok:
-                raise RuntimeError("failed to encode resized JPEG")
-            results.append(RGBFrameResult(job.output_path, jpeg.tobytes()))
         except Exception as exc:
             raise RuntimeError(
                 "RGB transcode failed "
@@ -1235,6 +1273,10 @@ def _convert_source_group(
                     "output_frame_count": 0,
                     "written_file_count": 0,
                     "output_bytes": 0,
+                    "source_decode_failure_count": 0,
+                    "placeholder_file_count": 0,
+                    "invalid_frame_indices": [],
+                    "source_decode_failures": [],
                 },
                 "planned_view_regular_file_count": 4 + spec.frame_count,
                 "written_view_regular_file_count": 4,
@@ -1291,8 +1333,52 @@ def _convert_source_group(
                     view_stats["rgb"]["output_frame_count"] += 1
                     view_stats["rgb"]["written_file_count"] += 1
                     view_stats["rgb"]["output_bytes"] += written_bytes
+                    if result.source_decode_error is not None:
+                        if not 0 <= result.local_frame < spec.frame_count:
+                            raise AssertionError("invalid placeholder local-frame index")
+                        expected_source_frame = spec.source_frame_start + result.local_frame
+                        if result.source_frame != expected_source_frame:
+                            raise AssertionError(
+                                "placeholder source/local frame indices do not reconcile"
+                            )
+                        failure = {
+                            "layout": spec.layout,
+                            "source_sequence": spec.source_sequence,
+                            "split": spec.split,
+                            "scene_id": spec.scene_id,
+                            "view": view,
+                            "local_frame": result.local_frame,
+                            "source_frame": result.source_frame,
+                            "error": result.source_decode_error,
+                            "output_file": (
+                                f"view_{view}/rgba_{result.local_frame:05d}.jpg"
+                            ),
+                            "recovery": "black_output_resolution_jpeg_quality_95",
+                        }
+                        view_stats["rgb"]["source_decode_failures"].append(failure)
+                        view_stats["rgb"]["invalid_frame_indices"].append(
+                            result.local_frame
+                        )
+                        view_stats["rgb"]["source_decode_failure_count"] += 1
+                        view_stats["rgb"]["placeholder_file_count"] += 1
             if view_stats["rgb"]["output_frame_count"] != spec.frame_count:
                 raise AssertionError("RGB output frame count does not match scene frame count")
+            invalid_view_frames = view_stats["rgb"]["invalid_frame_indices"]
+            if invalid_view_frames != sorted(set(invalid_view_frames)):
+                raise AssertionError("invalid RGB frame indices must be sorted and unique")
+            if view_stats["rgb"]["source_decode_failure_count"] != len(
+                view_stats["rgb"]["source_decode_failures"]
+            ):
+                raise AssertionError("RGB decode-failure counts do not reconcile")
+            if [
+                failure["local_frame"]
+                for failure in view_stats["rgb"]["source_decode_failures"]
+            ] != invalid_view_frames:
+                raise AssertionError("RGB decode failures do not match invalid frames")
+            if view_stats["rgb"]["placeholder_file_count"] != len(
+                invalid_view_frames
+            ):
+                raise AssertionError("RGB placeholder counts do not reconcile")
             rgb_seconds = time.perf_counter() - rgb_start
             view_stats["written_view_regular_file_count"] += view_stats["rgb"][
                 "written_file_count"
@@ -1350,6 +1436,14 @@ def _convert_source_group(
                 int(item["rgb"]["written_file_count"]) for item in view_values
             ),
             "output_bytes": sum(int(item["rgb"]["output_bytes"]) for item in view_values),
+            "source_decode_failure_count": sum(
+                int(item["rgb"]["source_decode_failure_count"])
+                for item in view_values
+            ),
+            "placeholder_file_count": sum(
+                int(item["rgb"]["placeholder_file_count"])
+                for item in view_values
+            ),
         }
         planned_scene_files = 2 + sum(
             int(item["planned_view_regular_file_count"]) for item in view_values
@@ -1390,6 +1484,15 @@ def _scene_metadata(
     recorder: ValidationRecorder,
     stats: dict[str, Any],
 ) -> dict[str, Any]:
+    invalid_rgb_frame_indices = sorted(
+        {
+            int(frame)
+            for view_stats in stats["views"].values()
+            for frame in view_stats["rgb"]["invalid_frame_indices"]
+        }
+    )
+    if any(frame < 0 or frame >= spec.frame_count for frame in invalid_rgb_frame_indices):
+        raise AssertionError("scene invalid RGB frame index is outside the scene")
     return {
         "schema_version": SCHEMA_VERSION,
         "format": "pointodyssey_mvtracker_preprocessed",
@@ -1412,6 +1515,18 @@ def _scene_metadata(
                 "format": "jpeg",
                 "quality": JPEG_QUALITY,
                 "resize_interpolation": "cv2.INTER_LINEAR",
+                "invalid_frame_indices": invalid_rgb_frame_indices,
+                "invalid_frame_semantics": (
+                    "scene-local frame indices for which at least one view's source "
+                    "JPEG failed cv2.imdecode; loaders must not sample windows containing "
+                    "these frames"
+                ),
+                "decode_failure_placeholder": {
+                    "image": "constant_black",
+                    "resolution_hw": [OUTPUT_HEIGHT, OUTPUT_WIDTH],
+                    "quality": JPEG_QUALITY,
+                    "training_use": "forbidden_by_invalid_frame_indices",
+                },
             },
             "depth": {
                 "format": "npy",
@@ -1582,6 +1697,8 @@ def _aggregate_scene_statistics(
         "output_frame_count",
         "written_file_count",
         "output_bytes",
+        "source_decode_failure_count",
+        "placeholder_file_count",
     )
     visibility_fields = (
         "visibility_true_before_gating",
@@ -1609,6 +1726,8 @@ def _aggregate_scene_statistics(
     planned_scene_regular_file_count = 0
     written_before_scene_metadata_file_count = 0
     scene_accounted_stage_total = 0.0
+    decode_failures: list[dict[str, Any]] = []
+    invalid_scene_frames: list[dict[str, Any]] = []
     finite_min: float | None = None
     finite_max: float | None = None
     for spec in specs:
@@ -1626,9 +1745,31 @@ def _aggregate_scene_statistics(
         if scene_depth["finite_max"] is not None:
             value = float(scene_depth["finite_max"])
             finite_max = value if finite_max is None else max(finite_max, value)
+        scene_invalid_rgb_frames: set[int] = set()
         for view_stats in stats["views"].values():
             for field in visibility_fields:
                 visibility_totals[field] += int(view_stats[field])
+            view_rgb = view_stats["rgb"]
+            view_failures = view_rgb["source_decode_failures"]
+            view_invalid_frames = view_rgb["invalid_frame_indices"]
+            if int(view_rgb["source_decode_failure_count"]) != len(view_failures):
+                raise AssertionError("scene RGB decode-failure counts do not reconcile")
+            if int(view_rgb["placeholder_file_count"]) != len(view_invalid_frames):
+                raise AssertionError("scene RGB placeholder counts do not reconcile")
+            if len(view_failures) != len(view_invalid_frames):
+                raise AssertionError("scene RGB failure and placeholder counts differ")
+            decode_failures.extend(view_failures)
+            scene_invalid_rgb_frames.update(int(frame) for frame in view_invalid_frames)
+        if scene_invalid_rgb_frames:
+            invalid_scene_frames.append(
+                {
+                    "split": spec.split,
+                    "scene_id": spec.scene_id,
+                    "layout": spec.layout,
+                    "source_sequence": spec.source_sequence,
+                    "invalid_frame_indices": sorted(scene_invalid_rgb_frames),
+                }
+            )
         source_io = stats["io_counts"]["source"]
         output_io = stats["io_counts"]["output"]
         source_chunk_frame_count += int(source_io["source_chunk_frame_count"])
@@ -1672,6 +1813,10 @@ def _aggregate_scene_statistics(
         raise AssertionError("output RGB frames do not reconcile with output camera frames")
     if rgb_totals["written_file_count"] != rgb_totals["output_frame_count"]:
         raise AssertionError("output RGB files do not reconcile with output RGB frames")
+    if rgb_totals["source_decode_failure_count"] != len(decode_failures):
+        raise AssertionError("root RGB decode-failure counts do not reconcile")
+    if rgb_totals["placeholder_file_count"] != len(decode_failures):
+        raise AssertionError("root RGB placeholder counts do not reconcile")
 
     before = visibility_totals["visibility_true_before_gating"]
     after_geometry = visibility_totals["visibility_true_after_geometric_gating"]
@@ -1775,6 +1920,12 @@ def _aggregate_scene_statistics(
         },
         "rgb": {
             **rgb_totals,
+            "invalid_scene_frame_count": sum(
+                len(item["invalid_frame_indices"]) for item in invalid_scene_frames
+            ),
+            "scenes_with_invalid_rgb_count": len(invalid_scene_frames),
+            "invalid_scene_frames": invalid_scene_frames,
+            "source_decode_failures": decode_failures,
         },
         "visibility": {
             **visibility_totals,

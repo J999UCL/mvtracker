@@ -3,6 +3,7 @@ import multiprocessing
 import tempfile
 import unittest
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -462,6 +463,9 @@ class RGBWorkerTests(unittest.TestCase):
         (result,) = preprocessing._transcode_rgb_batch((job,))
 
         self.assertEqual(result.output_path, job.output_path)
+        self.assertEqual(result.source_frame, job.source_frame)
+        self.assertEqual(result.local_frame, job.local_frame)
+        self.assertIsNone(result.source_decode_error)
         decoded = cv2.imdecode(
             np.frombuffer(result.encoded_jpeg, dtype=np.uint8),
             cv2.IMREAD_COLOR,
@@ -482,6 +486,71 @@ class RGBWorkerTests(unittest.TestCase):
         Path(result.output_path).write_bytes(b"not-a-jpeg")
         with self.assertRaisesRegex(RuntimeError, "frame=0"):
             preprocessing._validate_jpeg_batch((validation_job,))
+
+    def test_invalid_jpeg_bytes_produce_decodable_black_placeholder(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        job = replace(self._job(root, 2), encoded_jpeg=b"not-a-jpeg")
+
+        (result,) = preprocessing._transcode_rgb_batch((job,))
+
+        self.assertEqual(result.source_frame, 2)
+        self.assertEqual(result.local_frame, 2)
+        self.assertEqual(
+            result.source_decode_error,
+            "cv2.imdecode returned no image",
+        )
+        decoded = cv2.imdecode(
+            np.frombuffer(result.encoded_jpeg, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.shape, (3, 4, 3))
+        self.assertEqual(int(np.count_nonzero(decoded)), 0)
+
+    def test_opencv_decode_exception_produces_placeholder(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        job = self._job(root, 1)
+
+        with mock.patch.object(
+            preprocessing.cv2,
+            "imdecode",
+            side_effect=cv2.error("synthetic decode failure"),
+        ):
+            (result,) = preprocessing._transcode_rgb_batch((job,))
+
+        self.assertIsNotNone(result.source_decode_error)
+        self.assertTrue(
+            result.source_decode_error.startswith("cv2.imdecode failed:"),
+            result.source_decode_error,
+        )
+        decoded = cv2.imdecode(
+            np.frombuffer(result.encoded_jpeg, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        self.assertEqual(decoded.shape, (3, 4, 3))
+        self.assertEqual(int(np.count_nonzero(decoded)), 0)
+
+    def test_decoded_wrong_resolution_remains_fatal(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        wrong_size = np.zeros((5, 8, 3), dtype=np.uint8)
+        encoded_ok, encoded = cv2.imencode(".jpg", wrong_size)
+        self.assertTrue(encoded_ok)
+        job = replace(
+            self._job(root, 0),
+            encoded_jpeg=encoded.tobytes(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "RGB transcode failed") as raised:
+            preprocessing._transcode_rgb_batch((job,))
+
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        self.assertIn("source JPEG decodes to", str(raised.exception.__cause__))
 
     def test_spawn_processpool_matches_serial_jpeg_bytes_and_validation(self):
         temporary = tempfile.TemporaryDirectory()
@@ -599,6 +668,36 @@ class RGBWorkerTests(unittest.TestCase):
 
 
 class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
+    def test_scene_metadata_unions_invalid_rgb_frames_across_views(self):
+        spec = preprocessing.SceneSpec(
+            split="train",
+            scene_id="000000",
+            layout="raw",
+            source_sequence="synthetic",
+            environment_family="synthetic",
+            source_frame_start=0,
+            source_frame_end=4,
+            source_frame_count=4,
+            source_fps=30,
+        )
+        stats = {
+            "views": {
+                "0": {"rgb": {"invalid_frame_indices": [1, 3]}},
+                "1": {"rgb": {"invalid_frame_indices": [0, 1]}},
+            }
+        }
+
+        metadata = preprocessing._scene_metadata(
+            spec,
+            preprocessing.ValidationRecorder(ignore_failures=False),
+            stats,
+        )
+
+        self.assertEqual(
+            metadata["output"]["rgb"]["invalid_frame_indices"],
+            [0, 1, 3],
+        )
+
     def test_converter_uses_persisted_resized_depth_and_reconciles_visibility(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -774,6 +873,10 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(view_stats["rgb"]["source_frame_count"], 1)
         self.assertEqual(view_stats["rgb"]["output_frame_count"], 1)
         self.assertEqual(view_stats["rgb"]["written_file_count"], 1)
+        self.assertEqual(view_stats["rgb"]["source_decode_failure_count"], 0)
+        self.assertEqual(view_stats["rgb"]["placeholder_file_count"], 0)
+        self.assertEqual(view_stats["rgb"]["invalid_frame_indices"], [])
+        self.assertEqual(view_stats["rgb"]["source_decode_failures"], [])
         self.assertGreater(view_stats["rgb"]["output_bytes"], 0)
         self.assertEqual(view_stats["planned_view_regular_file_count"], 5)
         self.assertEqual(view_stats["written_view_regular_file_count"], 5)
@@ -800,6 +903,8 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(scene["rgb_all_views"]["source_frame_count"], 1)
         self.assertEqual(scene["rgb_all_views"]["output_frame_count"], 1)
         self.assertEqual(scene["rgb_all_views"]["written_file_count"], 1)
+        self.assertEqual(scene["rgb_all_views"]["source_decode_failure_count"], 0)
+        self.assertEqual(scene["rgb_all_views"]["placeholder_file_count"], 0)
         self.assertEqual(
             scene["io_counts"]["source"],
             {
@@ -844,6 +949,118 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             np.load(output_view.parent / "tracks_3d.npy"),
             tracks,
         )
+
+    def test_converter_records_invalid_rgb_frame_and_failure_provenance(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source_root = root / "source"
+        build_root = root / "build"
+        build_root.mkdir()
+        spec = preprocessing.SceneSpec(
+            split="train",
+            scene_id="000000",
+            layout="raw",
+            source_sequence="synthetic_corrupt_rgb",
+            environment_family="synthetic",
+            source_frame_start=0,
+            source_frame_end=1,
+            source_frame_count=1,
+            source_fps=30,
+        )
+        source_scene = (
+            source_root
+            / preprocessing.SOURCE_SUBROOTS[spec.layout]
+            / spec.source_sequence
+        )
+        source_view = source_scene / "0"
+        source_view.mkdir(parents=True)
+        np.save(
+            source_scene / "tracks_xyz.npy",
+            np.asarray([[[0.0, 0.0, 1.0]]], dtype=np.float32),
+        )
+        np.save(
+            source_scene / "queries_xytv.npy",
+            np.zeros((1, 4), dtype=np.float32),
+        )
+        np.save(
+            source_view / "intrinsics.npy",
+            np.asarray([1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        )
+        np.save(
+            source_view / "extrinsics_w2c.npy",
+            np.eye(4, dtype=np.float32)[None],
+        )
+        np.save(source_view / "visibility.npy", np.ones((1, 1), dtype=bool))
+        np.save(source_view / "depth.npy", np.ones((1, 2, 2), dtype=np.float32))
+        jpeg_objects = np.empty((1,), dtype=object)
+        jpeg_objects[0] = np.frombuffer(b"not-a-jpeg", dtype=np.uint8).copy()
+        np.save(source_view / "images_jpeg_bytes.npy", jpeg_objects)
+
+        recorder = preprocessing.ValidationRecorder(ignore_failures=False)
+        scene_stats = {}
+        with mock.patch.multiple(
+            preprocessing,
+            POINT_COUNT=1,
+            VIEW_IDS=(0,),
+            SOURCE_HEIGHT=2,
+            SOURCE_WIDTH=2,
+            OUTPUT_HEIGHT=2,
+            OUTPUT_WIDTH=2,
+            SCALE_X=1.0,
+            SCALE_Y=1.0,
+        ), mock.patch.object(preprocessing, "_validate_source_queries"):
+            preprocessing._prepare_scene_roots(build_root, [spec])
+            preprocessing._convert_source_group(
+                source_root,
+                build_root,
+                [spec],
+                recorder,
+                scene_stats,
+                process_workers=1,
+            )
+            metadata = preprocessing._scene_metadata(
+                spec,
+                recorder,
+                scene_stats[(spec.split, spec.scene_id)],
+            )
+
+        rgb_stats = scene_stats[(spec.split, spec.scene_id)]["views"]["0"]["rgb"]
+        self.assertEqual(rgb_stats["source_decode_failure_count"], 1)
+        self.assertEqual(rgb_stats["placeholder_file_count"], 1)
+        self.assertEqual(rgb_stats["invalid_frame_indices"], [0])
+        self.assertEqual(len(rgb_stats["source_decode_failures"]), 1)
+        self.assertEqual(
+            rgb_stats["source_decode_failures"][0],
+            {
+                "layout": "raw",
+                "source_sequence": "synthetic_corrupt_rgb",
+                "split": "train",
+                "scene_id": "000000",
+                "view": 0,
+                "local_frame": 0,
+                "source_frame": 0,
+                "error": "cv2.imdecode returned no image",
+                "output_file": "view_0/rgba_00000.jpg",
+                "recovery": "black_output_resolution_jpeg_quality_95",
+            },
+        )
+        self.assertEqual(metadata["output"]["rgb"]["invalid_frame_indices"], [0])
+        self.assertEqual(
+            metadata["output"]["rgb"]["decode_failure_placeholder"],
+            {
+                "image": "constant_black",
+                "resolution_hw": [2, 2],
+                "quality": 95,
+                "training_use": "forbidden_by_invalid_frame_indices",
+            },
+        )
+        self.assertEqual(recorder.failures, [])
+
+        output_jpeg = build_root / "train" / "000000" / "view_0" / "rgba_00000.jpg"
+        decoded = cv2.imread(str(output_jpeg), cv2.IMREAD_COLOR)
+        self.assertEqual(decoded.shape, (2, 2, 3))
+        self.assertEqual(int(np.count_nonzero(decoded)), 0)
 
 
 class StatisticsAggregationTests(unittest.TestCase):
@@ -896,8 +1113,20 @@ class StatisticsAggregationTests(unittest.TestCase):
                     "output_frame_count": 1,
                     "written_file_count": 1,
                     "output_bytes": 123,
+                    "source_decode_failure_count": 0,
+                    "placeholder_file_count": 0,
                 },
-                "views": {"0": visibility},
+                "views": {
+                    "0": {
+                        **visibility,
+                        "rgb": {
+                            "source_decode_failure_count": 0,
+                            "placeholder_file_count": 0,
+                            "invalid_frame_indices": [],
+                            "source_decode_failures": [],
+                        },
+                    }
+                },
                 "io_counts": {
                     "source": {
                         "source_chunk_frame_count": 1,
@@ -977,6 +1206,12 @@ class StatisticsAggregationTests(unittest.TestCase):
                 "output_frame_count": 1,
                 "written_file_count": 1,
                 "output_bytes": 123,
+                "source_decode_failure_count": 0,
+                "placeholder_file_count": 0,
+                "invalid_scene_frame_count": 0,
+                "scenes_with_invalid_rgb_count": 0,
+                "invalid_scene_frames": [],
+                "source_decode_failures": [],
             },
         )
         self.assertEqual(

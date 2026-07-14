@@ -24,6 +24,37 @@ from mvtracker.datasets.utils import Datapoint, read_json, read_tiff, read_png, 
     aug_depth
 
 
+def _legal_contiguous_window_starts(n_frames, seq_len, invalid_frame_indices=()):
+    """Return inclusive window starts whose frames do not intersect invalid indices."""
+    if isinstance(n_frames, bool) or not isinstance(n_frames, (int, np.integer)) or n_frames < 0:
+        raise ValueError(f"n_frames must be a non-negative integer, got {n_frames!r}.")
+    if isinstance(seq_len, bool) or not isinstance(seq_len, (int, np.integer)) or seq_len <= 0:
+        raise ValueError(f"seq_len must be a positive integer, got {seq_len!r}.")
+
+    invalid_frame_indices = list(invalid_frame_indices)
+    if any(isinstance(frame_idx, bool) or not isinstance(frame_idx, (int, np.integer))
+           for frame_idx in invalid_frame_indices):
+        raise ValueError("Invalid RGB frame indices must be integers.")
+    invalid_frame_indices = [int(frame_idx) for frame_idx in invalid_frame_indices]
+    if len(set(invalid_frame_indices)) != len(invalid_frame_indices):
+        raise ValueError("Invalid RGB frame indices must be unique.")
+    if any(frame_idx < 0 or frame_idx >= n_frames for frame_idx in invalid_frame_indices):
+        raise ValueError(
+            f"Invalid RGB frame indices must be in [0, {n_frames}), got {invalid_frame_indices}."
+        )
+
+    if n_frames < seq_len:
+        return np.empty(0, dtype=np.int64)
+
+    starts = np.arange(n_frames - seq_len + 1, dtype=np.int64)
+    legal = np.ones(starts.shape, dtype=bool)
+    for frame_idx in invalid_frame_indices:
+        first_affected_start = max(0, frame_idx - seq_len + 1)
+        last_affected_start = min(frame_idx, n_frames - seq_len)
+        legal[first_affected_start:last_affected_start + 1] = False
+    return starts[legal]
+
+
 class KubricMultiViewDataset(torch.utils.data.Dataset):
 
     @staticmethod
@@ -440,7 +471,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             name += f"-t{self.seq_len}"
         if self.sample_vis_1st_frame:
             name += f"-sample_vis_1st_frame"
-        return name + "--v1"  # bump this if you change the selection policy
+        return name + "--v2"  # v2: inclusive starts excluding invalid-RGB windows
 
     def __len__(self):
         return self.virtual_len
@@ -492,6 +523,18 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         camera_positions = datapoint["camera_positions"].numpy()
         lookat_positions = datapoint["lookat_positions"].numpy()
         views = datapoint["views"]
+        invalid_rgb_frame_indices = datapoint.get("invalid_rgb_frame_indices", ())
+        legal_start_indices = _legal_contiguous_window_starts(
+            n_frames=traj3d_world.shape[0],
+            seq_len=self.seq_len,
+            invalid_frame_indices=invalid_rgb_frame_indices,
+        )
+        if len(legal_start_indices) == 0:
+            scene_path = os.path.join(self.data_root, self.seq_names[index])
+            raise ValueError(
+                f"No valid {self.seq_len}-frame windows remain in scene {scene_path}; "
+                f"invalid RGB frame indices: {list(invalid_rgb_frame_indices)}."
+            )
 
         # Take a random depth type, if enabled
         if self.enable_variable_depth_type_augs:
@@ -757,7 +800,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
 
         # If the video is too long, randomly crop self.seq_len frames
         if self.seq_len < n_frames:
-            start_ind = rnd_np.choice(n_frames - self.seq_len, 1)[0]
+            start_ind = int(rnd_np.choice(legal_start_indices))
             rgbs = rgbs[:, start_ind: start_ind + self.seq_len]
             depths = depths[:, start_ind: start_ind + self.seq_len]
             segs = segs[:, start_ind: start_ind + self.seq_len]
@@ -1132,6 +1175,24 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         else:
             raise ValueError("No camera data found: neither views.npz nor cameras.npz exist.")
 
+        invalid_rgb_frame_indices = []
+        scene_metadata_path = os.path.join(scene_path, "scene.json")
+        if os.path.isfile(scene_metadata_path):
+            scene_metadata = read_json(scene_metadata_path)
+            if not isinstance(scene_metadata, dict):
+                raise ValueError(f"{scene_metadata_path}: root must be an object.")
+            output_metadata = scene_metadata.get("output", {})
+            if not isinstance(output_metadata, dict):
+                raise ValueError(f"{scene_metadata_path}: 'output' must be an object.")
+            rgb_metadata = output_metadata.get("rgb", {})
+            if not isinstance(rgb_metadata, dict):
+                raise ValueError(f"{scene_metadata_path}: 'output.rgb' must be an object.")
+            invalid_rgb_frame_indices = rgb_metadata.get("invalid_frame_indices", [])
+            if not isinstance(invalid_rgb_frame_indices, list):
+                raise ValueError(
+                    f"{scene_metadata_path}: 'output.rgb.invalid_frame_indices' must be a list."
+                )
+
         n_frames = tracks_3d.shape[0]
         n_tracks = tracks_3d.shape[1]
         n_views = camera_positions.shape[0]
@@ -1249,7 +1310,8 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             "tracked_objects": tracked_objects,
             "camera_positions": camera_positions,
             "lookat_positions": lookat_positions,
-            "views": views_data
+            "views": views_data,
+            "invalid_rgb_frame_indices": invalid_rgb_frame_indices,
         }
 
         return datapoint
