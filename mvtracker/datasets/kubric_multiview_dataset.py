@@ -1034,7 +1034,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             rot_x = R.from_euler('x', rot_x_angle, degrees=True).as_matrix()
             rot_y = R.from_euler('y', rot_y_angle, degrees=True).as_matrix()
             rot_z = R.from_euler('z', rot_z_angle, degrees=True).as_matrix()
-            rot = torch.from_numpy(rot_z @ rot_y @ rot_x)
+            rot = torch.as_tensor(rot_z @ rot_y @ rot_x, dtype=torch.float32)
             T_rot = torch.eye(4)
             T_rot[:3, :3] = rot
             T_scale_and_translate = torch.tensor([
