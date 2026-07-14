@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import signal, sys
 
-from mvtracker.datasets import KubricMultiViewDataset
+from mvtracker.datasets import KubricMultiViewDataset, PointOdysseyMultiViewDataset
 from mvtracker.datasets import TapVidDataset
 from mvtracker.datasets import kubric_multiview_dataset
 from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
@@ -539,6 +539,10 @@ def main(cfg: DictConfig):
         train_dataset = None
     elif cfg.datasets.train.name.startswith("kubric-multiview-v3"):
         train_dataset = KubricMultiViewDataset.from_name(cfg.datasets.train.name, cfg.datasets.root, cfg, fabric)
+    elif cfg.datasets.train.name.startswith("pointodyssey-multiview-"):
+        train_dataset = PointOdysseyMultiViewDataset.from_name(
+            cfg.datasets.train.name, cfg.datasets.root, cfg, fabric
+        )
     else:
         raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
 

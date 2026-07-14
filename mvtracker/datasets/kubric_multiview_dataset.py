@@ -515,13 +515,9 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         rnd_np = np.random.RandomState(seed=seed)
 
         # Load the data
-        datapoint = KubricMultiViewDataset.getitem_raw_datapoint(os.path.join(self.data_root, self.seq_names[index]))
+        datapoint = self.getitem_raw_datapoint(os.path.join(self.data_root, self.seq_names[index]))
 
         traj3d_world = datapoint["tracks_3d"].numpy()
-        tracks_segmentation_ids = datapoint["tracks_segmentation_ids"].numpy()
-        tracked_objects = datapoint["tracked_objects"]
-        camera_positions = datapoint["camera_positions"].numpy()
-        lookat_positions = datapoint["lookat_positions"].numpy()
         views = datapoint["views"]
         invalid_rgb_frame_indices = datapoint.get("invalid_rgb_frame_indices", ())
         legal_start_indices = _legal_contiguous_window_starts(
@@ -745,8 +741,6 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         traj3d_world = traj3d_world[:, selected_indices]
         traj2d = traj2d[:, :, selected_indices]
         visibility = visibility[:, :, selected_indices]
-        tracks_segmentation_ids = tracks_segmentation_ids[selected_indices]
-
         if traj3d_world.shape[1] > max_tracks_to_preload:
             traj3d_world = traj3d_world[:, :max_tracks_to_preload]
             traj2d = traj2d[:, :, :max_tracks_to_preload]

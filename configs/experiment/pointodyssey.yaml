@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /model: mvtracker
+
+experiment_path: ./logs/pointodyssey
+
+datasets:
+  train:
+    name: pointodyssey-multiview-training
+  eval:
+    names: []
+
+augmentations:
+  variable_depth_type: false
+  variable_num_views: false
