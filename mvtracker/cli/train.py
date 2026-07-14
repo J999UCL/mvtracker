@@ -52,6 +52,13 @@ from collections import deque
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 
+def _scale_microbatch_loss(loss, gradient_accumulation_steps):
+    """Scale one microbatch loss so accumulated gradients form a batch mean."""
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    return loss / gradient_accumulation_steps
+
+
 def fetch_optimizer(trainer_cfg, model):
     """Create the optimizer and learning rate scheduler"""
     optimizer = optim.AdamW(model.parameters(), lr=trainer_cfg.lr, weight_decay=trainer_cfg.wdecay)
@@ -350,17 +357,28 @@ def main(cfg: DictConfig):
     extras(cfg)
     Path(cfg.experiment_path).mkdir(exist_ok=True, parents=True)
 
+    gradient_accumulation_steps = int(cfg.trainer.gradient_accumulation_steps)
+    if gradient_accumulation_steps < 1:
+        raise ValueError("trainer.gradient_accumulation_steps must be at least 1")
+    logging.info(
+        "Serial gradient accumulation: %d microbatches per optimizer step",
+        gradient_accumulation_steps,
+    )
+
     num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", 1))
     devices = int(os.environ.get("SLURM_GPUS_PER_NODE", torch.cuda.device_count()))
     logging.info(f"SLURM job num nodes: {num_nodes}")
     logging.info(f"SLURM tasks per node (devices): {devices}")
 
-    from lightning.fabric.strategies import DDPStrategy
+    strategy = "auto"
+    if num_nodes * devices > 1:
+        from lightning.fabric.strategies import DDPStrategy
+        strategy = DDPStrategy(find_unused_parameters=True)
     fabric = Fabric(
         num_nodes=num_nodes,
         devices=devices,
         precision=cfg.trainer.precision,
-        strategy=DDPStrategy(find_unused_parameters=True),
+        strategy=strategy,
     )
     fabric.launch()
     fabric.seed_everything(cfg.reproducibility.seed, workers=True)
@@ -561,9 +579,19 @@ def main(cfg: DictConfig):
         # eval_dataloaders += [("kubric-multiview-v3-training", train_loader)]
         train_loader = fabric.setup_dataloaders(train_loader)
         logging.info(f"LEN TRAIN LOADER={len(train_loader)}")
-        num_epochs = cfg.trainer.num_steps // len(train_loader) + 1 + (1 if cfg.modes.do_initial_static_pretrain else 0)
+        optimizer_steps_per_epoch = max(
+            1,
+            len(train_loader) // gradient_accumulation_steps,
+        )
+        num_epochs = (
+            cfg.trainer.num_steps // optimizer_steps_per_epoch
+            + 1
+            + (1 if cfg.modes.do_initial_static_pretrain else 0)
+        )
         if cfg.modes.do_initial_static_pretrain:
-            cfg.trainer.num_steps += len(pretraining_dataloader)
+            cfg.trainer.num_steps += (
+                len(pretraining_dataloader) // gradient_accumulation_steps
+            )
     else:
         train_loader = None
         num_epochs = None
@@ -600,7 +628,7 @@ def main(cfg: DictConfig):
         fabric.load(experiment_path, state)
         total_steps = state.total_steps  # Integers are immutable, so they cannot be changed inplace
         if train_loader is not None:
-            epoch = total_steps // len(train_loader) - 1
+            epoch = total_steps // optimizer_steps_per_epoch - 1
         logging.info(f"Loaded checkpoint {experiment_path} (total_steps={total_steps})")
         logging.info(f"Total steps after loading checkpoint: {total_steps}")
 
@@ -645,7 +673,7 @@ def main(cfg: DictConfig):
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            total_steps=total_steps + 1,
+            total_steps=total_steps,
         )
         fabric.save(save_path, state)
         logging.info(f"Saved checkpoint to {save_path}. Waiting for all ranks to finish...")
@@ -658,23 +686,31 @@ def main(cfg: DictConfig):
     logging.info(f"Registered signal handlers for SIGUSR1 and SIGTERM.")
 
     model.train()
-    should_keep_training = True if cfg.trainer.num_steps > 0 else False
+    should_keep_training = total_steps < cfg.trainer.num_steps
     total_batches_loaded = 0
     total_batches_failed = 0
     if fabric.global_rank == 0:
         tqdm_total_steps = tqdm(
             total=cfg.trainer.num_steps,
             desc=f"Total Training Progress (rank={fabric.global_rank})",
-            unit="batch",
+            unit="optimizer step",
             initial=total_steps,
             position=0,
         )
     threads = []
-    had_run_pretraining_epoch = cfg.modes.do_initial_static_pretrain and total_steps > len(pretraining_dataloader)
+    pretraining_optimizer_steps = (
+        len(pretraining_dataloader) // gradient_accumulation_steps
+        if pretraining_dataloader is not None
+        else 0
+    )
+    had_run_pretraining_epoch = (
+        cfg.modes.do_initial_static_pretrain
+        and total_steps >= pretraining_optimizer_steps
+    )
     logging.info(f"{total_steps=}, {epoch=}/{num_epochs}, {had_run_pretraining_epoch=}")
     while should_keep_training:
         epoch += 1
-        i_batch = -1
+        i_batch = 0
 
         if cfg.modes.do_initial_static_pretrain and not had_run_pretraining_epoch:
             had_run_pretraining_epoch = True
@@ -683,10 +719,34 @@ def main(cfg: DictConfig):
         else:
             data_iter = iter(train_loader)
             n_batches = len(train_loader)
+        n_batches -= n_batches % gradient_accumulation_steps
+        if n_batches == 0:
+            raise ValueError(
+                "The training loader must contain at least "
+                f"{gradient_accumulation_steps} microbatches"
+            )
         if fabric.global_rank == 0:
-            tqdm_epoch = tqdm(total=n_batches, desc=f"Epoch {epoch + 1}/{num_epochs}", unit="batch", position=1)
+            tqdm_epoch = tqdm(
+                total=n_batches // gradient_accumulation_steps,
+                desc=f"Epoch {epoch + 1}/{num_epochs}",
+                unit="optimizer step",
+                position=1,
+            )
 
-        while i_batch < n_batches:
+        microbatches_accumulated = 0
+        accumulation_started_at = None
+        accumulated_dataloader_duration = 0.0
+        accumulated_fwd_duration = 0.0
+        accumulated_sync_duration = 0.0
+        accumulated_bwd_duration = 0.0
+        accumulated_loss_value = 0.0
+        accumulated_component_losses = {}
+        accumulated_metrics = {}
+
+        while i_batch < n_batches and total_steps < cfg.trainer.num_steps:
+            if accumulation_started_at is None:
+                accumulation_started_at = time.time()
+                optimizer.zero_grad()
             start_time_1 = time.time()
             logging.info(f"Gonna load batch {i_batch + 1}/{n_batches} (rank={fabric.global_rank})")
             try:
@@ -694,6 +754,7 @@ def main(cfg: DictConfig):
             except StopIteration:
                 data_iter = iter(train_loader)
                 n_batches = len(train_loader)
+                n_batches -= n_batches % gradient_accumulation_steps
                 batch = next(data_iter)
 
             batch, gotit = batch
@@ -707,6 +768,7 @@ def main(cfg: DictConfig):
 
             if not all(gotit):
                 total_batches_failed += 1
+                accumulated_dataloader_duration += time.time() - start_time_1
                 logging.info(f"batch is None: "
                              f"failed {total_batches_failed} / {total_batches_loaded} "
                              f"({total_batches_failed / total_batches_loaded * 100:.2f}%) batches")
@@ -717,13 +779,21 @@ def main(cfg: DictConfig):
             assert model.training
 
             start_time_2 = time.time()
-            dataloader_duration = start_time_2 - start_time_1
-            logging.info(f"Datapoint: {batch.seq_name} (Waited for {dataloader_duration:>5.2f}s)")
+            microbatch_dataloader_duration = start_time_2 - start_time_1
+            accumulated_dataloader_duration += microbatch_dataloader_duration
+            logging.info(
+                f"Datapoint: {batch.seq_name} "
+                f"(microbatch {microbatches_accumulated + 1}/{gradient_accumulation_steps}, "
+                f"waited {microbatch_dataloader_duration:>5.2f}s)"
+            )
 
             train_iters = cfg.trainer.train_iters
             if cfg.trainer.augment_train_iters:
                 train_iters = augment_train_iters(train_iters, total_steps, cfg.trainer.augment_train_iters_warmup)
-            optimizer.zero_grad()
+
+            is_final_microbatch = (
+                microbatches_accumulated + 1 == gradient_accumulation_steps
+            )
 
             try:
                 output = forward_batch_multi_view(
@@ -734,8 +804,11 @@ def main(cfg: DictConfig):
                     train_iters=train_iters,
                     gamma=cfg.trainer.gamma,
                     save_debug_logs=(
-                            ((total_steps % cfg.trainer.viz_freq) == (cfg.trainer.viz_freq - 1))
-                            or (total_steps in [0, 10, 100, cfg.trainer.num_steps - 1])
+                            is_final_microbatch
+                            and (
+                                ((total_steps % cfg.trainer.viz_freq) == (cfg.trainer.viz_freq - 1))
+                                or (total_steps in [0, 10, 100, cfg.trainer.num_steps - 1])
+                            )
                     ),
                     debug_logs_path=os.path.join(
                         cfg.experiment_path,
@@ -751,7 +824,7 @@ def main(cfg: DictConfig):
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
-                    total_steps=total_steps + 1,
+                    total_steps=total_steps,
                 )
                 fabric._strategy.checkpoint_io.save_checkpoint(
                     checkpoint=fabric._strategy._convert_stateful_objects_in_state(_unwrap_objects(state), filter={}),
@@ -773,22 +846,51 @@ def main(cfg: DictConfig):
             for k, v in output.items():
                 if k == "metrics":
                     for metric_name, metric_value in v.items():
-                        tb_writer.add_scalar(metric_name, metric_value, total_steps)
+                        accumulated_metrics[metric_name] = (
+                            accumulated_metrics.get(metric_name, 0.0)
+                            + float(metric_value)
+                        )
                 elif "loss" in v:
                     loss += v["loss"]
-                    tb_writer.add_scalar(f"live_{k}_loss", v["loss"].item(), total_steps)
+                    accumulated_component_losses[k] = (
+                        accumulated_component_losses.get(k, 0.0)
+                        + v["loss"].detach().item()
+                    )
                 else:
                     raise ValueError(f"Unknown key {k} in output")
+            accumulated_loss_value += loss.detach().item()
 
             start_time_3 = time.time()
-            fwd_duration = start_time_3 - start_time_2
+            accumulated_fwd_duration += start_time_3 - start_time_2
 
             fabric.barrier()
 
             start_time_4 = time.time()
-            sync_duration = start_time_4 - start_time_3
+            accumulated_sync_duration += start_time_4 - start_time_3
 
-            fabric.backward(loss)
+            backward_started_at = time.time()
+            fabric.backward(
+                _scale_microbatch_loss(loss, gradient_accumulation_steps)
+            )
+            accumulated_bwd_duration += time.time() - backward_started_at
+            microbatches_accumulated += 1
+            if microbatches_accumulated < gradient_accumulation_steps:
+                continue
+
+            mean_loss_value = accumulated_loss_value / gradient_accumulation_steps
+            for metric_name, metric_total in accumulated_metrics.items():
+                tb_writer.add_scalar(
+                    metric_name,
+                    metric_total / gradient_accumulation_steps,
+                    total_steps,
+                )
+            for component_name, component_total in accumulated_component_losses.items():
+                tb_writer.add_scalar(
+                    f"live_{component_name}_loss",
+                    component_total / gradient_accumulation_steps,
+                    total_steps,
+                )
+
             # Log a limited number of grad + optimizer state pairs, also log current learning rate
             if (total_steps <= 10) or (total_steps % cfg.trainer.viz_freq == 0):
                 log_limit = 5
@@ -815,12 +917,16 @@ def main(cfg: DictConfig):
                     if param.grad_fn:
                         print(f"{prefix} {name} grad_fn: {param.grad_fn}")
                 logging.info(f"{prefix} LR at step {total_steps}: {scheduler.get_last_lr()}")
+            optimizer_update_started_at = time.time()
             fabric.clip_gradients(model, optimizer, clip_val=cfg.trainer.grad_clip)
             optimizer.step()
             scheduler.step()
+            accumulated_bwd_duration += time.time() - optimizer_update_started_at
 
-            start_time_5 = time.time()
-            bwd_duration = start_time_5 - start_time_4
+            dataloader_duration = accumulated_dataloader_duration
+            fwd_duration = accumulated_fwd_duration
+            sync_duration = accumulated_sync_duration
+            bwd_duration = accumulated_bwd_duration
 
             if fabric.global_rank == 0:
                 if (total_steps % cfg.trainer.viz_freq == 0) or (
@@ -859,7 +965,7 @@ def main(cfg: DictConfig):
                     threads.append(thread)
 
                 if len(output) > 1:
-                    tb_writer.add_scalar(f"live_total_loss", loss.item(), total_steps)
+                    tb_writer.add_scalar(f"live_total_loss", mean_loss_value, total_steps)
                 tb_writer.add_scalar(f"learning_rate", optimizer.param_groups[0]["lr"], total_steps)
 
             if total_steps % cfg.trainer.save_ckpt_freq == 0:
@@ -883,14 +989,14 @@ def main(cfg: DictConfig):
                 tqdm_epoch.update(1)
                 tqdm_total_steps.update(1)
                 tqdm_epoch.set_postfix(
-                    loss=loss.item(),
+                    loss=mean_loss_value,
                     lr=optimizer.param_groups[0]["lr"],
                     train_iters=cfg.trainer.train_iters,
                     gamma=cfg.trainer.gamma,
                     seq_name=batch.seq_name,
                 )
 
-            total_duration = time.time() - start_time_1
+            total_duration = time.time() - accumulation_started_at
             logging.info(
                 f"[timing:{total_steps:06d}] "
                 f"Total: {total_duration:>6.2f}s | "
@@ -985,7 +1091,17 @@ def main(cfg: DictConfig):
                     bwd_durations.clear()
                     dataloader_durations.clear()
 
-            if total_steps > cfg.trainer.num_steps:
+            microbatches_accumulated = 0
+            accumulation_started_at = None
+            accumulated_dataloader_duration = 0.0
+            accumulated_fwd_duration = 0.0
+            accumulated_sync_duration = 0.0
+            accumulated_bwd_duration = 0.0
+            accumulated_loss_value = 0.0
+            accumulated_component_losses = {}
+            accumulated_metrics = {}
+
+            if total_steps >= cfg.trainer.num_steps:
                 should_keep_training = False
                 break
 

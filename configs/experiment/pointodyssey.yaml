@@ -10,6 +10,9 @@ datasets:
   eval:
     names: []
 
+trainer:
+  gradient_accumulation_steps: 8
+
 augmentations:
   variable_depth_type: false
   variable_num_views: false

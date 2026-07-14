@@ -52,6 +52,10 @@ def _load_top_level_function(function_name, namespace):
 
 
 _track_cache_file = _load_top_level_function("_track_cache_file", {"os": os})
+_training_virtual_dataset_size = _load_top_level_function(
+    "_training_virtual_dataset_size",
+    {},
+)
 
 
 def _load_kubric_method(method_name):
@@ -169,6 +173,34 @@ class LegalContiguousWindowStartsTests(unittest.TestCase):
 
 
 class VirtualDatasetIndexTests(unittest.TestCase):
+    def test_training_virtual_size_accounts_for_serial_microbatches(self):
+        self.assertEqual(
+            _training_virtual_dataset_size(
+                world_size=1,
+                num_steps=200_000,
+                gradient_accumulation_steps=8,
+            ),
+            1_608_000,
+        )
+
+    def test_training_virtual_size_preserves_upstream_default(self):
+        self.assertEqual(
+            _training_virtual_dataset_size(
+                world_size=2,
+                num_steps=100,
+                gradient_accumulation_steps=1,
+            ),
+            2_200,
+        )
+
+    def test_training_virtual_size_rejects_zero_accumulation(self):
+        with self.assertRaisesRegex(ValueError, "must be at least 1"):
+            _training_virtual_dataset_size(
+                world_size=1,
+                num_steps=100,
+                gradient_accumulation_steps=0,
+            )
+
     def test_repeated_scene_keeps_distinct_seed_index(self):
         class DatasetStub:
             real_len = 78

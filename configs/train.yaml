@@ -39,6 +39,7 @@ trainer:
   wdecay: 0.00001
   anneal_strategy: linear
   grad_clip: 1.0
+  gradient_accumulation_steps: 1
   precision: 16-mixed               # training precision (e.g., 16-mixed, bf16-mixed or 32-true)
   visibility_loss_weight: 0.1
 

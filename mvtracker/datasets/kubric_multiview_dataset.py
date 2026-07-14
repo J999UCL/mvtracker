@@ -24,6 +24,14 @@ from mvtracker.datasets.utils import Datapoint, read_json, read_tiff, read_png, 
     aug_depth
 
 
+def _training_virtual_dataset_size(world_size, num_steps, gradient_accumulation_steps):
+    """Reserve one distinct virtual index per training microbatch."""
+    gradient_accumulation_steps = int(gradient_accumulation_steps)
+    if gradient_accumulation_steps < 1:
+        raise ValueError("trainer.gradient_accumulation_steps must be at least 1")
+    return int(world_size) * gradient_accumulation_steps * (int(num_steps) + 1000)
+
+
 def _legal_contiguous_window_starts(n_frames, seq_len, invalid_frame_indices=()):
     """Return inclusive window starts whose frames do not intersect invalid indices."""
     if isinstance(n_frames, bool) or not isinstance(n_frames, (int, np.integer)) or n_frames < 0:
@@ -195,7 +203,13 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             "use_cached_tracks": use_cached_tracks,
         }
         if training:
-            kubric_kwargs["virtual_dataset_size"] = fabric.world_size * (training_args.trainer.num_steps + 1000)
+            kubric_kwargs["virtual_dataset_size"] = _training_virtual_dataset_size(
+                world_size=fabric.world_size,
+                num_steps=training_args.trainer.num_steps,
+                gradient_accumulation_steps=(
+                    training_args.trainer.gradient_accumulation_steps
+                ),
+            )
         if training or overfit_on_train:
             kubric_kwargs["data_root"] = (
                 os.path.join(training_args.datasets.root, "kubric-multiview", "train")
