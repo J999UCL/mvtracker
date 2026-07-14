@@ -256,6 +256,30 @@ For a full-scale MVTracker on an 80 GB GPU:
 python -m mvtracker.cli.train +experiment=mvtracker_overfit
 ```
 
+### Live PointOdyssey training dashboard
+
+On the training host, point the dashboard at the same experiment directory as
+the trainer and explicitly select the physical GPU to monitor:
+
+```bash
+python scripts/pointodyssey_training_dashboard.py \
+  --run-dir /path/to/experiment \
+  --gpu-index 0 \
+  --port 8766
+```
+
+Keep the server bound to its default loopback address and forward it from your
+local machine:
+
+```bash
+ssh -N -L 8766:127.0.0.1:8766 TRAINING_HOST
+```
+
+Then open `http://127.0.0.1:8766/`. The browser receives live server-sent
+events from the remote process. Training losses and timings come from the run's
+TensorBoard events, loader diagnostics come from `train.log`, validation plots
+appear when evaluation scalars are written, and GPU telemetry comes from NVML.
+
 ## Practical Considerations
 
 <details>
