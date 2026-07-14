@@ -11,14 +11,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing
 import os
 import platform
 import shutil
 import sys
 import tempfile
+import time
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
 
 import cv2
 import numpy as np
@@ -49,7 +53,7 @@ else:
     )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OUTPUT_HEIGHT = 384
 OUTPUT_WIDTH = 512
 JPEG_QUALITY = 95
@@ -59,6 +63,10 @@ DEPTH_TRACK_TOLERANCE_METRES = 0.05
 RIGID_DETERMINANT_TOLERANCE = 1e-3
 SCALE_X = OUTPUT_WIDTH / SOURCE_WIDTH
 SCALE_Y = OUTPUT_HEIGHT / SOURCE_HEIGHT
+DEFAULT_WORKERS = 4
+RGB_MAX_BATCH_FRAMES = 8
+RGB_MAX_BATCH_BYTES = 8 * 1024 * 1024
+JPEG_VALIDATION_BATCH_FILES = 32
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,45 @@ class SceneSpec:
     @property
     def source_key(self) -> tuple[str, str]:
         return self.layout, self.source_sequence
+
+
+@dataclass(frozen=True)
+class RGBFrameJob:
+    layout: str
+    sequence: str
+    view: int
+    source_frame: int
+    split: str
+    scene_id: str
+    local_frame: int
+    output_path: str
+    encoded_jpeg: bytes
+    source_height: int
+    source_width: int
+    output_height: int
+    output_width: int
+    jpeg_quality: int
+
+
+@dataclass(frozen=True)
+class RGBFrameResult:
+    output_path: str
+    encoded_jpeg: bytes
+
+
+@dataclass(frozen=True)
+class JPEGValidationJob:
+    split: str
+    scene_id: str
+    view: int
+    frame: int
+    path: str
+    expected_height: int
+    expected_width: int
+
+
+BatchInput = TypeVar("BatchInput")
+BatchOutput = TypeVar("BatchOutput")
 
 
 class SemanticValidationError(RuntimeError):
@@ -147,6 +194,239 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     return value
+
+
+def _initialize_process_worker() -> None:
+    """Prevent each spawned OpenCV worker from creating its own thread pool."""
+    cv2.setNumThreads(1)
+
+
+def _transcode_rgb_batch(batch: tuple[RGBFrameJob, ...]) -> tuple[RGBFrameResult, ...]:
+    """Decode, resize, and encode one ordered batch without writing files."""
+    results: list[RGBFrameResult] = []
+    for job in batch:
+        try:
+            encoded = np.frombuffer(job.encoded_jpeg, dtype=np.uint8)
+            decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise ValueError("source JPEG cannot be decoded")
+            expected_source_shape = (job.source_height, job.source_width, 3)
+            if decoded.shape != expected_source_shape:
+                raise ValueError(
+                    f"source JPEG decodes to {decoded.shape}, expected {expected_source_shape}"
+                )
+            resized = cv2.resize(
+                decoded,
+                (job.output_width, job.output_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            ok, jpeg = cv2.imencode(
+                ".jpg",
+                resized,
+                [cv2.IMWRITE_JPEG_QUALITY, job.jpeg_quality],
+            )
+            if not ok:
+                raise RuntimeError("failed to encode resized JPEG")
+            results.append(RGBFrameResult(job.output_path, jpeg.tobytes()))
+        except Exception as exc:
+            raise RuntimeError(
+                "RGB transcode failed "
+                f"layout={job.layout} sequence={job.sequence} view={job.view} "
+                f"source_frame={job.source_frame} split={job.split} "
+                f"scene={job.scene_id} local_frame={job.local_frame}"
+            ) from exc
+    return tuple(results)
+
+
+def _validate_jpeg_batch(batch: tuple[JPEGValidationJob, ...]) -> int:
+    """Decode persisted JPEGs in deterministic batch order."""
+    for job in batch:
+        try:
+            decoded = cv2.imread(job.path, cv2.IMREAD_COLOR)
+            expected_shape = (job.expected_height, job.expected_width, 3)
+            if decoded is None or decoded.shape != expected_shape:
+                observed = None if decoded is None else decoded.shape
+                raise ValueError(
+                    f"prepared JPEG decodes to {observed}, expected {expected_shape}"
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "prepared JPEG validation failed "
+                f"split={job.split} scene={job.scene_id} view={job.view} "
+                f"frame={job.frame} path={job.path}"
+            ) from exc
+    return len(batch)
+
+
+def _batch_context(batch: Sequence[Any]) -> str:
+    first = batch[0]
+    last = batch[-1]
+    if isinstance(first, RGBFrameJob) and isinstance(last, RGBFrameJob):
+        return (
+            f"{first.layout}/{first.sequence}/view_{first.view} "
+            f"frames={first.source_frame}-{last.source_frame}"
+        )
+    if isinstance(first, JPEGValidationJob) and isinstance(last, JPEGValidationJob):
+        return (
+            f"split={first.split} scene={first.scene_id} view={first.view} "
+            f"frames={first.frame}-{last.frame}"
+        )
+    return f"items={len(batch)}"
+
+
+def _ordered_bounded_batches(
+    executor: ProcessPoolExecutor,
+    worker: Callable[[BatchInput], BatchOutput],
+    batches: Iterable[BatchInput],
+    *,
+    max_in_flight: int,
+    stage: str,
+) -> Iterator[BatchOutput]:
+    """Submit a bounded number of batches and consume them in input order."""
+    if max_in_flight <= 0:
+        raise ValueError("max_in_flight must be positive")
+    iterator = iter(batches)
+    pending: deque[tuple[str, Future[BatchOutput]]] = deque()
+    exhausted = False
+    deferred_error: BaseException | None = None
+
+    def cancel_pending() -> None:
+        for _other_context, other in pending:
+            other.cancel()
+
+    def submit_one() -> None:
+        nonlocal deferred_error, exhausted
+        if exhausted or deferred_error is not None:
+            return
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            exhausted = True
+            return
+        except BaseException as exc:
+            exhausted = True
+            deferred_error = exc
+            return
+        try:
+            context = _batch_context(batch)
+            future = executor.submit(worker, batch)
+        except BaseException as exc:
+            exhausted = True
+            deferred_error = exc
+            return
+        pending.append((context, future))
+
+    for _ in range(max_in_flight):
+        submit_one()
+    while pending:
+        context, future = pending.popleft()
+        try:
+            yield future.result()
+        except BaseException as exc:
+            cancel_pending()
+            if isinstance(exc, Exception):
+                raise RuntimeError(f"{stage} batch failed: {context}") from exc
+            raise
+        submit_one()
+    if deferred_error is not None:
+        raise deferred_error
+
+
+def _iter_rgb_batches(jobs: Iterable[RGBFrameJob]) -> Iterator[tuple[RGBFrameJob, ...]]:
+    batch: list[RGBFrameJob] = []
+    batch_bytes = 0
+    iterator = iter(jobs)
+    while True:
+        try:
+            job = next(iterator)
+        except StopIteration:
+            break
+        except BaseException:
+            if batch:
+                yield tuple(batch)
+            raise
+        encoded_bytes = len(job.encoded_jpeg)
+        if batch and (
+            len(batch) >= RGB_MAX_BATCH_FRAMES
+            or batch_bytes + encoded_bytes > RGB_MAX_BATCH_BYTES
+        ):
+            yield tuple(batch)
+            batch = []
+            batch_bytes = 0
+        batch.append(job)
+        batch_bytes += encoded_bytes
+    if batch:
+        yield tuple(batch)
+
+
+def _iter_scene_rgb_jobs(
+    images: np.ndarray,
+    spec: SceneSpec,
+    view: int,
+    output_view: Path,
+) -> Iterator[RGBFrameJob]:
+    for local_frame, source_frame in enumerate(
+        range(spec.source_frame_start, spec.source_frame_end)
+    ):
+        encoded = images[source_frame]
+        if not isinstance(encoded, np.ndarray) or encoded.ndim != 1 or encoded.dtype != np.uint8:
+            raise ValueError(
+                "invalid source JPEG object "
+                f"layout={spec.layout} sequence={spec.source_sequence} view={view} "
+                f"source_frame={source_frame}: expected one-dimensional uint8 array"
+            )
+        encoded_bytes = encoded.tobytes()
+        images[source_frame] = None
+        yield RGBFrameJob(
+            layout=spec.layout,
+            sequence=spec.source_sequence,
+            view=view,
+            source_frame=source_frame,
+            split=spec.split,
+            scene_id=spec.scene_id,
+            local_frame=local_frame,
+            output_path=str(output_view / f"rgba_{local_frame:05d}.jpg"),
+            encoded_jpeg=encoded_bytes,
+            source_height=SOURCE_HEIGHT,
+            source_width=SOURCE_WIDTH,
+            output_height=OUTPUT_HEIGHT,
+            output_width=OUTPUT_WIDTH,
+            jpeg_quality=JPEG_QUALITY,
+        )
+
+
+def _iter_validation_batches(
+    jobs: Iterable[JPEGValidationJob],
+) -> Iterator[tuple[JPEGValidationJob, ...]]:
+    batch: list[JPEGValidationJob] = []
+    for job in jobs:
+        batch.append(job)
+        if len(batch) >= JPEG_VALIDATION_BATCH_FILES:
+            yield tuple(batch)
+            batch = []
+    if batch:
+        yield tuple(batch)
+
+
+def _run_batches(
+    batches: Iterable[BatchInput],
+    worker: Callable[[BatchInput], BatchOutput],
+    *,
+    process_pool: ProcessPoolExecutor | None,
+    process_workers: int,
+    stage: str,
+) -> Iterator[BatchOutput]:
+    if process_pool is None:
+        for batch in batches:
+            yield worker(batch)
+        return
+    yield from _ordered_bounded_batches(
+        process_pool,
+        worker,
+        batches,
+        max_in_flight=2 * process_workers,
+        stage=stage,
+    )
 
 
 def chunk_ranges(frame_count: int, chunk_length: int = LONG_CHUNK_LENGTH) -> list[tuple[int, int]]:
@@ -420,47 +700,31 @@ def _depth_track_consistency_masks(
     selected_camera_z = flat_camera_z[candidate_ids]
     center_x = np.floor(selected_xy[:, 0] + 0.5).astype(np.int64)
     center_y = np.floor(selected_xy[:, 1] + 0.5).astype(np.int64)
-    accepted = np.zeros(candidate_ids.shape, dtype=bool)
-    any_valid = np.zeros(candidate_ids.shape, dtype=bool)
-    for offset_y in (-1, 0, 1):
-        sample_y = center_y + offset_y
-        for offset_x in (-1, 0, 1):
-            sample_x = center_x + offset_x
-            inside = (
-                (sample_x >= 0)
-                & (sample_x < OUTPUT_WIDTH)
-                & (sample_y >= 0)
-                & (sample_y < OUTPUT_HEIGHT)
-            )
-            if not inside.any():
-                continue
-            positions = np.flatnonzero(inside)
-            sampled_depth = depth_frame[sample_y[positions], sample_x[positions]]
-            valid_depth = np.isfinite(sampled_depth) & (sampled_depth > 0.0)
-            any_valid[positions] |= valid_depth
-            accepted[positions] |= valid_depth & (
-                np.abs(sampled_depth - selected_camera_z[positions])
-                <= DEPTH_TRACK_TOLERANCE_METRES
-            )
+    offsets_y = np.asarray((-1, -1, -1, 0, 0, 0, 1, 1, 1), dtype=np.int64)
+    offsets_x = np.asarray((-1, 0, 1, -1, 0, 1, -1, 0, 1), dtype=np.int64)
+    sample_x = center_x[:, None] + offsets_x[None, :]
+    sample_y = center_y[:, None] + offsets_y[None, :]
+    inside = (
+        (sample_x >= 0)
+        & (sample_x < OUTPUT_WIDTH)
+        & (sample_y >= 0)
+        & (sample_y < OUTPUT_HEIGHT)
+    )
+    safe_x = np.clip(sample_x, 0, OUTPUT_WIDTH - 1)
+    safe_y = np.clip(sample_y, 0, OUTPUT_HEIGHT - 1)
+    sampled_depth = depth_frame[safe_y, safe_x]
+    valid_depth = inside & np.isfinite(sampled_depth) & (sampled_depth > 0.0)
+    any_valid = valid_depth.any(axis=1)
+    accepted = (
+        valid_depth
+        & (
+            np.abs(sampled_depth - selected_camera_z[:, None])
+            <= DEPTH_TRACK_TOLERANCE_METRES
+        )
+    ).any(axis=1)
     consistent_mask.reshape(-1)[candidate_ids] = accepted
     any_valid_depth_mask.reshape(-1)[candidate_ids] = any_valid
     return consistent_mask, any_valid_depth_mask
-
-
-def _depth_track_consistency_mask(
-    depth_frame: np.ndarray,
-    projected_xy: np.ndarray,
-    camera_z: np.ndarray,
-    candidate_mask: np.ndarray,
-) -> np.ndarray:
-    """Keep candidates matching finite positive resized depth in a 3x3 neighbourhood."""
-    consistent_mask, _any_valid_depth_mask = _depth_track_consistency_masks(
-        depth_frame,
-        projected_xy,
-        camera_z,
-        candidate_mask,
-    )
-    return consistent_mask
 
 
 def _validate_source_queries(
@@ -634,8 +898,13 @@ def _record_finite_failure(
     *,
     view: int | None = None,
     frame_axis: bool = True,
+    finite_mask: np.ndarray | None = None,
 ) -> None:
-    finite = np.isfinite(array)
+    finite = np.isfinite(array) if finite_mask is None else np.asarray(finite_mask, dtype=bool)
+    if finite.shape != array.shape:
+        raise ValueError(
+            f"finite mask shape must match array shape; got {finite.shape} and {array.shape}"
+        )
     if finite.all():
         return
     first = np.argwhere(~finite)[0]
@@ -666,7 +935,11 @@ def _convert_source_group(
     source_specs: Sequence[SceneSpec],
     recorder: ValidationRecorder,
     scene_stats: dict[tuple[str, str], dict[str, Any]],
+    process_pool: ProcessPoolExecutor | None = None,
+    process_workers: int = 1,
 ) -> None:
+    if process_workers <= 0:
+        raise ValueError("process_workers must be positive")
     first = source_specs[0]
     source_dir = _source_scene_dir(source_root, first)
     tracks = _require_array(
@@ -698,29 +971,49 @@ def _convert_source_group(
 
     _validate_source_queries(source_specs, tracks, queries, intrinsics_4, extrinsics, visibilities, recorder)
 
+    track_finite_masks: dict[tuple[str, str], np.ndarray] = {}
     for spec in source_specs:
+        track_start = time.perf_counter()
         output_scene = _output_scene_dir(build_root, spec)
         tracks_chunk = np.asarray(tracks[spec.source_frame_start : spec.source_frame_end], dtype=np.float32)
         np.save(output_scene / "tracks_3d.npy", np.ascontiguousarray(tracks_chunk))
+        finite_coordinates = np.isfinite(tracks_chunk)
         _record_finite_failure(
             recorder,
             spec,
             "tracks_finite",
             tracks_chunk,
             "all world-track coordinates are finite",
+            finite_mask=finite_coordinates,
         )
-        scene_stats[(spec.split, spec.scene_id)] = {"views": {}}
+        finite_track_samples = finite_coordinates.all(axis=-1)
+        track_finite_masks[(spec.split, spec.scene_id)] = finite_track_samples
+        coordinate_count = int(tracks_chunk.size)
+        finite_coordinate_count = int(finite_coordinates.sum())
+        track_seconds = time.perf_counter() - track_start
+        scene_stats[(spec.split, spec.scene_id)] = {
+            "tracks": {
+                "track_id_count": POINT_COUNT,
+                "frame_count": spec.frame_count,
+                "track_sample_count": spec.frame_count * POINT_COUNT,
+                "coordinate_value_count": coordinate_count,
+                "finite_coordinate_value_count": finite_coordinate_count,
+                "nonfinite_coordinate_value_count": coordinate_count - finite_coordinate_count,
+            },
+            "exclusive_stage_seconds": {
+                "tracks_validate_and_write": track_seconds,
+                "projection_and_geometric_visibility": 0.0,
+                "depth_resize_write_and_consistency": 0.0,
+                "rgb_decode_resize_encode_write": 0.0,
+            },
+            "views": {},
+        }
 
     for view in VIEW_IDS:
         source_view = source_dir / str(view)
         images = np.load(source_view / "images_jpeg_bytes.npy", allow_pickle=True)
         if images.shape != (first.source_frame_count,) or images.dtype != np.dtype(object):
             raise ValueError(f"invalid object JPEG array: {source_view / 'images_jpeg_bytes.npy'}")
-        for frame, image_bytes in enumerate(images):
-            if not isinstance(image_bytes, np.ndarray) or image_bytes.ndim != 1 or image_bytes.dtype != np.uint8:
-                raise ValueError(
-                    f"{source_view / 'images_jpeg_bytes.npy'} frame {frame} is not a 1-D uint8 JPEG vector"
-                )
 
         source_depth = _open_depth(source_view, first.layout, first.source_frame_count)
         resized_k = scale_intrinsics(intrinsics_4[view])
@@ -783,8 +1076,9 @@ def _convert_source_group(
                     frame=start + bad,
                 )
 
+            projection_start = time.perf_counter()
             projected_xy, camera_z = _project_points(tracks_chunk, extrinsics_chunk, resized_k)
-            finite_tracks = np.isfinite(tracks_chunk).all(axis=-1)
+            finite_tracks = track_finite_masks[(spec.split, spec.scene_id)]
             finite_projection = np.isfinite(projected_xy).all(axis=-1) & np.isfinite(camera_z)
             inside = (
                 (projected_xy[..., 0] >= -0.5)
@@ -800,11 +1094,12 @@ def _convert_source_group(
                 & inside
             )
             output_visibility = geometric_visibility.copy()
-            any_valid_depth_visibility = np.zeros_like(geometric_visibility)
+            projection_seconds = time.perf_counter() - projection_start
 
             np.save(output_view / "intrinsics.npy", np.ascontiguousarray(resized_k))
             np.save(output_view / "extrinsics_w2c.npy", extrinsics_chunk)
 
+            depth_start = time.perf_counter()
             depth_output = np.lib.format.open_memmap(
                 output_view / "depth.npy",
                 mode="w+",
@@ -813,8 +1108,17 @@ def _convert_source_group(
             )
             first_nonfinite_frame: int | None = None
             first_negative_frame: int | None = None
-            nonfinite_count = 0
-            negative_count = 0
+            source_nonfinite_count = 0
+            source_negative_count = 0
+            prepared_depth_positive_count = 0
+            prepared_depth_zero_count = 0
+            prepared_depth_negative_count = 0
+            prepared_depth_nonfinite_count = 0
+            prepared_depth_finite_count = 0
+            prepared_depth_finite_min: float | None = None
+            prepared_depth_finite_max: float | None = None
+            rejected_no_valid_depth = 0
+            rejected_residual_over_tolerance = 0
             for local_frame, source_frame in enumerate(range(start, end)):
                 source_depth_frame = np.asarray(source_depth[source_frame], dtype=np.float32)
                 nonfinite = ~np.isfinite(source_depth_frame)
@@ -823,39 +1127,60 @@ def _convert_source_group(
                     first_nonfinite_frame = source_frame
                 if negative.any() and first_negative_frame is None:
                     first_negative_frame = source_frame
-                nonfinite_count += int(nonfinite.sum())
-                negative_count += int(negative.sum())
+                source_nonfinite_count += int(nonfinite.sum())
+                source_negative_count += int(negative.sum())
                 resized_depth_frame = cv2.resize(
                     source_depth_frame,
                     (OUTPUT_WIDTH, OUTPUT_HEIGHT),
                     interpolation=cv2.INTER_NEAREST,
                 )
                 depth_output[local_frame] = resized_depth_frame
+
+                prepared_finite = np.isfinite(resized_depth_frame)
+                prepared_positive = prepared_finite & (resized_depth_frame > 0.0)
+                prepared_negative = prepared_finite & (resized_depth_frame < 0.0)
+                prepared_zero = prepared_finite & (resized_depth_frame == 0.0)
+                frame_finite_count = int(prepared_finite.sum())
+                prepared_depth_finite_count += frame_finite_count
+                prepared_depth_positive_count += int(prepared_positive.sum())
+                prepared_depth_zero_count += int(prepared_zero.sum())
+                prepared_depth_negative_count += int(prepared_negative.sum())
+                prepared_depth_nonfinite_count += int((~prepared_finite).sum())
+                if frame_finite_count:
+                    frame_values = resized_depth_frame[prepared_finite]
+                    frame_min = float(frame_values.min())
+                    frame_max = float(frame_values.max())
+                    prepared_depth_finite_min = (
+                        frame_min
+                        if prepared_depth_finite_min is None
+                        else min(prepared_depth_finite_min, frame_min)
+                    )
+                    prepared_depth_finite_max = (
+                        frame_max
+                        if prepared_depth_finite_max is None
+                        else max(prepared_depth_finite_max, frame_max)
+                    )
+
                 depth_consistent, any_valid_depth = _depth_track_consistency_masks(
                     resized_depth_frame,
                     projected_xy[local_frame],
                     camera_z[local_frame],
                     geometric_visibility[local_frame],
                 )
-                any_valid_depth_visibility[local_frame] = any_valid_depth
                 output_visibility[local_frame] &= depth_consistent
+                frame_candidates = geometric_visibility[local_frame]
+                rejected_no_valid_depth += int((frame_candidates & ~any_valid_depth).sum())
+                rejected_residual_over_tolerance += int(
+                    (frame_candidates & any_valid_depth & ~depth_consistent).sum()
+                )
             depth_output.flush()
             del depth_output
             np.save(output_view / "visibility.npy", np.ascontiguousarray(output_visibility))
+            depth_seconds = time.perf_counter() - depth_start
 
             before = int(source_visibility.sum())
             after_geometry = int(geometric_visibility.sum())
             after_depth_consistency = int(output_visibility.sum())
-            rejected_no_valid_depth = int(
-                (geometric_visibility & ~any_valid_depth_visibility).sum()
-            )
-            rejected_residual_over_tolerance = int(
-                (
-                    geometric_visibility
-                    & any_valid_depth_visibility
-                    & ~output_visibility
-                ).sum()
-            )
             if (
                 after_depth_consistency
                 + rejected_no_valid_depth
@@ -863,7 +1188,33 @@ def _convert_source_group(
                 != after_geometry
             ):
                 raise AssertionError("depth-consistency visibility counts do not reconcile")
-            scene_stats[(spec.split, spec.scene_id)]["views"][str(view)] = {
+            prepared_depth_pixel_count = spec.frame_count * OUTPUT_HEIGHT * OUTPUT_WIDTH
+            if (
+                prepared_depth_positive_count
+                + prepared_depth_zero_count
+                + prepared_depth_negative_count
+                + prepared_depth_nonfinite_count
+                != prepared_depth_pixel_count
+            ):
+                raise AssertionError("prepared-depth category counts do not reconcile")
+
+            view_stats = {
+                "source_chunk_frame_count": spec.frame_count,
+                "output_frame_count": spec.frame_count,
+                "prepared_depth": {
+                    "value_count": prepared_depth_pixel_count,
+                    "finite_count": prepared_depth_finite_count,
+                    "positive_count": prepared_depth_positive_count,
+                    "zero_count": prepared_depth_zero_count,
+                    "negative_count": prepared_depth_negative_count,
+                    "nonfinite_count": prepared_depth_nonfinite_count,
+                    "finite_min": prepared_depth_finite_min,
+                    "finite_max": prepared_depth_finite_max,
+                },
+                "source_depth_diagnostics": {
+                    "negative_count": source_negative_count,
+                    "nonfinite_count": source_nonfinite_count,
+                },
                 "visibility_true_before_gating": before,
                 "visibility_true_after_geometric_gating": after_geometry,
                 "visibility_removed_by_geometric_gating": before - after_geometry,
@@ -879,43 +1230,159 @@ def _convert_source_group(
                 ),
                 "visibility_true_after_gating": after_depth_consistency,
                 "visibility_removed_by_gating": before - after_depth_consistency,
+                "rgb": {
+                    "source_frame_count": spec.frame_count,
+                    "output_frame_count": 0,
+                    "written_file_count": 0,
+                    "output_bytes": 0,
+                },
+                "planned_view_regular_file_count": 4 + spec.frame_count,
+                "written_view_regular_file_count": 4,
+                "exclusive_stage_seconds": {
+                    "projection_and_geometric_visibility": projection_seconds,
+                    "depth_resize_write_and_consistency": depth_seconds,
+                    "rgb_decode_resize_encode_write": 0.0,
+                },
             }
-            if nonfinite_count:
+            scene_stats[(spec.split, spec.scene_id)]["views"][str(view)] = view_stats
+            scene_stats[(spec.split, spec.scene_id)]["exclusive_stage_seconds"][
+                "depth_resize_write_and_consistency"
+            ] += depth_seconds
+            scene_stats[(spec.split, spec.scene_id)]["exclusive_stage_seconds"][
+                "projection_and_geometric_visibility"
+            ] += projection_seconds
+
+            if source_nonfinite_count:
                 recorder.record(
                     spec,
                     "depth_finite",
-                    {"nonfinite_count": nonfinite_count},
+                    {"nonfinite_count": source_nonfinite_count},
                     "all source optical-Z values are finite",
                     view=view,
                     frame=first_nonfinite_frame,
                 )
-            if negative_count:
+            if source_negative_count:
                 recorder.record(
                     spec,
                     "depth_nonnegative",
-                    {"negative_count": negative_count},
+                    {"negative_count": source_negative_count},
                     "source optical-Z is non-negative; zero denotes invalid depth",
                     view=view,
                     frame=first_negative_frame,
                 )
 
-            for local_frame, source_frame in enumerate(range(start, end)):
-                encoded = images[source_frame]
-                decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-                if decoded is None:
-                    raise ValueError(f"cannot decode JPEG {source_view} frame {source_frame}")
-                if decoded.shape != (SOURCE_HEIGHT, SOURCE_WIDTH, 3):
-                    raise ValueError(
-                        f"{source_view} frame {source_frame} decodes to {decoded.shape}, "
-                        f"expected {(SOURCE_HEIGHT, SOURCE_WIDTH, 3)}"
-                    )
-                resized = cv2.resize(decoded, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LINEAR)
-                ok, jpeg = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                if not ok:
-                    raise RuntimeError(f"failed to encode resized JPEG {source_view} frame {source_frame}")
-                (output_view / f"rgba_{local_frame:05d}.jpg").write_bytes(jpeg.tobytes())
+            rgb_start = time.perf_counter()
+            rgb_jobs = _iter_scene_rgb_jobs(images, spec, view, output_view)
+            rgb_batches = _iter_rgb_batches(rgb_jobs)
+            for results in _run_batches(
+                rgb_batches,
+                _transcode_rgb_batch,
+                process_pool=process_pool,
+                process_workers=process_workers,
+                stage="RGB transcode",
+            ):
+                for result in results:
+                    written_bytes = Path(result.output_path).write_bytes(result.encoded_jpeg)
+                    if written_bytes != len(result.encoded_jpeg):
+                        raise OSError(
+                            f"short JPEG write for {result.output_path}: "
+                            f"expected {len(result.encoded_jpeg)}, wrote {written_bytes}"
+                        )
+                    view_stats["rgb"]["output_frame_count"] += 1
+                    view_stats["rgb"]["written_file_count"] += 1
+                    view_stats["rgb"]["output_bytes"] += written_bytes
+            if view_stats["rgb"]["output_frame_count"] != spec.frame_count:
+                raise AssertionError("RGB output frame count does not match scene frame count")
+            rgb_seconds = time.perf_counter() - rgb_start
+            view_stats["written_view_regular_file_count"] += view_stats["rgb"][
+                "written_file_count"
+            ]
+            view_stats["exclusive_stage_seconds"][
+                "rgb_decode_resize_encode_write"
+            ] = rgb_seconds
+            scene_stats[(spec.split, spec.scene_id)]["exclusive_stage_seconds"][
+                "rgb_decode_resize_encode_write"
+            ] += rgb_seconds
 
         del images
+
+    for spec in source_specs:
+        stats = scene_stats[(spec.split, spec.scene_id)]
+        view_values = list(stats["views"].values())
+        finite_mins = [
+            float(item["prepared_depth"]["finite_min"])
+            for item in view_values
+            if item["prepared_depth"]["finite_min"] is not None
+        ]
+        finite_maxes = [
+            float(item["prepared_depth"]["finite_max"])
+            for item in view_values
+            if item["prepared_depth"]["finite_max"] is not None
+        ]
+        stats["prepared_depth_all_views"] = {
+            "value_count": sum(int(item["prepared_depth"]["value_count"]) for item in view_values),
+            "finite_count": sum(
+                int(item["prepared_depth"]["finite_count"]) for item in view_values
+            ),
+            "positive_count": sum(
+                int(item["prepared_depth"]["positive_count"]) for item in view_values
+            ),
+            "zero_count": sum(
+                int(item["prepared_depth"]["zero_count"]) for item in view_values
+            ),
+            "negative_count": sum(
+                int(item["prepared_depth"]["negative_count"]) for item in view_values
+            ),
+            "nonfinite_count": sum(
+                int(item["prepared_depth"]["nonfinite_count"]) for item in view_values
+            ),
+            "finite_min": min(finite_mins) if finite_mins else None,
+            "finite_max": max(finite_maxes) if finite_maxes else None,
+        }
+        stats["rgb_all_views"] = {
+            "source_frame_count": sum(
+                int(item["rgb"]["source_frame_count"]) for item in view_values
+            ),
+            "output_frame_count": sum(
+                int(item["rgb"]["output_frame_count"]) for item in view_values
+            ),
+            "written_file_count": sum(
+                int(item["rgb"]["written_file_count"]) for item in view_values
+            ),
+            "output_bytes": sum(int(item["rgb"]["output_bytes"]) for item in view_values),
+        }
+        planned_scene_files = 2 + sum(
+            int(item["planned_view_regular_file_count"]) for item in view_values
+        )
+        written_before_scene_metadata_files = 1 + sum(
+            int(item["written_view_regular_file_count"]) for item in view_values
+        )
+        stats["io_counts"] = {
+            "source": {
+                "source_sequence_frame_count": spec.source_frame_count,
+                "source_chunk_frame_count": spec.frame_count,
+                "source_camera_chunk_frame_count": spec.frame_count * len(VIEW_IDS),
+                "logical_asset_reference_count": 2 + 5 * len(VIEW_IDS),
+                "logical_asset_semantics": (
+                    "tracks and queries plus images, depth, intrinsics, extrinsics, and "
+                    "visibility per view; each Zarr store counts as one logical asset"
+                ),
+            },
+            "output": {
+                "scene_frame_count": spec.frame_count,
+                "camera_frame_count": spec.frame_count * len(VIEW_IDS),
+                "jpeg_file_count": spec.frame_count * len(VIEW_IDS),
+                "npy_file_count": 1 + 4 * len(VIEW_IDS),
+                "json_file_count": 1,
+                "planned_scene_regular_file_count": planned_scene_files,
+                "written_before_scene_metadata_file_count": (
+                    written_before_scene_metadata_files
+                ),
+            },
+        }
+        stats["accounted_scene_stage_total"] = sum(
+            float(seconds) for seconds in stats["exclusive_stage_seconds"].values()
+        )
 
 
 def _scene_metadata(
@@ -1002,7 +1469,14 @@ def _write_scene_metadata(
             handle.write("\n")
 
 
-def _validate_output_tree(build_root: Path, specs: Sequence[SceneSpec]) -> None:
+def _validate_output_tree(
+    build_root: Path,
+    specs: Sequence[SceneSpec],
+    process_pool: ProcessPoolExecutor | None = None,
+    process_workers: int = 1,
+) -> dict[str, int]:
+    if process_workers <= 0:
+        raise ValueError("process_workers must be positive")
     expected_scene_dirs = {(spec.split, spec.scene_id) for spec in specs}
     actual_scene_dirs: set[tuple[str, str]] = set()
     forbidden_names = {"queries_xytv.npy", "trajs_2d.npy", "trajs_3d.npy", "annotations.npz"}
@@ -1016,10 +1490,15 @@ def _validate_output_tree(build_root: Path, specs: Sequence[SceneSpec]) -> None:
     if offenders:
         raise ValueError(f"forbidden derived/query files in prepared tree: {offenders[:10]}")
 
+    expected_output_file_count = 0
+    expected_rgb_file_count = 0
+    actual_rgb_file_count = 0
+    validated_rgb_file_count = 0
     for spec in specs:
         scene_dir = _output_scene_dir(build_root, spec)
         _require_file(scene_dir / "scene.json")
         _require_array(scene_dir / "tracks_3d.npy", (spec.frame_count, POINT_COUNT, 3), np.float32)
+        expected_output_file_count += 2 + len(VIEW_IDS) * (4 + spec.frame_count)
         for view in VIEW_IDS:
             view_dir = _require_dir(scene_dir / f"view_{view}")
             _require_array(view_dir / "depth.npy", (spec.frame_count, OUTPUT_HEIGHT, OUTPUT_WIDTH), np.float32)
@@ -1028,21 +1507,325 @@ def _validate_output_tree(build_root: Path, specs: Sequence[SceneSpec]) -> None:
             _require_array(view_dir / "visibility.npy", (spec.frame_count, POINT_COUNT), np.bool_)
             expected_jpegs = [f"rgba_{frame:05d}.jpg" for frame in range(spec.frame_count)]
             actual_jpegs = sorted(path.name for path in view_dir.glob("rgba_*.jpg"))
+            expected_rgb_file_count += len(expected_jpegs)
+            actual_rgb_file_count += len(actual_jpegs)
             if actual_jpegs != expected_jpegs:
                 raise ValueError(f"non-contiguous JPEG sequence in {view_dir}")
-            for jpeg_name in expected_jpegs:
-                decoded = cv2.imread(str(view_dir / jpeg_name), cv2.IMREAD_COLOR)
-                if decoded is None or decoded.shape != (OUTPUT_HEIGHT, OUTPUT_WIDTH, 3):
-                    raise ValueError(f"invalid prepared JPEG: {view_dir / jpeg_name}")
+            validation_jobs = (
+                JPEGValidationJob(
+                    split=spec.split,
+                    scene_id=spec.scene_id,
+                    view=view,
+                    frame=frame,
+                    path=str(view_dir / jpeg_name),
+                    expected_height=OUTPUT_HEIGHT,
+                    expected_width=OUTPUT_WIDTH,
+                )
+                for frame, jpeg_name in enumerate(expected_jpegs)
+            )
+            for count in _run_batches(
+                _iter_validation_batches(validation_jobs),
+                _validate_jpeg_batch,
+                process_pool=process_pool,
+                process_workers=process_workers,
+                stage="persisted JPEG validation",
+            ):
+                validated_rgb_file_count += count
         actual_view_dirs = {path.name for path in scene_dir.iterdir() if path.is_dir()}
         expected_view_dirs = {f"view_{view}" for view in VIEW_IDS}
         if actual_view_dirs != expected_view_dirs:
             raise ValueError(f"{scene_dir} must contain exactly {sorted(expected_view_dirs)}")
 
+    actual_output_file_count = sum(
+        1 for path in build_root.rglob("*") if path.is_file()
+    )
+    if actual_output_file_count != expected_output_file_count:
+        raise ValueError(
+            "prepared output file count does not match the exact contract: "
+            f"expected {expected_output_file_count}, got {actual_output_file_count}"
+        )
+    if validated_rgb_file_count != expected_rgb_file_count:
+        raise AssertionError("validated JPEG count does not match expected JPEG count")
+    return {
+        "planned_temporary_tree_file_count_before_root_report": expected_output_file_count,
+        "written_temporary_tree_file_count_before_root_report": actual_output_file_count,
+        "planned_rgb_file_count": expected_rgb_file_count,
+        "written_rgb_file_count": actual_rgb_file_count,
+        "validated_rgb_file_count": validated_rgb_file_count,
+    }
+
+
+def _aggregate_scene_statistics(
+    specs: Sequence[SceneSpec],
+    scene_stats: dict[tuple[str, str], dict[str, Any]],
+    output_validation: dict[str, int],
+    timings_seconds: dict[str, float],
+) -> dict[str, Any]:
+    track_fields = (
+        "track_id_count",
+        "frame_count",
+        "track_sample_count",
+        "coordinate_value_count",
+        "finite_coordinate_value_count",
+        "nonfinite_coordinate_value_count",
+    )
+    depth_count_fields = (
+        "value_count",
+        "finite_count",
+        "positive_count",
+        "zero_count",
+        "negative_count",
+        "nonfinite_count",
+    )
+    rgb_fields = (
+        "source_frame_count",
+        "output_frame_count",
+        "written_file_count",
+        "output_bytes",
+    )
+    visibility_fields = (
+        "visibility_true_before_gating",
+        "visibility_true_after_geometric_gating",
+        "visibility_removed_by_geometric_gating",
+        "depth_consistency_candidate_count",
+        "visibility_rejected_no_valid_depth",
+        "visibility_rejected_residual_over_tolerance",
+        "visibility_true_after_depth_consistency_gating",
+        "visibility_removed_by_depth_consistency_gating",
+        "visibility_true_after_gating",
+        "visibility_removed_by_gating",
+    )
+    track_totals = {field: 0 for field in track_fields}
+    depth_totals = {field: 0 for field in depth_count_fields}
+    rgb_totals = {field: 0 for field in rgb_fields}
+    visibility_totals = {field: 0 for field in visibility_fields}
+    source_chunk_frame_count = 0
+    source_camera_chunk_frame_count = 0
+    source_logical_asset_reference_count = 0
+    output_scene_frame_count = 0
+    output_camera_frame_count = 0
+    output_npy_file_count = 0
+    output_scene_json_file_count = 0
+    planned_scene_regular_file_count = 0
+    written_before_scene_metadata_file_count = 0
+    scene_accounted_stage_total = 0.0
+    finite_min: float | None = None
+    finite_max: float | None = None
+    for spec in specs:
+        stats = scene_stats[(spec.split, spec.scene_id)]
+        for field in track_fields:
+            track_totals[field] += int(stats["tracks"][field])
+        for field in depth_count_fields:
+            depth_totals[field] += int(stats["prepared_depth_all_views"][field])
+        for field in rgb_fields:
+            rgb_totals[field] += int(stats["rgb_all_views"][field])
+        scene_depth = stats["prepared_depth_all_views"]
+        if scene_depth["finite_min"] is not None:
+            value = float(scene_depth["finite_min"])
+            finite_min = value if finite_min is None else min(finite_min, value)
+        if scene_depth["finite_max"] is not None:
+            value = float(scene_depth["finite_max"])
+            finite_max = value if finite_max is None else max(finite_max, value)
+        for view_stats in stats["views"].values():
+            for field in visibility_fields:
+                visibility_totals[field] += int(view_stats[field])
+        source_io = stats["io_counts"]["source"]
+        output_io = stats["io_counts"]["output"]
+        source_chunk_frame_count += int(source_io["source_chunk_frame_count"])
+        source_camera_chunk_frame_count += int(
+            source_io["source_camera_chunk_frame_count"]
+        )
+        source_logical_asset_reference_count += int(
+            source_io["logical_asset_reference_count"]
+        )
+        output_scene_frame_count += int(output_io["scene_frame_count"])
+        output_camera_frame_count += int(output_io["camera_frame_count"])
+        output_npy_file_count += int(output_io["npy_file_count"])
+        output_scene_json_file_count += int(output_io["json_file_count"])
+        planned_scene_regular_file_count += int(
+            output_io["planned_scene_regular_file_count"]
+        )
+        written_before_scene_metadata_file_count += int(
+            output_io["written_before_scene_metadata_file_count"]
+        )
+        scene_accounted_stage_total += float(stats["accounted_scene_stage_total"])
+
+    if track_totals["finite_coordinate_value_count"] + track_totals[
+        "nonfinite_coordinate_value_count"
+    ] != track_totals["coordinate_value_count"]:
+        raise AssertionError("root track finite-value counts do not reconcile")
+    if depth_totals["finite_count"] + depth_totals["nonfinite_count"] != depth_totals[
+        "value_count"
+    ]:
+        raise AssertionError("root prepared-depth finite counts do not reconcile")
+    if depth_totals["positive_count"] + depth_totals["zero_count"] + depth_totals[
+        "negative_count"
+    ] != depth_totals["finite_count"]:
+        raise AssertionError("root prepared-depth sign counts do not reconcile")
+    if (finite_min is None) != (depth_totals["finite_count"] == 0) or (
+        (finite_max is None) != (depth_totals["finite_count"] == 0)
+    ):
+        raise AssertionError("root prepared-depth finite extrema do not reconcile")
+    if rgb_totals["source_frame_count"] != source_camera_chunk_frame_count:
+        raise AssertionError("source RGB frames do not reconcile with source camera frames")
+    if rgb_totals["output_frame_count"] != output_camera_frame_count:
+        raise AssertionError("output RGB frames do not reconcile with output camera frames")
+    if rgb_totals["written_file_count"] != rgb_totals["output_frame_count"]:
+        raise AssertionError("output RGB files do not reconcile with output RGB frames")
+
+    before = visibility_totals["visibility_true_before_gating"]
+    after_geometry = visibility_totals["visibility_true_after_geometric_gating"]
+    after_depth = visibility_totals[
+        "visibility_true_after_depth_consistency_gating"
+    ]
+    no_depth = visibility_totals["visibility_rejected_no_valid_depth"]
+    residual = visibility_totals["visibility_rejected_residual_over_tolerance"]
+    if before != after_geometry + visibility_totals["visibility_removed_by_geometric_gating"]:
+        raise AssertionError("root geometric-visibility counts do not reconcile")
+    if visibility_totals["depth_consistency_candidate_count"] != after_geometry:
+        raise AssertionError("root depth-consistency candidate counts do not reconcile")
+    if after_geometry != after_depth + no_depth + residual:
+        raise AssertionError("root depth-consistency rejection counts do not reconcile")
+    if visibility_totals["visibility_removed_by_depth_consistency_gating"] != (
+        no_depth + residual
+    ):
+        raise AssertionError("root depth-consistency removed counts do not reconcile")
+    if visibility_totals["visibility_true_after_gating"] != after_depth:
+        raise AssertionError("root final visibility aliases do not reconcile")
+    if visibility_totals["visibility_removed_by_gating"] != before - after_depth:
+        raise AssertionError("root total visibility-removed counts do not reconcile")
+
+    planned_tree_files = output_validation[
+        "planned_temporary_tree_file_count_before_root_report"
+    ]
+    written_tree_files = output_validation[
+        "written_temporary_tree_file_count_before_root_report"
+    ]
+    if planned_scene_regular_file_count != planned_tree_files:
+        raise AssertionError("planned scene files do not reconcile with output validation")
+    if written_tree_files != planned_tree_files:
+        raise AssertionError("written temporary-tree files do not reconcile with plan")
+    if output_scene_json_file_count != len(specs):
+        raise AssertionError("scene metadata file counts do not reconcile with scene count")
+    if rgb_totals["written_file_count"] != output_validation["written_rgb_file_count"]:
+        raise AssertionError("written RGB files do not reconcile with output validation")
+    if rgb_totals["written_file_count"] != output_validation["planned_rgb_file_count"]:
+        raise AssertionError("planned RGB files do not reconcile with conversion")
+    if rgb_totals["written_file_count"] != output_validation["validated_rgb_file_count"]:
+        raise AssertionError("validated RGB files do not reconcile with conversion")
+
+    source_sequence_count = len({spec.source_key for spec in specs})
+    source_unique_frame_count = sum(
+        grouped_specs[0].source_frame_count for grouped_specs in _group_by_source(specs)
+    )
+    source_distinct_logical_asset_count = source_sequence_count * (
+        2 + 5 * len(VIEW_IDS)
+    )
+
+    canonical_timing_fields = (
+        "path_and_scene_spec_setup",
+        "preflight",
+        "temporary_tree_setup",
+        "source_conversion",
+        "scene_metadata_write",
+        "output_validation",
+        "process_pool_shutdown",
+    )
+    for field in (*canonical_timing_fields, "measured_total", "accounted_stage_total", "unattributed_orchestration"):
+        value = float(timings_seconds[field])
+        if not np.isfinite(value) or value < 0.0:
+            raise AssertionError(f"invalid root timing value for {field}: {value}")
+    calculated_accounted_total = sum(
+        float(timings_seconds[field]) for field in canonical_timing_fields
+    )
+    if not np.isclose(
+        calculated_accounted_total,
+        float(timings_seconds["accounted_stage_total"]),
+        rtol=1e-9,
+        atol=1e-9,
+    ):
+        raise AssertionError("root accounted timing does not reconcile")
+    if not np.isclose(
+        calculated_accounted_total + float(timings_seconds["unattributed_orchestration"]),
+        float(timings_seconds["measured_total"]),
+        rtol=1e-9,
+        atol=1e-9,
+    ):
+        raise AssertionError("root measured timing does not reconcile")
+
+    return {
+        "scene_count": len(specs),
+        "source_sequence_count": source_sequence_count,
+        "tracks": {
+            "prepared_scene_track_id_slot_count": track_totals["track_id_count"],
+            "prepared_scene_frame_count": track_totals["frame_count"],
+            "track_sample_count": track_totals["track_sample_count"],
+            "coordinate_value_count": track_totals["coordinate_value_count"],
+            "finite_coordinate_value_count": track_totals[
+                "finite_coordinate_value_count"
+            ],
+            "nonfinite_coordinate_value_count": track_totals[
+                "nonfinite_coordinate_value_count"
+            ],
+        },
+        "prepared_depth": {
+            **depth_totals,
+            "finite_min": finite_min,
+            "finite_max": finite_max,
+        },
+        "rgb": {
+            **rgb_totals,
+        },
+        "visibility": {
+            **visibility_totals,
+            "depth_consistency_tolerance_metres": DEPTH_TRACK_TOLERANCE_METRES,
+        },
+        "io_counts": {
+            "source_sequence_count": source_sequence_count,
+            "source_unique_frame_count": source_unique_frame_count,
+            "source_chunk_frame_count": source_chunk_frame_count,
+            "source_camera_chunk_frame_count": source_camera_chunk_frame_count,
+            "source_distinct_logical_asset_count": source_distinct_logical_asset_count,
+            "source_logical_asset_reference_count": (
+                source_logical_asset_reference_count
+            ),
+            "source_logical_asset_semantics": (
+                "tracks and queries plus images, depth, intrinsics, extrinsics, and "
+                "visibility per view; each Zarr store counts as one logical asset"
+            ),
+            "prepared_scene_count": len(specs),
+            "output_scene_frame_count": output_scene_frame_count,
+            "output_camera_frame_count": output_camera_frame_count,
+            "output_jpeg_file_count": rgb_totals["written_file_count"],
+            "output_npy_file_count": output_npy_file_count,
+            "output_scene_json_file_count": output_scene_json_file_count,
+            "output_root_json_file_count": 1,
+            "converted_file_count_before_scene_metadata": (
+                written_before_scene_metadata_file_count
+            ),
+            "temporary_tree_file_count_before_root_report": written_tree_files,
+            "published_regular_file_count": written_tree_files + 1,
+        },
+        "output_validation": output_validation,
+        "timing": {
+            "clock": "time.perf_counter",
+            "scope": (
+                "path setup through process-pool shutdown; report write and atomic "
+                "publication are excluded"
+            ),
+            "scene_exclusive_stage_seconds": scene_accounted_stage_total,
+            "wall_seconds": timings_seconds,
+        },
+    }
+
 
 def _report(
     specs: Sequence[SceneSpec],
     recorder: ValidationRecorder,
+    scene_stats: dict[tuple[str, str], dict[str, Any]] | None = None,
+    output_validation: dict[str, int] | None = None,
+    timings_seconds: dict[str, float] | None = None,
+    workers: int = 1,
 ) -> dict[str, Any]:
     split_counts = {}
     for split in ("train", "validation", "test"):
@@ -1052,7 +1835,7 @@ def _report(
             "frames": sum(spec.frame_count for spec in split_specs),
             "source_sequences": len({spec.source_key for spec in split_specs}),
         }
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "format": "pointodyssey_mvtracker_preprocessed_validation",
         "status": "completed_with_ignored_validation_failures" if recorder.failures else "completed",
@@ -1069,56 +1852,179 @@ def _report(
             "python": platform.python_version(),
             "numpy": np.__version__,
             "opencv": cv2.__version__,
+            "opencv_parent_thread_count": int(cv2.getNumThreads()),
+        },
+        "workers": workers,
+        "processing_config": {
+            "worker_count": workers,
+            "process_pool_enabled": workers > 1,
+            "process_start_method": "spawn" if workers > 1 else None,
+            "opencv_threads_per_process_worker": 1,
         },
         "split_plan": [asdict(spec) for spec in specs],
     }
+    if scene_stats is not None and output_validation is not None:
+        report["statistics"] = _aggregate_scene_statistics(
+            specs,
+            scene_stats,
+            output_validation,
+            timings_seconds or {},
+        )
+    return report
 
 
-def preprocess(source_root: Path, output_root: Path, *, ignore_validation_failures: bool = False) -> None:
+def preprocess(
+    source_root: Path,
+    output_root: Path,
+    *,
+    ignore_validation_failures: bool = False,
+    workers: int = DEFAULT_WORKERS,
+) -> None:
+    if workers <= 0:
+        raise ValueError("workers must be a positive integer")
+    total_start = time.perf_counter()
     source_root = Path(source_root).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
     specs = build_scene_specs()
+    path_setup_seconds = time.perf_counter() - total_start
+    preflight_start = time.perf_counter()
     preflight(source_root, output_root, specs)
+    timings_seconds: dict[str, float] = {
+        "path_and_scene_spec_setup": path_setup_seconds,
+        "preflight": time.perf_counter() - preflight_start,
+    }
     recorder = ValidationRecorder(ignore_validation_failures)
     scene_stats: dict[tuple[str, str], dict[str, Any]] = {}
 
-    build_root = Path(
-        tempfile.mkdtemp(prefix=f".{output_root.name}.tmp-", dir=str(output_root.parent))
-    )
+    build_root: Path | None = None
+    process_pool: ProcessPoolExecutor | None = None
     try:
+        build_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output_root.name}.tmp-",
+                dir=str(output_root.parent),
+            )
+        )
+        if workers > 1:
+            process_pool = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_process_worker,
+            )
+        stage_start = time.perf_counter()
         _prepare_scene_roots(build_root, specs)
+        temporary_tree_setup_seconds = time.perf_counter() - stage_start
+        timings_seconds["temporary_tree_setup"] = temporary_tree_setup_seconds
+        stage_start = time.perf_counter()
         for source_specs in _group_by_source(specs):
             print(
                 f"POINTODYSSEY_PREPROCESS_SOURCE {source_specs[0].layout} "
                 f"{source_specs[0].source_sequence}",
                 flush=True,
             )
-            _convert_source_group(source_root, build_root, source_specs, recorder, scene_stats)
+            _convert_source_group(
+                source_root,
+                build_root,
+                source_specs,
+                recorder,
+                scene_stats,
+                process_pool=process_pool,
+                process_workers=workers,
+            )
+        timings_seconds["source_conversion"] = time.perf_counter() - stage_start
+        stage_start = time.perf_counter()
         _write_scene_metadata(build_root, specs, recorder, scene_stats)
-        _validate_output_tree(build_root, specs)
-        report = _report(specs, recorder)
+        timings_seconds["scene_metadata_write"] = time.perf_counter() - stage_start
+        stage_start = time.perf_counter()
+        output_validation = _validate_output_tree(
+            build_root,
+            specs,
+            process_pool=process_pool,
+            process_workers=workers,
+        )
+        timings_seconds["output_validation"] = time.perf_counter() - stage_start
+        stage_start = time.perf_counter()
+        if process_pool is not None:
+            process_pool.shutdown(wait=True, cancel_futures=True)
+            process_pool = None
+        timings_seconds["process_pool_shutdown"] = time.perf_counter() - stage_start
+        measured_total = time.perf_counter() - total_start
+        accounted_fields = (
+            "path_and_scene_spec_setup",
+            "preflight",
+            "temporary_tree_setup",
+            "source_conversion",
+            "scene_metadata_write",
+            "output_validation",
+            "process_pool_shutdown",
+        )
+        accounted_total = sum(timings_seconds[field] for field in accounted_fields)
+        timings_seconds["measured_total"] = measured_total
+        timings_seconds["accounted_stage_total"] = accounted_total
+        timings_seconds["unattributed_orchestration"] = measured_total - accounted_total
+        report = _report(
+            specs,
+            recorder,
+            scene_stats,
+            output_validation,
+            timings_seconds,
+            workers,
+        )
+        report_start = time.perf_counter()
         with (build_root / "validation_report.json").open("w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
+        report_write_seconds = time.perf_counter() - report_start
         recorder.raise_if_strict()
         if output_root.exists():
             raise FileExistsError(f"output root appeared during preprocessing: {output_root}")
         os.replace(build_root, output_root)
-    except Exception:
-        shutil.rmtree(build_root, ignore_errors=True)
+    except BaseException:
+        if process_pool is not None:
+            try:
+                process_pool.shutdown(wait=True, cancel_futures=True)
+            except BaseException as shutdown_exc:
+                print(
+                    f"POINTODYSSEY_PREPROCESS_SHUTDOWN_ERROR {shutdown_exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if build_root is not None:
+            shutil.rmtree(build_root, ignore_errors=True)
         raise
 
+    total_seconds = time.perf_counter() - total_start
     print(
         f"POINTODYSSEY_PREPROCESS_DONE output={output_root} scenes={len(specs)} "
-        f"semantic_failures={len(recorder.failures)}",
+        f"semantic_failures={len(recorder.failures)} workers={workers} "
+        f"report_write_seconds={report_write_seconds:.6f} total_seconds={total_seconds:.6f}",
         flush=True,
     )
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=DEFAULT_WORKERS,
+        help=(
+            "Number of RGB/JPEG worker processes. Use 1 for the deterministic serial path "
+            f"(default: {DEFAULT_WORKERS})."
+        ),
+    )
     parser.add_argument(
         "--ignore-validation-failures",
         action="store_true",
@@ -1136,6 +2042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.source_root,
         args.output_root,
         ignore_validation_failures=args.ignore_validation_failures,
+        workers=args.workers,
     )
     return 0
 
