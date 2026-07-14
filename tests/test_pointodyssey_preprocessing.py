@@ -1,8 +1,10 @@
+import io
 import json
 import multiprocessing
 import tempfile
 import unittest
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -117,6 +119,142 @@ class CommandLineTests(unittest.TestCase):
                     preprocessing.parse_args(
                         [*self._base_args(), "--workers", workers]
                     )
+
+
+class ProgressReporterTests(unittest.TestCase):
+    @staticmethod
+    def _spec() -> preprocessing.SceneSpec:
+        return preprocessing.SceneSpec(
+            split="train",
+            scene_id="000000",
+            layout="raw",
+            source_sequence="synthetic",
+            environment_family="synthetic",
+            source_frame_start=0,
+            source_frame_end=2,
+            source_frame_count=2,
+            source_fps=30,
+        )
+
+    def test_atomic_progress_sidecar_and_terminal_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "prepared"
+            spec = self._spec()
+            recorder = preprocessing.ValidationRecorder(ignore_failures=True)
+            reporter = preprocessing.ProgressReporter(
+                root / "source",
+                output_root,
+                [spec],
+                workers=3,
+                update_interval_seconds=0.0,
+            )
+            reporter.bind_recorder(recorder)
+            terminal = io.StringIO()
+            with redirect_stdout(terminal):
+                reporter.set_stage("converting", "source_conversion")
+                reporter.set_active(
+                    "rgb",
+                    layout="raw",
+                    source_sequence="synthetic",
+                    split="train",
+                    scene_id="000000",
+                    view=2,
+                )
+                recorder.record(spec, "synthetic", -1, "non-negative")
+                reporter.record_invalid_rgb_frame(spec, 1)
+                reporter.record_invalid_rgb_frame(spec, 1)
+                reporter.advance_many(
+                    sources=1,
+                    scenes=1,
+                    frames=2,
+                    camera_frames=8,
+                    jpegs=8,
+                    validated_jpegs=8,
+                    output_bytes=4096,
+                )
+                reporter.completed()
+
+            progress_path = Path(f"{output_root}.progress.json")
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["format"], "pointodyssey_preprocessing_progress")
+            self.assertEqual(payload["status"], "completed")
+            self.assertEqual(payload["workers"], 3)
+            self.assertEqual(payload["active"]["stage"], "completed")
+            self.assertEqual(payload["progress"]["frames"], {
+                "completed": 2,
+                "total": 2,
+                "percent": 100.0,
+            })
+            self.assertEqual(payload["progress"]["output_bytes"]["completed"], 4096)
+            self.assertIsNone(payload["progress"]["output_bytes"]["total"])
+            self.assertIsNone(payload["progress"]["output_bytes"]["percent"])
+            self.assertEqual(payload["diagnostics"], {
+                "semantic_validation_failures": 1,
+                "invalid_rgb_frames": 1,
+            })
+            self.assertIn("source_conversion", payload["timing"]["stages_seconds"])
+            self.assertEqual(payload["timing"]["current_stage_elapsed_seconds"], 0.0)
+            self.assertIsNone(payload["error"])
+            self.assertIn("POINTODYSSEY_PROGRESS status=completed", terminal.getvalue())
+            self.assertFalse(list(root.glob(".*progress.json.tmp-*")))
+
+    def test_failure_state_keeps_exception_details(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "prepared"
+            reporter = preprocessing.ProgressReporter(
+                root / "source",
+                output_root,
+                [self._spec()],
+                workers=1,
+            )
+            with redirect_stderr(io.StringIO()):
+                reporter.failed(ValueError("synthetic failure"))
+
+            payload = json.loads(
+                Path(f"{output_root}.progress.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["active"]["stage"], "failed")
+            self.assertEqual(payload["error"], {
+                "type": "ValueError",
+                "message": "synthetic failure",
+            })
+
+    def test_active_phase_does_not_finish_top_level_stage_timing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reporter = preprocessing.ProgressReporter(
+                root / "source",
+                root / "prepared",
+                [self._spec()],
+                workers=1,
+                update_interval_seconds=0.0,
+            )
+            with redirect_stdout(io.StringIO()):
+                reporter.set_stage("converting", "source_conversion")
+                reporter.set_active("tracks")
+                tracks_snapshot = reporter.snapshot()
+                reporter.set_active("depth")
+                depth_snapshot = reporter.snapshot()
+
+            self.assertEqual(tracks_snapshot["active"]["stage"], "source_conversion")
+            self.assertEqual(tracks_snapshot["active"]["phase"], "tracks")
+            self.assertEqual(depth_snapshot["active"]["stage"], "source_conversion")
+            self.assertEqual(depth_snapshot["active"]["phase"], "depth")
+            self.assertNotIn(
+                "source_conversion",
+                depth_snapshot["timing"]["stages_seconds"],
+            )
+
+            with redirect_stdout(io.StringIO()):
+                reporter.set_stage("validating_output", "output_validation")
+            transitioned = reporter.snapshot()
+            self.assertIn("source_conversion", transitioned["timing"]["stages_seconds"])
+            self.assertEqual(transitioned["active"]["stage"], "output_validation")
+            self.assertIsNone(transitioned["active"]["phase"])
 
 
 class DepthTrackConsistencyMaskTests(unittest.TestCase):
@@ -1011,19 +1149,43 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             SCALE_Y=1.0,
         ), mock.patch.object(preprocessing, "_validate_source_queries"):
             preprocessing._prepare_scene_roots(build_root, [spec])
-            preprocessing._convert_source_group(
+            progress = preprocessing.ProgressReporter(
                 source_root,
-                build_root,
+                root / "prepared",
                 [spec],
-                recorder,
-                scene_stats,
-                process_workers=1,
+                workers=1,
+                update_interval_seconds=0.0,
             )
+            with redirect_stdout(io.StringIO()):
+                preprocessing._convert_source_group(
+                    source_root,
+                    build_root,
+                    [spec],
+                    recorder,
+                    scene_stats,
+                    process_workers=1,
+                    progress=progress,
+                )
             metadata = preprocessing._scene_metadata(
                 spec,
                 recorder,
                 scene_stats[(spec.split, spec.scene_id)],
             )
+            with redirect_stdout(io.StringIO()):
+                preprocessing._write_scene_metadata(
+                    build_root,
+                    [spec],
+                    recorder,
+                    scene_stats,
+                    progress=progress,
+                )
+                preprocessing._validate_output_tree(
+                    build_root,
+                    [spec],
+                    process_workers=1,
+                    progress=progress,
+                )
+            progress_snapshot = progress.snapshot()
 
         rgb_stats = scene_stats[(spec.split, spec.scene_id)]["views"]["0"]["rgb"]
         self.assertEqual(rgb_stats["source_decode_failure_count"], 1)
@@ -1046,6 +1208,66 @@ class ConverterDepthConsistencyIntegrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(metadata["output"]["rgb"]["invalid_frame_indices"], [0])
+        self.assertEqual(
+            progress_snapshot["statistics"]["tracks"],
+            {
+                "track_id_slots": 1,
+                "track_samples": 1,
+                "coordinate_values": 3,
+                "finite_coordinate_values": 3,
+                "nonfinite_coordinate_values": 0,
+            },
+        )
+        self.assertEqual(
+            progress_snapshot["statistics"]["depth"],
+            {
+                "values": 4,
+                "finite": 4,
+                "positive": 4,
+                "zero": 0,
+                "negative": 0,
+                "nonfinite": 0,
+                "finite_min": 1.0,
+                "finite_max": 1.0,
+            },
+        )
+        self.assertEqual(
+            progress_snapshot["statistics"]["visibility"],
+            {
+                "before_gating": 1,
+                "after_geometric_gating": 1,
+                "rejected_no_valid_depth": 0,
+                "rejected_residual_over_tolerance": 0,
+                "accepted": 1,
+            },
+        )
+        output_jpeg_bytes = (build_root / "train" / "000000" / "view_0" / "rgba_00000.jpg").stat().st_size
+        self.assertEqual(
+            progress_snapshot["statistics"]["rgb"],
+            {
+                "source_frames": 1,
+                "output_frames": 1,
+                "output_bytes": output_jpeg_bytes,
+                "invalid_frames": 1,
+            },
+        )
+        self.assertEqual(
+            progress_snapshot["statistics"]["io"],
+            {
+                "source_scene_frames": 1,
+                "source_camera_frames": 1,
+                "source_files": 7,
+                "output_scene_frames": 1,
+                "output_camera_frames": 1,
+                "output_files": 7,
+            },
+        )
+        self.assertEqual(progress_snapshot["progress"]["camera_frames"]["completed"], 1)
+        self.assertEqual(progress_snapshot["progress"]["jpegs"]["completed"], 1)
+        self.assertEqual(
+            progress_snapshot["progress"]["validated_jpegs"]["completed"],
+            1,
+        )
         self.assertEqual(
             metadata["output"]["rgb"]["decode_failure_placeholder"],
             {
@@ -1324,6 +1546,63 @@ class ValidationPolicyTests(unittest.TestCase):
     def test_structural_failure_remains_fatal_in_ignore_mode(self):
         self._run_mock_preprocess(ignore=True, structural_failure=True, expected_exception=ValueError)
 
+    def test_completed_sidecar_precedes_publication_and_is_not_rewritten_after(self):
+        original_replace = preprocessing.os.replace
+        observed_at_publication = []
+
+        def observe_replace(source, destination):
+            if Path(source).is_dir():
+                progress_path = Path(f"{destination}.progress.json")
+                observed_at_publication.append(
+                    json.loads(progress_path.read_text(encoding="utf-8"))
+                )
+            return original_replace(source, destination)
+
+        with mock.patch.object(preprocessing.os, "replace", side_effect=observe_replace):
+            output_root = self._run_mock_preprocess(ignore=True)
+
+        self.assertEqual(len(observed_at_publication), 1)
+        self.assertEqual(observed_at_publication[0]["status"], "completed")
+        final_payload = json.loads(
+            Path(f"{output_root}.progress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(final_payload, observed_at_publication[0])
+
+    def test_publication_failure_overwrites_completed_sidecar_without_double_timing(self):
+        original_replace = preprocessing.os.replace
+        completed_at_publication = []
+
+        def fail_dataset_replace(source, destination):
+            if Path(source).is_dir():
+                progress_path = Path(f"{destination}.progress.json")
+                completed_at_publication.append(
+                    json.loads(progress_path.read_text(encoding="utf-8"))
+                )
+                raise OSError("synthetic publication failure")
+            return original_replace(source, destination)
+
+        with mock.patch.object(
+            preprocessing.os,
+            "replace",
+            side_effect=fail_dataset_replace,
+        ):
+            output_root = self._run_mock_preprocess(
+                ignore=True,
+                expected_exception=OSError,
+            )
+
+        self.assertEqual(len(completed_at_publication), 1)
+        self.assertEqual(completed_at_publication[0]["status"], "completed")
+        failed_payload = json.loads(
+            Path(f"{output_root}.progress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(failed_payload["status"], "failed")
+        self.assertEqual(
+            failed_payload["timing"]["stages_seconds"],
+            completed_at_publication[0]["timing"]["stages_seconds"],
+        )
+        self.assertEqual(failed_payload["error"]["type"], "OSError")
+
     def _run_mock_preprocess(
         self,
         *,
@@ -1346,9 +1625,11 @@ class ValidationPolicyTests(unittest.TestCase):
             *,
             process_pool,
             process_workers,
+            progress,
         ):
             self.assertIsNone(process_pool)
             self.assertEqual(process_workers, 1)
+            self.assertIsInstance(progress, preprocessing.ProgressReporter)
             if structural_failure:
                 raise ValueError("synthetic structural failure")
             recorder.record(spec, "synthetic_semantic_failure", -1, "non-negative")

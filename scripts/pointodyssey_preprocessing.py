@@ -21,6 +21,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
 
@@ -67,6 +68,9 @@ DEFAULT_WORKERS = 4
 RGB_MAX_BATCH_FRAMES = 8
 RGB_MAX_BATCH_BYTES = 8 * 1024 * 1024
 JPEG_VALIDATION_BATCH_FILES = 32
+PROGRESS_SCHEMA_VERSION = 1
+PROGRESS_UPDATE_INTERVAL_SECONDS = 1.0
+PROGRESS_TERMINAL_INTERVAL_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,362 @@ BatchOutput = TypeVar("BatchOutput")
 
 class SemanticValidationError(RuntimeError):
     """Raised after conversion when strict semantic validation has failed."""
+
+
+class ProgressReporter:
+    """Publish bounded live progress to the terminal and an atomic JSON sidecar."""
+
+    _COUNT_KEYS = (
+        "sources",
+        "scenes",
+        "frames",
+        "camera_frames",
+        "jpegs",
+        "validated_jpegs",
+        "output_bytes",
+    )
+
+    def __init__(
+        self,
+        source_root: Path,
+        output_root: Path,
+        specs: Sequence[SceneSpec],
+        workers: int,
+        *,
+        update_interval_seconds: float = PROGRESS_UPDATE_INTERVAL_SECONDS,
+    ) -> None:
+        if update_interval_seconds < 0.0:
+            raise ValueError("progress update interval must be non-negative")
+        self.source_root = Path(source_root)
+        self.output_root = Path(output_root)
+        self.path = Path(f"{self.output_root}.progress.json")
+        self.workers = int(workers)
+        self.update_interval_seconds = float(update_interval_seconds)
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self._start = time.perf_counter()
+        self._last_emit = float("-inf")
+        self._last_terminal_emit = float("-inf")
+        self._stage_started = self._start
+        self._stage_name = "setup"
+        self._stage_running = True
+        self._stages_seconds: dict[str, float] = {}
+        self.status = "starting"
+        self.active: dict[str, Any] = {
+            "stage": "setup",
+            "phase": None,
+            "layout": None,
+            "source_sequence": None,
+            "split": None,
+            "scene_id": None,
+            "view": None,
+        }
+        camera_frames = sum(spec.frame_count for spec in specs) * len(VIEW_IDS)
+        self._totals: dict[str, int | None] = {
+            "sources": len({spec.source_key for spec in specs}),
+            "scenes": len(specs),
+            "frames": sum(spec.frame_count for spec in specs),
+            "camera_frames": camera_frames,
+            "jpegs": camera_frames,
+            "validated_jpegs": camera_frames,
+            # Output JPEG size is known only after encoding.
+            "output_bytes": None,
+        }
+        self._completed = {key: 0 for key in self._COUNT_KEYS}
+        self._semantic_validation_failures = 0
+        self._invalid_rgb_frames = 0
+        self._invalid_rgb_frame_keys: set[tuple[str, str, int]] = set()
+        self._recorder: ValidationRecorder | None = None
+        self._error: dict[str, str] | None = None
+        self._statistics: dict[str, dict[str, Any]] = {
+            "tracks": {
+                "track_id_slots": 0,
+                "track_samples": 0,
+                "coordinate_values": 0,
+                "finite_coordinate_values": 0,
+                "nonfinite_coordinate_values": 0,
+            },
+            "depth": {
+                "values": 0,
+                "finite": 0,
+                "positive": 0,
+                "zero": 0,
+                "negative": 0,
+                "nonfinite": 0,
+                "finite_min": None,
+                "finite_max": None,
+            },
+            "visibility": {
+                "before_gating": 0,
+                "after_geometric_gating": 0,
+                "rejected_no_valid_depth": 0,
+                "rejected_residual_over_tolerance": 0,
+                "accepted": 0,
+            },
+            "rgb": {
+                "source_frames": 0,
+                "output_frames": 0,
+                "output_bytes": 0,
+                "invalid_frames": 0,
+            },
+            "io": {
+                "source_scene_frames": 0,
+                "source_camera_frames": 0,
+                "source_files": 0,
+                "output_scene_frames": 0,
+                "output_camera_frames": 0,
+                "output_files": 0,
+            },
+        }
+
+    def bind_recorder(self, recorder: "ValidationRecorder") -> None:
+        self._recorder = recorder
+
+    def set_stage(self, status: str, stage: str, **active: Any) -> None:
+        now = time.perf_counter()
+        self._finish_current_stage(now)
+        self._stage_name = stage
+        self._stage_started = now
+        self._stage_running = True
+        self.status = status
+        self.active.update(
+            {
+                "stage": stage,
+                "phase": None,
+                "layout": None,
+                "source_sequence": None,
+                "split": None,
+                "scene_id": None,
+                "view": None,
+            }
+        )
+        self.active.update(active)
+        self.emit(force=True)
+
+    def set_active(self, phase: str, *, force: bool = False, **active: Any) -> None:
+        self.active["phase"] = phase
+        self.active.update(active)
+        self.emit(force=force)
+
+    def advance(self, key: str, amount: int = 1) -> None:
+        self.advance_many(**{key: amount})
+
+    def advance_many(self, **amounts: int) -> None:
+        for key, amount in amounts.items():
+            if key not in self._completed:
+                raise KeyError(f"unknown progress counter: {key}")
+            if amount < 0:
+                raise ValueError("progress counters cannot move backwards")
+            self._completed[key] += int(amount)
+            total = self._totals[key]
+            if total is not None and self._completed[key] > total:
+                raise AssertionError(f"progress counter exceeds total: {key}")
+        self.emit()
+
+    def record_invalid_rgb_frame(self, spec: SceneSpec, local_frame: int) -> None:
+        self._invalid_rgb_frame_keys.add((spec.split, spec.scene_id, int(local_frame)))
+        self._invalid_rgb_frames = len(self._invalid_rgb_frame_keys)
+        self._statistics["rgb"]["invalid_frames"] = self._invalid_rgb_frames
+        self.emit()
+
+    def add_statistics(self, section: str, **increments: int) -> None:
+        if section not in self._statistics:
+            raise KeyError(f"unknown statistics section: {section}")
+        target = self._statistics[section]
+        for key, amount in increments.items():
+            if key not in target or key in {"finite_min", "finite_max"}:
+                raise KeyError(f"unknown cumulative statistic: {section}.{key}")
+            if amount < 0:
+                raise ValueError("cumulative statistics cannot move backwards")
+            target[key] += int(amount)
+        self.emit()
+
+    def add_depth_statistics(
+        self,
+        *,
+        values: int,
+        finite: int,
+        positive: int,
+        zero: int,
+        negative: int,
+        nonfinite: int,
+        finite_min: float | None,
+        finite_max: float | None,
+    ) -> None:
+        target = self._statistics["depth"]
+        increments = {
+            "values": values,
+            "finite": finite,
+            "positive": positive,
+            "zero": zero,
+            "negative": negative,
+            "nonfinite": nonfinite,
+        }
+        for key, amount in increments.items():
+            if amount < 0:
+                raise ValueError("depth statistics cannot move backwards")
+            target[key] += int(amount)
+        if finite_min is not None:
+            current = target["finite_min"]
+            target["finite_min"] = finite_min if current is None else min(current, finite_min)
+        if finite_max is not None:
+            current = target["finite_max"]
+            target["finite_max"] = finite_max if current is None else max(current, finite_max)
+        self.emit()
+
+    def completed(self) -> None:
+        now = time.perf_counter()
+        self._finish_current_stage(now)
+        self.status = "completed"
+        self.active.update(
+            {
+                "stage": "completed",
+                "phase": None,
+                "layout": None,
+                "source_sequence": None,
+                "split": None,
+                "scene_id": None,
+                "view": None,
+            }
+        )
+        self.emit(force=True)
+
+    def failed(self, error: BaseException) -> None:
+        if self.status == "failed":
+            return
+        now = time.perf_counter()
+        self._finish_current_stage(now)
+        self.status = "failed"
+        self.active["stage"] = "failed"
+        self.active["phase"] = None
+        self._error = {"type": type(error).__name__, "message": str(error)}
+        self.emit(force=True, file=sys.stderr)
+
+    def snapshot(self) -> dict[str, Any]:
+        now = time.perf_counter()
+        elapsed = max(0.0, now - self._start)
+        if self._recorder is not None:
+            self._semantic_validation_failures = len(self._recorder.failures)
+        progress: dict[str, dict[str, Any]] = {}
+        rates: dict[str, float] = {}
+        rate_names = {
+            "sources": "sources_per_second",
+            "scenes": "scenes_per_second",
+            "frames": "frames_per_second",
+            "camera_frames": "camera_frames_per_second",
+            "jpegs": "jpegs_per_second",
+            "validated_jpegs": "validated_jpegs_per_second",
+            "output_bytes": "output_mib_per_second",
+        }
+        for key in self._COUNT_KEYS:
+            completed = self._completed[key]
+            total = self._totals[key]
+            percent = None if total is None else (100.0 * completed / total if total else 100.0)
+            progress[key] = {
+                "completed": completed,
+                "total": total,
+                "percent": percent,
+            }
+            rate = completed / elapsed if elapsed > 0.0 else 0.0
+            if key == "output_bytes":
+                rate /= 1024**2
+            rates[rate_names[key]] = rate
+        return {
+            "schema_version": PROGRESS_SCHEMA_VERSION,
+            "format": "pointodyssey_preprocessing_progress",
+            "status": self.status,
+            "started_at": self.started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "elapsed_seconds": elapsed,
+            "source_root": str(self.source_root),
+            "output_root": str(self.output_root),
+            "workers": self.workers,
+            "active": dict(self.active),
+            "progress": progress,
+            "rates": rates,
+            "diagnostics": {
+                "semantic_validation_failures": self._semantic_validation_failures,
+                "invalid_rgb_frames": self._invalid_rgb_frames,
+            },
+            "counter_semantics": {
+                "camera_frames": "depth camera frames fully processed",
+                "output_bytes": "encoded output JPEG bytes written",
+                "source_files": "distinct logical source assets opened per source sequence",
+            },
+            "statistics": {
+                section: dict(values) for section, values in self._statistics.items()
+            },
+            "timing": {
+                "current_stage_elapsed_seconds": (
+                    0.0
+                    if self.status in {"completed", "failed"}
+                    else max(0.0, now - self._stage_started)
+                ),
+                "stages_seconds": dict(self._stages_seconds),
+            },
+            "error": self._error,
+        }
+
+    def _finish_current_stage(self, now: float) -> None:
+        if not self._stage_running:
+            return
+        elapsed = max(0.0, now - self._stage_started)
+        self._stages_seconds[self._stage_name] = (
+            self._stages_seconds.get(self._stage_name, 0.0) + elapsed
+        )
+        self._stage_running = False
+
+    def emit(self, *, force: bool = False, file: Any = None) -> None:
+        now = time.perf_counter()
+        if not force and now - self._last_emit < self.update_interval_seconds:
+            return
+        snapshot = self.snapshot()
+        temporary_path = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}")
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+        os.replace(temporary_path, self.path)
+        self._last_emit = now
+        if not force and now - self._last_terminal_emit < PROGRESS_TERMINAL_INTERVAL_SECONDS:
+            return
+        self._last_terminal_emit = now
+        progress = snapshot["progress"]
+        rates = snapshot["rates"]
+
+        def count(name: str) -> str:
+            item = progress[name]
+            total = "?" if item["total"] is None else str(item["total"])
+            return f"{item['completed']}/{total}"
+
+        active = snapshot["active"]
+        source = active["source_sequence"] or "-"
+        scene = (
+            f"{active['split']}/{active['scene_id']}"
+            if active["split"] is not None and active["scene_id"] is not None
+            else "-"
+        )
+        view = "-" if active["view"] is None else str(active["view"])
+        layout = active["layout"] or "-"
+        phase = active["phase"] or "-"
+        print(
+            "POINTODYSSEY_PROGRESS "
+            f"status={snapshot['status']} stage={active['stage']} phase={phase} "
+            f"layout={layout} "
+            f"source={source} scene={scene} view={view} workers={self.workers} "
+            f"elapsed={snapshot['elapsed_seconds']:.1f}s "
+            f"sources={count('sources')} scenes={count('scenes')} "
+            f"frames={count('frames')} camera_frames={count('camera_frames')} "
+            f"jpegs={count('jpegs')} validated_jpegs={count('validated_jpegs')} "
+            f"bytes={progress['output_bytes']['completed']} "
+            f"fps={rates['frames_per_second']:.2f} "
+            f"camera_fps={rates['camera_frames_per_second']:.2f} "
+            f"jpegps={rates['jpegs_per_second']:.2f} "
+            f"validated_jpegps={rates['validated_jpegs_per_second']:.2f} "
+            f"mibps={rates['output_mib_per_second']:.2f} "
+            f"failures={snapshot['diagnostics']['semantic_validation_failures']} "
+            f"invalid_rgb={snapshot['diagnostics']['invalid_rgb_frames']}",
+            file=file,
+            flush=True,
+        )
 
 
 class ValidationRecorder:
@@ -975,6 +1335,7 @@ def _convert_source_group(
     scene_stats: dict[tuple[str, str], dict[str, Any]],
     process_pool: ProcessPoolExecutor | None = None,
     process_workers: int = 1,
+    progress: ProgressReporter | None = None,
 ) -> None:
     if process_workers <= 0:
         raise ValueError("process_workers must be positive")
@@ -1011,6 +1372,15 @@ def _convert_source_group(
 
     track_finite_masks: dict[tuple[str, str], np.ndarray] = {}
     for spec in source_specs:
+        if progress is not None:
+            progress.set_active(
+                "tracks",
+                layout=spec.layout,
+                source_sequence=spec.source_sequence,
+                split=spec.split,
+                scene_id=spec.scene_id,
+                view=None,
+            )
         track_start = time.perf_counter()
         output_scene = _output_scene_dir(build_root, spec)
         tracks_chunk = np.asarray(tracks[spec.source_frame_start : spec.source_frame_end], dtype=np.float32)
@@ -1028,6 +1398,16 @@ def _convert_source_group(
         track_finite_masks[(spec.split, spec.scene_id)] = finite_track_samples
         coordinate_count = int(tracks_chunk.size)
         finite_coordinate_count = int(finite_coordinates.sum())
+        if progress is not None:
+            progress.add_statistics(
+                "tracks",
+                track_id_slots=POINT_COUNT,
+                track_samples=spec.frame_count * POINT_COUNT,
+                coordinate_values=coordinate_count,
+                finite_coordinate_values=finite_coordinate_count,
+                nonfinite_coordinate_values=coordinate_count - finite_coordinate_count,
+            )
+            progress.add_statistics("io", output_files=1)
         track_seconds = time.perf_counter() - track_start
         scene_stats[(spec.split, spec.scene_id)] = {
             "tracks": {
@@ -1063,6 +1443,16 @@ def _convert_source_group(
             extrinsics_chunk = np.ascontiguousarray(extrinsics_chunk_4x4[:, :3, :4])
             source_visibility = np.asarray(visibilities[view][start:end], dtype=bool)
             tracks_chunk = np.asarray(tracks[start:end], dtype=np.float32)
+
+            if progress is not None:
+                progress.set_active(
+                    "projection",
+                    layout=spec.layout,
+                    source_sequence=spec.source_sequence,
+                    split=spec.split,
+                    scene_id=spec.scene_id,
+                    view=view,
+                )
 
             _record_finite_failure(
                 recorder,
@@ -1137,6 +1527,15 @@ def _convert_source_group(
             np.save(output_view / "intrinsics.npy", np.ascontiguousarray(resized_k))
             np.save(output_view / "extrinsics_w2c.npy", extrinsics_chunk)
 
+            if progress is not None:
+                progress.set_active(
+                    "depth",
+                    layout=spec.layout,
+                    source_sequence=spec.source_sequence,
+                    split=spec.split,
+                    scene_id=spec.scene_id,
+                    view=view,
+                )
             depth_start = time.perf_counter()
             depth_output = np.lib.format.open_memmap(
                 output_view / "depth.npy",
@@ -1184,6 +1583,8 @@ def _convert_source_group(
                 prepared_depth_zero_count += int(prepared_zero.sum())
                 prepared_depth_negative_count += int(prepared_negative.sum())
                 prepared_depth_nonfinite_count += int((~prepared_finite).sum())
+                frame_min: float | None = None
+                frame_max: float | None = None
                 if frame_finite_count:
                     frame_values = resized_depth_frame[prepared_finite]
                     frame_min = float(frame_values.min())
@@ -1199,6 +1600,19 @@ def _convert_source_group(
                         else max(prepared_depth_finite_max, frame_max)
                     )
 
+                if progress is not None:
+                    progress.add_depth_statistics(
+                        values=int(resized_depth_frame.size),
+                        finite=frame_finite_count,
+                        positive=int(prepared_positive.sum()),
+                        zero=int(prepared_zero.sum()),
+                        negative=int(prepared_negative.sum()),
+                        nonfinite=int((~prepared_finite).sum()),
+                        finite_min=frame_min,
+                        finite_max=frame_max,
+                    )
+                    progress.add_statistics("io", source_camera_frames=1)
+
                 depth_consistent, any_valid_depth = _depth_track_consistency_masks(
                     resized_depth_frame,
                     projected_xy[local_frame],
@@ -1211,9 +1625,13 @@ def _convert_source_group(
                 rejected_residual_over_tolerance += int(
                     (frame_candidates & any_valid_depth & ~depth_consistent).sum()
                 )
+                if progress is not None:
+                    progress.advance("camera_frames")
             depth_output.flush()
             del depth_output
             np.save(output_view / "visibility.npy", np.ascontiguousarray(output_visibility))
+            if progress is not None:
+                progress.add_statistics("io", output_files=4)
             depth_seconds = time.perf_counter() - depth_start
 
             before = int(source_visibility.sum())
@@ -1235,6 +1653,15 @@ def _convert_source_group(
                 != prepared_depth_pixel_count
             ):
                 raise AssertionError("prepared-depth category counts do not reconcile")
+            if progress is not None:
+                progress.add_statistics(
+                    "visibility",
+                    before_gating=before,
+                    after_geometric_gating=after_geometry,
+                    rejected_no_valid_depth=rejected_no_valid_depth,
+                    rejected_residual_over_tolerance=rejected_residual_over_tolerance,
+                    accepted=after_depth_consistency,
+                )
 
             view_stats = {
                 "source_chunk_frame_count": spec.frame_count,
@@ -1313,6 +1740,15 @@ def _convert_source_group(
                     frame=first_negative_frame,
                 )
 
+            if progress is not None:
+                progress.set_active(
+                    "rgb",
+                    layout=spec.layout,
+                    source_sequence=spec.source_sequence,
+                    split=spec.split,
+                    scene_id=spec.scene_id,
+                    view=view,
+                )
             rgb_start = time.perf_counter()
             rgb_jobs = _iter_scene_rgb_jobs(images, spec, view, output_view)
             rgb_batches = _iter_rgb_batches(rgb_jobs)
@@ -1333,6 +1769,22 @@ def _convert_source_group(
                     view_stats["rgb"]["output_frame_count"] += 1
                     view_stats["rgb"]["written_file_count"] += 1
                     view_stats["rgb"]["output_bytes"] += written_bytes
+                    if progress is not None:
+                        progress.advance_many(
+                            jpegs=1,
+                            output_bytes=written_bytes,
+                        )
+                        progress.add_statistics(
+                            "rgb",
+                            source_frames=1,
+                            output_frames=1,
+                            output_bytes=written_bytes,
+                        )
+                        progress.add_statistics(
+                            "io",
+                            output_camera_frames=1,
+                            output_files=1,
+                        )
                     if result.source_decode_error is not None:
                         if not 0 <= result.local_frame < spec.frame_count:
                             raise AssertionError("invalid placeholder local-frame index")
@@ -1361,6 +1813,8 @@ def _convert_source_group(
                         )
                         view_stats["rgb"]["source_decode_failure_count"] += 1
                         view_stats["rgb"]["placeholder_file_count"] += 1
+                        if progress is not None:
+                            progress.record_invalid_rgb_frame(spec, result.local_frame)
             if view_stats["rgb"]["output_frame_count"] != spec.frame_count:
                 raise AssertionError("RGB output frame count does not match scene frame count")
             invalid_view_frames = view_stats["rgb"]["invalid_frame_indices"]
@@ -1389,6 +1843,13 @@ def _convert_source_group(
             scene_stats[(spec.split, spec.scene_id)]["exclusive_stage_seconds"][
                 "rgb_decode_resize_encode_write"
             ] += rgb_seconds
+            if progress is not None and view == VIEW_IDS[-1]:
+                progress.advance_many(scenes=1, frames=spec.frame_count)
+                progress.add_statistics(
+                    "io",
+                    source_scene_frames=spec.frame_count,
+                    output_scene_frames=spec.frame_count,
+                )
 
         del images
 
@@ -1477,6 +1938,9 @@ def _convert_source_group(
         stats["accounted_scene_stage_total"] = sum(
             float(seconds) for seconds in stats["exclusive_stage_seconds"].values()
         )
+
+    if progress is not None:
+        progress.add_statistics("io", source_files=2 + 5 * len(VIEW_IDS))
 
 
 def _scene_metadata(
@@ -1572,6 +2036,7 @@ def _write_scene_metadata(
     specs: Sequence[SceneSpec],
     recorder: ValidationRecorder,
     scene_stats: dict[tuple[str, str], dict[str, Any]],
+    progress: ProgressReporter | None = None,
 ) -> None:
     for spec in specs:
         metadata = _scene_metadata(
@@ -1582,6 +2047,8 @@ def _write_scene_metadata(
         with (_output_scene_dir(build_root, spec) / "scene.json").open("w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
+        if progress is not None:
+            progress.add_statistics("io", output_files=1)
 
 
 def _validate_output_tree(
@@ -1589,6 +2056,7 @@ def _validate_output_tree(
     specs: Sequence[SceneSpec],
     process_pool: ProcessPoolExecutor | None = None,
     process_workers: int = 1,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, int]:
     if process_workers <= 0:
         raise ValueError("process_workers must be positive")
@@ -1615,6 +2083,15 @@ def _validate_output_tree(
         _require_array(scene_dir / "tracks_3d.npy", (spec.frame_count, POINT_COUNT, 3), np.float32)
         expected_output_file_count += 2 + len(VIEW_IDS) * (4 + spec.frame_count)
         for view in VIEW_IDS:
+            if progress is not None:
+                progress.set_active(
+                    "jpeg_validation",
+                    layout=spec.layout,
+                    source_sequence=spec.source_sequence,
+                    split=spec.split,
+                    scene_id=spec.scene_id,
+                    view=view,
+                )
             view_dir = _require_dir(scene_dir / f"view_{view}")
             _require_array(view_dir / "depth.npy", (spec.frame_count, OUTPUT_HEIGHT, OUTPUT_WIDTH), np.float32)
             _require_array(view_dir / "intrinsics.npy", (3, 3), np.float32)
@@ -1646,6 +2123,8 @@ def _validate_output_tree(
                 stage="persisted JPEG validation",
             ):
                 validated_rgb_file_count += count
+                if progress is not None:
+                    progress.advance("validated_jpegs", count)
         actual_view_dirs = {path.name for path in scene_dir.iterdir() if path.is_dir()}
         expected_view_dirs = {f"view_{view}" for view in VIEW_IDS}
         if actual_view_dirs != expected_view_dirs:
@@ -2037,14 +2516,23 @@ def preprocess(
     source_root = Path(source_root).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
     specs = build_scene_specs()
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+    progress = ProgressReporter(source_root, output_root, specs, workers)
+    print(f"POINTODYSSEY_PROGRESS_FILE path={progress.path}", flush=True)
+    progress.set_stage("preflight", "preflight")
     path_setup_seconds = time.perf_counter() - total_start
     preflight_start = time.perf_counter()
-    preflight(source_root, output_root, specs)
+    try:
+        preflight(source_root, output_root, specs)
+    except BaseException as exc:
+        progress.failed(exc)
+        raise
     timings_seconds: dict[str, float] = {
         "path_and_scene_spec_setup": path_setup_seconds,
         "preflight": time.perf_counter() - preflight_start,
     }
     recorder = ValidationRecorder(ignore_validation_failures)
+    progress.bind_recorder(recorder)
     scene_stats: dict[tuple[str, str], dict[str, Any]] = {}
 
     build_root: Path | None = None
@@ -2063,15 +2551,22 @@ def preprocess(
                 initializer=_initialize_process_worker,
             )
         stage_start = time.perf_counter()
+        progress.set_stage("starting", "temporary_tree_setup")
         _prepare_scene_roots(build_root, specs)
         temporary_tree_setup_seconds = time.perf_counter() - stage_start
         timings_seconds["temporary_tree_setup"] = temporary_tree_setup_seconds
         stage_start = time.perf_counter()
+        progress.set_stage("converting", "source_conversion")
         for source_specs in _group_by_source(specs):
-            print(
-                f"POINTODYSSEY_PREPROCESS_SOURCE {source_specs[0].layout} "
-                f"{source_specs[0].source_sequence}",
-                flush=True,
+            first_source_spec = source_specs[0]
+            progress.set_active(
+                "source_setup",
+                force=True,
+                layout=first_source_spec.layout,
+                source_sequence=first_source_spec.source_sequence,
+                split=None,
+                scene_id=None,
+                view=None,
             )
             _convert_source_group(
                 source_root,
@@ -2081,24 +2576,37 @@ def preprocess(
                 scene_stats,
                 process_pool=process_pool,
                 process_workers=workers,
+                progress=progress,
             )
+            progress.advance("sources")
         timings_seconds["source_conversion"] = time.perf_counter() - stage_start
         stage_start = time.perf_counter()
-        _write_scene_metadata(build_root, specs, recorder, scene_stats)
+        progress.set_stage("writing_metadata", "scene_metadata")
+        _write_scene_metadata(
+            build_root,
+            specs,
+            recorder,
+            scene_stats,
+            progress=progress,
+        )
         timings_seconds["scene_metadata_write"] = time.perf_counter() - stage_start
         stage_start = time.perf_counter()
+        progress.set_stage("validating_output", "output_validation")
         output_validation = _validate_output_tree(
             build_root,
             specs,
             process_pool=process_pool,
             process_workers=workers,
+            progress=progress,
         )
         timings_seconds["output_validation"] = time.perf_counter() - stage_start
         stage_start = time.perf_counter()
+        progress.set_stage("validating_output", "process_pool_shutdown")
         if process_pool is not None:
             process_pool.shutdown(wait=True, cancel_futures=True)
             process_pool = None
         timings_seconds["process_pool_shutdown"] = time.perf_counter() - stage_start
+        progress.set_stage("publishing", "report_and_atomic_publish")
         measured_total = time.perf_counter() - total_start
         accounted_fields = (
             "path_and_scene_spec_setup",
@@ -2125,12 +2633,17 @@ def preprocess(
         with (build_root / "validation_report.json").open("w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
+        progress.add_statistics("io", output_files=1)
         report_write_seconds = time.perf_counter() - report_start
         recorder.raise_if_strict()
         if output_root.exists():
             raise FileExistsError(f"output root appeared during preprocessing: {output_root}")
+        # Persist the terminal snapshot while the sidecar's parent is still the only
+        # publication target. If publication fails, the exception path overwrites it
+        # with a failed snapshot; after successful publication telemetry is untouched.
+        progress.completed()
         os.replace(build_root, output_root)
-    except BaseException:
+    except BaseException as exc:
         if process_pool is not None:
             try:
                 process_pool.shutdown(wait=True, cancel_futures=True)
@@ -2142,6 +2655,7 @@ def preprocess(
                 )
         if build_root is not None:
             shutil.rmtree(build_root, ignore_errors=True)
+        progress.failed(exc)
         raise
 
     total_seconds = time.perf_counter() - total_start
