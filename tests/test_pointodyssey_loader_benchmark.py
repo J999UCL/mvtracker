@@ -54,6 +54,23 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(args.worker_counts, [0, 2, 4, 8])
         self.assertEqual(args.warmup_samples, 32)
         self.assertEqual(args.samples_per_worker, 156)
+        self.assertFalse(args.skip_coverage)
+
+    def test_coverage_can_be_skipped(self):
+        args = benchmark.parse_args(
+            [
+                "--dataset-root",
+                "/tmp/data",
+                "--output-dir",
+                "/tmp/output",
+                "--worker-counts",
+                "8",
+                "--skip-coverage",
+            ]
+        )
+
+        self.assertEqual(args.worker_counts, [8])
+        self.assertTrue(args.skip_coverage)
 
     def test_duplicate_workers_are_rejected(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

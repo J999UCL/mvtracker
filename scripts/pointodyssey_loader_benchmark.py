@@ -55,6 +55,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup-samples", type=int, default=32)
     parser.add_argument("--samples-per-worker", type=int, default=156)
+    parser.add_argument("--skip-coverage", action="store_true")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--progress-every", type=int, default=8)
     parser.add_argument(
@@ -746,6 +747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "warmup_samples": args.warmup_samples,
             "measured_samples_per_worker": args.samples_per_worker,
             "tail_samples": tail_count,
+            "skip_coverage": args.skip_coverage,
             "seed": args.seed,
             "cache_state": "system page cache is not dropped",
         },
@@ -775,27 +777,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 job_type="loader-benchmark",
             )
 
-        summary["coverage"] = run_coverage(
-            runtime,
-            contracts,
-            seed=args.seed,
-            progress_every=args.progress_every,
-        )
-        _atomic_json(output_dir / "summary.json", summary)
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "coverage/all_78_scenes_load": int(
-                        summary["coverage"]["all_78_scenes_load"]
-                    ),
-                    "coverage/successes": summary["coverage"]["successes"],
-                    "coverage/gotit_false": summary["coverage"]["gotit_false"],
-                    "coverage/exceptions": summary["coverage"]["exceptions"],
-                    "coverage/invariant_failures": summary["coverage"][
-                        "invariant_failures"
-                    ],
-                }
+        if args.skip_coverage:
+            summary["coverage"] = {"skipped": True}
+            print("POINTODYSSEY_COVERAGE skipped", flush=True)
+        else:
+            summary["coverage"] = run_coverage(
+                runtime,
+                contracts,
+                seed=args.seed,
+                progress_every=args.progress_every,
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "coverage/all_78_scenes_load": int(
+                            summary["coverage"]["all_78_scenes_load"]
+                        ),
+                        "coverage/successes": summary["coverage"]["successes"],
+                        "coverage/gotit_false": summary["coverage"]["gotit_false"],
+                        "coverage/exceptions": summary["coverage"]["exceptions"],
+                        "coverage/invariant_failures": summary["coverage"][
+                            "invariant_failures"
+                        ],
+                    }
+                )
+        _atomic_json(output_dir / "summary.json", summary)
 
         for workers in args.worker_counts:
             print(
@@ -826,7 +832,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         summary["status"] = (
             "completed"
-            if summary["coverage"]["all_78_scenes_load"]
+            if (args.skip_coverage or summary["coverage"]["all_78_scenes_load"])
             and len(clean_lanes) == len(args.worker_counts)
             else "failed"
         )
