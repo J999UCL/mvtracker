@@ -499,6 +499,11 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.virtual_len
 
+    def _motion_bucket_ratios(self, total_tracks, very_dynamic_tracks):
+        """Return motion-bucket ratios; subclasses may opt into dataset-specific policy."""
+        del total_tracks, very_dynamic_tracks
+        return self.ratio_dynamic, self.ratio_very_dynamic
+
     def __getitem__(self, index):
         virtual_index = int(index)
         scene_index = virtual_index % self.real_len
@@ -751,17 +756,22 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                          f"other: {(~static_points & ~dynamic_points & ~very_dynamic_points).sum()}")
 
         # Sample the points according to the desired ratios if possible
+        ratio_dynamic, ratio_very_dynamic = self._motion_bucket_ratios(
+            total_tracks=traj3d_world.shape[1],
+            very_dynamic_tracks=int(very_dynamic_points.sum()),
+        )
+        ratio_static = 1 - ratio_dynamic - ratio_very_dynamic
         max_tracks_to_preload = traj3d_world.shape[1]
         max_tracks_to_preload = min([
             max_tracks_to_preload,
-            int(dynamic_points.sum() / self.ratio_dynamic) if self.ratio_dynamic > 0 else max_tracks_to_preload,
-            int(very_dynamic_points.sum() // self.ratio_very_dynamic) if self.ratio_very_dynamic > 0 else max_tracks_to_preload,
-            int(static_points.sum() / (1 - self.ratio_dynamic - self.ratio_very_dynamic)),
+            int(dynamic_points.sum() / ratio_dynamic) if ratio_dynamic > 0 else max_tracks_to_preload,
+            int(very_dynamic_points.sum() // ratio_very_dynamic) if ratio_very_dynamic > 0 else max_tracks_to_preload,
+            int(static_points.sum() / ratio_static) if ratio_static > 0 else max_tracks_to_preload,
         ])
         if self.max_tracks_to_preload is not None:
             max_tracks_to_preload = min(max_tracks_to_preload, self.max_tracks_to_preload)
-        n_dynamic = min(int(max_tracks_to_preload * self.ratio_dynamic), dynamic_points.sum())
-        n_very_dynamic = min(int(max_tracks_to_preload * self.ratio_very_dynamic), very_dynamic_points.sum())
+        n_dynamic = min(int(max_tracks_to_preload * ratio_dynamic), dynamic_points.sum())
+        n_very_dynamic = min(int(max_tracks_to_preload * ratio_very_dynamic), very_dynamic_points.sum())
         n_static = max_tracks_to_preload - n_dynamic - n_very_dynamic
 
         dynamic_indices = rnd_np.choice(np.where(dynamic_points)[0], n_dynamic, replace=False)

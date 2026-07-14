@@ -105,6 +105,19 @@ def _project_tracks(
 class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
     """MV-Tracker's Kubric sampling policy over prepared PointOdyssey scenes."""
 
+    def _motion_bucket_ratios(self, total_tracks, very_dynamic_tracks):
+        """Reassign an undersupplied very-dynamic quota to dynamic tracks."""
+        target_tracks = total_tracks
+        if self.max_tracks_to_preload is not None:
+            target_tracks = min(target_tracks, self.max_tracks_to_preload)
+        if self.traj_per_sample is not None:
+            target_tracks = min(target_tracks, self.traj_per_sample)
+
+        required_very_dynamic = int(np.ceil(target_tracks * self.ratio_very_dynamic))
+        if very_dynamic_tracks < required_very_dynamic:
+            return self.ratio_dynamic + self.ratio_very_dynamic, 0.0
+        return self.ratio_dynamic, self.ratio_very_dynamic
+
     @staticmethod
     def from_name(
         dataset_name: str,

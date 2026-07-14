@@ -55,6 +55,33 @@ def _load_loader_module():
 loader = _load_loader_module()
 
 
+class MotionBucketTests(unittest.TestCase):
+    @staticmethod
+    def _dataset():
+        dataset = loader.PointOdysseyMultiViewDataset.__new__(
+            loader.PointOdysseyMultiViewDataset
+        )
+        dataset.ratio_dynamic = 0.5
+        dataset.ratio_very_dynamic = 0.25
+        dataset.traj_per_sample = 512
+        dataset.max_tracks_to_preload = 18000
+        return dataset
+
+    def test_preserves_kubric_ratios_when_very_dynamic_quota_is_available(self):
+        ratios = self._dataset()._motion_bucket_ratios(
+            total_tracks=2600,
+            very_dynamic_tracks=128,
+        )
+        self.assertEqual(ratios, (0.5, 0.25))
+
+    def test_reassigns_undersupplied_very_dynamic_quota_to_dynamic_tracks(self):
+        ratios = self._dataset()._motion_bucket_ratios(
+            total_tracks=2600,
+            very_dynamic_tracks=127,
+        )
+        self.assertEqual(ratios, (0.75, 0.0))
+
+
 class PreparedSceneTests(unittest.TestCase):
     FRAME_COUNT = 2
     POINT_COUNT = 2
