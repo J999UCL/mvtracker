@@ -477,9 +477,10 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         return self.virtual_len
 
     def __getitem__(self, index):
-        index = index % self.real_len
+        virtual_index = int(index)
+        scene_index = virtual_index % self.real_len
 
-        sample, gotit = self._getitem_helper(index)
+        sample, gotit = self._getitem_helper(scene_index, seed_index=virtual_index)
 
         if not gotit:
             logging.warning("warning: sampling failed")
@@ -498,10 +499,13 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
 
         return sample, gotit
 
-    def _getitem_helper(self, index):
+    def _getitem_helper(self, index, seed_index=None):
         start_time_1 = time.time()
 
         gotit = True
+
+        if seed_index is None:
+            seed_index = index
 
         # Take a new seed from torch or use self.seed if set
         # The rest of the code will use generators initialized with this seed
@@ -510,7 +514,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         else:
             seed = self.seed
             if self.add_index_to_seed:
-                seed += index
+                seed += seed_index
         rnd_torch = torch.Generator().manual_seed(seed)
         rnd_np = np.random.RandomState(seed=seed)
 

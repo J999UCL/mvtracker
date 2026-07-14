@@ -30,6 +30,37 @@ def _load_window_start_helper():
 _legal_contiguous_window_starts = _load_window_start_helper()
 
 
+def _load_kubric_method(method_name):
+    """Load one dataset method without importing optional vision dependencies."""
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "mvtracker"
+        / "datasets"
+        / "kubric_multiview_dataset.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(source_path))
+    dataset_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "KubricMultiViewDataset"
+    )
+    method = next(
+        node
+        for node in dataset_class.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == method_name
+    )
+    module = ast.Module(body=[method], type_ignores=[])
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+    return namespace[method_name]
+
+
+_kubric_getitem = _load_kubric_method("__getitem__")
+
+
 class LegalContiguousWindowStartsTests(unittest.TestCase):
     def test_includes_final_legal_start(self):
         starts = _legal_contiguous_window_starts(n_frames=30, seq_len=24)
@@ -111,6 +142,30 @@ class LegalContiguousWindowStartsTests(unittest.TestCase):
 
         self.assertEqual(starts.dtype, np.int64)
         self.assertEqual(starts.size, 0)
+
+
+class VirtualDatasetIndexTests(unittest.TestCase):
+    def test_repeated_scene_keeps_distinct_seed_index(self):
+        class DatasetStub:
+            real_len = 78
+
+            def __init__(self):
+                self.calls = []
+
+            def _getitem_helper(self, scene_index, seed_index=None):
+                self.calls.append((scene_index, seed_index))
+                return scene_index, True
+
+        dataset = DatasetStub()
+
+        first_sample, first_gotit = _kubric_getitem(dataset, 5)
+        repeated_sample, repeated_gotit = _kubric_getitem(dataset, 83)
+
+        self.assertTrue(first_gotit)
+        self.assertTrue(repeated_gotit)
+        self.assertEqual(first_sample, 5)
+        self.assertEqual(repeated_sample, 5)
+        self.assertEqual(dataset.calls, [(5, 5), (5, 83)])
 
 
 if __name__ == "__main__":
