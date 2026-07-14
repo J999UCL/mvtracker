@@ -569,12 +569,20 @@ class TrainingDashboardState:
                     "optimization/microbatch_grad_cosine_min",
                     [],
                 ),
-                "clip_coefficient": scalars.get(
-                    "optimization/clip_coefficient",
+                "max_abs_pre_clip": scalars.get(
+                    "optimization/max_abs_grad_pre_clip",
                     [],
                 ),
-                "clipped_fraction": scalars.get(
-                    "optimization/clipped_step_fraction",
+                "norm_retention": scalars.get(
+                    "optimization/norm_retention_after_value_clip",
+                    [],
+                ),
+                "clipped_element_fraction": scalars.get(
+                    "optimization/gradient_elements_clipped_fraction",
+                    [],
+                ),
+                "clipped_step_fraction": scalars.get(
+                    "optimization/value_clipped_step_fraction",
                     [],
                 ),
             }
@@ -794,7 +802,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="grid-3" style="margin-top:22px">
       <div class="chart-panel"><h3>Gradient norms</h3><div class="chart-wrap compact"><canvas id="gradient-norms"></canvas></div></div>
       <div class="chart-panel"><h3>Microbatch gradient agreement</h3><div class="chart-wrap compact"><canvas id="gradient-cosine"></canvas></div><div class="chart-note">Cosine of each microbatch gradient against the running accumulator; negative values indicate cancellation.</div></div>
-      <div class="chart-panel"><h3>Gradient clipping</h3><div class="chart-wrap compact"><canvas id="gradient-clipping"></canvas></div><div class="chart-note">Coefficient 1 means unchanged; clipped fraction is cumulative.</div></div>
+      <div class="chart-panel"><h3>Elementwise gradient clipping</h3><div class="chart-wrap compact"><canvas id="gradient-clipping"></canvas></div><div class="chart-note">Upstream clips each gradient element to ±1; norm retention is post/pre global norm and clipped-step fraction is cumulative.</div></div>
     </div>
   </section>
 
@@ -850,7 +858,7 @@ const charts={
   learningRate:new Chart(document.getElementById('learning-rate'),{type:'line',data:{datasets:[line('Learning rate',palette.s1)]},options:options('Optimizer step','Learning rate',{legend:false,tickCallback:value=>Number(value).toExponential(1)})}),
   gradientNorms:new Chart(document.getElementById('gradient-norms'),{type:'line',data:{datasets:[line('Pre-clip',palette.s1),line('Post-clip',palette.s2),line('Microbatch mean',palette.s3)]},options:options('Optimizer step','Global L2 norm',{min:0})}),
   gradientCosine:new Chart(document.getElementById('gradient-cosine'),{type:'line',data:{datasets:[line('Mean cosine',palette.s1),line('Minimum cosine',palette.s5)]},options:options('Optimizer step','Cosine similarity',{min:-1,max:1})}),
-  gradientClipping:new Chart(document.getElementById('gradient-clipping'),{type:'line',data:{datasets:[line('Clip coefficient',palette.s1),line('Clipped fraction',palette.s4)]},options:options('Optimizer step','Fraction',{min:0,max:1})}),
+  gradientClipping:new Chart(document.getElementById('gradient-clipping'),{type:'line',data:{datasets:[line('Norm retention',palette.s1),line('Elements clipped',palette.s5),line('Steps clipped',palette.s4)]},options:options('Optimizer step','Fraction',{min:0,max:1})}),
   rejection:new Chart(document.getElementById('rejection-rate'),{type:'line',data:{datasets:[line('Rejected',palette.s1)]},options:options('Optimizer step','Rejected attempts (%)',{min:0,max:100,legend:false})}),
   tracks:new Chart(document.getElementById('track-count'),{type:'line',data:{datasets:[line('Mean',palette.s1),line('Maximum',palette.s2,{borderDash:[5,4],pointRadius:0}),line('Minimum',palette.s3,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Tracks')}),
   scenes:new Chart(document.getElementById('scene-coverage'),{type:'line',data:{datasets:[line('Seen',palette.s1)]},options:options('Optimizer step','Unique scenes',{min:0})}),
@@ -891,7 +899,7 @@ function render(state){
   const gradients=state.series?.gradients||{};
   update(charts.gradientNorms,[points(gradients.pre_clip),points(gradients.post_clip),points(gradients.microbatch_mean)]);
   update(charts.gradientCosine,[points(gradients.cosine_mean),points(gradients.cosine_min)]);
-  update(charts.gradientClipping,[points(gradients.clip_coefficient),points(gradients.clipped_fraction)]);
+  update(charts.gradientClipping,[points(gradients.norm_retention),points(gradients.clipped_element_fraction),points(gradients.clipped_step_fraction)]);
   const pipeline=state.series?.pipeline||[];
   update(charts.rejection,[pipePoints(pipeline,'rejection_percent')]);
   update(charts.tracks,[pipePoints(pipeline,'tracks_mean'),pipePoints(pipeline,'tracks_max'),pipePoints(pipeline,'tracks_min')]);
