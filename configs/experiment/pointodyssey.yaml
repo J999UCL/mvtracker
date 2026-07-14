@@ -14,8 +14,21 @@ datasets:
       - pointodyssey-multiview-validation
 
 trainer:
+  num_steps: 280
+  eval_freq: 100
+  viz_freq: 100
+  save_ckpt_freq: 100
+  lr: 0.0001
   gradient_accumulation_steps: 8
 
 augmentations:
   variable_depth_type: false
   variable_num_views: false
+
+modes:
+  validate_at_start: true
+
+logging:
+  log_wandb: true
+  wandb_project: mvtracker-pointodyssey
+  tags: [pointodyssey, upstream-weights, one-hour-pilot]

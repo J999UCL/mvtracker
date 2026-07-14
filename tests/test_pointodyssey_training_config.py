@@ -20,6 +20,23 @@ class PointOdysseyTrainingConfigTests(unittest.TestCase):
 
         self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 8)
 
+    def test_pointodyssey_one_hour_pilot_settings(self):
+        config = yaml.safe_load(
+            (self.config_root / "experiment" / "pointodyssey.yaml").read_text()
+        )
+
+        self.assertEqual(config["trainer"]["num_steps"], 280)
+        self.assertEqual(config["trainer"]["lr"], 0.0001)
+        self.assertEqual(config["trainer"]["eval_freq"], 100)
+        self.assertEqual(config["trainer"]["viz_freq"], 100)
+        self.assertEqual(config["trainer"]["save_ckpt_freq"], 100)
+        self.assertTrue(config["modes"]["validate_at_start"])
+        self.assertTrue(config["logging"]["log_wandb"])
+        self.assertEqual(
+            config["logging"]["wandb_project"],
+            "mvtracker-pointodyssey",
+        )
+
     def test_pointodyssey_registers_only_the_validation_split_for_evaluation(self):
         config = yaml.safe_load(
             (self.config_root / "experiment" / "pointodyssey.yaml").read_text()
