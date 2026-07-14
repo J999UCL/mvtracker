@@ -256,24 +256,6 @@ For a full-scale MVTracker on an 80 GB GPU:
 python -m mvtracker.cli.train +experiment=mvtracker_overfit
 ```
 
-### PointOdyssey schema-v5 repair
-
-Existing schema-v4 prepared data must be repaired before training with the
-schema-v5 loader. The repair recomputes visibility and depth-frame exclusions,
-but hard-links RGB, depth, tracks, intrinsics, and extrinsics instead of
-re-encoding or copying them:
-
-```bash
-python scripts/pointodyssey_repair_preprocessed.py \
-  --source-root /tmp/thakwani/PointOdyssey/extracted \
-  --prepared-root /tmp/thakwani/PointOdyssey_MVTracker \
-  --output-root /tmp/thakwani/PointOdyssey_MVTracker_v5
-```
-
-The prepared and output roots must share a filesystem. The command refuses to
-overwrite either tree, has no copy fallback, validates the temporary v5 tree,
-and publishes only after repair succeeds.
-
 ### Live PointOdyssey training dashboard
 
 On the training host, point the dashboard at the same experiment directory as
