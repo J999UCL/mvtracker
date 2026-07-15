@@ -1510,7 +1510,11 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                 for v in range(V):
                     rgb = rgbs[v, i]
                     rgb = Image.fromarray(rgb)
-                    F_torchvision.gaussian_blur(rgb, self.blur_aug.kernel_size, [sigma, sigma])
+                    rgb = F_torchvision.gaussian_blur(
+                        rgb,
+                        self.blur_aug.kernel_size,
+                        [sigma, sigma],
+                    )
                     rgb = np.array(rgb, dtype=np.uint8)
                     rgbs[v, i] = rgb
 
