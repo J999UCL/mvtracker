@@ -23,6 +23,10 @@ class PointOdysseyTrainingConfigTests(unittest.TestCase):
             config["datasets"]["pointodyssey_prepared_dir"],
             "PointOdyssey_MVTracker_v5",
         )
+        self.assertEqual(
+            config["datasets"]["train"]["exclude_scene_ids"],
+            ["000008"],
+        )
 
     def test_pointodyssey_long_run_settings(self):
         config = yaml.safe_load(

@@ -10,6 +10,7 @@ datasets:
   train:
     name: pointodyssey-multiview-training
     traj_per_sample: 256
+    exclude_scene_ids: ["000008"]
   eval:
     names:
       - pointodyssey-multiview-validation
@@ -34,4 +35,4 @@ modes:
 logging:
   log_wandb: true
   wandb_project: mvtracker-pointodyssey
-  tags: [pointodyssey, upstream-weights, reduced-rgb, long-run]
+  tags: [pointodyssey, upstream-weights, reduced-rgb, long-run, exclude-000008]

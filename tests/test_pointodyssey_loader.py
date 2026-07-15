@@ -82,6 +82,23 @@ class MotionBucketTests(unittest.TestCase):
         self.assertEqual(ratios, (0.75, 0.0))
 
 
+class SceneExclusionTests(unittest.TestCase):
+    def test_excludes_only_requested_scene_ids(self):
+        self.assertEqual(
+            loader._exclude_scene_ids(
+                ["000007", "000008", "000009"],
+                ["000008"],
+            ),
+            ["000007", "000009"],
+        )
+
+    def test_rejects_missing_or_duplicate_scene_ids(self):
+        with self.assertRaisesRegex(ValueError, "were not found: 000010"):
+            loader._exclude_scene_ids(["000008"], ["000010"])
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            loader._exclude_scene_ids(["000008"], ["000008", "000008"])
+
+
 class PreparedSceneTests(unittest.TestCase):
     FRAME_COUNT = 2
     POINT_COUNT = 2
@@ -420,6 +437,25 @@ class FromNameTests(unittest.TestCase):
             kwargs["data_root"],
             str(Path("/datasets") / "PointOdyssey_MVTracker_v5" / "train"),
         )
+
+    def test_training_scene_exclusions_come_from_training_config(self):
+        with mock.patch.object(
+            loader.KubricMultiViewDataset,
+            "from_name",
+            return_value=self._base_kwargs(),
+        ):
+            kwargs = loader.PointOdysseyMultiViewDataset.from_name(
+                "pointodyssey-multiview-training",
+                "/datasets",
+                training_args=SimpleNamespace(
+                    modes=SimpleNamespace(debug=False),
+                    datasets={"train": {"exclude_scene_ids": ["000008"]}},
+                ),
+                fabric=object(),
+                just_return_kwargs=True,
+            )
+
+        self.assertEqual(kwargs["excluded_scene_ids"], ("000008",))
 
 
 if __name__ == "__main__":

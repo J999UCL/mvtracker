@@ -3,6 +3,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,22 @@ _POINT_COUNT = 2600
 _WINDOW_LENGTH = 24
 _DEPTH_TRACK_TOLERANCE_METRES = 0.05
 _DEPTH_FRAME_FAILURE_FRACTION = 0.5
+
+
+def _exclude_scene_ids(
+    scene_ids: list[str],
+    excluded_scene_ids: tuple[str, ...] | list[str],
+) -> list[str]:
+    excluded = tuple(excluded_scene_ids)
+    if len(excluded) != len(set(excluded)):
+        raise ValueError("PointOdyssey excluded scene IDs must be unique.")
+    missing = sorted(set(excluded) - set(scene_ids))
+    if missing:
+        raise ValueError(
+            "PointOdyssey excluded scene IDs were not found: " + ", ".join(missing)
+        )
+    excluded_set = set(excluded)
+    return [scene_id for scene_id in scene_ids if scene_id not in excluded_set]
 
 
 def _require_dict(value: Any, context: str) -> dict[str, Any]:
@@ -146,6 +163,25 @@ def _project_tracks(
 class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
     """MV-Tracker's Kubric sampling policy over prepared PointOdyssey scenes."""
 
+    def __init__(self, *args, excluded_scene_ids=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        original_real_len = self.real_len
+        self.seq_names = _exclude_scene_ids(
+            self.seq_names,
+            tuple(excluded_scene_ids),
+        )
+        if not self.seq_names:
+            raise ValueError("PointOdyssey scene exclusion removed every scene.")
+        self.real_len = len(self.seq_names)
+        if self.virtual_len == original_real_len:
+            self.virtual_len = self.real_len
+        if excluded_scene_ids:
+            logging.info(
+                "Excluded PointOdyssey scenes %s; using %d prepared scenes.",
+                list(excluded_scene_ids),
+                self.real_len,
+            )
+
     def _motion_bucket_ratios(self, total_tracks, very_dynamic_tracks):
         """Reassign an undersupplied very-dynamic quota to dynamic tracks."""
         target_tracks = total_tracks
@@ -213,6 +249,7 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
         if requested_split == "training" and training_args.modes.debug:
             prepared_split = "validation"
         prepared_directory = "PointOdyssey_MVTracker"
+        excluded_scene_ids = ()
         if training_args is not None:
             datasets_config = getattr(training_args, "datasets", None)
             if datasets_config is not None:
@@ -220,6 +257,12 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
                     "pointodyssey_prepared_dir",
                     prepared_directory,
                 )
+                if requested_split == "training":
+                    train_config = datasets_config.get("train")
+                    if train_config is not None:
+                        excluded_scene_ids = tuple(
+                            train_config.get("exclude_scene_ids", ())
+                        )
         kwargs.update({
             "data_root": os.path.join(
                 dataset_root,
@@ -235,6 +278,7 @@ class PointOdysseyMultiViewDataset(KubricMultiViewDataset):
             "supported_duster_views_sets": None,
             "enable_variable_depth_type_augs": False,
             "enable_variable_num_views_augs": False,
+            "excluded_scene_ids": excluded_scene_ids,
         })
         if just_return_kwargs:
             return kwargs
