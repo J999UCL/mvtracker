@@ -24,16 +24,18 @@ class PointOdysseyTrainingConfigTests(unittest.TestCase):
             "PointOdyssey_MVTracker_v5",
         )
 
-    def test_pointodyssey_one_hour_pilot_settings(self):
+    def test_pointodyssey_long_run_settings(self):
         config = yaml.safe_load(
             (self.config_root / "experiment" / "pointodyssey.yaml").read_text()
         )
 
-        self.assertEqual(config["trainer"]["num_steps"], 280)
-        self.assertEqual(config["trainer"]["lr"], 0.0001)
-        self.assertEqual(config["trainer"]["eval_freq"], 100)
-        self.assertEqual(config["trainer"]["viz_freq"], 100)
-        self.assertEqual(config["trainer"]["save_ckpt_freq"], 100)
+        self.assertEqual(config["trainer"]["num_steps"], 2000)
+        self.assertEqual(config["trainer"]["lr"], 0.00005)
+        self.assertEqual(config["trainer"]["eval_freq"], 500)
+        self.assertEqual(config["trainer"]["viz_freq"], 500)
+        self.assertEqual(config["trainer"]["save_ckpt_freq"], 500)
+        self.assertFalse(config["augmentations"]["rgb"])
+        self.assertTrue(config["augmentations"]["variable_trajpersample"])
         self.assertTrue(config["modes"]["validate_at_start"])
         self.assertTrue(config["logging"]["log_wandb"])
         self.assertEqual(
