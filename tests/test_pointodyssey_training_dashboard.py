@@ -67,6 +67,27 @@ class TrainingLogReaderTests(unittest.TestCase):
             self.assertIn("CUDA out of memory", reader.fatal_error)
             self.assertTrue(reader.finished)
 
+    def test_computes_trailing_clipped_step_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.log"
+            path.write_text(
+                "[optimizer:000000] elements_clipped=10 clipped=1\n"
+                "[optimizer:000001] elements_clipped=0 clipped=0\n"
+                "[optimizer:000002] elements_clipped=2 clipped=1\n"
+                "[optimizer:000003] elements_clipped=0 clipped=0\n",
+                encoding="utf-8",
+            )
+            reader = dashboard.TrainingLogReader(path)
+            reader.refresh()
+
+            series = reader.rolling_clipped_step_rate(window_size=3)
+
+            self.assertEqual([point["step"] for point in series], [0, 1, 2, 3])
+            self.assertEqual(
+                [point["value"] for point in series],
+                [1.0, 0.5, 2 / 3, 1 / 3],
+            )
+
 
 class HydraConfigReaderTests(unittest.TestCase):
     def test_reads_dashboard_fields_from_real_hydra_yaml(self):
@@ -155,6 +176,7 @@ class DashboardStateTests(unittest.TestCase):
             log_path.write_text(
                 "Datapoint: ['000001'] (microbatch 1/1, waited  0.25s)\n"
                 "FWD pass: num_points=64\n"
+                "[optimizer:000001] elements_clipped=3 clipped=1\n"
                 "[timing:000001] Total:  2.00s | Data:  0.50s | Fwd:  0.60s | "
                 "Sync:  0.00s | Bwd:  0.90s |\n",
                 encoding="utf-8",
@@ -204,6 +226,10 @@ class DashboardStateTests(unittest.TestCase):
             self.assertEqual(snapshot["series"]["gpu"][0]["utilization_percent"], 100)
             self.assertEqual(snapshot["series"]["baseline"]["stationary"][0]["value"], 0.5)
             self.assertEqual(snapshot["series"]["gradients"]["pre_clip"][0]["value"], 2.0)
+            self.assertEqual(
+                snapshot["series"]["gradients"]["clipped_step_rate_50"],
+                [{"step": 1, "value": 1.0}],
+            )
 
 
 class DashboardHTTPTests(unittest.TestCase):
@@ -256,6 +282,8 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("new EventSource('/api/stream')", html)
         self.assertIn("emaPoints", html)
         self.assertIn("rawLoss", html)
+        self.assertIn("Clipped steps (last 50)", html)
+        self.assertIn("latest 50 optimizer steps", html)
         self.assertNotIn("setInterval", html)
 
     def test_state_endpoint_is_uncached_json(self):
