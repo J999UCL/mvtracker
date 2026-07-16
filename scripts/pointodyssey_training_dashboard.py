@@ -791,7 +791,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <section>
     <h2>Training losses</h2>
-    <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap"><canvas id="loss-combined"></canvas></div></div>
+    <div class="chart-panel"><h3>Combined trend</h3><div class="chart-wrap"><canvas id="loss-combined"></canvas></div><div class="chart-note">Trailing 50-step means. Raw per-step values are shown as faint, unconnected points in the detail plots below.</div></div>
     <div class="grid-3" style="margin-top:22px">
       <div class="chart-panel"><h3>Total loss</h3><div class="chart-wrap compact"><canvas id="loss-total"></canvas></div></div>
       <div class="chart-panel"><h3>Visibility loss</h3><div class="chart-wrap compact"><canvas id="loss-visibility"></canvas></div></div>
@@ -864,16 +864,22 @@ const alphaColor=(hex,alpha)=>{
   const match=/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
   return match?`rgba(${parseInt(match[1],16)},${parseInt(match[2],16)},${parseInt(match[3],16)},${alpha})`:hex;
 };
-const rawLoss=(label,stroke)=>line(`${label} raw`,alphaColor(stroke,.22),{borderWidth:1,pointRadius:2,pointHoverRadius:4,tension:0});
-const emaLoss=(label,stroke)=>line(`${label} EMA`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18});
+const meanLoss=(label,stroke,extra={})=>line(`${label} 50-step mean`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
+const rawLossPoints=(label,stroke)=>line(`${label} raw points`,alphaColor(stroke,.16),{showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0});
+const compactNumber=value=>{
+  const number=Number(value), magnitude=Math.abs(number);
+  if(!Number.isFinite(number)) return value;
+  if((magnitude>0&&magnitude<.001)||magnitude>=1000) return number.toExponential(1);
+  return number.toLocaleString(undefined,{maximumFractionDigits:3});
+};
 function options(xTitle,yTitle,extra={}){
-  return {responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:180},interaction:{mode:'index',intersect:false},plugins:{legend:{display:extra.legend!==false,position:'bottom',labels:{color:palette.text,usePointStyle:true,boxWidth:8}},tooltip:{enabled:true,backgroundColor:palette.panel,titleColor:palette.text,bodyColor:palette.text,borderColor:palette.border,borderWidth:1}},scales:{x:{type:'linear',grid:{color:palette.border},ticks:{color:palette.muted,maxTicksLimit:10},title:{display:true,text:xTitle,color:palette.muted}},y:{min:extra.min,max:extra.max,grid:{color:palette.border},ticks:{color:palette.muted,callback:extra.tickCallback},title:{display:true,text:yTitle,color:palette.muted}},...(extra.scales||{})}};
+  return {responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:180},interaction:{mode:'index',intersect:false},plugins:{legend:{display:extra.legend!==false,position:'bottom',labels:{color:palette.text,usePointStyle:true,boxWidth:8}},tooltip:{enabled:true,backgroundColor:palette.panel,titleColor:palette.text,bodyColor:palette.text,borderColor:palette.border,borderWidth:1}},scales:{x:{type:'linear',grid:{color:palette.border},ticks:{color:palette.muted,maxTicksLimit:10},title:{display:true,text:xTitle,color:palette.muted}},y:{min:extra.min,max:extra.max,grid:{color:palette.border},ticks:{color:palette.muted,callback:extra.tickCallback||compactNumber},title:{display:true,text:yTitle,color:palette.muted}},...(extra.scales||{})}};
 }
 const charts={
-  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:[rawLoss('Total',palette.s1),emaLoss('Total',palette.s1),rawLoss('Visibility',palette.s2),emaLoss('Visibility',palette.s2),rawLoss('Trajectory',palette.s3),emaLoss('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
-  total:new Chart(document.getElementById('loss-total'),{type:'line',data:{datasets:[rawLoss('Total',palette.s1),emaLoss('Total',palette.s1)]},options:options('Optimizer step','Loss')}),
-  visibility:new Chart(document.getElementById('loss-visibility'),{type:'line',data:{datasets:[rawLoss('Visibility',palette.s2),emaLoss('Visibility',palette.s2)]},options:options('Optimizer step','Loss')}),
-  flow:new Chart(document.getElementById('loss-flow'),{type:'line',data:{datasets:[rawLoss('Trajectory',palette.s3),emaLoss('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
+  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:[meanLoss('Total',palette.s1),meanLoss('Visibility',palette.s2,{borderDash:[6,4]}),meanLoss('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
+  total:new Chart(document.getElementById('loss-total'),{type:'line',data:{datasets:[rawLossPoints('Total',palette.s1),meanLoss('Total',palette.s1)]},options:options('Optimizer step','Loss')}),
+  visibility:new Chart(document.getElementById('loss-visibility'),{type:'line',data:{datasets:[rawLossPoints('Visibility',palette.s2),meanLoss('Visibility',palette.s2)]},options:options('Optimizer step','Loss')}),
+  flow:new Chart(document.getElementById('loss-flow'),{type:'line',data:{datasets:[rawLossPoints('Trajectory',palette.s3),meanLoss('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
   stationary:new Chart(document.getElementById('stationary-baseline'),{type:'line',data:{datasets:[line('Model trajectory',palette.s1),line('Stationary baseline',palette.s4)]},options:options('Optimizer step','Trajectory loss')}),
   stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[line('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0})}),
   validation:new Chart(document.getElementById('validation'),{type:'line',data:{datasets:[line('Validation',palette.s1)]},options:options('Optimizer step','Score',{legend:false})}),
@@ -890,7 +896,10 @@ const charts={
   gpuThermal:new Chart(document.getElementById('gpu-thermal'),{type:'line',data:{datasets:[line('Power',palette.s3),line('Temperature',palette.s4,{yAxisID:'temp'})]},options:options('Elapsed time (min)','Power (W)',{scales:{temp:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Temperature (°C)',color:palette.muted}}}})})
 };
 const points=series=>(series||[]).map(point=>({x:Number(point.step),y:Number(point.value)}));
-const emaPoints=(series,alpha=.15)=>{let average=null;return points(series).map(point=>{average=average==null?point.y:(alpha*point.y+(1-alpha)*average);return{x:point.x,y:average};});};
+const movingAveragePoints=(series,windowSize=50)=>{
+  const input=points(series), window=[]; let sum=0;
+  return input.map(point=>{window.push(point.y);sum+=point.y;if(window.length>windowSize)sum-=window.shift();return{x:point.x,y:sum/window.length};});
+};
 const parityPoints=series=>points(series).map(point=>({x:point.x,y:1}));
 const pipePoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.step),y:Number(point[key])}));
 const gpuPoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.elapsed_seconds)/60,y:Number(point[key])}));
@@ -911,8 +920,8 @@ function render(state){
   text('latest-message',state.latest_log_message||'Waiting for training log…');
 
   const losses=state.series?.losses||{};
-  update(charts.combined,[points(losses.total),emaPoints(losses.total),points(losses.visibility),emaPoints(losses.visibility),points(losses.flow),emaPoints(losses.flow)]);
-  update(charts.total,[points(losses.total),emaPoints(losses.total)]); update(charts.visibility,[points(losses.visibility),emaPoints(losses.visibility)]); update(charts.flow,[points(losses.flow),emaPoints(losses.flow)]);
+  update(charts.combined,[movingAveragePoints(losses.total),movingAveragePoints(losses.visibility),movingAveragePoints(losses.flow)]);
+  update(charts.total,[points(losses.total),movingAveragePoints(losses.total)]); update(charts.visibility,[points(losses.visibility),movingAveragePoints(losses.visibility)]); update(charts.flow,[points(losses.flow),movingAveragePoints(losses.flow)]);
   const baseline=state.series?.baseline||{};
   update(charts.stationary,[points(losses.flow),points(baseline.stationary)]);
   update(charts.stationaryRatio,[points(baseline.model_ratio),parityPoints(baseline.model_ratio)]);
