@@ -32,9 +32,12 @@ class TapVid3DGpuDecodeTests(unittest.TestCase):
             seq_name="fixture",
             metadata={},
             output_size=(8, 10),
+            apply_rgb_aug=False,
+            rgb_augmentation=None,
             apply_depth_aug=False,
             augmentation_seed=1,
             depth_scale=1.0,
+            track_upscaling_factor=1.0,
             max_depth=1000.0,
             depth_patch_operations=(),
         )

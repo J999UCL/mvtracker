@@ -138,6 +138,9 @@ def _dataset(root: Path, *, points=16, views=4):
     dataset.enable_variable_num_views_augs = False
     dataset.enable_scene_transform_augs = False
     dataset.enable_camera_params_noise_augs = False
+    dataset.ratio_dynamic = 0.0
+    dataset.ratio_very_dynamic = 0.0
+    dataset.max_tracks_to_preload = None
     dataset.augmentation_probability = 1.0
     dataset.eraser_aug_prob = 0.5
     dataset.eraser_max = 10
@@ -204,7 +207,15 @@ class SelectiveLoaderTests(unittest.TestCase):
             dataset.crop_size = (8, 10)
             dataset.enable_cropping_augs = False
             dataset.enable_depth_augs = False
+            dataset.enable_rgb_augs = False
+            dataset.enable_variable_trajpersample_augs = False
+            dataset.enable_variable_num_views_augs = False
+            dataset.enable_scene_transform_augs = False
+            dataset.enable_camera_params_noise_augs = False
             dataset.augmentation_probability = 0
+            dataset.ratio_dynamic = 0.0
+            dataset.ratio_very_dynamic = 0.0
+            dataset.max_tracks_to_preload = None
 
             sample, gotit = dataset[0]
             self.assertTrue(gotit)
@@ -239,7 +250,15 @@ class SelectiveLoaderTests(unittest.TestCase):
             dataset.crop_size = (8, 10)
             dataset.enable_cropping_augs = False
             dataset.enable_depth_augs = False
+            dataset.enable_rgb_augs = False
+            dataset.enable_variable_trajpersample_augs = False
+            dataset.enable_variable_num_views_augs = False
+            dataset.enable_scene_transform_augs = False
+            dataset.enable_camera_params_noise_augs = False
             dataset.augmentation_probability = 0
+            dataset.ratio_dynamic = 0.0
+            dataset.ratio_very_dynamic = 0.0
+            dataset.max_tracks_to_preload = None
             with self.assertRaisesRegex(ValueError, "cache is stale"):
                 dataset[0]
 
@@ -297,6 +316,8 @@ class MvTrackerSamplingParityTests(unittest.TestCase):
             dataset = _dataset(Path(directory))
             dataset.num_views = None
             dataset.enable_variable_num_views_augs = True
+            dataset.enable_rgb_augs = False
+            dataset.enable_depth_augs = False
 
             counts = np.zeros(4, dtype=np.int64)
             for index in range(400):
@@ -333,7 +354,7 @@ class MvTrackerSamplingParityTests(unittest.TestCase):
         camera_z = np.ones((1, 5, 8), dtype=np.float32)
         visibility = np.zeros((1, 5, 8), dtype=np.bool_)
         visibility[:, 1, :] = True
-        visibility[:, 3:, :] = True
+        visibility[:, 2:, :] = True
 
         selected, queries = loader._sample_tracks(
             tracks,
@@ -349,7 +370,8 @@ class MvTrackerSamplingParityTests(unittest.TestCase):
 
         self.assertEqual(len(selected), 8)
         query_times = queries[:, 0].astype(np.int64)
-        self.assertEqual(np.count_nonzero(query_times == 1), 6)
+        np.testing.assert_array_equal(query_times[2:], np.ones(6, dtype=np.int64))
+        self.assertTrue(np.all(np.isin(query_times[:2], [1, 2, 3])))
         self.assertFalse(np.any(query_times == 4))
         self.assertTrue(np.all(visibility.any(axis=0)[query_times, selected]))
 
