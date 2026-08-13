@@ -296,6 +296,8 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("new EventSource('/api/stream')", html)
         self.assertIn("movingAveragePoints", html)
         self.assertIn("rawPoints", html)
+        self.assertIn('id="raw-opacity"', html)
+        self.assertIn("setRawOpacity", html)
         self.assertIn("Trailing 50-step means", html)
         self.assertIn("`${label} · 50-step mean`", html)
         self.assertIn("meanLine('Total'", html)

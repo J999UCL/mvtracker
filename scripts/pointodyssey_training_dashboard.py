@@ -772,6 +772,10 @@ INDEX_HTML = r"""<!doctype html>
     .chart-wrap.compact { height: 190px; }
     .chart-note { color: var(--muted); margin-top: 7px; font-size: 12px; }
     .validation-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+    .chart-controls { display: flex; justify-content: flex-end; margin: 4px 0 18px; }
+    .opacity-control { display: flex; align-items: center; gap: 10px; }
+    .opacity-control input { width: 170px; accent-color: var(--primary); }
+    .opacity-control output { width: 3.5em; color: var(--text); font-variant-numeric: tabular-nums; }
     label { color: var(--muted); display: grid; gap: 4px; }
     select { max-width: min(700px, 100%); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; color: var(--text); background: var(--panel); }
     .empty { height: 170px; display: grid; place-items: center; text-align: center; border-left: 1px solid var(--border); border-bottom: 1px solid var(--border); }
@@ -806,6 +810,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="metric"><div class="muted">Successful throughput</div><div class="value" id="throughput">—</div><div id="microbatch-config">—</div></div>
     <div class="metric"><div class="muted">Rejected attempts</div><div class="value" id="rejection">—</div><div id="attempt-counts">—</div></div>
     <div class="metric"><div class="muted">Peak GPU allocation</div><div class="value" id="peak-gpu">—</div><div id="peak-vram">—</div></div>
+  </div>
+  <div class="chart-controls">
+    <label class="opacity-control" for="raw-opacity">Raw-point visibility
+      <input id="raw-opacity" type="range" min="0" max="1" step="0.05" value="0.35">
+      <output id="raw-opacity-value" for="raw-opacity">35%</output>
+    </label>
   </div>
 
   <section>
@@ -889,7 +899,7 @@ const alphaColor=(hex,alpha)=>{
   return match?`rgba(${parseInt(match[1],16)},${parseInt(match[2],16)},${parseInt(match[3],16)},${alpha})`:hex;
 };
 const meanLine=(label,stroke,extra={})=>line(`${label} · 50-step mean`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
-const rawPoints=(label,stroke)=>line(`${label} · raw`,alphaColor(stroke,.14),{showInLegend:false,showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0});
+const rawPoints=(label,stroke)=>line(`${label} · raw`,alphaColor(stroke,.35),{showInLegend:false,showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0,isRawPoints:true,rawStroke:stroke});
 const compactNumber=value=>{
   const number=Number(value), magnitude=Math.abs(number);
   if(!Number.isFinite(number)) return value;
@@ -922,6 +932,24 @@ const charts={
   gpuVram:new Chart(document.getElementById('gpu-vram'),{type:'line',data:{datasets:[line('Used VRAM',palette.s2)]},options:options('Elapsed time (min)','VRAM (GiB)',{min:0,legend:false})}),
   gpuThermal:new Chart(document.getElementById('gpu-thermal'),{type:'line',data:{datasets:[line('Power',palette.s3),line('Temperature',palette.s4,{yAxisID:'temp'})]},options:options('Elapsed time (min)','Power (W)',{scales:{temp:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Temperature (°C)',color:palette.muted}}}})})
 };
+const rawOpacity=document.getElementById('raw-opacity');
+const rawOpacityValue=document.getElementById('raw-opacity-value');
+function setRawOpacity(value){
+  const opacity=Math.max(0,Math.min(1,Number(value)));
+  rawOpacityValue.value=`${Math.round(opacity*100)}%`;
+  Object.values(charts).forEach(chart=>{
+    chart.data.datasets.forEach(dataset=>{
+      if(!dataset.isRawPoints) return;
+      const color=alphaColor(dataset.rawStroke,opacity);
+      dataset.borderColor=color;
+      dataset.backgroundColor=color;
+      dataset.pointBackgroundColor=color;
+      dataset.pointBorderColor=color;
+    });
+    chart.update('none');
+  });
+}
+rawOpacity.addEventListener('input',event=>setRawOpacity(event.target.value));
 const points=series=>(series||[]).map(point=>({x:Number(point.step),y:Number(point.value)}));
 const movingAverageXY=(input,windowSize=50)=>{
   const window=[]; let sum=0;
