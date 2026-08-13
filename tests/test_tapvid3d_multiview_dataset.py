@@ -129,6 +129,18 @@ class CacheTests(unittest.TestCase):
                 {"prepared": 0, "reused": 1},
             )
 
+    def test_incomplete_cache_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_raw(root / "raw")
+            cache = root / "cache"
+            loader.prepare_tapvid3d_cache(root / "raw", cache)
+            (cache / "train/scene-alpha/view_0/jpeg_bytes.bin").unlink()
+            self.assertEqual(
+                loader.prepare_tapvid3d_cache(root / "raw", cache),
+                {"prepared": 1, "reused": 0},
+            )
+
 
 class SelectiveLoaderTests(unittest.TestCase):
     def test_reads_only_selected_window_and_returns_encoded_jpegs(self):

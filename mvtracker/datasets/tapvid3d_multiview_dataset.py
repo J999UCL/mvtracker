@@ -81,6 +81,25 @@ def _jpeg_size(encoded: np.ndarray) -> tuple[int, int]:
     return int(image.shape[0]), int(image.shape[1])
 
 
+def _cache_files_complete(target: Path, frame_count: int, views: Sequence[int]) -> bool:
+    for view in views:
+        view_root = target / f"view_{view}"
+        byte_path = view_root / "jpeg_bytes.bin"
+        offset_path = view_root / "jpeg_offsets.npy"
+        if not byte_path.is_file() or not offset_path.is_file():
+            return False
+        offsets = np.load(offset_path, mmap_mode="r", allow_pickle=False)
+        if (
+            offsets.shape != (frame_count + 1,)
+            or offsets.dtype != np.int64
+            or offsets[0] != 0
+            or np.any(offsets[1:] <= offsets[:-1])
+            or int(offsets[-1]) != byte_path.stat().st_size
+        ):
+            return False
+    return True
+
+
 def prepare_tapvid3d_cache(
     raw_root: Path,
     cache_root: Path,
@@ -147,7 +166,14 @@ def prepare_tapvid3d_cache(
             manifest_path = target / "manifest.json"
             if manifest_path.is_file():
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if manifest.get("source_fingerprint") == fingerprint:
+                if (
+                    manifest.get("source_fingerprint") == fingerprint
+                    and _cache_files_complete(
+                        target,
+                        frame_count,
+                        [int(path.name) for path in view_roots],
+                    )
+                ):
                     counts["reused"] += 1
                     continue
 
@@ -525,6 +551,12 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         }
         if _manifest_digest(current_files) != manifest["source_fingerprint"]:
             raise ValueError(f"{source_root}: cache is stale; rerun TAPVid-3D preparation")
+        if not _cache_files_complete(
+            cache_root,
+            int(manifest["frame_count"]),
+            manifest["views"],
+        ):
+            raise ValueError(f"{cache_root}: cache is incomplete; rerun TAPVid-3D preparation")
         return manifest
 
     def _manifest(self, sequence: str) -> dict[str, Any]:
