@@ -223,6 +223,9 @@ class SelectiveLoaderTests(unittest.TestCase):
             self.assertEqual(sample.depth.shape, (2, 3, 1, 8, 10))
             self.assertEqual(sample.trajectory_3d.shape, (3, 4, 3))
             self.assertEqual(sample.metadata["window_end_exclusive"] - sample.metadata["window_start"], 3)
+            self.assertEqual(sample.metadata["motion_track_count"], 4)
+            self.assertIn("motion_window_mean_m", sample.metadata)
+            self.assertIn("motion_full_dynamic_window_static_count", sample.metadata)
             with mock.patch.object(loader.np, "load", wraps=loader.np.load) as np_load:
                 dataset[1]
             self.assertFalse(any(
@@ -311,6 +314,18 @@ class FromNameTests(unittest.TestCase):
 
 
 class MvTrackerSamplingParityTests(unittest.TestCase):
+    def test_visible_path_length_only_counts_consecutively_visible_steps(self):
+        tracks = np.zeros((4, 2, 3), dtype=np.float32)
+        tracks[:, 0, 0] = [0.0, 0.1, 0.3, 0.6]
+        tracks[:, 1, 0] = [0.0, 1.0, 2.0, 3.0]
+        visibility = np.ones((1, 4, 2), dtype=np.bool_)
+        visibility[:, 2, 1] = False
+
+        np.testing.assert_allclose(
+            loader._visible_path_lengths(tracks, visibility),
+            [0.6, 1.0],
+        )
+
     def test_variable_views_are_uniformly_sampled_from_one_to_four(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = _dataset(Path(directory))

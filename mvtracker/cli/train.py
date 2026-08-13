@@ -964,6 +964,7 @@ def main(cfg: DictConfig):
         accumulated_loader_worker_seconds = 0.0
         accumulated_gpu_jpeg_decode_ms = 0.0
         accumulated_gpu_prepare_ms = 0.0
+        accumulated_sampling_metrics = {}
         accumulated_loss_value = 0.0
         accumulated_component_losses = {}
         accumulated_metrics = {}
@@ -1025,6 +1026,12 @@ def main(cfg: DictConfig):
                 accumulated_gpu_prepare_ms += float(np.mean([
                     item.get("gpu_prepare_total_ms", 0.0) for item in metadata
                 ]))
+                for name in metadata[0]:
+                    if name.startswith("motion_"):
+                        accumulated_sampling_metrics[name] = (
+                            accumulated_sampling_metrics.get(name, 0.0)
+                            + float(np.mean([item[name] for item in metadata]))
+                        )
 
             train_iters = cfg.trainer.train_iters
             if cfg.trainer.augment_train_iters:
@@ -1413,6 +1420,20 @@ def main(cfg: DictConfig):
                     accumulated_gpu_prepare_ms / microbatches_accumulated,
                     total_steps,
                 )
+                if accumulated_sampling_metrics:
+                    sampling_metrics = {
+                        name: value / microbatches_accumulated
+                        for name, value in accumulated_sampling_metrics.items()
+                    }
+                    for name, value in sampling_metrics.items():
+                        tb_writer.add_scalar(f"sampling/{name}", value, total_steps)
+                    logging.info(
+                        f"[sampling:{total_steps:06d}] "
+                        f"window_mean={sampling_metrics['motion_window_mean_m']:.3f}m "
+                        f"window_static={sampling_metrics['motion_window_static_count']:.1f} "
+                        f"full_dynamic_window_static="
+                        f"{sampling_metrics['motion_full_dynamic_window_static_count']:.1f}"
+                    )
 
                 if len(total_durations) >= timing_log_freq:
                     total_durations_np = np.array(total_durations)
@@ -1493,6 +1514,10 @@ def main(cfg: DictConfig):
             accumulated_fwd_duration = 0.0
             accumulated_sync_duration = 0.0
             accumulated_bwd_duration = 0.0
+            accumulated_loader_worker_seconds = 0.0
+            accumulated_gpu_jpeg_decode_ms = 0.0
+            accumulated_gpu_prepare_ms = 0.0
+            accumulated_sampling_metrics = {}
             accumulated_loss_value = 0.0
             accumulated_component_losses = {}
             accumulated_metrics = {}

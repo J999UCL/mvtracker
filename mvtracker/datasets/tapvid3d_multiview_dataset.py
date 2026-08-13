@@ -454,6 +454,13 @@ def _sample_tracks(
     return selected_array, query_points.astype(np.float32)
 
 
+def _visible_path_lengths(tracks: np.ndarray, visibility: np.ndarray) -> np.ndarray:
+    visible_consecutively = (visibility[:, :-1] & visibility[:, 1:]).any(axis=0)
+    movement = np.linalg.norm(np.diff(tracks, axis=0), axis=-1)
+    movement[~visible_consecutively] = 0
+    return movement.sum(axis=0)
+
+
 def _preselect_motion_tracks(
     tracks: np.ndarray,
     visibility: np.ndarray,
@@ -464,10 +471,7 @@ def _preselect_motion_tracks(
     maximum: int | None,
 ) -> np.ndarray:
     """Apply MVTracker's full-sequence motion-bucket preselection."""
-    visible_consecutively = (visibility[:, :-1] & visibility[:, 1:]).any(axis=0)
-    movement = np.linalg.norm(np.diff(tracks, axis=0), axis=-1)
-    movement[~visible_consecutively] = 0
-    movement = movement.sum(axis=0)
+    movement = _visible_path_lengths(tracks, visibility)
     static = movement < 0.01
     dynamic = movement > 0.1
     very_dynamic = movement > 2.0
@@ -987,6 +991,33 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         xy_z = transformed_trajectory[:, :, selected]
         selected_tracks = tracks[:, selected]
         selected_visibility = visibility_np[:, :, selected]
+        selected_global = preselected[selected]
+        full_movement = _visible_path_lengths(
+            tracks_all[:, selected_global],
+            visibility_all[:, :, selected_global],
+        )
+        window_movement = _visible_path_lengths(
+            tracks_all[frame_indices][:, selected_global],
+            visibility_all[:, frame_indices][:, :, selected_global],
+        )
+        motion_statistics = {
+            "motion_track_count": int(len(selected_global)),
+            "motion_full_mean_m": float(full_movement.mean()),
+            "motion_full_median_m": float(np.median(full_movement)),
+            "motion_full_p90_m": float(np.quantile(full_movement, 0.9)),
+            "motion_full_static_count": int((full_movement < 0.01).sum()),
+            "motion_full_dynamic_count": int((full_movement > 0.1).sum()),
+            "motion_full_very_dynamic_count": int((full_movement > 2.0).sum()),
+            "motion_window_mean_m": float(window_movement.mean()),
+            "motion_window_median_m": float(np.median(window_movement)),
+            "motion_window_p90_m": float(np.quantile(window_movement, 0.9)),
+            "motion_window_static_count": int((window_movement < 0.01).sum()),
+            "motion_window_dynamic_count": int((window_movement > 0.1).sum()),
+            "motion_window_very_dynamic_count": int((window_movement > 2.0).sum()),
+            "motion_full_dynamic_window_static_count": int(
+                ((full_movement > 0.1) & (window_movement < 0.01)).sum()
+            ),
+        }
         depth_scale = 1.0
         if getattr(self, "enable_scene_transform_augs", False):
             selected_tracks, query_points, xy_z, extrinsics_np, depth_scale = _scene_transform(
@@ -1017,6 +1048,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "selected_views": views,
                 "gotit": True,
                 "worker_prepare_seconds": time.perf_counter() - load_started,
+                **motion_statistics,
             },
             output_size=output_size,
             apply_rgb_aug=apply_rgb_aug,
