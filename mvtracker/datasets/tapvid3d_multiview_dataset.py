@@ -438,6 +438,35 @@ def _scene_transform(
         [[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]],
         dtype=np.float32,
     )
+    rotation_y = np.asarray(
+        [[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]],
+        dtype=np.float32,
+    )
+    rotation = rotation_y @ rotation_x
+    scale = float(rng.uniform(0.8, 1.5))
+    translation = rng.uniform(-2, 2, size=3).astype(np.float32)
+    transformed_tracks = np.einsum("ij,tnj->tni", rotation, tracks * scale) + translation
+    transformed_queries = query_points.copy()
+    transformed_queries[:, 1:] = (
+        np.einsum("ij,nj->ni", rotation, query_points[:, 1:] * scale) + translation
+    )
+    transformed_trajectory = trajectory.copy()
+    transformed_trajectory[..., 2] *= scale
+    rigid = np.eye(4, dtype=np.float32)
+    rigid[:3, :3] = rotation
+    rigid[:3, 3] = translation
+    square = np.repeat(np.eye(4, dtype=np.float32)[None, None], extrinsics.shape[0], axis=0)
+    square = np.repeat(square, extrinsics.shape[1], axis=1)
+    square[..., :3, :3] = extrinsics[..., :3, :3]
+    square[..., :3, 3] = extrinsics[..., :3, 3] * scale
+    transformed_extrinsics = np.einsum("vtij,jk->vtik", square, np.linalg.inv(rigid))[..., :3, :]
+    return (
+        transformed_tracks.astype(np.float32),
+        transformed_queries.astype(np.float32),
+        transformed_trajectory.astype(np.float32),
+        transformed_extrinsics.astype(np.float32),
+        scale,
+    )
 
 
 def _sample_depth_patch_operations(
@@ -493,35 +522,6 @@ def _sample_depth_patch_operations(
                         & (point_xy[:, 1] < y1)
                     )
     return tuple(operations), updated_visibility
-    rotation_y = np.asarray(
-        [[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]],
-        dtype=np.float32,
-    )
-    rotation = rotation_y @ rotation_x
-    scale = float(rng.uniform(0.8, 1.5))
-    translation = rng.uniform(-2, 2, size=3).astype(np.float32)
-    transformed_tracks = np.einsum("ij,tnj->tni", rotation, tracks * scale) + translation
-    transformed_queries = query_points.copy()
-    transformed_queries[:, 1:] = (
-        np.einsum("ij,nj->ni", rotation, query_points[:, 1:] * scale) + translation
-    )
-    transformed_trajectory = trajectory.copy()
-    transformed_trajectory[..., 2] *= scale
-    rigid = np.eye(4, dtype=np.float32)
-    rigid[:3, :3] = rotation
-    rigid[:3, 3] = translation
-    square = np.repeat(np.eye(4, dtype=np.float32)[None, None], extrinsics.shape[0], axis=0)
-    square = np.repeat(square, extrinsics.shape[1], axis=1)
-    square[..., :3, :3] = extrinsics[..., :3, :3]
-    square[..., :3, 3] = extrinsics[..., :3, 3] * scale
-    transformed_extrinsics = np.einsum("vtij,jk->vtik", square, np.linalg.inv(rigid))[..., :3, :]
-    return (
-        transformed_tracks.astype(np.float32),
-        transformed_queries.astype(np.float32),
-        transformed_trajectory.astype(np.float32),
-        transformed_extrinsics.astype(np.float32),
-        scale,
-    )
 
 
 class TapVid3DMultiViewDataset(KubricMultiViewDataset):
