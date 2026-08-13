@@ -15,6 +15,7 @@ import torch
 import torchvision
 from torch.nn import functional as F
 from torchvision.io import ImageReadMode, decode_jpeg
+from torchvision.transforms import functional as TF
 
 from mvtracker.datasets.kubric_multiview_dataset import (
     KubricMultiViewDataset,
@@ -245,9 +246,12 @@ class EncodedTapVid3DSample:
     seq_name: str
     metadata: dict[str, Any]
     output_size: tuple[int, int]
+    apply_rgb_aug: bool
+    rgb_augmentation: dict[str, Any] | None
     apply_depth_aug: bool
     augmentation_seed: int
     depth_scale: float
+    track_upscaling_factor: float
     max_depth: float
     depth_patch_operations: tuple[tuple[int, ...], ...]
 
@@ -327,8 +331,7 @@ def _spatial_transform(
             scale_delta_x = scale_delta_y = 0.0
         else:
             pad_left = pad_right = pad_top = pad_bottom = 0
-        offset_x = offset_y = 0
-        crop_x = crop_y = 0
+        frame_transforms: list[tuple[float, float, int, int]] = []
         for frame in range(frames):
             if enabled:
                 padded_w = source_w + pad_left + pad_right
@@ -348,29 +351,48 @@ def _spatial_transform(
                 new_h = max(output_h + 10, int(padded_h * scale_y))
                 scale_x = (new_w - 1) / (padded_w - 1)
                 scale_y = (new_h - 1) / (padded_h - 1)
-                visible_xy = transformed[view, frame, adjusted_visibility[view, frame]]
-                center = visible_xy.mean(axis=0) if len(visible_xy) else np.asarray([source_w / 2, source_h / 2])
+            else:
+                scale_x = (output_w - 1) / (source_w - 1)
+                scale_y = (output_h - 1) / (source_h - 1)
+                new_w, new_h = output_w, output_h
+            transformed[view, frame, :, 0] = (xy[view, frame, :, 0] + pad_left) * scale_x
+            transformed[view, frame, :, 1] = (xy[view, frame, :, 1] + pad_top) * scale_y
+            adjusted_intrinsics[view, frame, 0, :] *= scale_x
+            adjusted_intrinsics[view, frame, 1, :] *= scale_y
+            adjusted_intrinsics[view, frame, 0, 2] += pad_left * scale_x
+            adjusted_intrinsics[view, frame, 1, 2] += pad_top * scale_y
+            frame_transforms.append((scale_x, scale_y, new_w, new_h))
+
+        visible_at_start = adjusted_visibility[view, 0]
+        visible_tracks = transformed[view][:, visible_at_start]
+        if visible_tracks.shape[1]:
+            center_x = float(visible_tracks[:, 0, 0].mean())
+            center_y = float(visible_tracks[:, 0, 1].mean())
+        else:
+            center_x, center_y = output_w / 2, output_h / 2
+        crop_x = int(center_x - output_w // 2)
+        crop_y = int(center_y - output_h // 2)
+        offset_x = offset_y = 0
+
+        for frame, (scale_x, scale_y, new_w, new_h) in enumerate(frame_transforms):
+            if enabled:
                 if frame == 1:
                     offset_x = int(rng.randint(-36, 37))
                     offset_y = int(rng.randint(-36, 37))
                 elif frame > 1:
                     offset_x = int(offset_x * 0.8 + rng.randint(-36, 37) * 0.2)
                     offset_y = int(offset_y * 0.8 + rng.randint(-36, 37) * 0.2)
-                crop_x = int((center[0] + pad_left) * scale_x - output_w / 2) + offset_x
-                crop_y = int((center[1] + pad_top) * scale_y - output_h / 2) + offset_y
-                crop_x = int(np.clip(crop_x, 0, new_w - output_w))
-                crop_y = int(np.clip(crop_y, 0, new_h - output_h))
+                crop_x += offset_x
+                crop_y += offset_y
+                crop_x = int(np.clip(crop_x, 0, new_w - output_w - 1))
+                crop_y = int(np.clip(crop_y, 0, new_h - output_h - 1))
             else:
-                scale_x = (output_w - 1) / (source_w - 1)
-                scale_y = (output_h - 1) / (source_h - 1)
                 crop_x = crop_y = 0
 
-            transformed[view, frame, :, 0] = (xy[view, frame, :, 0] + pad_left) * scale_x - crop_x
-            transformed[view, frame, :, 1] = (xy[view, frame, :, 1] + pad_top) * scale_y - crop_y
-            adjusted_intrinsics[view, frame, 0, :] *= scale_x
-            adjusted_intrinsics[view, frame, 1, :] *= scale_y
-            adjusted_intrinsics[view, frame, 0, 2] += pad_left * scale_x - crop_x
-            adjusted_intrinsics[view, frame, 1, 2] += pad_top * scale_y - crop_y
+            transformed[view, frame, :, 0] -= crop_x
+            transformed[view, frame, :, 1] -= crop_y
+            adjusted_intrinsics[view, frame, 0, 2] -= crop_x
+            adjusted_intrinsics[view, frame, 1, 2] -= crop_y
             adjusted_visibility[view, frame] &= (
                 np.isfinite(transformed[view, frame]).all(axis=-1)
                 & (transformed[view, frame, :, 0] >= 0)
@@ -394,6 +416,10 @@ def _sample_tracks(
     visibility: np.ndarray,
     count: int,
     rng: np.random.RandomState,
+    *,
+    augment_this_datapoint: bool = False,
+    enable_variable_trajpersample_augs: bool = False,
+    sample_index: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     any_view = visibility.any(axis=0)
     eligible = any_view.sum(axis=0) >= 2
@@ -401,29 +427,72 @@ def _sample_tracks(
     indices = np.flatnonzero(eligible)
     if len(indices) < max(1, count // 4):
         return np.empty(0, dtype=np.int64), np.empty((0, 4), dtype=np.float32)
-    movement = np.linalg.norm(np.diff(tracks, axis=0), axis=-1).sum(axis=0)
-    buckets = (indices[movement[indices] > 2.0], indices[(movement[indices] > 0.1) & (movement[indices] <= 2.0)], indices[movement[indices] <= 0.1])
-    selected: list[int] = []
-    for bucket, fraction in zip(buckets, (0.25, 0.5, 0.25)):
-        take = min(len(bucket), round(count * fraction))
-        if take:
-            selected.extend(rng.choice(bucket, take, replace=False).tolist())
-    remaining = np.setdiff1d(indices, np.asarray(selected, dtype=np.int64), assume_unique=False)
-    if len(selected) < count and len(remaining):
-        take = min(count - len(selected), len(remaining))
-        selected.extend(rng.choice(remaining, take, replace=False).tolist())
-    rng.shuffle(selected)
-    selected_array = np.asarray(selected[:count], dtype=np.int64)
+    order = rng.permutation(len(indices))
+    sample_count = count
+    if augment_this_datapoint and enable_variable_trajpersample_augs:
+        if sample_index % 20 == 0:
+            sample_count //= 8
+        elif sample_index % 21 != 0:
+            low = max(1, sample_count // 4)
+            high = min(len(indices), sample_count) + 1
+            sample_count = int(rng.randint(low, high))
+    else:
+        sample_count = min(len(indices), sample_count)
+    selected_array = indices[order[:sample_count]]
     selected_visibility = visibility[:, :, selected_array]
     visible_any = selected_visibility.any(axis=0)
-    query_times = np.empty(len(selected_array), dtype=np.int64)
-    for point in range(len(selected_array)):
+    last_visible = (np.arange(len(visible_any))[:, None] * visible_any).max(axis=0)
+    visible_any[last_visible, np.arange(len(selected_array))] = False
+    random_query_count = len(selected_array) // 4
+    query_times = np.argmax(visible_any, axis=0)
+    for point in range(random_query_count):
         candidates = np.flatnonzero(visible_any[:, point])
         query_times[point] = int(candidates[rng.randint(len(candidates))])
     query_points = np.concatenate(
         [query_times[:, None].astype(np.float32), tracks[query_times, selected_array]], axis=1
     )
     return selected_array, query_points.astype(np.float32)
+
+
+def _preselect_motion_tracks(
+    tracks: np.ndarray,
+    visibility: np.ndarray,
+    rng: np.random.RandomState,
+    *,
+    ratio_dynamic: float,
+    ratio_very_dynamic: float,
+    maximum: int | None,
+) -> np.ndarray:
+    """Apply MVTracker's full-sequence motion-bucket preselection."""
+    visible_consecutively = (visibility[:, :-1] & visibility[:, 1:]).any(axis=0)
+    movement = np.linalg.norm(np.diff(tracks, axis=0), axis=-1)
+    movement[~visible_consecutively] = 0
+    movement = movement.sum(axis=0)
+    static = movement < 0.01
+    dynamic = movement > 0.1
+    very_dynamic = movement > 2.0
+    ratio_static = 1.0 - ratio_dynamic - ratio_very_dynamic
+    available = len(tracks[0])
+    available = min(
+        available,
+        int(dynamic.sum() / ratio_dynamic) if ratio_dynamic else available,
+        int(very_dynamic.sum() // ratio_very_dynamic) if ratio_very_dynamic else available,
+        int(static.sum() / ratio_static) if ratio_static else available,
+    )
+    if maximum is not None:
+        available = min(available, maximum)
+    n_dynamic = min(int(available * ratio_dynamic), int(dynamic.sum()))
+    n_very_dynamic = min(int(available * ratio_very_dynamic), int(very_dynamic.sum()))
+    n_static = available - n_dynamic - n_very_dynamic
+    selected = np.concatenate(
+        [
+            rng.choice(np.flatnonzero(dynamic), n_dynamic, replace=False),
+            rng.choice(np.flatnonzero(very_dynamic), n_very_dynamic, replace=False),
+            rng.choice(np.flatnonzero(static), n_static, replace=False),
+        ]
+    )
+    rng.shuffle(selected)
+    return selected.astype(np.int64, copy=False)
 
 
 def _scene_transform(
@@ -524,14 +593,161 @@ def _sample_depth_patch_operations(
     return tuple(operations), updated_visibility
 
 
+def _sample_color_jitter(rng: np.random.RandomState) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    return (
+        tuple(int(value) for value in rng.permutation(4)),
+        (
+            float(rng.uniform(0.8, 1.2)),
+            float(rng.uniform(0.8, 1.2)),
+            float(rng.uniform(0.8, 1.2)),
+            float(rng.uniform(-0.25 / np.pi, 0.25 / np.pi)),
+        ),
+    )
+
+
+def _sample_rgb_augmentation(
+    trajectory: np.ndarray,
+    visibility: np.ndarray,
+    height: int,
+    width: int,
+    rng: np.random.RandomState,
+    *,
+    eraser_probability: float,
+    eraser_max: int,
+    eraser_bounds: Sequence[int],
+    replace_probability: float,
+    replace_max: int,
+    replace_bounds: Sequence[int],
+) -> tuple[dict[str, Any], np.ndarray]:
+    views, frames, _, _ = trajectory.shape
+    updated_visibility = visibility.copy()
+    patch_operations: list[tuple[int, ...]] = []
+
+    def bounds(limit: int, center: int, extent: int) -> tuple[int, int]:
+        lower = int(np.clip(round(center - extent / 2), 0, limit - 1))
+        upper = int(np.clip(round(center + extent / 2), lower + 1, limit))
+        return lower, upper
+
+    for kind, probability, maximum, extents in (
+        (0, eraser_probability, eraser_max, eraser_bounds),
+        (1, replace_probability, replace_max, replace_bounds),
+    ):
+        for view in range(views):
+            for frame in range(1, frames):
+                if rng.rand() >= probability:
+                    continue
+                for _ in range(int(rng.randint(1, maximum + 1))):
+                    x0, x1 = bounds(width, int(rng.randint(width)), int(rng.randint(*extents)))
+                    y0, y1 = bounds(height, int(rng.randint(height)), int(rng.randint(*extents)))
+                    if kind == 0:
+                        patch_operations.append((kind, view, frame, x0, x1, y0, y1))
+                    else:
+                        source_frame = int(rng.randint(frames))
+                        source_x = int(rng.randint(0, width - (x1 - x0) + 1))
+                        source_y = int(rng.randint(0, height - (y1 - y0) + 1))
+                        patch_operations.append(
+                            (kind, view, frame, x0, x1, y0, y1, source_frame, source_x, source_y)
+                        )
+                    point_xy = trajectory[view, frame, :, :2]
+                    updated_visibility[view, frame] &= ~(
+                        (point_xy[:, 0] >= x0)
+                        & (point_xy[:, 0] < x1)
+                        & (point_xy[:, 1] >= y0)
+                        & (point_xy[:, 1] < y1)
+                    )
+
+    alternative_jitters = tuple(
+        tuple((_sample_color_jitter(rng), _sample_color_jitter(rng)) for _ in range(frames))
+        for _ in range(views)
+    )
+    color_jitters = (
+        tuple(_sample_color_jitter(rng) for _ in range(frames))
+        if rng.rand() < 0.25
+        else ()
+    )
+    blur_sigmas = (
+        tuple(float(rng.uniform(0.1, 2.0)) for _ in range(frames))
+        if rng.rand() < 0.25
+        else ()
+    )
+    return {
+        "patch_operations": tuple(patch_operations),
+        "alternative_jitters": alternative_jitters,
+        "color_jitters": color_jitters,
+        "blur_sigmas": blur_sigmas,
+    }, updated_visibility
+
+
+def _apply_color_jitter(
+    image: torch.Tensor,
+    parameters: tuple[tuple[int, ...], tuple[float, ...]],
+) -> torch.Tensor:
+    order, factors = parameters
+    result = image / 255.0
+    operations = (
+        lambda value: TF.adjust_brightness(value, factors[0]),
+        lambda value: TF.adjust_contrast(value, factors[1]),
+        lambda value: TF.adjust_saturation(value, factors[2]),
+        lambda value: TF.adjust_hue(value, factors[3]),
+    )
+    for operation in order:
+        result = operations[operation](result)
+    return result.clamp_(0, 1).mul_(255.0)
+
+
+def _apply_rgb_augmentation(video: torch.Tensor, specification: dict[str, Any]) -> torch.Tensor:
+    result = video.clone()
+    for operation in specification["patch_operations"]:
+        kind, view, frame, x0, x1, y0, y1, *parameters = operation
+        if kind == 0:
+            patch = result[view, frame, :, y0:y1, x0:x1]
+            patch.copy_(patch.mean(dim=(1, 2), keepdim=True))
+
+    alternative = result.clone()
+    for view, frames in enumerate(specification["alternative_jitters"]):
+        for frame, jitters in enumerate(frames):
+            for jitter in jitters:
+                alternative[view, frame] = _apply_color_jitter(alternative[view, frame], jitter)
+
+    for operation in specification["patch_operations"]:
+        kind, view, frame, x0, x1, y0, y1, *parameters = operation
+        if kind == 1:
+            source_frame, source_x, source_y = parameters
+            alternative_patch = alternative[
+                view,
+                source_frame,
+                :,
+                source_y : source_y + (y1 - y0),
+                source_x : source_x + (x1 - x0),
+            ]
+            result[view, frame, :, y0:y1, x0:x1] = alternative_patch
+
+    for frame, jitter in enumerate(specification["color_jitters"]):
+        for view in range(len(result)):
+            result[view, frame] = _apply_color_jitter(result[view, frame], jitter)
+    for frame, sigma in enumerate(specification["blur_sigmas"]):
+        for view in range(len(result)):
+            result[view, frame] = TF.gaussian_blur(
+                result[view, frame], [11, 11], [sigma, sigma]
+            )
+    return result
+
+
 class TapVid3DMultiViewDataset(KubricMultiViewDataset):
     """MVTracker sampling over cached raw TAPVid-3D sequences."""
 
     collate_fn = staticmethod(collate_encoded_tapvid3d)
     requires_cuda_prefetch = True
 
-    def __init__(self, *args, raw_root: str, **kwargs):
+    def __init__(
+        self,
+        *args,
+        raw_root: str,
+        view_count_probabilities: Sequence[float] | None = None,
+        **kwargs,
+    ):
         self.raw_root = Path(raw_root)
+        self.view_count_probabilities = tuple(view_count_probabilities or (0.25,) * 4)
         super().__init__(*args, **kwargs)
         self._manifests: dict[str, dict[str, Any]] = {}
         self._arrays: dict[Path, np.ndarray] = {}
@@ -610,6 +826,9 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             "data_root": os.path.join(dataset_root, cache_dir, _SPLITS[requested]),
             "raw_root": os.path.join(dataset_root, raw_dir, _SPLITS[requested]),
             "num_views": int(datasets_cfg.get("tapvid3d_num_views", 4)),
+            "view_count_probabilities": datasets_cfg.get(
+                "tapvid3d_view_count_probabilities", (0.25,) * 4
+            ),
             "views_to_return": None,
             "novel_views": None,
             "use_duster_depths": False,
@@ -617,10 +836,9 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             "duster_views": None,
             "supported_duster_views_sets": None,
             "enable_variable_depth_type_augs": False,
-            "enable_variable_num_views_augs": False,
         })
-        if kwargs.get("enable_rgb_augs"):
-            raise ValueError("GPU TAPVid-3D loading requires augmentations.rgb=false")
+        if requested == "training" and kwargs.get("enable_variable_num_views_augs"):
+            kwargs["num_views"] = None
         if kwargs.get("normalize_scene_following_vggt"):
             raise ValueError("GPU TAPVid-3D loading does not support VGGT scene normalization")
         if just_return_kwargs:
@@ -632,25 +850,55 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         virtual_index = int(index)
         scene_index = virtual_index % self.real_len
         sequence = self.seq_names[scene_index]
-        seed = int(self.seed + virtual_index if self.seed is not None and self.add_index_to_seed else self.seed or torch.randint(0, 2**31, ()).item())
+        if self.seed is None:
+            seed = int(torch.randint(0, 2**32 - 1, ()).item())
+        else:
+            seed = int(self.seed + virtual_index if self.add_index_to_seed else self.seed)
         rng = np.random.RandomState(seed)
         cache_root = Path(self.data_root) / sequence
         manifest = self._manifest(sequence)
         source_root = self.raw_root / manifest["source_sequence"]
 
         frame_count = int(manifest["frame_count"])
+        available_views = list(manifest["views"])
+        if getattr(self, "enable_variable_num_views_augs", False):
+            maximum_views = min(4, len(available_views))
+            probabilities = np.asarray(
+                getattr(self, "view_count_probabilities", (0.25,) * 4)[:maximum_views],
+                dtype=np.float64,
+            )
+            probabilities /= probabilities.sum()
+            view_count = int(rng.choice(np.arange(1, maximum_views + 1), p=probabilities))
+        else:
+            view_count = len(available_views) if self.num_views == -1 else int(self.num_views)
+        if len(available_views) < view_count:
+            raise ValueError(f"{source_root}: requires {view_count} views")
+        views = sorted(rng.choice(available_views, view_count, replace=False).tolist())
+
+        tracks_all = np.asarray(self._mmap(source_root / "tracks_xyz.npy"), dtype=np.float32)
+        visibility_all = np.stack(
+            [
+                np.asarray(self._mmap(source_root / str(view) / "visibility.npy"), dtype=np.bool_)
+                for view in views
+            ]
+        )
+        preselected = _preselect_motion_tracks(
+            tracks_all,
+            visibility_all,
+            rng,
+            ratio_dynamic=float(getattr(self, "ratio_dynamic", 0.5)),
+            ratio_very_dynamic=float(getattr(self, "ratio_very_dynamic", 0.25)),
+            maximum=getattr(self, "max_tracks_to_preload", 18000),
+        )
+        if not len(preselected):
+            return None, False
+
         legal = _legal_contiguous_window_starts(frame_count, self.seq_len)
         if not len(legal):
             raise ValueError(f"{source_root}: fewer than {self.seq_len} frames")
         start = int(rng.choice(legal))
         frame_indices = np.arange(start, start + self.seq_len)
-        available_views = list(manifest["views"])
-        if len(available_views) < self.num_views:
-            raise ValueError(f"{source_root}: requires {self.num_views} views")
-        views = sorted(rng.choice(available_views, self.num_views, replace=False).tolist())
-
-        tracks_all = self._mmap(source_root / "tracks_xyz.npy")
-        tracks = np.asarray(tracks_all[frame_indices], dtype=np.float32)
+        tracks = tracks_all[frame_indices][:, preselected]
         extrinsics = []
         intrinsics = []
         visibility = []
@@ -661,7 +909,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             extrinsics.append(np.asarray(self._mmap(raw_view / "extrinsics_w2c.npy")[frame_indices, :3, :4], dtype=np.float32))
             k = _intrinsics_matrix(self._mmap(raw_view / "intrinsics.npy"))
             intrinsics.append(np.repeat(k[None], self.seq_len, axis=0))
-            visibility.append(np.asarray(self._mmap(raw_view / "visibility.npy")[frame_indices], dtype=np.bool_))
+            visibility.append(visibility_all[views.index(view), frame_indices][:, preselected])
             depths.append(torch.from_numpy(np.asarray(self._mmap(raw_view / "depth.npy")[frame_indices], dtype=np.float32).copy()))
             cache_view = cache_root / f"view_{view}"
             encoded.extend(_read_encoded_frames(
@@ -676,35 +924,41 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         xy, camera_z = _project(tracks, extrinsics_np, intrinsics_np)
         visibility_np &= np.isfinite(xy).all(axis=-1) & np.isfinite(camera_z) & (camera_z > 0)
         source_size = tuple(int(value) for value in manifest["resolution_hw"])
+        augment_this_datapoint = bool(
+            self.augmentation_probability > 0
+            and rng.rand() <= self.augmentation_probability
+        )
+        apply_rgb_aug = bool(
+            augment_this_datapoint and getattr(self, "enable_rgb_augs", False)
+        )
+        rgb_augmentation = None
+        if apply_rgb_aug:
+            pre_crop_trajectory = np.concatenate([xy, camera_z[..., None]], axis=-1)
+            rgb_augmentation, visibility_np = _sample_rgb_augmentation(
+                pre_crop_trajectory,
+                visibility_np,
+                source_size[0],
+                source_size[1],
+                rng,
+                eraser_probability=self.eraser_aug_prob,
+                eraser_max=self.eraser_max,
+                eraser_bounds=self.eraser_bounds,
+                replace_probability=self.replace_aug_prob,
+                replace_max=self.replace_max,
+                replace_bounds=self.replace_bounds,
+            )
         output_size = tuple(int(value) for value in self.crop_size) if self.enable_cropping_augs else source_size
         xy, visibility_np, intrinsics_np, theta = _spatial_transform(
             xy, visibility_np, intrinsics_np, source_size, output_size, rng,
             self.enable_cropping_augs,
         )
-        selected, query_points = _sample_tracks(
-            tracks, xy, camera_z, visibility_np, self.traj_per_sample, rng
-        )
-        if not len(selected):
-            return None, False
-        xy_z = np.concatenate([xy[:, :, selected], camera_z[:, :, selected, None]], axis=-1)
-        selected_tracks = tracks[:, selected]
-        depth_scale = 1.0
-        if getattr(self, "enable_scene_transform_augs", False):
-            selected_tracks, query_points, xy_z, extrinsics_np, depth_scale = _scene_transform(
-                selected_tracks, query_points, xy_z, extrinsics_np, rng
-            )
-        if getattr(self, "enable_camera_params_noise_augs", False):
-            intrinsics_np = intrinsics_np + rng.normal(0, 0.001, size=intrinsics_np.shape)
-            extrinsics_np = extrinsics_np + rng.normal(0, 0.001, size=extrinsics_np.shape)
-        apply_depth_aug = bool(
-            self.enable_depth_augs and rng.rand() <= self.augmentation_probability
-        )
-        selected_visibility = visibility_np[:, :, selected]
+        transformed_trajectory = np.concatenate([xy, camera_z[..., None]], axis=-1)
+        apply_depth_aug = bool(augment_this_datapoint and self.enable_depth_augs)
         depth_patch_operations: tuple[tuple[int, ...], ...] = ()
         if apply_depth_aug:
-            depth_patch_operations, selected_visibility = _sample_depth_patch_operations(
-                xy_z,
-                selected_visibility,
+            depth_patch_operations, visibility_np = _sample_depth_patch_operations(
+                transformed_trajectory,
+                visibility_np,
                 output_size[0],
                 output_size[1],
                 rng,
@@ -715,6 +969,32 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 replace_max=self.replace_max,
                 replace_bounds=self.replace_bounds,
             )
+        selected, query_points = _sample_tracks(
+            tracks,
+            xy,
+            camera_z,
+            visibility_np,
+            self.traj_per_sample,
+            rng,
+            augment_this_datapoint=augment_this_datapoint,
+            enable_variable_trajpersample_augs=getattr(
+                self, "enable_variable_trajpersample_augs", False
+            ),
+            sample_index=scene_index,
+        )
+        if not len(selected):
+            return None, False
+        xy_z = transformed_trajectory[:, :, selected]
+        selected_tracks = tracks[:, selected]
+        selected_visibility = visibility_np[:, :, selected]
+        depth_scale = 1.0
+        if getattr(self, "enable_scene_transform_augs", False):
+            selected_tracks, query_points, xy_z, extrinsics_np, depth_scale = _scene_transform(
+                selected_tracks, query_points, xy_z, extrinsics_np, rng
+            )
+        if getattr(self, "enable_camera_params_noise_augs", False):
+            intrinsics_np = intrinsics_np + rng.normal(0, 0.001, size=intrinsics_np.shape)
+            extrinsics_np = extrinsics_np + rng.normal(0, 0.001, size=extrinsics_np.shape)
         sample = EncodedTapVid3DSample(
             jpeg_bytes=tuple(encoded),
             depth=torch.stack(depths)[:, :, None],
@@ -739,9 +1019,12 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "worker_prepare_seconds": time.perf_counter() - load_started,
             },
             output_size=output_size,
+            apply_rgb_aug=apply_rgb_aug,
+            rgb_augmentation=rgb_augmentation,
             apply_depth_aug=apply_depth_aug,
             augmentation_seed=seed,
             depth_scale=depth_scale,
+            track_upscaling_factor=1.0 / depth_scale,
             max_depth=float(getattr(self, "max_depth", 1000.0)),
             depth_patch_operations=depth_patch_operations,
         )
@@ -771,16 +1054,21 @@ def decode_tapvid3d_batch(
     for sample in batch.samples:
         decoded = decoded_all[decoded_offset:decoded_offset + len(sample.jpeg_bytes)]
         decoded_offset += len(sample.jpeg_bytes)
-        rgb = torch.stack(decoded).float()
         views, frames = sample.depth.shape[:2]
         source_h, source_w = sample.depth.shape[-2:]
         output_h, output_w = sample.output_size
+        rgb = torch.stack(decoded).float().reshape(
+            views, frames, 3, source_h, source_w
+        )
+        if sample.apply_rgb_aug:
+            rgb = _apply_rgb_augmentation(rgb, sample.rgb_augmentation)
+        rgb = rgb.reshape(views * frames, 3, source_h, source_w)
         theta = sample.theta.to(device, non_blocking=True).reshape(-1, 2, 3)
         grid = F.affine_grid(theta, (views * frames, 3, output_h, output_w), align_corners=True)
         rgb = F.grid_sample(rgb, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
         depth = sample.depth.to(device, non_blocking=True).reshape(views * frames, 1, source_h, source_w)
         depth = F.grid_sample(depth, grid, mode="nearest", padding_mode="zeros", align_corners=True)
-        depth *= sample.depth_scale
+        depth[depth > sample.max_depth] = 0
         if sample.apply_depth_aug:
             generator = torch.Generator(device=device).manual_seed(sample.augmentation_seed)
             invalid = depth == 0
@@ -804,7 +1092,7 @@ def decode_tapvid3d_batch(
                     ].clone()
             depth = depth_views.reshape(views * frames, 1, output_h, output_w)
             depth[invalid] = 0
-        depth[depth > sample.max_depth] = 0
+        depth *= sample.depth_scale
         videos.append(rgb.reshape(views, frames, 3, output_h, output_w))
         depths.append(depth.reshape(views, frames, 1, output_h, output_w))
 
@@ -826,7 +1114,7 @@ def decode_tapvid3d_batch(
         query_points=None,
         query_points_3d=stack("query_points_3d"),
         sample_metadata=[sample.metadata for sample in batch.samples],
-        track_upscaling_factor=1.0,
+        track_upscaling_factor=batch.samples[0].track_upscaling_factor,
     )
     if timing_events is not None:
         timing_events[2].record()

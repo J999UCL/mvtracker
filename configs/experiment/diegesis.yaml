@@ -1,17 +1,31 @@
 # @package _global_
 
+experiment_path: ./logs/diegesis
+restore_ckpt_path: ./checkpoints/mvtracker_200000_june2025_cleandepth.pth
+
 datasets:
   root: ${oc.env:DIEGESIS_MVTRACKER_ROOT}
   tapvid3d_raw_dir: TAPVid3D_raw
   tapvid3d_cache_dir: TAPVid3D_MVTracker_cache
   tapvid3d_num_views: 4
+  tapvid3d_view_count_probabilities: [0.25, 0.25, 0.25, 0.25]
   train:
     name: tapvid3d-multiview-training
+    traj_per_sample: 256
   eval:
     names:
       - tapvid3d-multiview-validation
 
+trainer:
+  gradient_accumulation_steps: 8
+
+augmentations:
+  rgb: true
+  depth: true
+  variable_depth_type: false
+  variable_num_views: true
+
 logging:
   log_wandb: true
   wandb_project: mvtracker-diegesis
-  tags: [diegesis, tapvid3d, nvjpeg]
+  tags: [diegesis, tapvid3d, nvjpeg, clean-depth]
