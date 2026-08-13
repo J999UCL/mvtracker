@@ -12,6 +12,7 @@ class PointOdysseyTrainingConfigTests(unittest.TestCase):
         config = yaml.safe_load((self.config_root / "train.yaml").read_text())
 
         self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 1)
+        self.assertEqual(config["trainer"]["expensive_diagnostics_interval"], 50)
 
     def test_pointodyssey_uses_eight_serial_microbatches(self):
         config = yaml.safe_load(

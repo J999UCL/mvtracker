@@ -820,7 +820,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <section>
     <h2>Training losses</h2>
-    <div class="chart-panel"><h3>Combined trend</h3><div class="chart-wrap"><canvas id="loss-combined"></canvas></div><div class="chart-note">Trailing 50-step means. Raw per-step values are shown as faint, unconnected points in the detail plots below.</div></div>
+    <div class="chart-panel"><h3>Combined trend</h3><div class="chart-wrap"><canvas id="loss-combined"></canvas></div><div class="chart-note">Trailing 50-sample means. Raw values are shown as faint, unconnected points in the detail plots below.</div></div>
     <div class="grid-3" style="margin-top:22px">
       <div class="chart-panel"><h3>Total loss</h3><div class="chart-wrap compact"><canvas id="loss-total"></canvas></div></div>
       <div class="chart-panel"><h3>Visibility loss</h3><div class="chart-wrap compact"><canvas id="loss-visibility"></canvas></div></div>
@@ -831,8 +831,8 @@ INDEX_HTML = r"""<!doctype html>
   <section>
     <h2>Trajectory baseline</h2>
     <div class="grid-2">
-      <div class="chart-panel"><h3>Model versus stationary prediction</h3><div class="chart-wrap"><canvas id="stationary-baseline"></canvas></div><div class="chart-note">Faint points are raw steps; solid lines are trailing 50-step means. Stationary holds every track at its query coordinate.</div></div>
-      <div class="chart-panel"><h3>Model / stationary loss</h3><div class="chart-wrap"><canvas id="stationary-ratio"></canvas></div><div class="chart-note">Faint points are raw ratios; the solid line is the trailing 50-step mean. Below 1.0 means the model beats the no-motion baseline.</div></div>
+      <div class="chart-panel"><h3>Model versus stationary prediction</h3><div class="chart-wrap"><canvas id="stationary-baseline"></canvas></div><div class="chart-note">Faint points are diagnostic samples; solid lines are trailing 50-sample means. Stationary holds every track at its query coordinate.</div></div>
+      <div class="chart-panel"><h3>Model / stationary loss</h3><div class="chart-wrap"><canvas id="stationary-ratio"></canvas></div><div class="chart-note">Faint points are diagnostic samples; the solid line is the trailing 50-sample mean. Below 1.0 means the model beats the no-motion baseline.</div></div>
     </div>
   </section>
 
@@ -852,8 +852,8 @@ INDEX_HTML = r"""<!doctype html>
       <div class="chart-panel"><h3>Learning-rate schedule</h3><div class="chart-wrap"><canvas id="learning-rate"></canvas></div></div>
     </div>
     <div class="grid-3" style="margin-top:22px">
-      <div class="chart-panel"><h3>Gradient norms</h3><div class="chart-wrap compact"><canvas id="gradient-norms"></canvas></div><div class="chart-note">Faint points are raw steps; strong lines are trailing 50-step means.</div></div>
-      <div class="chart-panel"><h3>Microbatch gradient agreement</h3><div class="chart-wrap compact"><canvas id="gradient-cosine"></canvas></div><div class="chart-note">Trailing 50-step means over faint raw points. Negative cosine indicates gradient cancellation.</div></div>
+      <div class="chart-panel"><h3>Gradient norms</h3><div class="chart-wrap compact"><canvas id="gradient-norms"></canvas></div><div class="chart-note">Faint points are diagnostic samples; strong lines are trailing 50-sample means.</div></div>
+      <div class="chart-panel"><h3>Microbatch gradient agreement</h3><div class="chart-wrap compact"><canvas id="gradient-cosine"></canvas></div><div class="chart-note">Trailing 50-sample means over diagnostic samples. Negative cosine indicates gradient cancellation.</div></div>
       <div class="chart-panel"><h3>Elementwise gradient clipping</h3><div class="chart-wrap compact"><canvas id="gradient-clipping"></canvas></div><div class="chart-note">Upstream clips each gradient element to ±1; norm retention is post/pre global norm. Clipped-step rate is the share of the latest 50 optimizer steps with any clipped element.</div></div>
     </div>
   </section>
@@ -898,7 +898,7 @@ const alphaColor=(hex,alpha)=>{
   const match=/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
   return match?`rgba(${parseInt(match[1],16)},${parseInt(match[2],16)},${parseInt(match[3],16)},${alpha})`:hex;
 };
-const meanLine=(label,stroke,extra={})=>line(`${label} · 50-step mean`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
+const meanLine=(label,stroke,extra={})=>line(`${label} · 50-sample mean`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
 const rawPoints=(label,stroke)=>line(`${label} · raw`,alphaColor(stroke,.35),{showInLegend:false,showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0,isRawPoints:true,rawStroke:stroke});
 const compactNumber=value=>{
   const number=Number(value), magnitude=Math.abs(number);

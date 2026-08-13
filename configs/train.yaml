@@ -41,6 +41,7 @@ trainer:
   grad_clip: 1.0
   gradient_accumulation_steps: 1
   gradient_diagnostics: true
+  expensive_diagnostics_interval: 50 # stationary/reprojection/gradient diagnostics, in optimizer steps
   precision: 16-mixed               # training precision (e.g., 16-mixed, bf16-mixed or 32-true)
   visibility_loss_weight: 0.1
 

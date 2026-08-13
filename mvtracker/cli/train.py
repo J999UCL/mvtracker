@@ -230,7 +230,17 @@ def fetch_optimizer(trainer_cfg, model):
     return optimizer, scheduler
 
 
-def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_debug_logs=False, debug_logs_path=''):
+def forward_batch_multi_view(
+        batch,
+        model,
+        cfg,
+        step,
+        train_iters,
+        gamma,
+        save_debug_logs=False,
+        debug_logs_path='',
+        run_expensive_diagnostics=True,
+):
     # Per view data
     rgbs = batch.video
     depths = batch.videodepth
@@ -263,12 +273,12 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
     assert valid_tracks_per_frame.shape == (batch_size, num_frames, num_points)
 
     gt_visibilities_any_view = gt_visibilities_per_view.any(dim=1)
-    assert gt_visibilities_any_view.any(dim=1).all(), "All points should be visible at in least one frame."
+    if save_debug_logs:
+        assert gt_visibilities_any_view.any(dim=1).all(), "All points should be visible at in least one frame."
 
-    for batch_idx in range(batch_size):
-        for point_idx in range(num_points):
-            t = query_points_3d[batch_idx, point_idx, 0].long().item()
-            valid_tracks_per_frame[batch_idx, :t, point_idx] = False
+    frame_indices = torch.arange(num_frames, device=query_points_3d.device)[None, :, None]
+    query_frames = query_points_3d[:, :, 0].long()[:, None, :]
+    valid_tracks_per_frame = valid_tracks_per_frame & (frame_indices >= query_frames)
 
     # Run the model
     results = model(
@@ -295,11 +305,11 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
     vis_gts = []
     traj_gts = []
     valids_gts = []
-    query_points_t_min = query_points_3d[:, :, 0].long().min()
+    query_points_t_min = int(query_points_3d[:, :, 0].long().min().item())
+    gt_visibilities_any_view_sorted = gt_visibilities_any_view[:, :, sort_inds]
+    gt_trajectories_3d_worldspace_sorted = gt_trajectories_3d_worldspace[:, :, sort_inds]
+    valid_tracks_per_frame_sorted = valid_tracks_per_frame[:, :, sort_inds]
     for i, wind_p_idx_end in enumerate(p_idx_end_list):
-        gt_visibilities_any_view_sorted = gt_visibilities_any_view[:, :, sort_inds]
-        gt_trajectories_3d_worldspace_sorted = gt_trajectories_3d_worldspace[:, :, sort_inds]
-        valid_tracks_per_frame_sorted = valid_tracks_per_frame[:, :, sort_inds]
         ind = query_points_t_min + i * (cfg.model.sliding_window_len // 2)
         vis_gts.append(gt_visibilities_any_view_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
         traj_gts.append(
@@ -307,13 +317,14 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
         valids_gts.append(valid_tracks_per_frame_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
 
     # Compute the losses
-    logging.info(f"[DEBUG] "
-                 f"{step=} "
-                 f"{track_upscaling_factor=} "
-                 f"{coord_predictions[0][0][0, 0, 0]=} "
-                 f"{coord_predictions[-1][0][0, 0, 0]=} "
-                 f"{vis_predictions[0][0, 0, 0]=} "
-                 f"{vis_predictions[-1][0, 0, 0]=}")
+    if save_debug_logs:
+        logging.info(f"[DEBUG] "
+                     f"{step=} "
+                     f"{track_upscaling_factor=} "
+                     f"{coord_predictions[0][0][0, 0, 0]=} "
+                     f"{coord_predictions[-1][0][0, 0, 0]=} "
+                     f"{vis_predictions[0][0, 0, 0]=} "
+                     f"{vis_predictions[-1][0, 0, 0]=}")
     xyz_loss = sequence_loss_3d(coord_predictions, traj_gts, vis_gts, valids_gts, gamma) * track_upscaling_factor
     vis_loss = balanced_ce_loss(vis_predictions, vis_gts, valids_gts)
 
@@ -321,31 +332,37 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
     # world-space coordinate for the full clip, then evaluate it with the exact
     # same sliding windows, valid masks, refinement weights, and Z scaling as
     # the model trajectory loss.
-    with torch.no_grad():
-        query_xyz_sorted = query_points_3d[:, sort_inds, 1:]
-        stationary_predictions = []
-        for window_predictions, window_gt in zip(coord_predictions, traj_gts):
-            window_track_count = window_gt.shape[2]
-            stationary = query_xyz_sorted[:, None, :window_track_count].expand(
-                -1,
-                window_gt.shape[1],
-                -1,
-                -1,
+    diagnostic_metrics = {}
+    if run_expensive_diagnostics:
+        with torch.no_grad():
+            query_xyz_sorted = query_points_3d[:, sort_inds, 1:]
+            stationary_predictions = []
+            for window_predictions, window_gt in zip(coord_predictions, traj_gts):
+                window_track_count = window_gt.shape[2]
+                stationary = query_xyz_sorted[:, None, :window_track_count].expand(
+                    -1,
+                    window_gt.shape[1],
+                    -1,
+                    -1,
+                )
+                stationary_predictions.append(
+                    [stationary.clone() for _ in window_predictions]
+                )
+            stationary_xyz_loss = (
+                sequence_loss_3d(
+                    stationary_predictions,
+                    traj_gts,
+                    vis_gts,
+                    valids_gts,
+                    gamma,
+                )
+                * track_upscaling_factor
             )
-            stationary_predictions.append(
-                [stationary.clone() for _ in window_predictions]
-            )
-        stationary_xyz_loss = (
-            sequence_loss_3d(
-                stationary_predictions,
-                traj_gts,
-                vis_gts,
-                valids_gts,
-                gamma,
-            )
-            * track_upscaling_factor
-        )
-        model_to_stationary_ratio = xyz_loss.detach() / stationary_xyz_loss.clamp_min(1e-12)
+            model_to_stationary_ratio = xyz_loss.detach() / stationary_xyz_loss.clamp_min(1e-12)
+            diagnostic_metrics = {
+                "baseline/stationary_trajectory_loss": stationary_xyz_loss.item(),
+                "baseline/model_to_stationary_ratio": model_to_stationary_ratio.item(),
+            }
 
     # Compute 3DPT metrics
     # eval_3dpt_results_dict = evaluate_3dpt(
@@ -360,12 +377,6 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
     #     query_points=query_points_3d[0].cpu().numpy(),
     # )
 
-    # Invert the intrinsics and extrinsics matrices
-    intrs_inv = torch.inverse(intrs.float())
-    extrs_square = torch.eye(4).to(extrs.device)[None].repeat(batch_size, num_views, num_frames, 1, 1)
-    extrs_square[:, :, :, :3, :] = extrs
-    extrs_inv = torch.inverse(extrs_square.float())
-
     # Project the predictions to pixel space
     pred_trajectories = pred_trajectories[0].detach()
     pred_trajectories_pixel_xy_camera_z_per_view = torch.stack([
@@ -376,24 +387,32 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
         ), dim=-1)
         for view_idx in range(num_views)
     ], dim=0)
-    for view_idx in range(num_views):
-        pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
-            pixel_xy=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, :2],
-            camera_z=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, 2:],
-            intrs_inv=intrs_inv[0, view_idx],
-            extrs_inv=extrs_inv[0, view_idx],
-        )
-        if not torch.allclose(pred_trajectories_reproduced, pred_trajectories, atol=1):
-            warnings.warn(f"Reprojection of the predicted trajectories failed: "
-                          f"view_idx={view_idx}, "
-                          f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - pred_trajectories))}")
+    if run_expensive_diagnostics:
+        intrs_inv = torch.inverse(intrs.float())
+        extrs_square = torch.eye(4, device=extrs.device)[None, None, None].expand(
+            batch_size, num_views, num_frames, -1, -1
+        ).clone()
+        extrs_square[:, :, :, :3, :] = extrs
+        extrs_inv = torch.inverse(extrs_square.float())
+        for view_idx in range(num_views):
+            pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
+                pixel_xy=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, :2],
+                camera_z=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, 2:],
+                intrs_inv=intrs_inv[0, view_idx],
+                extrs_inv=extrs_inv[0, view_idx],
+            )
+            if not torch.allclose(pred_trajectories_reproduced, pred_trajectories, atol=1):
+                warnings.warn(f"Reprojection of the predicted trajectories failed: "
+                              f"view_idx={view_idx}, "
+                              f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - pred_trajectories))}")
 
-    logging.info(
-        f"{step=}, "
-        f"seq={batch.seq_name}, "
-        f"{xyz_loss.item()=}, "
-        f"{vis_loss.item()=}, "
-    )
+    if save_debug_logs:
+        logging.info(
+            f"{step=}, "
+            f"seq={batch.seq_name}, "
+            f"{xyz_loss.item()=}, "
+            f"{vis_loss.item()=}, "
+        )
 
     output = {
         "flow": {
@@ -405,10 +424,7 @@ def forward_batch_multi_view(batch, model, cfg, step, train_iters, gamma, save_d
             "loss": vis_loss * cfg.trainer.visibility_loss_weight,
             "predictions": pred_visibilities[0].detach(),
         },
-        "metrics": {
-            "baseline/stationary_trajectory_loss": stationary_xyz_loss.item(),
-            "baseline/model_to_stationary_ratio": model_to_stationary_ratio.item(),
-        },
+        "metrics": diagnostic_metrics,
         # "metrics": {
         #     k: v
         #     for k, v in eval_3dpt_results_dict.items()
@@ -819,6 +835,11 @@ def main(cfg: DictConfig):
         model.parameters(),
         enabled=bool(cfg.trainer.get("gradient_diagnostics", True)),
     )
+    expensive_diagnostics_interval = int(
+        cfg.trainer.get("expensive_diagnostics_interval", 50)
+    )
+    if expensive_diagnostics_interval < 1:
+        raise ValueError("trainer.expensive_diagnostics_interval must be at least 1")
 
     folder_ckpts = [
         f
@@ -971,7 +992,7 @@ def main(cfg: DictConfig):
         accumulated_gpu_jpeg_decode_ms = 0.0
         accumulated_gpu_prepare_ms = 0.0
         accumulated_sampling_metrics = {}
-        accumulated_loss_value = 0.0
+        accumulated_loss_value = None
         accumulated_component_losses = {}
         accumulated_metrics = {}
         microbatch_gradient_norms = []
@@ -1046,6 +1067,9 @@ def main(cfg: DictConfig):
             is_final_microbatch = (
                 microbatches_accumulated + 1 == gradient_accumulation_steps
             )
+            run_expensive_diagnostics = (
+                total_steps % expensive_diagnostics_interval == 0
+            )
 
             try:
                 with torch.profiler.record_function("train/model_and_loss_forward"):
@@ -1067,6 +1091,7 @@ def main(cfg: DictConfig):
                             cfg.experiment_path,
                             f'forward_pass__train_step-{total_steps}_global_rank-{fabric.global_rank}'
                         ),
+                        run_expensive_diagnostics=run_expensive_diagnostics,
                     )
             except Exception as e:
                 logging.critical(f"Forward pass crashed at step {total_steps}: {e}")
@@ -1107,11 +1132,15 @@ def main(cfg: DictConfig):
                     loss += v["loss"]
                     accumulated_component_losses[k] = (
                         accumulated_component_losses.get(k, 0.0)
-                        + v["loss"].detach().item()
+                        + v["loss"].detach()
                     )
                 else:
                     raise ValueError(f"Unknown key {k} in output")
-            accumulated_loss_value += loss.detach().item()
+            accumulated_loss_value = (
+                loss.detach()
+                if accumulated_loss_value is None
+                else accumulated_loss_value + loss.detach()
+            )
 
             start_time_3 = time.time()
             accumulated_fwd_duration += start_time_3 - start_time_2
@@ -1122,13 +1151,18 @@ def main(cfg: DictConfig):
             accumulated_sync_duration += start_time_4 - start_time_3
 
             backward_started_at = time.time()
-            gradient_diagnostics.begin()
+            if run_expensive_diagnostics:
+                gradient_diagnostics.begin()
             with torch.profiler.record_function("train/backward"):
                 fabric.backward(
                     _scale_microbatch_loss(loss, gradient_accumulation_steps)
                 )
-            microbatch_gradient = gradient_diagnostics.finish(
-                unscale_factor=gradient_accumulation_steps,
+            microbatch_gradient = (
+                gradient_diagnostics.finish(
+                    unscale_factor=gradient_accumulation_steps,
+                )
+                if run_expensive_diagnostics
+                else None
             )
             if microbatch_gradient is not None:
                 microbatch_gradient_norms.append(microbatch_gradient["norm"])
@@ -1142,7 +1176,9 @@ def main(cfg: DictConfig):
                     torch_profiler.step()
                 continue
 
-            mean_loss_value = accumulated_loss_value / gradient_accumulation_steps
+            mean_loss_value = (
+                accumulated_loss_value / gradient_accumulation_steps
+            ).item()
             for metric_name, metric_total in accumulated_metrics.items():
                 tb_writer.add_scalar(
                     metric_name,
@@ -1152,7 +1188,7 @@ def main(cfg: DictConfig):
             for component_name, component_total in accumulated_component_losses.items():
                 tb_writer.add_scalar(
                     f"live_{component_name}_loss",
-                    component_total / gradient_accumulation_steps,
+                    (component_total / gradient_accumulation_steps).item(),
                     total_steps,
                 )
 
@@ -1185,30 +1221,32 @@ def main(cfg: DictConfig):
             optimizer_update_started_at = time.time()
             with torch.profiler.record_function("train/gradient_clip_and_optimizer"):
                 model_parameters = list(model.parameters())
-                pre_clip_gradient_norm = float(
-                    _global_gradient_l2_norm(model_parameters).item()
-                )
-                max_abs_gradient_pre_clip, clipped_element_fraction = (
-                    _gradient_value_clip_stats(
-                        model_parameters,
-                        float(cfg.trainer.grad_clip),
+                if run_expensive_diagnostics:
+                    pre_clip_gradient_norm = float(
+                        _global_gradient_l2_norm(model_parameters).item()
                     )
-                )
+                    max_abs_gradient_pre_clip, clipped_element_fraction = (
+                        _gradient_value_clip_stats(
+                            model_parameters,
+                            float(cfg.trainer.grad_clip),
+                        )
+                    )
                 fabric.clip_gradients(model, optimizer, clip_val=cfg.trainer.grad_clip)
-                post_clip_gradient_norm = float(
-                    _global_gradient_l2_norm(model_parameters).item()
-                )
-                gradient_norm_retention = (
-                    post_clip_gradient_norm / pre_clip_gradient_norm
-                    if pre_clip_gradient_norm > 0.0
-                    else 1.0
-                )
-                was_clipped = clipped_element_fraction > 0.0
-                clipped_optimizer_steps += int(was_clipped)
-                diagnostic_optimizer_steps += 1
-                clipped_step_fraction = (
-                    clipped_optimizer_steps / float(diagnostic_optimizer_steps)
-                )
+                if run_expensive_diagnostics:
+                    post_clip_gradient_norm = float(
+                        _global_gradient_l2_norm(model_parameters).item()
+                    )
+                    gradient_norm_retention = (
+                        post_clip_gradient_norm / pre_clip_gradient_norm
+                        if pre_clip_gradient_norm > 0.0
+                        else 1.0
+                    )
+                    was_clipped = clipped_element_fraction > 0.0
+                    clipped_optimizer_steps += int(was_clipped)
+                    diagnostic_optimizer_steps += 1
+                    clipped_step_fraction = (
+                        clipped_optimizer_steps / float(diagnostic_optimizer_steps)
+                    )
                 optimizer.step()
                 scheduler.step()
             accumulated_bwd_duration += time.time() - optimizer_update_started_at
@@ -1228,37 +1266,38 @@ def main(cfg: DictConfig):
                 if microbatch_gradient_cosines
                 else None
             )
-            logging.info(
-                "[optimizer:%06d] loss=%.8f grad_pre=%.8f grad_post=%.8f "
-                "max_abs_pre=%.8f value_clip=%.8f norm_retention=%.8f "
-                "elements_clipped=%.8f clipped=%d clipped_step_fraction=%.6f "
-                "micro_grad_mean=%s micro_grad_cos_mean=%s micro_grad_cos_min=%s",
-                total_steps,
-                mean_loss_value,
-                pre_clip_gradient_norm,
-                post_clip_gradient_norm,
-                max_abs_gradient_pre_clip,
-                float(cfg.trainer.grad_clip),
-                gradient_norm_retention,
-                clipped_element_fraction,
-                int(was_clipped),
-                clipped_step_fraction,
-                (
-                    f"{microbatch_gradient_norm_mean:.8f}"
-                    if microbatch_gradient_norm_mean is not None
-                    else "n/a"
-                ),
-                (
-                    f"{microbatch_gradient_cosine_mean:.8f}"
-                    if microbatch_gradient_cosine_mean is not None
-                    else "n/a"
-                ),
-                (
-                    f"{microbatch_gradient_cosine_min:.8f}"
-                    if microbatch_gradient_cosine_min is not None
-                    else "n/a"
-                ),
-            )
+            if run_expensive_diagnostics:
+                logging.info(
+                    "[optimizer:%06d] loss=%.8f grad_pre=%.8f grad_post=%.8f "
+                    "max_abs_pre=%.8f value_clip=%.8f norm_retention=%.8f "
+                    "elements_clipped=%.8f clipped=%d clipped_step_fraction=%.6f "
+                    "micro_grad_mean=%s micro_grad_cos_mean=%s micro_grad_cos_min=%s",
+                    total_steps,
+                    mean_loss_value,
+                    pre_clip_gradient_norm,
+                    post_clip_gradient_norm,
+                    max_abs_gradient_pre_clip,
+                    float(cfg.trainer.grad_clip),
+                    gradient_norm_retention,
+                    clipped_element_fraction,
+                    int(was_clipped),
+                    clipped_step_fraction,
+                    (
+                        f"{microbatch_gradient_norm_mean:.8f}"
+                        if microbatch_gradient_norm_mean is not None
+                        else "n/a"
+                    ),
+                    (
+                        f"{microbatch_gradient_cosine_mean:.8f}"
+                        if microbatch_gradient_cosine_mean is not None
+                        else "n/a"
+                    ),
+                    (
+                        f"{microbatch_gradient_cosine_min:.8f}"
+                        if microbatch_gradient_cosine_min is not None
+                        else "n/a"
+                    ),
+                )
 
             dataloader_duration = accumulated_dataloader_duration
             fwd_duration = accumulated_fwd_duration
@@ -1304,36 +1343,37 @@ def main(cfg: DictConfig):
                 if len(output) > 1:
                     tb_writer.add_scalar(f"live_total_loss", mean_loss_value, total_steps)
                 tb_writer.add_scalar(f"learning_rate", optimizer.param_groups[0]["lr"], total_steps)
-                tb_writer.add_scalar(
-                    "optimization/grad_norm_pre_clip",
-                    pre_clip_gradient_norm,
-                    total_steps,
-                )
-                tb_writer.add_scalar(
-                    "optimization/grad_norm_post_clip",
-                    post_clip_gradient_norm,
-                    total_steps,
-                )
-                tb_writer.add_scalar(
-                    "optimization/max_abs_grad_pre_clip",
-                    max_abs_gradient_pre_clip,
-                    total_steps,
-                )
-                tb_writer.add_scalar(
-                    "optimization/norm_retention_after_value_clip",
-                    gradient_norm_retention,
-                    total_steps,
-                )
-                tb_writer.add_scalar(
-                    "optimization/gradient_elements_clipped_fraction",
-                    clipped_element_fraction,
-                    total_steps,
-                )
-                tb_writer.add_scalar(
-                    "optimization/value_clipped_step_fraction",
-                    clipped_step_fraction,
-                    total_steps,
-                )
+                if run_expensive_diagnostics:
+                    tb_writer.add_scalar(
+                        "optimization/grad_norm_pre_clip",
+                        pre_clip_gradient_norm,
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/grad_norm_post_clip",
+                        post_clip_gradient_norm,
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/max_abs_grad_pre_clip",
+                        max_abs_gradient_pre_clip,
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/norm_retention_after_value_clip",
+                        gradient_norm_retention,
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/gradient_elements_clipped_fraction",
+                        clipped_element_fraction,
+                        total_steps,
+                    )
+                    tb_writer.add_scalar(
+                        "optimization/value_clipped_step_fraction",
+                        clipped_step_fraction,
+                        total_steps,
+                    )
                 if microbatch_gradient_norms:
                     tb_writer.add_scalar(
                         "optimization/microbatch_grad_norm_mean",
@@ -1524,7 +1564,7 @@ def main(cfg: DictConfig):
             accumulated_gpu_jpeg_decode_ms = 0.0
             accumulated_gpu_prepare_ms = 0.0
             accumulated_sampling_metrics = {}
-            accumulated_loss_value = 0.0
+            accumulated_loss_value = None
             accumulated_component_losses = {}
             accumulated_metrics = {}
             microbatch_gradient_norms = []

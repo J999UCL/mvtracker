@@ -1,5 +1,6 @@
 import logging
 import os
+from bisect import bisect_left
 from collections import defaultdict
 from typing import Optional, Callable
 
@@ -284,15 +285,8 @@ class MVTracker(nn.Module):
         assert track_mask.shape == (B, S, N, 1)
         assert feat_init is None or feat_init.shape == (B, S, N, self.latent_dim)
 
-        assert track_mask.any(1).all(), "All points should be requested to be tracked at least for one frame"
-
-        intrs_inv = torch.inverse(intrs.float()).type(intrs.dtype)
-        extrs_square = torch.eye(4).to(extrs.device)[None].repeat(B, V, S, 1, 1)
-        extrs_square[:, :, :, :3, :] = extrs
-        extrs_inv = torch.inverse(extrs_square.float()).type(extrs.dtype)
-        assert intrs_inv.shape == (B, V, S, 3, 3)
-        assert extrs_square.shape == (B, V, S, 4, 4)
-        assert extrs_inv.shape == (B, V, S, 4, 4)
+        if save_debug_logs:
+            assert track_mask.any(1).all(), "All points should be requested to be tracked at least for one frame"
 
         fcorr_fns = {}
         for lvl in range(self.corr_n_levels):
@@ -402,7 +396,7 @@ class MVTracker(nn.Module):
             coords = coords + d_coord
             ffeats = ffeats + d_feats
 
-            if torch.isnan(coords).any():
+            if save_debug_logs and torch.isnan(coords).any():
                 logging.error("Got NaN values in coords, perhaps the training exploded")
                 import ipdb
                 ipdb.set_trace()
@@ -460,10 +454,11 @@ class MVTracker(nn.Module):
             self.stats_depth += [(depths == 0).float().mean().item() * 100]
 
         # Scene normalization (optional): Rigid transformation to center first camera and rescale the scene like VGGT
-        qp_range_before = np.stack([
-            query_points[0, :, 1:].min(0).values.cpu().numpy().round(2),
-            query_points[0, :, 1:].max(0).values.cpu().numpy().round(2),
-        ])
+        if save_debug_logs:
+            qp_range_before = np.stack([
+                query_points[0, :, 1:].min(0).values.cpu().numpy().round(2),
+                query_points[0, :, 1:].max(0).values.cpu().numpy().round(2),
+            ])
         if self.normalize_scene_in_fwd_pass:
             assert batch_size == 1, "VGGT normalization assumes batch size 1"
             max_depth = 24
@@ -479,11 +474,11 @@ class MVTracker(nn.Module):
             query_points, extrs = query_points[0], extrs[0]  # Remove batch dimension
             extrs, query_points, _, _ = transform_scene(T, extrs, query_points, None, None)
             query_points, extrs = query_points[None], extrs[None]  # Add batch dimension
-        qp_range_after = np.stack([
-            query_points[0, :, 1:].min(0).values.cpu().numpy().round(2),
-            query_points[0, :, 1:].max(0).values.cpu().numpy().round(2),
-        ])
         if save_debug_logs:
+            qp_range_after = np.stack([
+                query_points[0, :, 1:].min(0).values.cpu().numpy().round(2),
+                query_points[0, :, 1:].max(0).values.cpu().numpy().round(2),
+            ])
             logging.info(f"Query points range before normalization:\n{qp_range_before}")
             logging.info(f"Query points range after normalization: \n{qp_range_after}")
 
@@ -492,12 +487,6 @@ class MVTracker(nn.Module):
         # Unpack the query points
         query_points_t = query_points[:, :, :1].long()
         query_points_xyz_worldspace = query_points[:, :, 1:]
-
-        # Invert intrinsics and extrinsics
-        intrs_inv = torch.inverse(intrs.float()).type(intrs.dtype)
-        extrs_square = torch.eye(4).to(extrs.device)[None].repeat(batch_size, num_views, num_frames, 1, 1)
-        extrs_square[:, :, :, :3, :] = extrs
-        extrs_inv = torch.inverse(extrs_square.float()).type(extrs.dtype)
 
         # Interpolate the rgbs and depthmaps to the stride of the SpaTracker
         strided_height = height // self.stride
@@ -517,13 +506,15 @@ class MVTracker(nn.Module):
         # Sort the queries via their first appeared time
         _, sort_inds = torch.sort(query_points_t, dim=0, descending=False)
         inv_sort_inds = torch.argsort(sort_inds, dim=0)
-        assert torch.allclose(query_points_t, query_points_t[sort_inds][inv_sort_inds])
+        if save_debug_logs:
+            assert torch.allclose(query_points_t, query_points_t[sort_inds][inv_sort_inds])
 
         query_points_t_ = query_points_t[sort_inds]
         query_points_xyz_worldspace_ = query_points_xyz_worldspace[..., sort_inds, :]
         coords_init_ = coords_init[..., sort_inds, :].clone()
         vis_init_ = vis_init[:, :, sort_inds].clone()
         track_mask_ = track_mask[:, :, sort_inds].clone()
+        query_times = query_points_t_.detach().cpu().tolist()
 
         # Delete the unsorted variables (for safety)
         del coords_init, vis_init, query_points_t, query_points, query_points_xyz_worldspace, track_mask
@@ -532,16 +523,15 @@ class MVTracker(nn.Module):
         traj_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points, 3))
         vis_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points))
 
-        w_idx_start = query_points_t_.min()
+        w_idx_start = query_times[0]
         p_idx_start = 0
         vis_predictions = []
         coord_predictions = []
         p_idx_end_list = []
         fmaps_seq, depths_seq, feat_init, rerun_fmap_coloring_fn = None, None, None, None
         while w_idx_start < num_frames - self.S // 2:
-            curr_wind_points = torch.nonzero(query_points_t_ < w_idx_start + self.S)
-            assert curr_wind_points.shape[0] > 0
-            p_idx_end = curr_wind_points[-1].item() + 1
+            p_idx_end = bisect_left(query_times, w_idx_start + self.S)
+            assert p_idx_end > 0
             p_idx_end_list.append(p_idx_end)
 
             intrs_seq = intrs[:, :, w_idx_start:w_idx_start + self.S]
@@ -571,11 +561,15 @@ class MVTracker(nn.Module):
                 (2 * (rgbs[:, :, new_seq_t0: new_seq_t1].to(device) / 255.0) - 1.0),
                 image_features,
             )
-            _fmaps_seq_new = nn.functional.interpolate(
-                input=_fmaps_seq_new,
-                size=(strided_height, strided_width),
-                mode="bilinear",
-            ).reshape(batch_size, num_views, -1, self.latent_dim, strided_height, strided_width)
+            assert _fmaps_seq_new.shape[-2:] == (strided_height, strided_width)
+            _fmaps_seq_new = _fmaps_seq_new.reshape(
+                batch_size,
+                num_views,
+                -1,
+                self.latent_dim,
+                strided_height,
+                strided_width,
+            )
             fmaps_seq = smart_cat(fmaps_seq, _fmaps_seq_new, dim=2)
 
             if save_rerun_logs and rerun_fmap_coloring_fn is None:
@@ -627,14 +621,13 @@ class MVTracker(nn.Module):
                 _feat_init_new = torch.zeros(batch_size, p_idx_end - p_idx_start, self.latent_dim,
                                              device=_fmaps_seq_new.device, dtype=_fmaps_seq_new.dtype)
                 assert batch_size == 1
-                assert ((query_points_t_[p_idx_start:p_idx_end] > new_seq_t0)
-                        | (query_points_t_[p_idx_start:p_idx_end] < new_seq_t1)).all()
                 batch_idx = 0
                 for t in range(new_seq_t0, new_seq_t1):
-                    query_mask = query_points_t_[p_idx_start:p_idx_end] == t
-                    if query_mask.sum() == 0:
+                    query_start = max(p_idx_start, bisect_left(query_times, t))
+                    query_end = min(p_idx_end, bisect_left(query_times, t + 1))
+                    if query_start == query_end:
                         continue
-                    query_points_world = query_points_xyz_worldspace_[batch_idx, p_idx_start:p_idx_end][query_mask]
+                    query_points_world = query_points_xyz_worldspace_[batch_idx, query_start:query_end]
 
                     rgbd_xyz_current = rgbd_xyz[batch_idx, t - new_seq_t0].reshape(-1, 3)  # Combine views for frame
                     rgbd_fvec_current = rgbd_fvec[batch_idx, t - new_seq_t0].reshape(-1, self.latent_dim)
@@ -650,7 +643,9 @@ class MVTracker(nn.Module):
                     neighbor_xyz = rgbd_xyz_current[neighbor_indices[0, :, 0]]
                     neighbor_fvec = rgbd_fvec_current[neighbor_indices[0, :, 0]]
 
-                    _feat_init_new[batch_idx, query_mask] = neighbor_fvec
+                    local_start = query_start - p_idx_start
+                    local_end = query_end - p_idx_start
+                    _feat_init_new[batch_idx, local_start:local_end] = neighbor_fvec
 
                 feat_init = smart_cat(feat_init, _feat_init_new.repeat(1, self.S, 1, 1), dim=2)
 

@@ -102,6 +102,19 @@ class GradientAccumulationTests(unittest.TestCase):
             "_scale_microbatch_loss(loss, gradient_accumulation_steps)",
         )
 
+    def test_expensive_diagnostics_use_optimizer_step_interval(self):
+        main_source = ast.unparse(_load_train_main_ast())
+
+        self.assertIn(
+            "total_steps % expensive_diagnostics_interval == 0",
+            main_source,
+        )
+        self.assertIn(
+            "run_expensive_diagnostics=run_expensive_diagnostics",
+            main_source,
+        )
+        self.assertIn("gradient_diagnostics.begin()", main_source)
+
 
 if __name__ == "__main__":
     unittest.main()
