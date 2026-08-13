@@ -29,6 +29,9 @@ class TapVid3DTrainingConfigTests(unittest.TestCase):
             ["tapvid3d-multiview-validation"],
         )
         self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 8)
+        self.assertEqual(config["trainer"]["num_steps"], 2000)
+        self.assertEqual(config["trainer"]["eval_freq"], 250)
+        self.assertTrue(config["modes"]["validate_at_start"])
         self.assertTrue(config["augmentations"]["rgb"])
         self.assertTrue(config["augmentations"]["depth"])
         self.assertTrue(config["augmentations"]["variable_num_views"])

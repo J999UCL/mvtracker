@@ -17,7 +17,12 @@ datasets:
       - tapvid3d-multiview-validation
 
 trainer:
+  num_steps: 2000
+  eval_freq: 250
   gradient_accumulation_steps: 8
+
+modes:
+  validate_at_start: true
 
 augmentations:
   rgb: true
