@@ -17,8 +17,19 @@ def _load_module():
     class StubKubric:
         @staticmethod
         def from_name(*args, **kwargs):
+            training_args = kwargs.get("training_args")
+            augmentations = getattr(training_args, "augmentations", {})
+            get_aug = (
+                augmentations.get
+                if isinstance(augmentations, dict)
+                else lambda name, default: getattr(augmentations, name, default)
+            )
             return {
-                "enable_rgb_augs": False,
+                "enable_rgb_augs": get_aug("rgb", False),
+                "enable_depth_augs": get_aug("depth", False),
+                "enable_variable_depth_type_augs": get_aug("variable_depth_type", False),
+                "enable_variable_num_views_augs": get_aug("variable_num_views", False),
+                "enable_variable_trajpersample_augs": get_aug("variable_trajpersample", False),
                 "normalize_scene_following_vggt": False,
             }
 
@@ -104,6 +115,38 @@ def _write_raw(root: Path, *, frames=6, points=6, views=2, height=8, width=10):
         np.save(view_root / "depth.npy", np.full((frames, height, width), 2, dtype=np.float32))
         np.save(view_root / "foreground_mask.npy", np.ones((frames, height, width), dtype=np.bool_))
     return sequence
+
+
+def _dataset(root: Path, *, points=16, views=4):
+    _write_raw(root / "raw", points=points, views=views)
+    loader.prepare_tapvid3d_cache(root / "raw", root / "cache")
+    dataset = loader.TapVid3DMultiViewDataset.__new__(loader.TapVid3DMultiViewDataset)
+    dataset.raw_root = root / "raw/train"
+    dataset.data_root = str(root / "cache/train")
+    dataset.seq_names = ["scene-alpha"]
+    dataset.real_len = 1
+    dataset.seq_len = 3
+    dataset.num_views = views
+    dataset.traj_per_sample = 8
+    dataset.seed = 12
+    dataset.add_index_to_seed = True
+    dataset.crop_size = (8, 10)
+    dataset.enable_cropping_augs = False
+    dataset.enable_rgb_augs = True
+    dataset.enable_depth_augs = True
+    dataset.enable_variable_trajpersample_augs = True
+    dataset.enable_variable_num_views_augs = False
+    dataset.enable_scene_transform_augs = False
+    dataset.enable_camera_params_noise_augs = False
+    dataset.augmentation_probability = 1.0
+    dataset.eraser_aug_prob = 0.5
+    dataset.eraser_max = 10
+    dataset.eraser_bounds = [2, 100]
+    dataset.replace_aug_prob = 0.5
+    dataset.replace_max = 10
+    dataset.replace_bounds = [2, 100]
+    dataset.max_depth = 24
+    return dataset
 
 
 class CacheTests(unittest.TestCase):
@@ -217,6 +260,98 @@ class FromNameTests(unittest.TestCase):
         self.assertEqual(kwargs["data_root"], "/datasets/indexed-data/validation")
         self.assertEqual(kwargs["raw_root"], "/datasets/raw-data/validation")
         self.assertEqual(kwargs["num_views"], 3)
+
+    def test_training_keeps_rgb_depth_and_variable_view_augmentations(self):
+        config = types.SimpleNamespace(
+            datasets={
+                "tapvid3d_raw_dir": "raw-data",
+                "tapvid3d_cache_dir": "indexed-data",
+                "tapvid3d_num_views": 4,
+            },
+            augmentations=types.SimpleNamespace(
+                rgb=True,
+                depth=True,
+                variable_depth_type=False,
+                variable_num_views=True,
+                variable_trajpersample=True,
+            ),
+        )
+        kwargs = loader.TapVid3DMultiViewDataset.from_name(
+            "tapvid3d-multiview-training",
+            "/datasets",
+            training_args=config,
+            fabric=object(),
+            just_return_kwargs=True,
+        )
+        self.assertTrue(kwargs["enable_rgb_augs"])
+        self.assertTrue(kwargs["enable_depth_augs"])
+        self.assertTrue(kwargs["enable_variable_num_views_augs"])
+        self.assertTrue(kwargs["enable_variable_trajpersample_augs"])
+        self.assertFalse(kwargs["enable_variable_depth_type_augs"])
+        self.assertIsNone(kwargs["num_views"])
+
+
+class MvTrackerSamplingParityTests(unittest.TestCase):
+    def test_variable_views_are_uniformly_sampled_from_one_to_four(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _dataset(Path(directory))
+            dataset.num_views = None
+            dataset.enable_variable_num_views_augs = True
+
+            counts = np.zeros(4, dtype=np.int64)
+            for index in range(400):
+                sample, gotit = dataset[index]
+                self.assertTrue(gotit)
+                selected_views = sample.metadata["selected_views"]
+                self.assertEqual(len(selected_views), len(set(selected_views)))
+                self.assertTrue(set(selected_views).issubset({0, 1, 2, 3}))
+                counts[len(selected_views) - 1] += 1
+
+            np.testing.assert_allclose(counts, np.full(4, 100), atol=30)
+
+    def test_shared_augmentation_gate_controls_rgb_depth_and_track_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _dataset(Path(directory))
+            dataset.augmentation_probability = 0.0
+            plain, gotit = dataset[20]
+            self.assertTrue(gotit)
+            self.assertEqual(plain.trajectory_3d.shape[1], 8)
+            self.assertFalse(plain.apply_rgb_aug)
+            self.assertFalse(plain.apply_depth_aug)
+
+            dataset.augmentation_probability = 1.0
+            augmented, gotit = dataset[20]
+            self.assertTrue(gotit)
+            self.assertEqual(augmented.trajectory_3d.shape[1], 1)
+            self.assertTrue(augmented.apply_rgb_aug)
+            self.assertTrue(augmented.apply_depth_aug)
+
+    def test_query_policy_uses_first_visibility_for_three_quarters(self):
+        tracks = np.zeros((5, 8, 3), dtype=np.float32)
+        tracks[..., 0] = np.arange(8, dtype=np.float32)
+        xy = np.zeros((1, 5, 8, 2), dtype=np.float32)
+        camera_z = np.ones((1, 5, 8), dtype=np.float32)
+        visibility = np.zeros((1, 5, 8), dtype=np.bool_)
+        visibility[:, 1, :] = True
+        visibility[:, 3:, :] = True
+
+        selected, queries = loader._sample_tracks(
+            tracks,
+            xy,
+            camera_z,
+            visibility,
+            8,
+            np.random.RandomState(7),
+            augment_this_datapoint=False,
+            enable_variable_trajpersample_augs=False,
+            sample_index=1,
+        )
+
+        self.assertEqual(len(selected), 8)
+        query_times = queries[:, 0].astype(np.int64)
+        self.assertEqual(np.count_nonzero(query_times == 1), 6)
+        self.assertFalse(np.any(query_times == 4))
+        self.assertTrue(np.all(visibility.any(axis=0)[query_times, selected]))
 
 
 class SpatialTransformTests(unittest.TestCase):

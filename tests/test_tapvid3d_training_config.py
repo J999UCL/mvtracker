@@ -17,20 +17,25 @@ class TapVid3DTrainingConfigTests(unittest.TestCase):
         self.assertFalse(config["augmentations"]["rgb"])
         self.assertTrue(config["logging"]["log_wandb"])
 
-    def test_diegesis_config_only_overrides_dataset_and_logging_wiring(self):
+    def test_diegesis_config_uses_clean_depth_3090_recipe(self):
         path = Path(__file__).resolve().parents[1] / "configs/experiment/diegesis.yaml"
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
 
         self.assertEqual(config["datasets"]["root"], "${oc.env:DIEGESIS_MVTRACKER_ROOT}")
         self.assertEqual(config["datasets"]["train"]["name"], "tapvid3d-multiview-training")
+        self.assertEqual(config["datasets"]["train"]["traj_per_sample"], 256)
         self.assertEqual(
             config["datasets"]["eval"]["names"],
             ["tapvid3d-multiview-validation"],
         )
+        self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 8)
+        self.assertTrue(config["augmentations"]["rgb"])
+        self.assertTrue(config["augmentations"]["depth"])
+        self.assertTrue(config["augmentations"]["variable_num_views"])
+        self.assertFalse(config["augmentations"]["variable_depth_type"])
+        self.assertIn("cleandepth", config["restore_ckpt_path"])
         self.assertEqual(config["logging"]["wandb_project"], "mvtracker-diegesis")
-        self.assertNotIn("trainer", config)
         self.assertNotIn("model", config)
-        self.assertNotIn("augmentations", config)
 
     def test_diegesis_split_is_complete_disjoint_and_matches_its_algorithm(self):
         root = Path(__file__).resolve().parents[1]
