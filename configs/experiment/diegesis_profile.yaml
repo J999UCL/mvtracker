@@ -1,0 +1,48 @@
+# @package _global_
+
+experiment_path: ${oc.env:MVTRACKER_PROFILE_RUN_DIR}
+restore_ckpt_path: ${oc.env:MVTRACKER_PROFILE_CHECKPOINT}
+
+datasets:
+  root: ${oc.env:DIEGESIS_MVTRACKER_ROOT}
+  tapvid3d_raw_dir: TAPVid3D_raw
+  tapvid3d_cache_dir: TAPVid3D_MVTracker_cache
+  tapvid3d_num_views: 4
+  tapvid3d_view_count_probabilities: [0.25, 0.25, 0.25, 0.25]
+  train:
+    name: tapvid3d-multiview-training
+    traj_per_sample: 256
+  eval:
+    names: []
+
+trainer:
+  num_steps: 52
+  eval_freq: 10000
+  viz_freq: 10000
+  save_ckpt_freq: 10000
+  gradient_accumulation_steps: 8
+  expensive_diagnostics_interval: 50
+  profiler:
+    enabled: true
+    wait: 8
+    warmup: 8
+    active: 8
+    repeat: 1
+    record_shapes: true
+    profile_memory: true
+    with_stack: false
+    with_flops: true
+
+modes:
+  validate_at_start: false
+
+augmentations:
+  rgb: true
+  depth: true
+  variable_depth_type: false
+  variable_num_views: true
+
+logging:
+  log_wandb: true
+  wandb_project: mvtracker-diegesis-profiling
+  tags: [diegesis, throughput-profile, nvjpeg, clean-depth]
