@@ -272,7 +272,10 @@ class EncodedTapVid3DBatch:
 
 
 def collate_encoded_tapvid3d(batch):
-    return EncodedTapVid3DBatch([sample for sample, _ in batch]), [gotit for _, gotit in batch]
+    return (
+        EncodedTapVid3DBatch([sample for sample, gotit in batch if gotit]),
+        [gotit for _, gotit in batch],
+    )
 
 
 def _read_encoded_frames(

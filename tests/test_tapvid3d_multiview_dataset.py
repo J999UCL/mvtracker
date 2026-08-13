@@ -189,6 +189,12 @@ class CacheTests(unittest.TestCase):
 
 
 class SelectiveLoaderTests(unittest.TestCase):
+    def test_collate_keeps_rejected_samples_out_of_the_pinned_batch(self):
+        encoded, gotit = loader.collate_encoded_tapvid3d([(None, False)])
+        self.assertEqual(encoded.samples, [])
+        self.assertEqual(gotit, [False])
+        self.assertIs(encoded.pin_memory(), encoded)
+
     def test_reads_only_selected_window_and_returns_encoded_jpegs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
