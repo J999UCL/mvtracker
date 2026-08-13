@@ -362,6 +362,10 @@ class MvTrackerSamplingParityTests(unittest.TestCase):
             self.assertTrue(augmented.apply_rgb_aug)
             self.assertTrue(augmented.apply_depth_aug)
 
+            rotating, gotit = dataset[1]
+            self.assertTrue(gotit)
+            self.assertGreater(rotating.trajectory_3d.shape[1], 1)
+
     def test_query_policy_uses_first_visibility_for_three_quarters(self):
         tracks = np.zeros((5, 8, 3), dtype=np.float32)
         tracks[..., 0] = np.arange(8, dtype=np.float32)

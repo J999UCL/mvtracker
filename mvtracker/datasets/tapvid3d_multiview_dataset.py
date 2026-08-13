@@ -984,7 +984,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             enable_variable_trajpersample_augs=getattr(
                 self, "enable_variable_trajpersample_augs", False
             ),
-            sample_index=scene_index,
+            sample_index=virtual_index,
         )
         if not len(selected):
             return None, False
