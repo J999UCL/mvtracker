@@ -278,7 +278,7 @@ def forward_batch_multi_view(
 
     frame_indices = torch.arange(num_frames, device=query_points_3d.device)[None, :, None]
     query_frames = query_points_3d[:, :, 0].long()[:, None, :]
-    valid_tracks_per_frame = valid_tracks_per_frame & (frame_indices >= query_frames)
+    valid_tracks_per_frame = valid_tracks_per_frame * (frame_indices >= query_frames)
 
     # Run the model
     results = model(
