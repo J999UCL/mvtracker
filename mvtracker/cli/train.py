@@ -764,9 +764,14 @@ def main(cfg: DictConfig):
         raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
 
     if not cfg.modes.eval_only:
-        if getattr(train_dataset, "requires_cuda_prefetch", False):
+        requires_cuda_prefetch = getattr(train_dataset, "requires_cuda_prefetch", False)
+        if requires_cuda_prefetch:
             torch.multiprocessing.set_sharing_strategy("file_system")
-        train_loader = StatefulDataLoader(
+        loader_type = torch.utils.data.DataLoader if requires_cuda_prefetch else StatefulDataLoader
+        loader_kwargs = {}
+        if not requires_cuda_prefetch:
+            loader_kwargs["in_order"] = cfg.reproducibility.deterministic
+        train_loader = loader_type(
             train_dataset,
             batch_size=cfg.datasets.train.batch_size,
             shuffle=True,
@@ -776,10 +781,9 @@ def main(cfg: DictConfig):
             drop_last=True,
             prefetch_factor=cfg.datasets.train.get("prefetch_factor", 2) if cfg.datasets.train.num_workers > 0 else None,
             persistent_workers=cfg.datasets.train.num_workers > 0,
-            in_order=cfg.reproducibility.deterministic,
+            **loader_kwargs,
         )
         # eval_dataloaders += [("kubric-multiview-v3-training", train_loader)]
-        requires_cuda_prefetch = getattr(train_dataset, "requires_cuda_prefetch", False)
         train_loader = fabric.setup_dataloaders(
             train_loader,
             move_to_device=not requires_cuda_prefetch,
