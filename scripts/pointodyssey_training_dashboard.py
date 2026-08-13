@@ -633,6 +633,24 @@ class TrainingDashboardState:
                     scalars.get("timing/only_bwd", []), log_timing["bwd"]
                 ),
             }
+            motion = {
+                name: scalars.get(f"sampling/{tag}", [])
+                for name, tag in {
+                    "track_count": "motion_track_count",
+                    "full_mean": "motion_full_mean_m",
+                    "full_median": "motion_full_median_m",
+                    "full_p90": "motion_full_p90_m",
+                    "window_mean": "motion_window_mean_m",
+                    "window_median": "motion_window_median_m",
+                    "window_p90": "motion_window_p90_m",
+                    "window_static": "motion_window_static_count",
+                    "window_dynamic": "motion_window_dynamic_count",
+                    "window_very_dynamic": "motion_window_very_dynamic_count",
+                    "full_dynamic_window_static": (
+                        "motion_full_dynamic_window_static_count"
+                    ),
+                }.items()
+            }
             validation = {
                 tag: points for tag, points in scalars.items() if tag.startswith("eval_")
             }
@@ -693,6 +711,7 @@ class TrainingDashboardState:
                     "gradients": gradients,
                     "learning_rate": scalars.get("learning_rate", []),
                     "timing": timing,
+                    "motion": motion,
                     "validation": validation,
                     "pipeline": pipeline,
                     "gpu": gpu,
@@ -836,6 +855,11 @@ INDEX_HTML = r"""<!doctype html>
       <div class="chart-panel"><h3>Tracks per microbatch</h3><div class="chart-wrap compact"><canvas id="track-count"></canvas></div><div class="chart-note">Trailing 50-step means over faint raw minimum, mean and maximum counts.</div></div>
       <div class="chart-panel"><h3>Cumulative scene coverage</h3><div class="chart-wrap compact"><canvas id="scene-coverage"></canvas></div></div>
     </div>
+    <div class="grid-3" style="margin-top:22px">
+      <div class="chart-panel"><h3>Sampled path length</h3><div class="chart-wrap compact"><canvas id="motion-path-length"></canvas></div><div class="chart-note">Visible 3D path length over the complete scene versus the sampled 24-frame window.</div></div>
+      <div class="chart-panel"><h3>Window motion buckets</h3><div class="chart-wrap compact"><canvas id="motion-window-buckets"></canvas></div><div class="chart-note">Static &lt;1 cm, dynamic &gt;10 cm and very dynamic &gt;2 m. Very-dynamic tracks are also included in dynamic.</div></div>
+      <div class="chart-panel"><h3>Global/window mismatch</h3><div class="chart-wrap compact"><canvas id="motion-window-mismatch"></canvas></div><div class="chart-note">Tracks moving &gt;10 cm globally but &lt;1 cm inside the sampled window, compared with all sampled tracks.</div></div>
+    </div>
   </section>
 
   <section>
@@ -891,6 +915,9 @@ const charts={
   rejection:new Chart(document.getElementById('rejection-rate'),{type:'line',data:{datasets:[line('Rejected',palette.s1)]},options:options('Optimizer step','Rejected attempts (%)',{min:0,max:100,legend:false})}),
   tracks:new Chart(document.getElementById('track-count'),{type:'line',data:{datasets:[rawPoints('Mean',palette.s1),meanLine('Mean',palette.s1),rawPoints('Maximum',palette.s2),meanLine('Maximum',palette.s2,{borderDash:[6,4]}),rawPoints('Minimum',palette.s3),meanLine('Minimum',palette.s3,{borderDash:[2,3]})]},options:options('Optimizer step','Tracks')}),
   scenes:new Chart(document.getElementById('scene-coverage'),{type:'line',data:{datasets:[line('Seen',palette.s1)]},options:options('Optimizer step','Unique scenes',{min:0})}),
+  motionPath:new Chart(document.getElementById('motion-path-length'),{type:'line',data:{datasets:[line('Full mean',palette.s1),line('Window mean',palette.s2),line('Window p90',palette.s4,{borderDash:[6,4]})]},options:options('Optimizer step','Path length (m)',{min:0})}),
+  motionBuckets:new Chart(document.getElementById('motion-window-buckets'),{type:'line',data:{datasets:[line('Static',palette.s3),line('Dynamic',palette.s1),line('Very dynamic',palette.s5)]},options:options('Optimizer step','Tracks',{min:0})}),
+  motionMismatch:new Chart(document.getElementById('motion-window-mismatch'),{type:'line',data:{datasets:[line('All sampled',palette.s2),line('Global dynamic → window static',palette.s5)]},options:options('Optimizer step','Tracks',{min:0})}),
   gpuUtil:new Chart(document.getElementById('gpu-util'),{type:'line',data:{datasets:[line('Utilization',palette.s1)]},options:options('Elapsed time (min)','Utilization (%)',{min:0,max:100,legend:false})}),
   gpuVram:new Chart(document.getElementById('gpu-vram'),{type:'line',data:{datasets:[line('Used VRAM',palette.s2)]},options:options('Elapsed time (min)','VRAM (GiB)',{min:0,legend:false})}),
   gpuThermal:new Chart(document.getElementById('gpu-thermal'),{type:'line',data:{datasets:[line('Power',palette.s3),line('Temperature',palette.s4,{yAxisID:'temp'})]},options:options('Elapsed time (min)','Power (W)',{scales:{temp:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Temperature (°C)',color:palette.muted}}}})})
@@ -938,6 +965,10 @@ function render(state){
   const trackMean=pipePoints(pipeline,'tracks_mean'), trackMax=pipePoints(pipeline,'tracks_max'), trackMin=pipePoints(pipeline,'tracks_min');
   update(charts.tracks,[trackMean,movingAverageXY(trackMean),trackMax,movingAverageXY(trackMax),trackMin,movingAverageXY(trackMin)]);
   update(charts.scenes,[pipePoints(pipeline,'scenes_cumulative')]);
+  const motion=state.series?.motion||{};
+  update(charts.motionPath,[points(motion.full_mean),points(motion.window_mean),points(motion.window_p90)]);
+  update(charts.motionBuckets,[points(motion.window_static),points(motion.window_dynamic),points(motion.window_very_dynamic)]);
+  update(charts.motionMismatch,[points(motion.track_count),points(motion.full_dynamic_window_static)]);
   const gpu=state.series?.gpu||[];
   update(charts.gpuUtil,[gpuPoints(gpu,'utilization_percent')]); update(charts.gpuVram,[gpuPoints(gpu,'vram_used_gib')]); update(charts.gpuThermal,[gpuPoints(gpu,'power_watts'),gpuPoints(gpu,'temperature_c')]);
 

@@ -215,6 +215,12 @@ class DashboardStateTests(unittest.TestCase):
                         {"step": 0, "value": 2.0, "wall_time": 1.0}
                     ],
                     "timing/step": [{"step": 1, "value": 2.0, "wall_time": 1.0}],
+                    "sampling/motion_window_mean_m": [
+                        {"step": 1, "value": 0.2, "wall_time": 1.0}
+                    ],
+                    "sampling/motion_full_dynamic_window_static_count": [
+                        {"step": 1, "value": 3.0, "wall_time": 1.0}
+                    ],
                 },
                 error=None,
             )
@@ -226,6 +232,11 @@ class DashboardStateTests(unittest.TestCase):
             self.assertEqual(snapshot["series"]["gpu"][0]["utilization_percent"], 100)
             self.assertEqual(snapshot["series"]["baseline"]["stationary"][0]["value"], 0.5)
             self.assertEqual(snapshot["series"]["gradients"]["pre_clip"][0]["value"], 2.0)
+            self.assertEqual(snapshot["series"]["motion"]["window_mean"][0]["value"], 0.2)
+            self.assertEqual(
+                snapshot["series"]["motion"]["full_dynamic_window_static"][0]["value"],
+                3.0,
+            )
             self.assertEqual(
                 snapshot["series"]["gradients"]["clipped_step_rate_50"],
                 [{"step": 1, "value": 1.0}],
@@ -274,6 +285,9 @@ class DashboardHTTPTests(unittest.TestCase):
             "rejection-rate",
             "track-count",
             "scene-coverage",
+            "motion-path-length",
+            "motion-window-buckets",
+            "motion-window-mismatch",
             "gpu-util",
             "gpu-vram",
             "gpu-thermal",

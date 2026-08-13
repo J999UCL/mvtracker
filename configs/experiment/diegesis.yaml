@@ -26,6 +26,6 @@ augmentations:
   variable_num_views: true
 
 logging:
-  log_wandb: true
+  log_wandb: false
   wandb_project: mvtracker-diegesis
   tags: [diegesis, tapvid3d, nvjpeg, clean-depth]

@@ -34,6 +34,7 @@ class TapVid3DTrainingConfigTests(unittest.TestCase):
         self.assertTrue(config["augmentations"]["variable_num_views"])
         self.assertFalse(config["augmentations"]["variable_depth_type"])
         self.assertIn("cleandepth", config["restore_ckpt_path"])
+        self.assertFalse(config["logging"]["log_wandb"])
         self.assertEqual(config["logging"]["wandb_project"], "mvtracker-diegesis")
         self.assertNotIn("model", config)
 
