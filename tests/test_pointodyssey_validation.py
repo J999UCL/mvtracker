@@ -4,6 +4,15 @@ from mvtracker.evaluation.evaluator_3dpt import _evaluation_setting_for_dataset
 
 
 class PointOdysseyValidationTests(unittest.TestCase):
+    def test_tapvid3d_uses_the_existing_kubric_multiview_metric_policy(self):
+        self.assertEqual(
+            _evaluation_setting_for_dataset(
+                "tapvid3d-multiview-validation",
+                no_tracking_labels=False,
+            ),
+            "kubric-multiview",
+        )
+
     def test_pointodyssey_uses_the_existing_kubric_multiview_metric_policy(self):
         self.assertEqual(
             _evaluation_setting_for_dataset(

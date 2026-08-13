@@ -40,8 +40,10 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 def _evaluation_setting_for_dataset(dataset_name: str, no_tracking_labels: bool) -> str:
-    if "kubric" in dataset_name or dataset_name.startswith(
-        "pointodyssey-multiview-"
+    if (
+        "kubric" in dataset_name
+        or dataset_name.startswith("pointodyssey-multiview-")
+        or dataset_name.startswith("tapvid3d-multiview-")
     ):
         return "kubric-multiview"
     if "panoptic-multiview" in dataset_name:
