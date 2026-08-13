@@ -764,6 +764,8 @@ def main(cfg: DictConfig):
         raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
 
     if not cfg.modes.eval_only:
+        if getattr(train_dataset, "requires_cuda_prefetch", False):
+            torch.multiprocessing.set_sharing_strategy("file_system")
         train_loader = StatefulDataLoader(
             train_dataset,
             batch_size=cfg.datasets.train.batch_size,
