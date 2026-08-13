@@ -31,7 +31,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import signal, sys
 
-from mvtracker.datasets import KubricMultiViewDataset, PointOdysseyMultiViewDataset
+from mvtracker.datasets import (
+    KubricMultiViewDataset,
+    PointOdysseyMultiViewDataset,
+    TapVid3DMultiViewDataset,
+)
+from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
 from mvtracker.datasets import TapVidDataset
 from mvtracker.datasets import kubric_multiview_dataset
 from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
@@ -612,6 +617,10 @@ def main(cfg: DictConfig):
             eval_dataset = PointOdysseyMultiViewDataset.from_name(
                 dataset_name, cfg.datasets.root, cfg
             )
+        elif dataset_name.startswith("tapvid3d-multiview-"):
+            eval_dataset = TapVid3DMultiViewDataset.from_name(
+                dataset_name, cfg.datasets.root, cfg
+            )
         elif dataset_name.startswith("panoptic-multiview"):
             eval_dataset = PanopticStudioMultiViewDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("dex-ycb-multiview"):
@@ -674,8 +683,13 @@ def main(cfg: DictConfig):
             batch_size=1,
             shuffle=False,
             num_workers=cfg.datasets.eval.num_workers,
-            collate_fn=collate_fn,
+            collate_fn=getattr(eval_dataset, "collate_fn", collate_fn),
+            pin_memory=True,
+            persistent_workers=cfg.datasets.eval.num_workers > 0,
+            prefetch_factor=2 if cfg.datasets.eval.num_workers > 0 else None,
         )
+        if getattr(eval_dataset, "requires_cuda_prefetch", False):
+            eval_dataloader = CudaPrefetchLoader(eval_dataloader)
         eval_dataloaders.append((dataset_name, eval_dataloader))
 
     # # Let each rank handle a subset of the evaluation dataloaders
@@ -742,6 +756,10 @@ def main(cfg: DictConfig):
         train_dataset = PointOdysseyMultiViewDataset.from_name(
             cfg.datasets.train.name, cfg.datasets.root, cfg, fabric
         )
+    elif cfg.datasets.train.name.startswith("tapvid3d-multiview-"):
+        train_dataset = TapVid3DMultiViewDataset.from_name(
+            cfg.datasets.train.name, cfg.datasets.root, cfg, fabric
+        )
     else:
         raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
 
@@ -752,13 +770,20 @@ def main(cfg: DictConfig):
             shuffle=True,
             num_workers=cfg.datasets.train.num_workers,
             pin_memory=True,
-            collate_fn=collate_fn,
+            collate_fn=getattr(train_dataset, "collate_fn", collate_fn),
             drop_last=True,
-            prefetch_factor=4 if cfg.datasets.train.num_workers > 0 else None,
+            prefetch_factor=cfg.datasets.train.get("prefetch_factor", 2) if cfg.datasets.train.num_workers > 0 else None,
+            persistent_workers=cfg.datasets.train.num_workers > 0,
             in_order=cfg.reproducibility.deterministic,
         )
         # eval_dataloaders += [("kubric-multiview-v3-training", train_loader)]
-        train_loader = fabric.setup_dataloaders(train_loader)
+        requires_cuda_prefetch = getattr(train_dataset, "requires_cuda_prefetch", False)
+        train_loader = fabric.setup_dataloaders(
+            train_loader,
+            move_to_device=not requires_cuda_prefetch,
+        )
+        if requires_cuda_prefetch:
+            train_loader = CudaPrefetchLoader(train_loader, device=fabric.device)
         logging.info(f"LEN TRAIN LOADER={len(train_loader)}")
         optimizer_steps_per_epoch = max(
             1,
@@ -936,6 +961,9 @@ def main(cfg: DictConfig):
         accumulated_fwd_duration = 0.0
         accumulated_sync_duration = 0.0
         accumulated_bwd_duration = 0.0
+        accumulated_loader_worker_seconds = 0.0
+        accumulated_gpu_jpeg_decode_ms = 0.0
+        accumulated_gpu_prepare_ms = 0.0
         accumulated_loss_value = 0.0
         accumulated_component_losses = {}
         accumulated_metrics = {}
@@ -986,6 +1014,17 @@ def main(cfg: DictConfig):
                 f"(microbatch {microbatches_accumulated + 1}/{gradient_accumulation_steps}, "
                 f"waited {microbatch_dataloader_duration:>5.2f}s)"
             )
+            if batch.sample_metadata:
+                metadata = batch.sample_metadata
+                accumulated_loader_worker_seconds += float(np.mean([
+                    item.get("worker_prepare_seconds", 0.0) for item in metadata
+                ]))
+                accumulated_gpu_jpeg_decode_ms += float(np.mean([
+                    item.get("gpu_jpeg_decode_ms", 0.0) for item in metadata
+                ]))
+                accumulated_gpu_prepare_ms += float(np.mean([
+                    item.get("gpu_prepare_total_ms", 0.0) for item in metadata
+                ]))
 
             train_iters = cfg.trainer.train_iters
             if cfg.trainer.augment_train_iters:
@@ -1359,6 +1398,21 @@ def main(cfg: DictConfig):
                 tb_writer.add_scalar(f"timing/only_sync", sync_durations[-1], total_steps)
                 tb_writer.add_scalar(f"timing/only_bwd", bwd_durations[-1], total_steps)
                 tb_writer.add_scalar(f"timing/only_dataloader", dataloader_duration, total_steps)
+                tb_writer.add_scalar(
+                    "timing/loader_worker_prepare_seconds",
+                    accumulated_loader_worker_seconds / microbatches_accumulated,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "timing/gpu_jpeg_decode_ms",
+                    accumulated_gpu_jpeg_decode_ms / microbatches_accumulated,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "timing/gpu_batch_prepare_ms",
+                    accumulated_gpu_prepare_ms / microbatches_accumulated,
+                    total_steps,
+                )
 
                 if len(total_durations) >= timing_log_freq:
                     total_durations_np = np.array(total_durations)

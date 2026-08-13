@@ -1,0 +1,871 @@
+"""High-throughput loader for the raw multi-view TAPVid-3D contract."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+import numpy as np
+import torch
+import torchvision
+from torch.nn import functional as F
+from torchvision.io import ImageReadMode, decode_jpeg
+
+from mvtracker.datasets.kubric_multiview_dataset import (
+    KubricMultiViewDataset,
+    _legal_contiguous_window_starts,
+)
+from mvtracker.datasets.utils import Datapoint, aug_depth
+
+
+_DATASET_PREFIX = "tapvid3d-multiview-"
+_SPLITS = {"training": "train", "validation": "validation", "test": "test"}
+_CACHE_FORMAT = "tapvid3d_mvtracker_jpeg_index"
+_CACHE_VERSION = 1
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _source_stat(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _manifest_digest(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _numeric_view_dirs(sequence_root: Path) -> list[Path]:
+    views = sorted(
+        (path for path in sequence_root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    )
+    if [int(path.name) for path in views] != list(range(len(views))):
+        raise ValueError(f"{sequence_root}: view directories must be contiguous from 0")
+    if not views:
+        raise ValueError(f"{sequence_root}: no numeric view directories")
+    return views
+
+
+def _read_jpeg_objects(path: Path, frame_count: int) -> list[np.ndarray]:
+    images = np.load(path, allow_pickle=True)
+    if images.shape != (frame_count,) or images.dtype != np.dtype(object):
+        raise ValueError(f"{path}: expected object array with shape {(frame_count,)}")
+    result = []
+    for frame, image in enumerate(images):
+        if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 1:
+            raise ValueError(f"{path}: frame {frame} is not a one-dimensional uint8 JPEG")
+        result.append(image)
+    return result
+
+
+def _jpeg_size(encoded: np.ndarray) -> tuple[int, int]:
+    import cv2
+
+    image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("JPEG decode failed")
+    return int(image.shape[0]), int(image.shape[1])
+
+
+def prepare_tapvid3d_cache(
+    raw_root: Path,
+    cache_root: Path,
+    *,
+    workers: int = 1,
+) -> dict[str, int]:
+    """Index raw JPEG object arrays into seekable byte stores.
+
+    Numeric arrays stay in the canonical raw dataset and are memory-mapped by the
+    loader. Existing complete cache entries are retained when their source stat
+    fingerprint still matches.
+    """
+
+    raw_root = raw_root.resolve()
+    cache_root = cache_root.resolve()
+    if workers < 1:
+        raise ValueError("workers must be at least one")
+    counts = {"prepared": 0, "reused": 0}
+    for split in _SPLITS.values():
+        split_root = raw_root / split
+        if not split_root.is_dir():
+            continue
+        for source in sorted(path for path in split_root.iterdir() if path.is_dir()):
+            tracks_path = source / "tracks_xyz.npy"
+            queries_path = source / "queries_xytv.npy"
+            tracks = np.load(tracks_path, mmap_mode="r", allow_pickle=False)
+            queries = np.load(queries_path, mmap_mode="r", allow_pickle=False)
+            if tracks.ndim != 3 or tracks.shape[2] != 3 or tracks.dtype != np.float32:
+                raise ValueError(f"{tracks_path}: expected (F, P, 3) float32")
+            frame_count, point_count, _ = tracks.shape
+            if queries.shape != (point_count, 4) or queries.dtype != np.float32:
+                raise ValueError(f"{queries_path}: expected {(point_count, 4)} float32")
+
+            view_roots = _numeric_view_dirs(source)
+            source_files = {"tracks_xyz.npy": _source_stat(tracks_path), "queries_xytv.npy": _source_stat(queries_path)}
+            resolution = None
+            for view_root in view_roots:
+                view = int(view_root.name)
+                expected = {
+                    "images_jpeg_bytes.npy": ((frame_count,), np.dtype(object)),
+                    "intrinsics.npy": ((4,), np.dtype(np.float32)),
+                    "extrinsics_w2c.npy": ((frame_count, 4, 4), np.dtype(np.float32)),
+                    "visibility.npy": ((frame_count, point_count), np.dtype(np.bool_)),
+                }
+                for name, (shape, dtype) in expected.items():
+                    path = view_root / name
+                    array = np.load(path, mmap_mode=None if dtype == np.dtype(object) else "r", allow_pickle=dtype == np.dtype(object))
+                    if array.shape != shape or array.dtype != dtype:
+                        raise ValueError(f"{path}: expected shape {shape} and dtype {dtype}")
+                    source_files[f"{view}/{name}"] = _source_stat(path)
+                for name, dtype in (("depth.npy", np.float32), ("foreground_mask.npy", np.bool_)):
+                    path = view_root / name
+                    array = np.load(path, mmap_mode="r", allow_pickle=False)
+                    if array.shape[:1] != (frame_count,) or array.ndim != 3 or array.dtype != np.dtype(dtype):
+                        raise ValueError(f"{path}: invalid shape or dtype")
+                    if resolution is None:
+                        resolution = tuple(int(value) for value in array.shape[1:])
+                    if tuple(array.shape[1:]) != resolution:
+                        raise ValueError(f"{path}: inconsistent image resolution")
+                    source_files[f"{view}/{name}"] = _source_stat(path)
+
+            fingerprint = _manifest_digest(source_files)
+            target = cache_root / split / source.name
+            manifest_path = target / "manifest.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest.get("source_fingerprint") == fingerprint:
+                    counts["reused"] += 1
+                    continue
+
+            staging = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+            if staging.exists():
+                import shutil
+
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True)
+            def pack_view(view_root: Path) -> None:
+                view = int(view_root.name)
+                encoded_frames = _read_jpeg_objects(view_root / "images_jpeg_bytes.npy", frame_count)
+                current_resolution = _jpeg_size(encoded_frames[0])
+                if current_resolution != resolution:
+                    raise ValueError(f"{view_root}: JPEG and depth resolutions differ")
+                offsets = np.zeros(frame_count + 1, dtype=np.int64)
+                view_target = staging / f"view_{view}"
+                view_target.mkdir()
+                with (view_target / "jpeg_bytes.bin").open("wb") as handle:
+                    for frame, encoded in enumerate(encoded_frames):
+                        handle.write(encoded)
+                        offsets[frame + 1] = offsets[frame] + encoded.size
+                np.save(view_target / "jpeg_offsets.npy", offsets)
+
+            if workers == 1:
+                for view_root in view_roots:
+                    pack_view(view_root)
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    list(executor.map(pack_view, view_roots))
+
+            manifest = {
+                "format": _CACHE_FORMAT,
+                "schema_version": _CACHE_VERSION,
+                "source_split": split,
+                "source_sequence": source.name,
+                "source_fingerprint": fingerprint,
+                "source_files": source_files,
+                "frame_count": frame_count,
+                "point_count": point_count,
+                "views": [int(path.name) for path in view_roots],
+                "resolution_hw": list(resolution),
+            }
+            _atomic_json(staging / "manifest.json", manifest)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                import shutil
+
+                shutil.rmtree(target)
+            os.replace(staging, target)
+            counts["prepared"] += 1
+    return counts
+
+
+@dataclass
+class EncodedTapVid3DSample:
+    jpeg_bytes: tuple[torch.Tensor, ...]
+    depth: torch.Tensor
+    theta: torch.Tensor
+    intrs: torch.Tensor
+    extrs: torch.Tensor
+    trajectory: torch.Tensor
+    trajectory_3d: torch.Tensor
+    visibility: torch.Tensor
+    valid: torch.Tensor
+    query_points_3d: torch.Tensor
+    seq_name: str
+    metadata: dict[str, Any]
+    output_size: tuple[int, int]
+    apply_depth_aug: bool
+    augmentation_seed: int
+    depth_scale: float
+    max_depth: float
+    depth_patch_operations: tuple[tuple[int, ...], ...]
+
+
+@dataclass
+class EncodedTapVid3DBatch:
+    samples: list[EncodedTapVid3DSample]
+
+    def pin_memory(self):
+        for sample in self.samples:
+            sample.jpeg_bytes = tuple(value.pin_memory() for value in sample.jpeg_bytes)
+            for name in (
+                "depth", "theta", "intrs", "extrs", "trajectory",
+                "trajectory_3d", "visibility", "valid", "query_points_3d",
+            ):
+                setattr(sample, name, getattr(sample, name).pin_memory())
+        return self
+
+
+def collate_encoded_tapvid3d(batch):
+    return EncodedTapVid3DBatch([sample for sample, _ in batch]), [gotit for _, gotit in batch]
+
+
+def _read_encoded_frames(
+    descriptor: int,
+    offsets: np.ndarray,
+    frame_indices: Sequence[int],
+    *,
+    label: Path,
+) -> tuple[torch.Tensor, ...]:
+    result = []
+    for frame in frame_indices:
+        start, end = int(offsets[frame]), int(offsets[frame + 1])
+        encoded = os.pread(descriptor, end - start, start)
+        if len(encoded) != end - start:
+            raise ValueError(f"{label}: truncated JPEG byte store")
+        result.append(torch.frombuffer(bytearray(encoded), dtype=torch.uint8))
+    return tuple(result)
+
+
+def _intrinsics_matrix(parameters: np.ndarray) -> np.ndarray:
+    fx, fy, cx, cy = parameters
+    return np.asarray([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+
+def _project(tracks: np.ndarray, extrinsics: np.ndarray, intrinsics: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    homogeneous = np.concatenate([tracks, np.ones_like(tracks[..., :1])], axis=-1)
+    camera = np.einsum("vtij,tnj->vtni", extrinsics, homogeneous)
+    pixels = np.einsum("vtij,vtnj->vtni", intrinsics, camera)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xy = pixels[..., :2] / pixels[..., 2:]
+    return np.asarray(xy, dtype=np.float32), np.asarray(camera[..., 2], dtype=np.float32)
+
+
+def _spatial_transform(
+    xy: np.ndarray,
+    visibility: np.ndarray,
+    intrinsics: np.ndarray,
+    source_size: tuple[int, int],
+    output_size: tuple[int, int],
+    rng: np.random.RandomState,
+    enabled: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    views, frames, _, _ = xy.shape
+    source_h, source_w = source_size
+    output_h, output_w = output_size
+    theta = np.zeros((views, frames, 2, 3), dtype=np.float32)
+    transformed = xy.copy()
+    adjusted_intrinsics = intrinsics.copy()
+    adjusted_visibility = visibility.copy()
+    for view in range(views):
+        if enabled:
+            pad_left, pad_right, pad_top, pad_bottom = (
+                int(rng.randint(0, 45)) for _ in range(4)
+            )
+            scale_x = scale_y = float(rng.uniform(0.8, 1.2))
+            scale_delta_x = scale_delta_y = 0.0
+        else:
+            pad_left = pad_right = pad_top = pad_bottom = 0
+        offset_x = offset_y = 0
+        crop_x = crop_y = 0
+        for frame in range(frames):
+            if enabled:
+                padded_w = source_w + pad_left + pad_right
+                padded_h = source_h + pad_top + pad_bottom
+                if frame == 1:
+                    scale_delta_x = float(rng.uniform(-0.15, 0.15))
+                    scale_delta_y = float(rng.uniform(-0.15, 0.15))
+                elif frame > 1:
+                    scale_delta_x = scale_delta_x * 0.8 + float(rng.uniform(-0.15, 0.15)) * 0.2
+                    scale_delta_y = scale_delta_y * 0.8 + float(rng.uniform(-0.15, 0.15)) * 0.2
+                scale_x = float(np.clip(scale_x + scale_delta_x, 0.8, 1.2))
+                scale_y = float(np.clip(scale_y + scale_delta_y, 0.8, 1.2))
+                shared_scale = (scale_x + scale_y) * 0.5
+                scale_x = scale_x * 0.5 + shared_scale * 0.5
+                scale_y = scale_y * 0.5 + shared_scale * 0.5
+                new_w = max(output_w + 10, int(padded_w * scale_x))
+                new_h = max(output_h + 10, int(padded_h * scale_y))
+                scale_x = (new_w - 1) / (padded_w - 1)
+                scale_y = (new_h - 1) / (padded_h - 1)
+                visible_xy = transformed[view, frame, adjusted_visibility[view, frame]]
+                center = visible_xy.mean(axis=0) if len(visible_xy) else np.asarray([source_w / 2, source_h / 2])
+                if frame == 1:
+                    offset_x = int(rng.randint(-36, 37))
+                    offset_y = int(rng.randint(-36, 37))
+                elif frame > 1:
+                    offset_x = int(offset_x * 0.8 + rng.randint(-36, 37) * 0.2)
+                    offset_y = int(offset_y * 0.8 + rng.randint(-36, 37) * 0.2)
+                crop_x = int((center[0] + pad_left) * scale_x - output_w / 2) + offset_x
+                crop_y = int((center[1] + pad_top) * scale_y - output_h / 2) + offset_y
+                crop_x = int(np.clip(crop_x, 0, new_w - output_w))
+                crop_y = int(np.clip(crop_y, 0, new_h - output_h))
+            else:
+                scale_x = (output_w - 1) / (source_w - 1)
+                scale_y = (output_h - 1) / (source_h - 1)
+                crop_x = crop_y = 0
+
+            transformed[view, frame, :, 0] = (xy[view, frame, :, 0] + pad_left) * scale_x - crop_x
+            transformed[view, frame, :, 1] = (xy[view, frame, :, 1] + pad_top) * scale_y - crop_y
+            adjusted_intrinsics[view, frame, 0, :] *= scale_x
+            adjusted_intrinsics[view, frame, 1, :] *= scale_y
+            adjusted_intrinsics[view, frame, 0, 2] += pad_left * scale_x - crop_x
+            adjusted_intrinsics[view, frame, 1, 2] += pad_top * scale_y - crop_y
+            adjusted_visibility[view, frame] &= (
+                np.isfinite(transformed[view, frame]).all(axis=-1)
+                & (transformed[view, frame, :, 0] >= 0)
+                & (transformed[view, frame, :, 0] < output_w)
+                & (transformed[view, frame, :, 1] >= 0)
+                & (transformed[view, frame, :, 1] < output_h)
+            )
+
+            ax = (output_w - 1) / (scale_x * (source_w - 1))
+            ay = (output_h - 1) / (scale_y * (source_h - 1))
+            bx = ax + 2 * (crop_x / scale_x - pad_left) / (source_w - 1) - 1
+            by = ay + 2 * (crop_y / scale_y - pad_top) / (source_h - 1) - 1
+            theta[view, frame] = ((ax, 0, bx), (0, ay, by))
+    return transformed, adjusted_visibility, adjusted_intrinsics, theta
+
+
+def _sample_tracks(
+    tracks: np.ndarray,
+    xy: np.ndarray,
+    camera_z: np.ndarray,
+    visibility: np.ndarray,
+    count: int,
+    rng: np.random.RandomState,
+) -> tuple[np.ndarray, np.ndarray]:
+    any_view = visibility.any(axis=0)
+    eligible = any_view.sum(axis=0) >= 2
+    eligible &= any_view[0] | any_view[len(any_view) // 2]
+    indices = np.flatnonzero(eligible)
+    if len(indices) < max(1, count // 4):
+        return np.empty(0, dtype=np.int64), np.empty((0, 4), dtype=np.float32)
+    movement = np.linalg.norm(np.diff(tracks, axis=0), axis=-1).sum(axis=0)
+    buckets = (indices[movement[indices] > 2.0], indices[(movement[indices] > 0.1) & (movement[indices] <= 2.0)], indices[movement[indices] <= 0.1])
+    selected: list[int] = []
+    for bucket, fraction in zip(buckets, (0.25, 0.5, 0.25)):
+        take = min(len(bucket), round(count * fraction))
+        if take:
+            selected.extend(rng.choice(bucket, take, replace=False).tolist())
+    remaining = np.setdiff1d(indices, np.asarray(selected, dtype=np.int64), assume_unique=False)
+    if len(selected) < count and len(remaining):
+        take = min(count - len(selected), len(remaining))
+        selected.extend(rng.choice(remaining, take, replace=False).tolist())
+    rng.shuffle(selected)
+    selected_array = np.asarray(selected[:count], dtype=np.int64)
+    selected_visibility = visibility[:, :, selected_array]
+    visible_any = selected_visibility.any(axis=0)
+    query_times = np.empty(len(selected_array), dtype=np.int64)
+    for point in range(len(selected_array)):
+        candidates = np.flatnonzero(visible_any[:, point])
+        query_times[point] = int(candidates[rng.randint(len(candidates))])
+    query_points = np.concatenate(
+        [query_times[:, None].astype(np.float32), tracks[query_times, selected_array]], axis=1
+    )
+    return selected_array, query_points.astype(np.float32)
+
+
+def _scene_transform(
+    tracks: np.ndarray,
+    query_points: np.ndarray,
+    trajectory: np.ndarray,
+    extrinsics: np.ndarray,
+    rng: np.random.RandomState,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    rx, ry = np.deg2rad(rng.uniform(-15, 15, size=2))
+    rotation_x = np.asarray(
+        [[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]],
+        dtype=np.float32,
+    )
+
+
+def _sample_depth_patch_operations(
+    trajectory: np.ndarray,
+    visibility: np.ndarray,
+    height: int,
+    width: int,
+    rng: np.random.RandomState,
+    *,
+    eraser_probability: float,
+    eraser_max: int,
+    eraser_bounds: Sequence[int],
+    replace_probability: float,
+    replace_max: int,
+    replace_bounds: Sequence[int],
+) -> tuple[tuple[tuple[int, ...], ...], np.ndarray]:
+    views, frames, _, _ = trajectory.shape
+    updated_visibility = visibility.copy()
+    operations: list[tuple[int, ...]] = []
+    for view in range(views):
+        for frame in range(1, frames):
+            for kind, probability, maximum, bounds in (
+                (0, eraser_probability, eraser_max, eraser_bounds),
+                (1, replace_probability, replace_max, replace_bounds),
+            ):
+                if rng.rand() >= probability:
+                    continue
+                for _ in range(int(rng.randint(1, maximum + 1))):
+                    xc, yc = int(rng.randint(width)), int(rng.randint(height))
+                    dx = int(rng.randint(bounds[0], bounds[1]))
+                    dy = int(rng.randint(bounds[0], bounds[1]))
+                    x0 = int(np.clip(round(xc - dx / 2), 0, width - 1))
+                    x1 = int(np.clip(round(xc + dx / 2), x0 + 1, width))
+                    y0 = int(np.clip(round(yc - dy / 2), 0, height - 1))
+                    y1 = int(np.clip(round(yc + dy / 2), y0 + 1, height))
+                    if kind == 0:
+                        fill_mode = int(rng.choice(4, p=[0.2, 0.1, 0.35, 0.35]))
+                        operations.append((kind, view, frame, x0, x1, y0, y1, fill_mode))
+                    else:
+                        source_view = int(rng.randint(views))
+                        source_frame = int(rng.randint(frames))
+                        source_x = int(rng.randint(0, width - (x1 - x0) + 1))
+                        source_y = int(rng.randint(0, height - (y1 - y0) + 1))
+                        operations.append((
+                            kind, view, frame, x0, x1, y0, y1,
+                            source_view, source_frame, source_x, source_y,
+                        ))
+                    point_xy = trajectory[view, frame, :, :2]
+                    updated_visibility[view, frame] &= ~(
+                        (point_xy[:, 0] >= x0)
+                        & (point_xy[:, 0] < x1)
+                        & (point_xy[:, 1] >= y0)
+                        & (point_xy[:, 1] < y1)
+                    )
+    return tuple(operations), updated_visibility
+    rotation_y = np.asarray(
+        [[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]],
+        dtype=np.float32,
+    )
+    rotation = rotation_y @ rotation_x
+    scale = float(rng.uniform(0.8, 1.5))
+    translation = rng.uniform(-2, 2, size=3).astype(np.float32)
+    transformed_tracks = np.einsum("ij,tnj->tni", rotation, tracks * scale) + translation
+    transformed_queries = query_points.copy()
+    transformed_queries[:, 1:] = (
+        np.einsum("ij,nj->ni", rotation, query_points[:, 1:] * scale) + translation
+    )
+    transformed_trajectory = trajectory.copy()
+    transformed_trajectory[..., 2] *= scale
+    rigid = np.eye(4, dtype=np.float32)
+    rigid[:3, :3] = rotation
+    rigid[:3, 3] = translation
+    square = np.repeat(np.eye(4, dtype=np.float32)[None, None], extrinsics.shape[0], axis=0)
+    square = np.repeat(square, extrinsics.shape[1], axis=1)
+    square[..., :3, :3] = extrinsics[..., :3, :3]
+    square[..., :3, 3] = extrinsics[..., :3, 3] * scale
+    transformed_extrinsics = np.einsum("vtij,jk->vtik", square, np.linalg.inv(rigid))[..., :3, :]
+    return (
+        transformed_tracks.astype(np.float32),
+        transformed_queries.astype(np.float32),
+        transformed_trajectory.astype(np.float32),
+        transformed_extrinsics.astype(np.float32),
+        scale,
+    )
+
+
+class TapVid3DMultiViewDataset(KubricMultiViewDataset):
+    """MVTracker sampling over cached raw TAPVid-3D sequences."""
+
+    collate_fn = staticmethod(collate_encoded_tapvid3d)
+    requires_cuda_prefetch = True
+
+    def __init__(self, *args, raw_root: str, **kwargs):
+        self.raw_root = Path(raw_root)
+        super().__init__(*args, **kwargs)
+        self._manifests: dict[str, dict[str, Any]] = {}
+        self._arrays: dict[Path, np.ndarray] = {}
+        self._jpeg_descriptors: dict[Path, int] = {}
+        for sequence in self.seq_names:
+            self._manifests[sequence] = self._load_manifest(sequence)
+
+    def _load_manifest(self, sequence: str) -> dict[str, Any]:
+        cache_root = Path(self.data_root) / sequence
+        manifest = json.loads((cache_root / "manifest.json").read_text(encoding="utf-8"))
+        if manifest.get("format") != _CACHE_FORMAT or manifest.get("schema_version") != _CACHE_VERSION:
+            raise ValueError(f"{cache_root}: unsupported or missing cache manifest")
+        source_root = self.raw_root / manifest["source_sequence"]
+        current_files = {
+            name: _source_stat(source_root / name)
+            for name in manifest["source_files"]
+        }
+        if _manifest_digest(current_files) != manifest["source_fingerprint"]:
+            raise ValueError(f"{source_root}: cache is stale; rerun TAPVid-3D preparation")
+        return manifest
+
+    def _manifest(self, sequence: str) -> dict[str, Any]:
+        manifests = getattr(self, "_manifests", None)
+        if manifests is None:
+            self._manifests = {}
+            manifests = self._manifests
+        if sequence not in manifests:
+            manifests[sequence] = self._load_manifest(sequence)
+        return manifests[sequence]
+
+    def _mmap(self, path: Path) -> np.ndarray:
+        arrays = getattr(self, "_arrays", None)
+        if arrays is None:
+            self._arrays = {}
+            arrays = self._arrays
+        if path not in arrays:
+            arrays[path] = np.load(path, mmap_mode="r", allow_pickle=False)
+        return arrays[path]
+
+    def _jpeg_descriptor(self, path: Path) -> int:
+        descriptors = getattr(self, "_jpeg_descriptors", None)
+        if descriptors is None:
+            self._jpeg_descriptors = {}
+            descriptors = self._jpeg_descriptors
+        if path not in descriptors:
+            descriptors[path] = os.open(path, os.O_RDONLY)
+        return descriptors[path]
+
+    @staticmethod
+    def from_name(dataset_name, dataset_root, training_args=None, fabric=None, just_return_kwargs=False):
+        if not dataset_name.startswith(_DATASET_PREFIX):
+            raise ValueError(f"Unsupported TAPVid-3D dataset name: {dataset_name}")
+        requested = dataset_name[len(_DATASET_PREFIX):]
+        if requested not in _SPLITS:
+            raise ValueError(f"Unsupported TAPVid-3D split: {requested}")
+        if requested == "training":
+            kwargs = KubricMultiViewDataset.from_name(
+                "kubric-multiview-v3-training", dataset_root,
+                training_args=training_args, fabric=fabric, just_return_kwargs=True,
+            )
+        else:
+            kwargs = KubricMultiViewDataset.from_name(
+                "kubric-multiview-v3", dataset_root,
+                training_args=training_args, just_return_kwargs=True,
+            )
+        datasets_cfg = getattr(training_args, "datasets", {}) if training_args is not None else {}
+        raw_dir = datasets_cfg.get("tapvid3d_raw_dir", "TAPVid3D_raw")
+        cache_dir = datasets_cfg.get("tapvid3d_cache_dir", "TAPVid3D_MVTracker_cache")
+        kwargs.update({
+            "data_root": os.path.join(dataset_root, cache_dir, _SPLITS[requested]),
+            "raw_root": os.path.join(dataset_root, raw_dir, _SPLITS[requested]),
+            "num_views": int(datasets_cfg.get("tapvid3d_num_views", 4)),
+            "views_to_return": None,
+            "novel_views": None,
+            "use_duster_depths": False,
+            "clean_duster_depths": False,
+            "duster_views": None,
+            "supported_duster_views_sets": None,
+            "enable_variable_depth_type_augs": False,
+            "enable_variable_num_views_augs": False,
+        })
+        if kwargs.get("enable_rgb_augs"):
+            raise ValueError("GPU TAPVid-3D loading requires augmentations.rgb=false")
+        if kwargs.get("normalize_scene_following_vggt"):
+            raise ValueError("GPU TAPVid-3D loading does not support VGGT scene normalization")
+        if just_return_kwargs:
+            return kwargs
+        return TapVid3DMultiViewDataset(**kwargs)
+
+    def __getitem__(self, index):
+        load_started = time.perf_counter()
+        virtual_index = int(index)
+        scene_index = virtual_index % self.real_len
+        sequence = self.seq_names[scene_index]
+        seed = int(self.seed + virtual_index if self.seed is not None and self.add_index_to_seed else self.seed or torch.randint(0, 2**31, ()).item())
+        rng = np.random.RandomState(seed)
+        cache_root = Path(self.data_root) / sequence
+        manifest = self._manifest(sequence)
+        source_root = self.raw_root / manifest["source_sequence"]
+
+        frame_count = int(manifest["frame_count"])
+        legal = _legal_contiguous_window_starts(frame_count, self.seq_len)
+        if not len(legal):
+            raise ValueError(f"{source_root}: fewer than {self.seq_len} frames")
+        start = int(rng.choice(legal))
+        frame_indices = np.arange(start, start + self.seq_len)
+        available_views = list(manifest["views"])
+        if len(available_views) < self.num_views:
+            raise ValueError(f"{source_root}: requires {self.num_views} views")
+        views = sorted(rng.choice(available_views, self.num_views, replace=False).tolist())
+
+        tracks_all = self._mmap(source_root / "tracks_xyz.npy")
+        tracks = np.asarray(tracks_all[frame_indices], dtype=np.float32)
+        extrinsics = []
+        intrinsics = []
+        visibility = []
+        depths = []
+        encoded = []
+        for view in views:
+            raw_view = source_root / str(view)
+            extrinsics.append(np.asarray(self._mmap(raw_view / "extrinsics_w2c.npy")[frame_indices, :3, :4], dtype=np.float32))
+            k = _intrinsics_matrix(self._mmap(raw_view / "intrinsics.npy"))
+            intrinsics.append(np.repeat(k[None], self.seq_len, axis=0))
+            visibility.append(np.asarray(self._mmap(raw_view / "visibility.npy")[frame_indices], dtype=np.bool_))
+            depths.append(torch.from_numpy(np.asarray(self._mmap(raw_view / "depth.npy")[frame_indices], dtype=np.float32).copy()))
+            cache_view = cache_root / f"view_{view}"
+            encoded.extend(_read_encoded_frames(
+                self._jpeg_descriptor(cache_view / "jpeg_bytes.bin"),
+                self._mmap(cache_view / "jpeg_offsets.npy"),
+                frame_indices,
+                label=cache_view,
+            ))
+        extrinsics_np = np.stack(extrinsics)
+        intrinsics_np = np.stack(intrinsics)
+        visibility_np = np.stack(visibility)
+        xy, camera_z = _project(tracks, extrinsics_np, intrinsics_np)
+        visibility_np &= np.isfinite(xy).all(axis=-1) & np.isfinite(camera_z) & (camera_z > 0)
+        source_size = tuple(int(value) for value in manifest["resolution_hw"])
+        output_size = tuple(int(value) for value in self.crop_size) if self.enable_cropping_augs else source_size
+        xy, visibility_np, intrinsics_np, theta = _spatial_transform(
+            xy, visibility_np, intrinsics_np, source_size, output_size, rng,
+            self.enable_cropping_augs,
+        )
+        selected, query_points = _sample_tracks(
+            tracks, xy, camera_z, visibility_np, self.traj_per_sample, rng
+        )
+        if not len(selected):
+            return None, False
+        xy_z = np.concatenate([xy[:, :, selected], camera_z[:, :, selected, None]], axis=-1)
+        selected_tracks = tracks[:, selected]
+        depth_scale = 1.0
+        if getattr(self, "enable_scene_transform_augs", False):
+            selected_tracks, query_points, xy_z, extrinsics_np, depth_scale = _scene_transform(
+                selected_tracks, query_points, xy_z, extrinsics_np, rng
+            )
+        if getattr(self, "enable_camera_params_noise_augs", False):
+            intrinsics_np = intrinsics_np + rng.normal(0, 0.001, size=intrinsics_np.shape)
+            extrinsics_np = extrinsics_np + rng.normal(0, 0.001, size=extrinsics_np.shape)
+        apply_depth_aug = bool(
+            self.enable_depth_augs and rng.rand() <= self.augmentation_probability
+        )
+        selected_visibility = visibility_np[:, :, selected]
+        depth_patch_operations: tuple[tuple[int, ...], ...] = ()
+        if apply_depth_aug:
+            depth_patch_operations, selected_visibility = _sample_depth_patch_operations(
+                xy_z,
+                selected_visibility,
+                output_size[0],
+                output_size[1],
+                rng,
+                eraser_probability=self.eraser_aug_prob,
+                eraser_max=self.eraser_max,
+                eraser_bounds=self.eraser_bounds,
+                replace_probability=self.replace_aug_prob,
+                replace_max=self.replace_max,
+                replace_bounds=self.replace_bounds,
+            )
+        sample = EncodedTapVid3DSample(
+            jpeg_bytes=tuple(encoded),
+            depth=torch.stack(depths)[:, :, None],
+            theta=torch.from_numpy(theta),
+            intrs=torch.from_numpy(intrinsics_np),
+            extrs=torch.from_numpy(extrinsics_np),
+            trajectory=torch.from_numpy(xy_z),
+            trajectory_3d=torch.from_numpy(np.asarray(selected_tracks, dtype=np.float32)),
+            visibility=torch.from_numpy(selected_visibility),
+            valid=torch.ones((self.seq_len, len(selected)), dtype=torch.float32),
+            query_points_3d=torch.from_numpy(query_points),
+            seq_name=sequence,
+            metadata={
+                "virtual_index": virtual_index,
+                "scene_index": scene_index,
+                "scene_name": sequence,
+                "seed": seed,
+                "window_start": start,
+                "window_end_exclusive": start + self.seq_len,
+                "selected_views": views,
+                "gotit": True,
+                "worker_prepare_seconds": time.perf_counter() - load_started,
+            },
+            output_size=output_size,
+            apply_depth_aug=apply_depth_aug,
+            augmentation_seed=seed,
+            depth_scale=depth_scale,
+            max_depth=float(getattr(self, "max_depth", 1000.0)),
+            depth_patch_operations=depth_patch_operations,
+        )
+        return sample, True
+
+
+def decode_tapvid3d_batch(
+    batch: EncodedTapVid3DBatch,
+    device: torch.device,
+    *,
+    timing_events: tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event] | None = None,
+) -> Datapoint:
+    if device.type != "cuda":
+        raise RuntimeError("TAPVid-3D training requires CUDA nvJPEG decoding")
+    version = tuple(int(value) for value in torchvision.__version__.split("+")[0].split(".")[:2])
+    if version < (0, 20):
+        raise RuntimeError("batched CUDA JPEG decoding requires torchvision 0.20 or newer")
+    if timing_events is not None:
+        timing_events[0].record()
+    flat_encoded = [encoded for sample in batch.samples for encoded in sample.jpeg_bytes]
+    decoded_all = decode_jpeg(flat_encoded, mode=ImageReadMode.RGB, device=device)
+    if timing_events is not None:
+        timing_events[1].record()
+    videos = []
+    depths = []
+    decoded_offset = 0
+    for sample in batch.samples:
+        decoded = decoded_all[decoded_offset:decoded_offset + len(sample.jpeg_bytes)]
+        decoded_offset += len(sample.jpeg_bytes)
+        rgb = torch.stack(decoded).float()
+        views, frames = sample.depth.shape[:2]
+        source_h, source_w = sample.depth.shape[-2:]
+        output_h, output_w = sample.output_size
+        theta = sample.theta.to(device, non_blocking=True).reshape(-1, 2, 3)
+        grid = F.affine_grid(theta, (views * frames, 3, output_h, output_w), align_corners=True)
+        rgb = F.grid_sample(rgb, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        depth = sample.depth.to(device, non_blocking=True).reshape(views * frames, 1, source_h, source_w)
+        depth = F.grid_sample(depth, grid, mode="nearest", padding_mode="zeros", align_corners=True)
+        depth *= sample.depth_scale
+        if sample.apply_depth_aug:
+            generator = torch.Generator(device=device).manual_seed(sample.augmentation_seed)
+            invalid = depth == 0
+            depth = aug_depth(depth, grid=(16, 16), scale=(0.99, 1.01), shift=(-0.001, 0.001), gn_kernel=(5, 5), gn_sigma=(2, 2), generator=generator)
+            depth_views = depth.reshape(views, frames, 1, output_h, output_w)
+            for operation in sample.depth_patch_operations:
+                kind, view, frame, x0, x1, y0, y1, *parameters = operation
+                if kind == 0:
+                    patch = depth_views[view, frame, :, y0:y1, x0:x1]
+                    fill_mode = parameters[0]
+                    fill = (patch.mean(), patch.min(), patch.max(), patch.new_zeros(()))[fill_mode]
+                    patch.fill_(fill)
+                else:
+                    source_view, source_frame, source_x, source_y = parameters
+                    depth_views[view, frame, :, y0:y1, x0:x1] = depth_views[
+                        source_view,
+                        source_frame,
+                        :,
+                        source_y:source_y + (y1 - y0),
+                        source_x:source_x + (x1 - x0),
+                    ].clone()
+            depth = depth_views.reshape(views * frames, 1, output_h, output_w)
+            depth[invalid] = 0
+        depth[depth > sample.max_depth] = 0
+        videos.append(rgb.reshape(views, frames, 3, output_h, output_w))
+        depths.append(depth.reshape(views, frames, 1, output_h, output_w))
+
+    def stack(name: str, *, floating=True):
+        result = torch.stack([getattr(sample, name) for sample in batch.samples]).to(device, non_blocking=True)
+        return result.float() if floating else result
+
+    result = Datapoint(
+        video=torch.stack(videos),
+        videodepth=torch.stack(depths),
+        segmentation=None,
+        trajectory=stack("trajectory"),
+        trajectory_3d=stack("trajectory_3d"),
+        visibility=stack("visibility"),
+        valid=stack("valid"),
+        seq_name=[sample.seq_name for sample in batch.samples],
+        intrs=stack("intrs"),
+        extrs=stack("extrs"),
+        query_points=None,
+        query_points_3d=stack("query_points_3d"),
+        sample_metadata=[sample.metadata for sample in batch.samples],
+        track_upscaling_factor=1.0,
+    )
+    if timing_events is not None:
+        timing_events[2].record()
+    return result
+
+
+def _record_stream(datapoint: Datapoint, stream: torch.cuda.Stream) -> None:
+    for value in vars(datapoint).values():
+        if isinstance(value, torch.Tensor) and value.is_cuda:
+            value.record_stream(stream)
+
+
+class _CudaPrefetchIterator:
+    def __init__(self, source: Iterable, device: torch.device):
+        self.source = iter(source)
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.next_item = None
+        self._preload()
+
+    def _preload(self):
+        try:
+            encoded, gotit = next(self.source)
+        except StopIteration:
+            self.next_item = None
+            return
+        if not all(gotit):
+            self.next_item = (None, gotit, None)
+        else:
+            events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
+            with torch.cuda.stream(self.stream):
+                datapoint = decode_tapvid3d_batch(
+                    encoded,
+                    self.device,
+                    timing_events=events,
+                )
+                self.next_item = (datapoint, gotit, events)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.next_item is None:
+            raise StopIteration
+        current = torch.cuda.current_stream(self.device)
+        current.wait_stream(self.stream)
+        datapoint, gotit, events = self.next_item
+        if datapoint is not None:
+            _record_stream(datapoint, current)
+            decode_ms = events[0].elapsed_time(events[1])
+            prepare_ms = events[0].elapsed_time(events[2])
+            for metadata in datapoint.sample_metadata:
+                metadata["gpu_jpeg_decode_ms"] = decode_ms
+                metadata["gpu_prepare_total_ms"] = prepare_ms
+        self._preload()
+        return datapoint, gotit
+
+
+class CudaPrefetchLoader:
+    def __init__(self, loader, device: torch.device | None = None):
+        self.loader = loader
+        self.device = device or torch.device("cuda", torch.cuda.current_device())
+
+    def __iter__(self):
+        return _CudaPrefetchIterator(self.loader, self.device)
+
+    def __len__(self):
+        return len(self.loader)
+
+    def state_dict(self):
+        return self.loader.state_dict()
+
+    def load_state_dict(self, state_dict):
+        return self.loader.load_state_dict(state_dict)

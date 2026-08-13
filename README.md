@@ -120,6 +120,26 @@ python -m cupyx.tools.install_library --cuda 12.x --library cudnn
 
 ## Datasets
 
+### Raw multi-view TAPVid-3D training data
+
+The `tapvid3d-multiview-*` adapter reads the raw TAPVid-3D directory contract
+(`tracks_xyz.npy`, `queries_xytv.npy`, and numeric per-view directories). Build
+its random-access JPEG index once, then train with batched CUDA/nvJPEG decoding:
+
+```bash
+python scripts/prepare_tapvid3d_mvtracker.py \
+  --raw-root datasets/TAPVid3D_raw \
+  --cache-root datasets/TAPVid3D_MVTracker_cache \
+  --workers 4
+
+python -m mvtracker.cli.train +experiment=tapvid3d_procedural
+```
+
+The cache preserves the original JPEG bytes and references the raw memory-mapped
+numeric arrays; it does not duplicate RGB, depth, tracks, or camera data. Training
+requires CUDA and Torchvision 0.20 or newer for batched nvJPEG. It rejects missing
+or stale cache entries rather than falling back to whole-sequence object-array loading.
+
 To benchmark multi-view 3D point tracking, we provide preprocessed versions of three datasets:
 
 - **MV-Kubric**: a synthetic training dataset adapted from single-view Kubric into a multi-view setting.  

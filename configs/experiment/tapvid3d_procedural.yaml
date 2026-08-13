@@ -1,0 +1,30 @@
+# @package _global_
+defaults:
+  - override /model: mvtracker
+
+experiment_path: ./logs/tapvid3d-procedural
+restore_ckpt_path: ./checkpoints/mvtracker_200000_june2025.pth
+
+datasets:
+  tapvid3d_raw_dir: TAPVid3D_raw
+  tapvid3d_cache_dir: TAPVid3D_MVTracker_cache
+  tapvid3d_num_views: 4
+  train:
+    name: tapvid3d-multiview-training
+    sequence_len: 24
+    traj_per_sample: 2048
+    num_workers: 4
+    prefetch_factor: 2
+  eval:
+    names:
+      - tapvid3d-multiview-validation
+
+augmentations:
+  rgb: false
+  variable_depth_type: false
+  variable_num_views: false
+
+logging:
+  log_wandb: true
+  wandb_project: mvtracker-tapvid3d
+  tags: [tapvid3d, procedural, nvjpeg]

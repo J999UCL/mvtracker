@@ -440,7 +440,10 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                and not fname.startswith(".")
                and not fname.startswith("_")
         ]
-        self.seq_names = sorted(self.seq_names, key=lambda x: int(x))
+        self.seq_names = sorted(
+            self.seq_names,
+            key=lambda name: (0, int(name)) if name.isdigit() else (1, name),
+        )
         seq_names_clean = []
         for seq_name in self.seq_names:
             scene_path = os.path.join(self.data_root, seq_name)
