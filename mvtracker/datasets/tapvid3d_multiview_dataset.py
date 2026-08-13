@@ -1164,6 +1164,7 @@ class _CudaPrefetchIterator:
         datapoint, gotit, events = self.next_item
         if datapoint is not None:
             _record_stream(datapoint, current)
+            events[2].synchronize()
             decode_ms = events[0].elapsed_time(events[1])
             prepare_ms = events[0].elapsed_time(events[2])
             for metadata in datapoint.sample_metadata:
