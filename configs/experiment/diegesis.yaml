@@ -1,0 +1,17 @@
+# @package _global_
+
+datasets:
+  root: ${oc.env:DIEGESIS_MVTRACKER_ROOT}
+  tapvid3d_raw_dir: TAPVid3D_raw
+  tapvid3d_cache_dir: TAPVid3D_MVTracker_cache
+  tapvid3d_num_views: 4
+  train:
+    name: tapvid3d-multiview-training
+  eval:
+    names:
+      - tapvid3d-multiview-validation
+
+logging:
+  log_wandb: true
+  wandb_project: mvtracker-diegesis
+  tags: [diegesis, tapvid3d, nvjpeg]

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import unittest
 from pathlib import Path
 
@@ -14,6 +16,56 @@ class TapVid3DTrainingConfigTests(unittest.TestCase):
         self.assertEqual(config["datasets"]["train"]["prefetch_factor"], 2)
         self.assertFalse(config["augmentations"]["rgb"])
         self.assertTrue(config["logging"]["log_wandb"])
+
+    def test_diegesis_config_only_overrides_dataset_and_logging_wiring(self):
+        path = Path(__file__).resolve().parents[1] / "configs/experiment/diegesis.yaml"
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["datasets"]["root"], "${oc.env:DIEGESIS_MVTRACKER_ROOT}")
+        self.assertEqual(config["datasets"]["train"]["name"], "tapvid3d-multiview-training")
+        self.assertEqual(
+            config["datasets"]["eval"]["names"],
+            ["tapvid3d-multiview-validation"],
+        )
+        self.assertEqual(config["logging"]["wandb_project"], "mvtracker-diegesis")
+        self.assertNotIn("trainer", config)
+        self.assertNotIn("model", config)
+        self.assertNotIn("augmentations", config)
+
+    def test_diegesis_split_is_complete_disjoint_and_matches_its_algorithm(self):
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads((root / "configs/diegesis_split_v1.json").read_text())
+        splits = manifest["splits"]
+
+        self.assertEqual({name: len(scenes) for name, scenes in splits.items()}, {
+            "train": 17,
+            "validation": 2,
+            "test": 2,
+        })
+        all_scenes = [scene for scenes in splits.values() for scene in scenes]
+        self.assertEqual(len(all_scenes), len(set(all_scenes)))
+
+        room_scenes = {
+            "Bathroom": [f"bathroom{index:02d}" for index in range(1, 5)],
+            "Bedroom": [f"bedroom{index:02d}" for index in range(1, 5)],
+            "DiningRoom": [f"diningroom{index:02d}" for index in range(1, 5)],
+            "Kitchen": [f"kitchen{index:02d}" for index in range(1, 5)],
+            "LivingRoom": [f"livingroom{index:02d}" for index in range(1, 6)],
+        }
+        digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+        ranked_rooms = sorted(
+            room_scenes,
+            key=lambda room: digest(f"diegesis-split-v1:room:{room}"),
+        )
+        selected = [
+            min(
+                room_scenes[room],
+                key=lambda scene: digest(f"diegesis-split-v1:scene:{scene}"),
+            )
+            for room in ranked_rooms[:4]
+        ]
+        self.assertEqual(splits["validation"], selected[:2])
+        self.assertEqual(splits["test"], selected[2:])
 
 
 if __name__ == "__main__":

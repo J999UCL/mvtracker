@@ -1,0 +1,40 @@
+{
+  "algorithm": {
+    "name": "room_diverse_sha256",
+    "namespace": "diegesis-split-v1",
+    "procedure": "Sort room types by SHA256(namespace + ':room:' + room_type). Hold out the lowest-ranked scene by SHA256(namespace + ':scene:' + scene_id) from the first two rooms for validation and the next two rooms for test; assign every other scene to train."
+  },
+  "source": {
+    "repo_id": "j99999/diegesis",
+    "revision": "81389015a6d713a848a120e34850f360621bcdce"
+  },
+  "splits": {
+    "train": [
+      "bathroom01",
+      "bathroom02",
+      "bathroom03",
+      "bedroom02",
+      "bedroom03",
+      "bedroom04",
+      "diningroom01",
+      "diningroom03",
+      "diningroom04",
+      "kitchen01",
+      "kitchen02",
+      "kitchen03",
+      "kitchen04",
+      "livingroom01",
+      "livingroom03",
+      "livingroom04",
+      "livingroom05"
+    ],
+    "validation": [
+      "diningroom02",
+      "bedroom01"
+    ],
+    "test": [
+      "bathroom04",
+      "livingroom02"
+    ]
+  }
+}
