@@ -321,12 +321,18 @@ def benchmark(
     neighbors: int,
     warmup: int,
     iterations: int,
+    dtype: torch.dtype,
+    backend: str,
 ) -> list[BenchmarkResult]:
     """Benchmark eager materialization against the production fused block."""
     torch.manual_seed(7)
     xyz = torch.randn(batch_size, num_points, 3, device=device)
-    fvec = torch.randn(batch_size, num_points, channels, device=device)
-    targets = torch.randn(batch_size, num_queries, channels, device=device)
+    fvec = torch.randn(
+        batch_size, num_points, channels, device=device, dtype=dtype
+    )
+    targets = torch.randn(
+        batch_size, num_queries, channels, device=device, dtype=dtype
+    )
     query_xyz = torch.randn(batch_size, num_queries, 3, device=device)
     indices = torch.randint(num_points, (batch_size, num_queries, neighbors), device=device)
 
@@ -357,20 +363,26 @@ def benchmark(
             value.grad = None
         block.corr_sample(targets, query_xyz).sum().backward()
 
-    baseline_time, baseline_peak = _time_calls(
-        eager_reference, warmup, iterations, device
-    )
-    candidate_time, candidate_peak = _time_calls(
-        production_fused, warmup, iterations, device
-    )
-    return [
-        BenchmarkResult(
-            "eager_reference", baseline_time, iterations, baseline_peak
-        ),
-        BenchmarkResult(
-            "production_fused", candidate_time, iterations, candidate_peak
-        ),
-    ]
+    results = []
+    if backend in {"eager", "both"}:
+        baseline_time, baseline_peak = _time_calls(
+            eager_reference, warmup, iterations, device
+        )
+        results.append(
+            BenchmarkResult(
+                "eager_reference", baseline_time, iterations, baseline_peak
+            )
+        )
+    if backend in {"production", "both"}:
+        candidate_time, candidate_peak = _time_calls(
+            production_fused, warmup, iterations, device
+        )
+        results.append(
+            BenchmarkResult(
+                "production_fused", candidate_time, iterations, candidate_peak
+            )
+        )
+    return results
 
 
 def parse_args(argv=None):
@@ -384,6 +396,12 @@ def parse_args(argv=None):
     parser.add_argument("--neighbors", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument(
+        "--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16"
+    )
+    parser.add_argument(
+        "--backend", choices=("eager", "production", "both"), default="both"
+    )
     return parser.parse_args(argv)
 
 
@@ -399,6 +417,8 @@ def main(argv=None):
         args.neighbors,
         args.warmup,
         args.iterations,
+        getattr(torch, args.dtype),
+        args.backend,
     )
     print(json.dumps([result.as_dict() for result in results], indent=2))
 
