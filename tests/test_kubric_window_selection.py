@@ -216,8 +216,23 @@ class CacheKeyTests(unittest.TestCase):
             num_views = 4
             seq_len = 24
             sample_vis_1st_frame = False
+            cache_version = "v3"
 
         self.assertTrue(_kubric_cache_key(DatasetStub()).endswith("--v3"))
+
+    def test_cache_key_can_select_released_v1_tracks(self):
+        class DatasetStub:
+            seed = 72
+            ratio_dynamic = 0.5
+            ratio_very_dynamic = 0.25
+            views_to_return = [0, 1, 2, 3]
+            traj_per_sample = 512
+            num_views = -1
+            seq_len = 24
+            sample_vis_1st_frame = False
+            cache_version = "v1"
+
+        self.assertTrue(_kubric_cache_key(DatasetStub()).endswith("--v1"))
 
 
 class VirtualDatasetIndexTests(unittest.TestCase):

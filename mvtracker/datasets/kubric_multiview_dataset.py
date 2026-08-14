@@ -211,6 +211,8 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             "ratio_dynamic": 0.5,
             "ratio_very_dynamic": 0.25,
             "use_cached_tracks": use_cached_tracks,
+            # The released paper benchmark ships frozen v1 track selections.
+            "cache_version": "v1" if use_cached_tracks else "v3",
         }
         if training:
             kubric_kwargs["virtual_dataset_size"] = _training_virtual_dataset_size(
@@ -309,6 +311,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             max_tracks_to_preload=18000,
             perform_sanity_checks=False,
             use_cached_tracks=False,
+            cache_version="v3",
     ):
         super(KubricMultiViewDataset, self).__init__()
 
@@ -336,6 +339,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
 
         self.perform_sanity_checks = perform_sanity_checks
         self.use_cached_tracks = use_cached_tracks
+        self.cache_version = cache_version
         self.cache_name = self._cache_key()
         self.max_tracks_to_preload = max_tracks_to_preload
         if self.traj_per_sample is not None and self.max_tracks_to_preload is not None:
@@ -508,7 +512,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             name += f"-t{self.seq_len}"
         if self.sample_vis_1st_frame:
             name += f"-sample_vis_1st_frame"
-        return name + "--v3"  # v3: generic invalid-frame window exclusions
+        return name + f"--{self.cache_version}"
 
     def __len__(self):
         return self.virtual_len
