@@ -12,6 +12,27 @@ import subprocess
 import torch
 
 
+def upstream_eager_correlation(
+    targets: torch.Tensor,
+    source_features: torch.Tensor,
+    neighbor_indices: torch.Tensor,
+    groups: int,
+) -> torch.Tensor:
+    """Untouched upstream gather, grouped einsum, and normalization."""
+    batch, queries, channels = targets.shape
+    neighbors = neighbor_indices.shape[-1]
+    batch_indices = torch.arange(batch, device=targets.device)[:, None, None]
+    neighbor_features = source_features[batch_indices, neighbor_indices]
+    grouped_targets = targets.view(batch, queries, groups, -1)
+    grouped_neighbors = neighbor_features.view(
+        batch, queries, neighbors, groups, -1
+    )
+    correlations = torch.einsum(
+        "BMGc,BMKGc->BMKG", grouped_targets, grouped_neighbors
+    )
+    return correlations / ((channels / groups) ** 0.5)
+
+
 def parse_shape(value: str) -> tuple[int, int, int]:
     parts = tuple(int(part) for part in value.split(","))
     if len(parts) != 3 or any(part <= 0 for part in parts):
@@ -95,6 +116,11 @@ def benchmark_shape(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--label", required=True)
+    parser.add_argument(
+        "--operator",
+        choices=("production", "upstream-eager"),
+        default="production",
+    )
     parser.add_argument("--shape", action="append", type=parse_shape, required=True)
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--neighbors", type=int, default=16)
@@ -111,13 +137,18 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    from mvtracker.models.core.mvtracker import indexed_correlation
+    if args.operator == "production":
+        from mvtracker.models.core.mvtracker import indexed_correlation
 
-    implementation_root = Path(indexed_correlation.__file__).resolve().parents[4]
+        operator = indexed_correlation.indexed_grouped_correlation
+        implementation_root = Path(indexed_correlation.__file__).resolve().parents[4]
+    else:
+        operator = upstream_eager_correlation
+        implementation_root = Path.cwd().resolve()
     dtype = getattr(torch, args.dtype)
     results = [
         benchmark_shape(
-            indexed_correlation.indexed_grouped_correlation,
+            operator,
             shape,
             channels=args.channels,
             neighbors=args.neighbors,
@@ -133,6 +164,7 @@ def main() -> None:
         json.dumps(
             {
                 "label": args.label,
+                "operator": args.operator,
                 "implementation_root": str(implementation_root),
                 "git_revision": git_revision(implementation_root),
                 "gpu": torch.cuda.get_device_name(),
