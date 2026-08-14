@@ -19,6 +19,7 @@ from mvtracker.models.core.embeddings import (
     get_3d_embedding,
 )
 from mvtracker.models.core.model_utils import smart_cat, init_pointcloud_from_rgbd, save_pointcloud_to_ply
+from mvtracker.models.core.mvtracker.indexed_correlation import indexed_grouped_correlation
 from mvtracker.models.core.spatracker.blocks import BasicEncoder
 from mvtracker.utils.basic import time_now
 
@@ -831,13 +832,11 @@ class PointcloudCorrBlock:
             neighbor_indices = torch.cat(neighbor_indices)
         batch_idx = torch.arange(self.B, device=self.xyz.device)[:, None, None]
         neighbor_xyz = self.xyz[batch_idx, neighbor_indices]
-        neighbor_fvec = self.fvec[batch_idx, neighbor_indices]
 
         # Compute the local correlations
-        targets_grouped = targets.view(self.B, M, self.groups, -1)
-        neighbor_fvec_grouped = neighbor_fvec.view(self.B, M, self.k, self.groups, -1)
-        corrs = torch.einsum('BMGc,BMKGc->BMKG', targets_grouped, neighbor_fvec_grouped)
-        corrs = corrs / ((self.C / self.groups) ** 0.5)
+        corrs = indexed_grouped_correlation(
+            targets, self.fvec, neighbor_indices, self.groups
+        )
 
         output = corrs
 
@@ -849,6 +848,9 @@ class PointcloudCorrBlock:
         # Append the neighbor xyz to the correlation
         if self.corr_add_neighbor_xyz:
             output = torch.cat([output, neighbor_xyz], -1)
+
+        if save_debug_logs or save_rerun_logs:
+            neighbor_fvec = self.fvec[batch_idx, neighbor_indices]
 
         if save_debug_logs:
 

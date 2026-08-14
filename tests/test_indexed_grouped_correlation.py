@@ -128,6 +128,30 @@ class IndexedGroupedCorrelationTests(unittest.TestCase):
         self.assertEqual(fvec.grad[0, 2].abs().sum().item(), 6.0)
         self.assertEqual(fvec.grad[0, 4].abs().sum().item(), 4.0)
 
+    def test_production_operator_matches_oracle_forward_and_gradients(self):
+        from mvtracker.models.core.mvtracker.indexed_correlation import (
+            indexed_grouped_correlation,
+        )
+
+        left = self._fixture()
+        targets, _, _, fvec, indices, groups = left
+        targets_candidate = targets.detach().clone().requires_grad_()
+        fvec_candidate = fvec.detach().clone().requires_grad_()
+
+        expected = harness.correlation_from_indices(
+            *left, False, False
+        )
+        actual = indexed_grouped_correlation(
+            targets_candidate, fvec_candidate, indices, groups
+        )
+        torch.testing.assert_close(actual, expected)
+
+        weights = torch.linspace(0.5, 1.5, expected.numel()).reshape_as(expected)
+        (expected * weights).sum().backward()
+        (actual * weights).sum().backward()
+        torch.testing.assert_close(targets_candidate.grad, targets.grad)
+        torch.testing.assert_close(fvec_candidate.grad, fvec.grad)
+
 
 if __name__ == "__main__":
     unittest.main()
