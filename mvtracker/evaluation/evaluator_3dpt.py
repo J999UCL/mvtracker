@@ -292,6 +292,10 @@ class Evaluator:
             gt_trajectories_3d_worldspace = datapoint.trajectory_3d
             valid_tracks_per_frame = datapoint.valid
             track_upscaling_factor = datapoint.track_upscaling_factor
+            if torch.is_tensor(track_upscaling_factor):
+                if track_upscaling_factor.numel() != 1:
+                    raise ValueError("evaluation requires one track scale for its single-scene batch")
+                track_upscaling_factor = track_upscaling_factor.item()
             seq_name = datapoint.seq_name[0]
 
             # Novel view data
