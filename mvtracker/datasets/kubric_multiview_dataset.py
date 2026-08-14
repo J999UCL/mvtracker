@@ -24,12 +24,22 @@ from mvtracker.datasets.utils import Datapoint, read_json, read_tiff, read_png, 
     aug_depth
 
 
-def _training_virtual_dataset_size(world_size, num_steps, gradient_accumulation_steps):
+def _training_virtual_dataset_size(
+    world_size,
+    num_steps,
+    gradient_accumulation_steps,
+    physical_batch_size=1,
+):
     """Reserve one distinct virtual index per training microbatch."""
     gradient_accumulation_steps = int(gradient_accumulation_steps)
     if gradient_accumulation_steps < 1:
         raise ValueError("trainer.gradient_accumulation_steps must be at least 1")
-    return int(world_size) * gradient_accumulation_steps * (int(num_steps) + 1000)
+    return (
+        int(world_size)
+        * int(physical_batch_size)
+        * gradient_accumulation_steps
+        * (int(num_steps) + 1000)
+    )
 
 
 def _legal_contiguous_window_starts(n_frames, seq_len, invalid_frame_indices=()):
@@ -209,6 +219,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                 gradient_accumulation_steps=(
                     training_args.trainer.gradient_accumulation_steps
                 ),
+                physical_batch_size=training_args.datasets.train.batch_size,
             )
         if training or overfit_on_train:
             kubric_kwargs["data_root"] = (

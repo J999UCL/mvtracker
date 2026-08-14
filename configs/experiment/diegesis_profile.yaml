@@ -11,6 +11,7 @@ datasets:
   tapvid3d_view_count_probabilities: [0.25, 0.25, 0.25, 0.25]
   train:
     name: tapvid3d-multiview-training
+    batch_size: 2
     traj_per_sample: 256
   eval:
     names: []
@@ -20,7 +21,7 @@ trainer:
   eval_freq: 10000
   viz_freq: 10000
   save_ckpt_freq: 10000
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   expensive_diagnostics_interval: 50
   profiler:
     enabled: true

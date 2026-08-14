@@ -54,11 +54,17 @@ def _load_module():
         sample_metadata: object = None
         track_upscaling_factor: object = 1.0
 
+    @dataclass(frozen=True)
+    class StubSampleRequest:
+        virtual_index: int
+        view_count: int
+
     kubric = types.ModuleType("mvtracker.datasets.kubric_multiview_dataset")
     kubric.KubricMultiViewDataset = StubKubric
     kubric._legal_contiguous_window_starts = legal_starts
     utils = types.ModuleType("mvtracker.datasets.utils")
     utils.Datapoint = StubDatapoint
+    utils.SampleRequest = StubSampleRequest
     utils.aug_depth = lambda depth, **kwargs: depth
     package = types.ModuleType("mvtracker")
     package.__path__ = []

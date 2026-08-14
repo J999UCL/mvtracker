@@ -91,7 +91,12 @@ def test_rank_batches_share_schedule_and_partition_indices():
         indices_zero = {request.virtual_index for request in batch_zero}
         indices_one = {request.virtual_index for request in batch_one}
         assert indices_zero.isdisjoint(indices_one)
-        assert indices_zero | indices_one == set(range(min(indices_zero | indices_one), max(indices_zero | indices_one) + 1))
+    all_indices = {
+        request.virtual_index
+        for batch in rank_zero + rank_one
+        for request in batch
+    }
+    assert all_indices == set(range(36))
 
 
 def test_epoch_changes_schedule_but_is_reproducible():

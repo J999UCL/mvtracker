@@ -77,12 +77,18 @@ class HomogeneousViewBatchSampler(torch.utils.data.Sampler[list[SampleRequest]])
     def __iter__(self):
         rng = np.random.RandomState(self.seed + self.epoch)
         global_batch_size = self.world_size * self.batch_size
+        shuffled_indices = rng.permutation(self.dataset_size)
         for batch_index in range(self.num_batches):
             view_count = int(rng.choice(self.view_counts, p=self.view_count_probabilities))
             start = batch_index * global_batch_size
             global_requests = [
-                SampleRequest(virtual_index=start + offset, view_count=view_count)
-                for offset in range(global_batch_size)
+                SampleRequest(
+                    virtual_index=int(shuffled_indices[start + offset]),
+                    view_count=view_count,
+                )
+                for offset in range(
+                    min(global_batch_size, self.dataset_size - start)
+                )
             ]
             local_start = self.rank * self.batch_size
             yield global_requests[local_start : local_start + self.batch_size]

@@ -23,7 +23,6 @@ from mvtracker.datasets.kubric_multiview_dataset import (
 )
 from mvtracker.datasets.utils import (
     Datapoint,
-    HomogeneousViewBatchSampler,
     SampleRequest,
     aug_depth,
 )

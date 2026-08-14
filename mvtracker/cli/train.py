@@ -41,7 +41,11 @@ from mvtracker.datasets import TapVidDataset
 from mvtracker.datasets import kubric_multiview_dataset
 from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
 from mvtracker.datasets.panoptic_studio_multiview_dataset import PanopticStudioMultiViewDataset
-from mvtracker.datasets.utils import collate_fn, dataclass_to_cuda_
+from mvtracker.datasets.utils import (
+    HomogeneousViewBatchSampler,
+    collate_fn,
+    dataclass_to_cuda_,
+)
 from mvtracker.models.core.losses import balanced_ce_loss, sequence_loss_3d
 from mvtracker.models.core.model_utils import world_space_to_pixel_xy_and_camera_z, pixel_xy_and_camera_z_to_world_space
 from mvtracker.models.evaluation_predictor_3dpt import EvaluationPredictor as EvaluationPredictor3D
@@ -497,6 +501,24 @@ def forward_batch_multi_view(
     # same sliding windows, valid masks, refinement weights, and Z scaling as
     # the model trajectory loss.
     diagnostic_metrics = {}
+    if track_padding_mask is None:
+        real_track_counts = torch.full(
+            (batch_size,), num_points, device=query_points_3d.device
+        )
+    else:
+        real_track_counts = (~track_padding_mask.bool()).sum(dim=1)
+    real_track_mean, padded_track_mean, fill_fraction = torch.stack((
+        real_track_counts.float().mean(),
+        num_points - real_track_counts.float().mean(),
+        real_track_counts.sum() / float(batch_size * num_points),
+    )).detach().cpu().tolist()
+    diagnostic_metrics.update({
+        "batching/physical_scenes": float(batch_size),
+        "batching/real_tracks_mean": real_track_mean,
+        "batching/padded_tracks_per_scene": padded_track_mean,
+        "batching/track_fill_fraction": fill_fraction,
+        "batching/view_count": float(num_views),
+    })
     if run_expensive_diagnostics:
         with torch.no_grad():
             stationary_losses = []
@@ -962,6 +984,7 @@ def main(cfg: DictConfig):
     else:
         raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
 
+    train_batch_sampler = None
     if not cfg.modes.eval_only:
         requires_cuda_prefetch = getattr(train_dataset, "requires_cuda_prefetch", False)
         if requires_cuda_prefetch:
@@ -970,22 +993,49 @@ def main(cfg: DictConfig):
         loader_kwargs = {}
         if not requires_cuda_prefetch:
             loader_kwargs["in_order"] = cfg.reproducibility.deterministic
-        train_loader = loader_type(
-            train_dataset,
-            batch_size=cfg.datasets.train.batch_size,
-            shuffle=True,
-            num_workers=cfg.datasets.train.num_workers,
-            pin_memory=True,
-            collate_fn=getattr(train_dataset, "collate_fn", collate_fn),
-            drop_last=True,
-            prefetch_factor=cfg.datasets.train.get("prefetch_factor", 2) if cfg.datasets.train.num_workers > 0 else None,
-            persistent_workers=cfg.datasets.train.num_workers > 0,
+        common_loader_kwargs = {
+            "num_workers": cfg.datasets.train.num_workers,
+            "pin_memory": True,
+            "collate_fn": getattr(train_dataset, "collate_fn", collate_fn),
+            "prefetch_factor": (
+                cfg.datasets.train.get("prefetch_factor", 2)
+                if cfg.datasets.train.num_workers > 0 else None
+            ),
+            "persistent_workers": cfg.datasets.train.num_workers > 0,
             **loader_kwargs,
-        )
+        }
+        if (
+            isinstance(train_dataset, TapVid3DMultiViewDataset)
+            and cfg.augmentations.variable_num_views
+        ):
+            train_batch_sampler = HomogeneousViewBatchSampler(
+                train_dataset,
+                int(cfg.datasets.train.batch_size),
+                world_size=fabric.world_size,
+                rank=fabric.global_rank,
+                seed=int(cfg.reproducibility.seed),
+                view_count_probabilities=cfg.datasets.get(
+                    "tapvid3d_view_count_probabilities", (0.25,) * 4
+                ),
+            )
+            train_loader = loader_type(
+                train_dataset,
+                batch_sampler=train_batch_sampler,
+                **common_loader_kwargs,
+            )
+        else:
+            train_loader = loader_type(
+                train_dataset,
+                batch_size=cfg.datasets.train.batch_size,
+                shuffle=True,
+                drop_last=True,
+                **common_loader_kwargs,
+            )
         # eval_dataloaders += [("kubric-multiview-v3-training", train_loader)]
         train_loader = fabric.setup_dataloaders(
             train_loader,
             move_to_device=not requires_cuda_prefetch,
+            use_distributed_sampler=train_batch_sampler is None,
         )
         if requires_cuda_prefetch:
             train_loader = CudaPrefetchLoader(train_loader, device=fabric.device)
@@ -1143,6 +1193,8 @@ def main(cfg: DictConfig):
     while should_keep_training:
         epoch += 1
         i_batch = 0
+        if train_batch_sampler is not None:
+            train_batch_sampler.set_epoch(epoch)
 
         if cfg.modes.do_initial_static_pretrain and not had_run_pretraining_epoch:
             had_run_pretraining_epoch = True
