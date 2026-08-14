@@ -99,7 +99,11 @@ def main() -> None:
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--neighbors", type=int, default=16)
     parser.add_argument("--groups", type=int, default=1)
-    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
+    parser.add_argument(
+        "--dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float32",
+    )
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--repeats", type=int, default=7)
