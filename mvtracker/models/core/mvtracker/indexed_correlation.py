@@ -112,7 +112,8 @@ def _correlation_target_backward_kernel(
     batch = pid // M
 
     neighbors = tl.arange(0, BLOCK_K)[:, None]
-    channels = tl.arange(0, BLOCK_C)[None, :]
+    channels_1d = tl.arange(0, BLOCK_C)
+    channels = channels_1d[None, :]
     mask = (neighbors < K) & (channels < C_PER_GROUP)
     source_indices = tl.load(
         indices
@@ -146,9 +147,9 @@ def _correlation_target_backward_kernel(
         grad_targets
         + batch * grad_target_stride_b
         + query * grad_target_stride_m
-        + grouped_channels * grad_target_stride_c,
+        + (group * C_PER_GROUP + channels_1d) * grad_target_stride_c,
         gradients,
-        mask=channels < C_PER_GROUP,
+        mask=channels_1d < C_PER_GROUP,
     )
 
 
