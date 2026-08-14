@@ -20,6 +20,14 @@ def _cuda_extension():
         os.environ["CUDA_HOME"] = str(bundled_cuda)
     if (venv_bin / "ninja").is_file():
         os.environ["PATH"] = f"{venv_bin}:{os.environ['PATH']}"
+    toolchain_bin = bundled_cuda / "bin"
+    bundled_gcc = toolchain_bin / "x86_64-conda-linux-gnu-gcc"
+    bundled_gxx = toolchain_bin / "x86_64-conda-linux-gnu-g++"
+    if bundled_gcc.is_file() and bundled_gxx.is_file():
+        os.environ.setdefault("CC", str(bundled_gcc))
+        os.environ.setdefault("CXX", str(bundled_gxx))
+    capability = torch.cuda.get_device_capability()
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{capability[0]}.{capability[1]}")
     from torch.utils import cpp_extension
 
     if cpp_extension.CUDA_HOME is None and bundled_cuda.is_dir():
@@ -33,7 +41,7 @@ def _cuda_extension():
             str(source_dir / "indexed_correlation_cuda.cu"),
         ],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--allow-unsupported-compiler"],
+        extra_cuda_cflags=["-O3"],
         verbose=False,
     )
 
