@@ -23,9 +23,6 @@ def _cuda_extension():
     toolchain_bin = bundled_cuda / "bin"
     bundled_gcc = toolchain_bin / "x86_64-conda-linux-gnu-gcc"
     bundled_gxx = toolchain_bin / "x86_64-conda-linux-gnu-g++"
-    if bundled_gcc.is_file() and bundled_gxx.is_file():
-        os.environ.setdefault("CC", str(bundled_gcc))
-        os.environ.setdefault("CXX", str(bundled_gxx))
     capability = torch.cuda.get_device_capability()
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{capability[0]}.{capability[1]}")
     from torch.utils import cpp_extension
@@ -38,16 +35,27 @@ def _cuda_extension():
         f"python{sys.version_info.major}.{sys.version_info.minor}"
     )
     include_flag = f"-I{python_include}"
-    return cpp_extension.load(
-        name="mvtracker_indexed_correlation_cuda",
-        sources=[
-            str(source_dir / "indexed_correlation_cuda.cpp"),
-            str(source_dir / "indexed_correlation_cuda.cu"),
-        ],
-        extra_cflags=["-O3", include_flag],
-        extra_cuda_cflags=["-O3", include_flag],
-        verbose=False,
-    )
+    previous_compilers = {key: os.environ.get(key) for key in ("CC", "CXX")}
+    if bundled_gcc.is_file() and bundled_gxx.is_file():
+        os.environ["CC"] = str(bundled_gcc)
+        os.environ["CXX"] = str(bundled_gxx)
+    try:
+        return cpp_extension.load(
+            name="mvtracker_indexed_correlation_cuda",
+            sources=[
+                str(source_dir / "indexed_correlation_cuda.cpp"),
+                str(source_dir / "indexed_correlation_cuda.cu"),
+            ],
+            extra_cflags=["-O3", include_flag],
+            extra_cuda_cflags=["-O3", include_flag],
+            verbose=False,
+        )
+    finally:
+        for key, value in previous_compilers.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @triton.jit
