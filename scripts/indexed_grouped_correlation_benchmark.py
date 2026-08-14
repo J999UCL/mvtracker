@@ -322,7 +322,7 @@ def benchmark(
     warmup: int,
     iterations: int,
 ) -> list[BenchmarkResult]:
-    """Benchmark current block arithmetic against the indexed candidate."""
+    """Benchmark eager materialization against the production fused block."""
     torch.manual_seed(7)
     xyz = torch.randn(batch_size, num_points, 3, device=device)
     fvec = torch.randn(batch_size, num_points, channels, device=device)
@@ -338,26 +338,37 @@ def benchmark(
     for value in (targets, query_xyz, xyz, fvec):
         value.requires_grad_()
 
-    def baseline():
+    def eager_reference():
+        for value in (targets, query_xyz, xyz, fvec):
+            value.grad = None
+        correlation_from_indices(
+            targets,
+            query_xyz,
+            xyz,
+            fvec,
+            indices,
+            groups,
+            True,
+            True,
+        ).sum().backward()
+
+    def production_fused():
         for value in (targets, query_xyz, xyz, fvec):
             value.grad = None
         block.corr_sample(targets, query_xyz).sum().backward()
 
-    def candidate():
-        for value in (targets, query_xyz, xyz, fvec):
-            value.grad = None
-        indexed_grouped_candidate(
-            targets, query_xyz, xyz, fvec, indices, groups, True, True
-        ).sum().backward()
-
-    baseline_time, baseline_peak = _time_calls(baseline, warmup, iterations, device)
-    candidate_time, candidate_peak = _time_calls(candidate, warmup, iterations, device)
+    baseline_time, baseline_peak = _time_calls(
+        eager_reference, warmup, iterations, device
+    )
+    candidate_time, candidate_peak = _time_calls(
+        production_fused, warmup, iterations, device
+    )
     return [
         BenchmarkResult(
-            "PointcloudCorrBlock", baseline_time, iterations, baseline_peak
+            "eager_reference", baseline_time, iterations, baseline_peak
         ),
         BenchmarkResult(
-            "indexed_grouped_candidate", candidate_time, iterations, candidate_peak
+            "production_fused", candidate_time, iterations, candidate_peak
         ),
     ]
 

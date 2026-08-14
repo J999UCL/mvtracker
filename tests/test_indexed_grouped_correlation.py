@@ -152,6 +152,53 @@ class IndexedGroupedCorrelationTests(unittest.TestCase):
         torch.testing.assert_close(targets_candidate.grad, targets.grad)
         torch.testing.assert_close(fvec_candidate.grad, fvec.grad)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_production_operator_cuda_bfloat16(self):
+        from mvtracker.models.core.mvtracker.indexed_correlation import (
+            indexed_grouped_correlation,
+        )
+
+        for groups in (1, 2, 4):
+            torch.manual_seed(29)
+            targets = torch.randn(
+                2, 17, 128, device="cuda", dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            source = torch.randn(
+                2, 257, 128, device="cuda", dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            indices = torch.randint(
+                257, (2, 17, 16), device="cuda", dtype=torch.int32
+            )
+            indices[:, :, 1] = indices[:, :, 0]
+            expected_targets = targets.detach().clone().requires_grad_()
+            expected_source = source.detach().clone().requires_grad_()
+
+            expected = harness.eager_oracle_correlation(
+                expected_targets,
+                torch.empty(2, 257, 3, device="cuda"),
+                expected_source,
+                indices,
+                groups,
+                False,
+                False,
+            )
+            actual = indexed_grouped_correlation(
+                targets, source, indices, groups
+            )
+            torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+            weights = torch.randn_like(actual)
+            (actual * weights).sum().backward()
+            (expected * weights).sum().backward()
+            torch.testing.assert_close(
+                targets.grad, expected_targets.grad, atol=3e-2, rtol=3e-2
+            )
+            torch.testing.assert_close(
+                source.grad, expected_source.grad, atol=3e-2, rtol=3e-2
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
