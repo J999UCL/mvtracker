@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
 from pathlib import Path
+import sys
 
 import torch
 import triton
@@ -12,17 +14,23 @@ import triton.language as tl
 
 @lru_cache(maxsize=1)
 def _cuda_extension():
-    from torch.utils.cpp_extension import load
+    bundled_cuda = Path(sys.prefix) / "cuda-toolkit"
+    if "CUDA_HOME" not in os.environ and bundled_cuda.is_dir():
+        os.environ["CUDA_HOME"] = str(bundled_cuda)
+    from torch.utils import cpp_extension
+
+    if cpp_extension.CUDA_HOME is None and bundled_cuda.is_dir():
+        cpp_extension.CUDA_HOME = str(bundled_cuda)
 
     source_dir = Path(__file__).resolve().parent
-    return load(
+    return cpp_extension.load(
         name="mvtracker_indexed_correlation_cuda",
         sources=[
             str(source_dir / "indexed_correlation_cuda.cpp"),
             str(source_dir / "indexed_correlation_cuda.cu"),
         ],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "--allow-unsupported-compiler"],
         verbose=False,
     )
 
