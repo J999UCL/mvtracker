@@ -153,76 +153,6 @@ def _correlation_target_backward_kernel(
     )
 
 
-@triton.jit
-def _correlation_source_backward_kernel(
-    grad_output,
-    targets,
-    indices,
-    grad_source,
-    grad_output_stride_b: tl.constexpr,
-    grad_output_stride_m: tl.constexpr,
-    grad_output_stride_k: tl.constexpr,
-    grad_output_stride_g: tl.constexpr,
-    target_stride_b: tl.constexpr,
-    target_stride_m: tl.constexpr,
-    target_stride_c: tl.constexpr,
-    index_stride_b: tl.constexpr,
-    index_stride_m: tl.constexpr,
-    index_stride_k: tl.constexpr,
-    grad_source_stride_b: tl.constexpr,
-    grad_source_stride_n: tl.constexpr,
-    grad_source_stride_c: tl.constexpr,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    G: tl.constexpr,
-    C_PER_GROUP: tl.constexpr,
-    NORMALIZATION: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    group = pid % G
-    pid //= G
-    neighbor = pid % K
-    pid //= K
-    query = pid % M
-    batch = pid // M
-
-    channels = tl.arange(0, BLOCK_C)
-    channel_mask = channels < C_PER_GROUP
-    source_index = tl.load(
-        indices
-        + batch * index_stride_b
-        + query * index_stride_m
-        + neighbor * index_stride_k
-    )
-    grouped_channels = group * C_PER_GROUP + channels
-    target_values = tl.load(
-        targets
-        + batch * target_stride_b
-        + query * target_stride_m
-        + grouped_channels * target_stride_c,
-        mask=channel_mask,
-        other=0.0,
-    ).to(tl.float32)
-    output_gradient = tl.load(
-        grad_output
-        + batch * grad_output_stride_b
-        + query * grad_output_stride_m
-        + neighbor * grad_output_stride_k
-        + group * grad_output_stride_g
-    ).to(tl.float32)
-    gradients = target_values * output_gradient
-    gradients /= NORMALIZATION
-    tl.atomic_add(
-        grad_source
-        + batch * grad_source_stride_b
-        + source_index * grad_source_stride_n
-        + grouped_channels * grad_source_stride_c,
-        gradients,
-        mask=channel_mask,
-    )
-
-
 def _eager_cpu_correlation(
     targets: torch.Tensor,
     source_features: torch.Tensor,
@@ -306,24 +236,23 @@ class _IndexedGroupedCorrelation(torch.autograd.Function):
             BLOCK_K=triton.next_power_of_2(neighbors),
             BLOCK_C=block_channels,
         )
-        _correlation_source_backward_kernel[(
-            batch_size * num_queries * neighbors * groups,
-        )](
-            grad_output,
-            targets,
-            neighbor_indices,
-            grad_source,
-            *grad_output.stride(),
-            *targets.stride(),
-            *neighbor_indices.stride(),
-            *grad_source.stride(),
-            M=num_queries,
-            K=neighbors,
-            G=groups,
-            C_PER_GROUP=channels_per_group,
-            NORMALIZATION=channels_per_group**0.5,
-            BLOCK_C=block_channels,
+        flat_grad_source = grad_source.view(-1, channels)
+        grouped_targets = targets.view(
+            batch_size, num_queries, groups, channels_per_group
         )
+        batch_offsets = (
+            torch.arange(batch_size, device=targets.device) * source_features.shape[1]
+        )[:, None]
+        for neighbor in range(neighbors):
+            flat_indices = (
+                neighbor_indices[:, :, neighbor].to(torch.int64) + batch_offsets
+            ).reshape(-1)
+            contributions = grouped_targets * grad_output[
+                :, :, neighbor, :, None
+            ]
+            contributions = contributions.reshape(-1, channels)
+            contributions = contributions / (channels_per_group**0.5)
+            flat_grad_source.index_add_(0, flat_indices, contributions)
         return grad_targets, grad_source, None, None
 
 
