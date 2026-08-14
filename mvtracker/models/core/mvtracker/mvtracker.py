@@ -345,6 +345,11 @@ class MVTracker(nn.Module):
         )
         if embed_dim > self.updateformer_input_dim:
             times_embed = times_embed[:, :, :self.updateformer_input_dim]
+        times_embed = (
+            times_embed[:, None]
+            .expand(B, N, S, self.updateformer_input_dim)
+            .reshape(B * N, S, self.updateformer_input_dim)
+        )
 
         coord_predictions = []
 
