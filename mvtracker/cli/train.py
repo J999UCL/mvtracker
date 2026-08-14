@@ -230,6 +230,136 @@ def fetch_optimizer(trainer_cfg, model):
     return optimizer, scheduler
 
 
+def _scene_scale(track_upscaling_factor, scene_index, batch_size, device, dtype):
+    """Return one scene's world-space loss scale as a device tensor."""
+    if torch.is_tensor(track_upscaling_factor):
+        if track_upscaling_factor.ndim == 0:
+            value = track_upscaling_factor
+        elif track_upscaling_factor.shape[0] == batch_size:
+            value = track_upscaling_factor[scene_index]
+        else:
+            raise ValueError(
+                "track_upscaling_factor must be scalar or have one value per scene"
+            )
+    elif isinstance(track_upscaling_factor, (list, tuple)):
+        if len(track_upscaling_factor) != batch_size:
+            raise ValueError(
+                "track_upscaling_factor must be scalar or have one value per scene"
+            )
+        value = track_upscaling_factor[scene_index]
+    else:
+        value = track_upscaling_factor
+    return torch.as_tensor(value, device=device, dtype=dtype)
+
+
+def _scene_index_tensor(value, scene_index, batch_size, device):
+    """Select a scene's track permutation while accepting list/tensor records."""
+    if torch.is_tensor(value):
+        if value.ndim > 1 and value.shape[0] == batch_size:
+            value = value[scene_index]
+        return value.to(device=device, dtype=torch.long)
+    if isinstance(value, (list, tuple)):
+        if len(value) == batch_size and not all(
+            isinstance(item, (int, np.integer)) for item in value
+        ):
+            value = value[scene_index]
+        return torch.as_tensor(value, device=device, dtype=torch.long)
+    return torch.as_tensor(value, device=device, dtype=torch.long)
+
+
+def _scene_prediction_tree(value, scene_index, batch_size):
+    """Keep a prediction tree's leading scene dimension at one."""
+    if torch.is_tensor(value):
+        if value.ndim > 0 and value.shape[0] == batch_size:
+            return value[scene_index:scene_index + 1]
+        if value.ndim > 0 and value.shape[0] == 1:
+            return value
+        return value.unsqueeze(0)
+    if isinstance(value, (list, tuple)):
+        return type(value)(
+            _scene_prediction_tree(item, scene_index, batch_size)
+            for item in value
+        )
+    raise TypeError(f"Unsupported prediction value: {type(value)!r}")
+
+
+def _scene_records(train_data, query_points_3d, batch_size, window_len):
+    """Normalize new per-scene records and retain the legacy B=1 contract."""
+    records = train_data.get("scenes")
+    if records is not None:
+        if len(records) != batch_size:
+            raise ValueError(
+                f"model returned {len(records)} scene records for batch size {batch_size}"
+            )
+        return records
+
+    if batch_size != 1:
+        raise ValueError(
+            "batched training requires model train_data['scenes']; "
+            "the legacy window metadata only supports batch size 1"
+        )
+    query_times = query_points_3d[0, :, 0].long()
+    start = int(query_times.min().item())
+    p_idx_end_list = train_data["p_idx_end_list"]
+    return [{
+        "sort_inds": train_data["sort_inds"],
+        "window_starts": [
+            start + i * (window_len // 2)
+            for i in range(len(p_idx_end_list))
+        ],
+        "p_idx_end_list": p_idx_end_list,
+        "coord_predictions": train_data["coord_predictions"],
+        "vis_predictions": train_data["vis_predictions"],
+    }]
+
+
+def _window_targets(
+    scene_record,
+    scene_index,
+    batch_size,
+    gt_visibility,
+    gt_trajectory,
+    valid_tracks,
+    query_points_3d,
+    window_len,
+):
+    """Build one scene's loss windows from the model's schedule metadata."""
+    device = query_points_3d.device
+    sort_inds = _scene_index_tensor(
+        scene_record["sort_inds"], scene_index, batch_size, device
+    )
+    gt_visibility = gt_visibility[scene_index:scene_index + 1].index_select(2, sort_inds)
+    gt_trajectory = gt_trajectory[scene_index:scene_index + 1].index_select(2, sort_inds)
+    valid_tracks = valid_tracks[scene_index:scene_index + 1].index_select(2, sort_inds)
+
+    starts = [int(value) for value in scene_record["window_starts"]]
+    p_idx_end_list = [int(value) for value in scene_record["p_idx_end_list"]]
+    if len(starts) != len(p_idx_end_list):
+        raise ValueError("window_starts and p_idx_end_list must have equal lengths")
+
+    vis_gts, traj_gts, valids_gts = [], [], []
+    for start, p_idx_end in zip(starts, p_idx_end_list):
+        vis_gts.append(gt_visibility[:, start:start + window_len, :p_idx_end])
+        traj_gts.append(gt_trajectory[:, start:start + window_len, :p_idx_end])
+        valids_gts.append(valid_tracks[:, start:start + window_len, :p_idx_end])
+    return sort_inds, vis_gts, traj_gts, valids_gts
+
+
+def _project_prediction_batch(pred_trajectories, intrs, extrs):
+    """Project B world-space predictions while retaining the batch dimension."""
+    predictions = []
+    for scene_index in range(pred_trajectories.shape[0]):
+        predictions.append(torch.stack([
+            torch.cat(world_space_to_pixel_xy_and_camera_z(
+                world_xyz=pred_trajectories[scene_index],
+                intrs=intrs[scene_index, view_index],
+                extrs=extrs[scene_index, view_index],
+            ), dim=-1)
+            for view_index in range(intrs.shape[1])
+        ], dim=0))
+    return torch.stack(predictions, dim=0)
+
+
 def forward_batch_multi_view(
         batch,
         model,
@@ -255,6 +385,7 @@ def forward_batch_multi_view(
     gt_trajectories_3d_worldspace = batch.trajectory_3d
     valid_tracks_per_frame = batch.valid
     track_upscaling_factor = batch.track_upscaling_factor
+    track_padding_mask = getattr(batch, "track_padding_mask", None)
 
     batch_size, num_views, num_frames, _, height, width = rgbs.shape
     num_points = gt_trajectories_2d_pixelspace_w_z_cameraspace.shape[3]
@@ -292,41 +423,74 @@ def forward_batch_multi_view(
         extrs=extrs,
         save_debug_logs=save_debug_logs,
         debug_logs_path=debug_logs_path,
+        track_padding_mask=track_padding_mask,
     )
     pred_trajectories = results["traj_e"]
     pred_visibilities = results["vis_e"]
-    vis_predictions = results["train_data"]["vis_predictions"]
-    coord_predictions = results["train_data"]["coord_predictions"]
-    p_idx_end_list = results["train_data"]["p_idx_end_list"]
-    sort_inds = results["train_data"]["sort_inds"]
+    train_data = results["train_data"]
+    scene_records = _scene_records(
+        train_data,
+        query_points_3d,
+        batch_size,
+        cfg.model.sliding_window_len,
+    )
+    if track_padding_mask is not None:
+        valid_tracks_per_frame = valid_tracks_per_frame * (
+            ~track_padding_mask[:, None, :]
+        )
 
-    # Prepare the ground truth for the loss functions,
-    # which expect the data to be in the sliding-window
-    vis_gts = []
-    traj_gts = []
-    valids_gts = []
-    query_points_t_min = int(query_points_3d[:, :, 0].long().min().item())
-    gt_visibilities_any_view_sorted = gt_visibilities_any_view[:, :, sort_inds]
-    gt_trajectories_3d_worldspace_sorted = gt_trajectories_3d_worldspace[:, :, sort_inds]
-    valid_tracks_per_frame_sorted = valid_tracks_per_frame[:, :, sort_inds]
-    for i, wind_p_idx_end in enumerate(p_idx_end_list):
-        ind = query_points_t_min + i * (cfg.model.sliding_window_len // 2)
-        vis_gts.append(gt_visibilities_any_view_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
-        traj_gts.append(
-            gt_trajectories_3d_worldspace_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
-        valids_gts.append(valid_tracks_per_frame_sorted[:, ind: ind + cfg.model.sliding_window_len, :wind_p_idx_end])
+    scene_losses = []
+    scene_vis_losses = []
+    scene_windows = []
+    for scene_index, scene_record in enumerate(scene_records):
+        sort_inds, vis_gts, traj_gts, valids_gts = _window_targets(
+            scene_record,
+            scene_index,
+            batch_size,
+            gt_visibilities_any_view,
+            gt_trajectories_3d_worldspace,
+            valid_tracks_per_frame,
+            query_points_3d,
+            cfg.model.sliding_window_len,
+        )
+        scene_coord_predictions = _scene_prediction_tree(
+            scene_record["coord_predictions"], scene_index, batch_size
+        )
+        scene_vis_predictions = _scene_prediction_tree(
+            scene_record["vis_predictions"], scene_index, batch_size
+        )
+        scene_windows.append((sort_inds, vis_gts, traj_gts, valids_gts,
+                              scene_coord_predictions, scene_vis_predictions))
+        scene_losses.append(
+            sequence_loss_3d(
+                scene_coord_predictions,
+                traj_gts,
+                vis_gts,
+                valids_gts,
+                gamma,
+            ) * _scene_scale(
+                track_upscaling_factor,
+                scene_index,
+                batch_size,
+                query_points_3d.device,
+                gt_trajectories_3d_worldspace.dtype,
+            )
+        )
+        scene_vis_losses.append(
+            balanced_ce_loss(scene_vis_predictions, vis_gts, valids_gts)
+        )
 
-    # Compute the losses
+    xyz_loss = torch.stack(scene_losses).mean()
+    vis_loss = torch.stack(scene_vis_losses).mean()
     if save_debug_logs:
-        logging.info(f"[DEBUG] "
-                     f"{step=} "
-                     f"{track_upscaling_factor=} "
-                     f"{coord_predictions[0][0][0, 0, 0]=} "
-                     f"{coord_predictions[-1][0][0, 0, 0]=} "
-                     f"{vis_predictions[0][0, 0, 0]=} "
-                     f"{vis_predictions[-1][0, 0, 0]=}")
-    xyz_loss = sequence_loss_3d(coord_predictions, traj_gts, vis_gts, valids_gts, gamma) * track_upscaling_factor
-    vis_loss = balanced_ce_loss(vis_predictions, vis_gts, valids_gts)
+        first_scene = scene_windows[0]
+        logging.info(
+            f"[DEBUG] {step=} {track_upscaling_factor=} "
+            f"{first_scene[4][0][0][0, 0, 0]=} "
+            f"{first_scene[4][-1][0][0, 0, 0]=} "
+            f"{first_scene[5][0][0, 0, 0]=} "
+            f"{first_scene[5][-1][0, 0, 0]=}"
+        )
 
     # Directly comparable no-motion baseline: keep every track at its queried
     # world-space coordinate for the full clip, then evaluate it with the exact
@@ -335,29 +499,36 @@ def forward_batch_multi_view(
     diagnostic_metrics = {}
     if run_expensive_diagnostics:
         with torch.no_grad():
-            query_xyz_sorted = query_points_3d[:, sort_inds, 1:]
-            stationary_predictions = []
-            for window_predictions, window_gt in zip(coord_predictions, traj_gts):
-                window_track_count = window_gt.shape[2]
-                stationary = query_xyz_sorted[:, None, :window_track_count].expand(
-                    -1,
-                    window_gt.shape[1],
-                    -1,
-                    -1,
+            stationary_losses = []
+            for scene_index, (sort_inds, vis_gts, traj_gts, valids_gts,
+                              scene_coord_predictions, _) in enumerate(scene_windows):
+                query_xyz_sorted = query_points_3d[scene_index:scene_index + 1].index_select(
+                    1, sort_inds
+                )[..., 1:]
+                stationary_predictions = []
+                for window_predictions, window_gt in zip(scene_coord_predictions, traj_gts):
+                    stationary = query_xyz_sorted[:, None, :window_gt.shape[2]].expand(
+                        -1, window_gt.shape[1], -1, -1
+                    )
+                    stationary_predictions.append([
+                        stationary.clone() for _ in window_predictions
+                    ])
+                stationary_losses.append(
+                    sequence_loss_3d(
+                        stationary_predictions,
+                        traj_gts,
+                        vis_gts,
+                        valids_gts,
+                        gamma,
+                    ) * _scene_scale(
+                        track_upscaling_factor,
+                        scene_index,
+                        batch_size,
+                        query_points_3d.device,
+                        gt_trajectories_3d_worldspace.dtype,
+                    )
                 )
-                stationary_predictions.append(
-                    [stationary.clone() for _ in window_predictions]
-                )
-            stationary_xyz_loss = (
-                sequence_loss_3d(
-                    stationary_predictions,
-                    traj_gts,
-                    vis_gts,
-                    valids_gts,
-                    gamma,
-                )
-                * track_upscaling_factor
-            )
+            stationary_xyz_loss = torch.stack(stationary_losses).mean()
             model_to_stationary_ratio = xyz_loss.detach() / stationary_xyz_loss.clamp_min(1e-12)
             diagnostic_metrics = {
                 "baseline/stationary_trajectory_loss": stationary_xyz_loss.item(),
@@ -378,15 +549,16 @@ def forward_batch_multi_view(
     # )
 
     # Project the predictions to pixel space
-    pred_trajectories = pred_trajectories[0].detach()
-    pred_trajectories_pixel_xy_camera_z_per_view = torch.stack([
-        torch.cat(world_space_to_pixel_xy_and_camera_z(
-            world_xyz=pred_trajectories,
-            intrs=intrs[0, view_idx],
-            extrs=extrs[0, view_idx],
-        ), dim=-1)
-        for view_idx in range(num_views)
-    ], dim=0)
+    pred_trajectories = pred_trajectories.detach()
+    if pred_trajectories.ndim == 3:
+        pred_trajectories = pred_trajectories.unsqueeze(0)
+    if pred_visibilities.ndim == 2:
+        pred_visibilities = pred_visibilities.unsqueeze(0)
+    pred_trajectories_pixel_xy_camera_z_per_view = _project_prediction_batch(
+        pred_trajectories,
+        intrs,
+        extrs,
+    )
     if run_expensive_diagnostics:
         intrs_inv = torch.inverse(intrs.float())
         extrs_square = torch.eye(4, device=extrs.device)[None, None, None].expand(
@@ -394,17 +566,28 @@ def forward_batch_multi_view(
         ).clone()
         extrs_square[:, :, :, :3, :] = extrs
         extrs_inv = torch.inverse(extrs_square.float())
-        for view_idx in range(num_views):
-            pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
-                pixel_xy=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, :2],
-                camera_z=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, 2:],
-                intrs_inv=intrs_inv[0, view_idx],
-                extrs_inv=extrs_inv[0, view_idx],
-            )
-            if not torch.allclose(pred_trajectories_reproduced, pred_trajectories, atol=1):
-                warnings.warn(f"Reprojection of the predicted trajectories failed: "
-                              f"view_idx={view_idx}, "
-                              f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - pred_trajectories))}")
+        for scene_index in range(batch_size):
+            for view_idx in range(num_views):
+                pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
+                    pixel_xy=pred_trajectories_pixel_xy_camera_z_per_view[
+                        scene_index, view_idx, :, :, :2
+                    ],
+                    camera_z=pred_trajectories_pixel_xy_camera_z_per_view[
+                        scene_index, view_idx, :, :, 2:
+                    ],
+                    intrs_inv=intrs_inv[scene_index, view_idx],
+                    extrs_inv=extrs_inv[scene_index, view_idx],
+                )
+                if not torch.allclose(
+                    pred_trajectories_reproduced,
+                    pred_trajectories[scene_index],
+                    atol=1,
+                ):
+                    warnings.warn(
+                        "Reprojection of the predicted trajectories failed: "
+                        f"scene_index={scene_index}, view_idx={view_idx}, "
+                        f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - pred_trajectories[scene_index]))}"
+                    )
 
     if save_debug_logs:
         logging.info(
@@ -422,7 +605,7 @@ def forward_batch_multi_view(
         },
         "visibility": {
             "loss": vis_loss * cfg.trainer.visibility_loss_weight,
-            "predictions": pred_visibilities[0].detach(),
+            "predictions": pred_visibilities.detach(),
         },
         "metrics": diagnostic_metrics,
         # "metrics": {
@@ -1308,14 +1491,16 @@ def main(cfg: DictConfig):
                 if (total_steps % cfg.trainer.viz_freq == 0) or (
                         total_steps == cfg.trainer.num_steps - 1) or total_steps in [0, 10, 100]:
                     logging.info(f"Creating training viz logs (rank: {fabric.global_rank}, step: {total_steps})")
-                    video = batch.video.clone().cpu()
-                    video_depth = batch.videodepth.clone().cpu()
+                    # Training visualization intentionally shows scene zero;
+                    # the loss path above handles every scene in the batch.
+                    video = batch.video[:1].clone().cpu()
+                    video_depth = batch.videodepth[:1].clone().cpu()
                     gt_viz, vector_colors = visualizer.visualize(
                         video=video,
                         video_depth=video_depth,
-                        tracks=batch.trajectory.clone().cpu(),
-                        visibility=batch.visibility.clone().cpu(),
-                        query_frame=batch.query_points_3d[..., 0].long().clone().cpu(),
+                        tracks=batch.trajectory[:1].clone().cpu(),
+                        visibility=batch.visibility[:1].clone().cpu(),
+                        query_frame=batch.query_points_3d[:1, ..., 0].long().clone().cpu(),
                         filename="train_gt_traj",
                         writer=tb_writer,
                         step=total_steps,
@@ -1324,9 +1509,9 @@ def main(cfg: DictConfig):
                     pred_viz, _ = visualizer.visualize(
                         video=video,
                         video_depth=video_depth,
-                        tracks=output["flow"]["predictions"][None].cpu(),
-                        visibility=(output["visibility"]["predictions"][None] > 0.5).cpu(),
-                        query_frame=batch.query_points_3d[..., 0].long().clone().cpu(),
+                        tracks=output["flow"]["predictions"][:1].cpu(),
+                        visibility=(output["visibility"]["predictions"][:1] > 0.5).cpu(),
+                        query_frame=batch.query_points_3d[:1, ..., 0].long().clone().cpu(),
                         filename="train_pred_traj",
                         writer=tb_writer,
                         step=total_steps,
