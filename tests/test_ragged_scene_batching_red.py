@@ -151,6 +151,29 @@ class SpatialPaddingIsolationRedTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the full-model parity contract")
 class FullModelSerialBatchedParityRedTests(unittest.TestCase):
+    @staticmethod
+    def _ragged_batch(batch_size=3, counts=(3, 5, 8)):
+        views, frames, height, width = 1, 4, 32, 32
+        rgb = torch.randn(
+            batch_size, views, frames, 3, height, width, device="cuda"
+        )
+        depth = torch.ones(
+            batch_size, views, frames, 1, height, width, device="cuda"
+        )
+        intrs = torch.eye(3, device="cuda").view(1, 1, 1, 3, 3).expand(
+            batch_size, views, frames, -1, -1
+        )
+        extrs = torch.zeros(batch_size, views, frames, 3, 4, device="cuda")
+        extrs[..., :3, :3] = torch.eye(3, device="cuda")
+        queries = torch.zeros(batch_size, max(counts), 4, device="cuda")
+        queries[..., 1:] = torch.randn_like(queries[..., 1:])
+        padding = torch.ones(
+            batch_size, max(counts), dtype=torch.bool, device="cuda"
+        )
+        for scene_index, count in enumerate(counts):
+            padding[scene_index, :count] = False
+        return rgb, depth, intrs, extrs, queries, padding
+
     def test_serial_and_padded_batched_outputs_match_on_valid_tracks(self):
         from mvtracker.models.core.mvtracker.mvtracker import MVTracker
 
@@ -209,26 +232,8 @@ class FullModelSerialBatchedParityRedTests(unittest.TestCase):
             time_depth=1, num_virtual_tracks=8, sliding_window_len=4, stride=2,
             corr_n_levels=1, corr_neighbors=1,
         ).cuda().eval()
-        batch_size, views, frames, height, width = 3, 1, 4, 32, 32
         counts = (3, 5, 8)
-        rgb = torch.randn(
-            batch_size, views, frames, 3, height, width, device="cuda"
-        )
-        depth = torch.ones(
-            batch_size, views, frames, 1, height, width, device="cuda"
-        )
-        intrs = torch.eye(3, device="cuda").view(1, 1, 1, 3, 3).expand(
-            batch_size, views, frames, -1, -1
-        )
-        extrs = torch.zeros(batch_size, views, frames, 3, 4, device="cuda")
-        extrs[..., :3, :3] = torch.eye(3, device="cuda")
-        queries = torch.zeros(batch_size, max(counts), 4, device="cuda")
-        queries[..., 1:] = torch.randn_like(queries[..., 1:])
-        padding = torch.ones(
-            batch_size, max(counts), dtype=torch.bool, device="cuda"
-        )
-        for scene_index, count in enumerate(counts):
-            padding[scene_index, :count] = False
+        rgb, depth, intrs, extrs, queries, padding = self._ragged_batch()
 
         with torch.no_grad():
             batched = model(
@@ -256,6 +261,34 @@ class FullModelSerialBatchedParityRedTests(unittest.TestCase):
                     rtol=1e-3,
                     atol=1e-3,
                 )
+
+    def test_three_scene_ragged_training_graph_backpropagates(self):
+        from mvtracker.models.core.mvtracker.mvtracker import MVTracker
+
+        torch.manual_seed(23)
+        model = MVTracker(
+            fmaps_dim=32, hidden_size=64, num_heads=4, space_depth=1,
+            time_depth=1, num_virtual_tracks=8, sliding_window_len=4, stride=2,
+            corr_n_levels=1, corr_neighbors=1,
+        ).cuda().train()
+        rgb, depth, intrs, extrs, queries, padding = self._ragged_batch()
+        result = model(
+            rgb, depth, queries, intrs, extrs, iters=1,
+            track_padding_mask=padding, is_train=True,
+        )
+        scene_losses = []
+        for record in result["train_data"]["scenes"]:
+            scene_losses.append(
+                record["coord_predictions"][-1][-1].square().mean()
+                + record["vis_predictions"][-1].square().mean()
+            )
+        torch.stack(scene_losses).mean().backward()
+        gradients = [
+            parameter.grad for parameter in model.parameters()
+            if parameter.grad is not None
+        ]
+        self.assertTrue(gradients)
+        self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
 
 
 if __name__ == "__main__":
