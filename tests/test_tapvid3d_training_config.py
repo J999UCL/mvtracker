@@ -23,13 +23,13 @@ class TapVid3DTrainingConfigTests(unittest.TestCase):
 
         self.assertEqual(config["datasets"]["root"], "${oc.env:DIEGESIS_MVTRACKER_ROOT}")
         self.assertEqual(config["datasets"]["train"]["name"], "tapvid3d-multiview-training")
-        self.assertEqual(config["datasets"]["train"]["traj_per_sample"], 128)
-        self.assertEqual(config["datasets"]["train"]["batch_size"], 2)
+        self.assertEqual(config["datasets"]["train"]["traj_per_sample"], 256)
+        self.assertEqual(config["datasets"]["train"]["batch_size"], 1)
         self.assertEqual(
             config["datasets"]["eval"]["names"],
             ["tapvid3d-multiview-validation"],
         )
-        self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 4)
+        self.assertEqual(config["trainer"]["gradient_accumulation_steps"], 8)
         self.assertEqual(config["trainer"]["num_steps"], 2000)
         self.assertEqual(config["trainer"]["eval_freq"], 250)
         self.assertTrue(config["modes"]["validate_at_start"])
