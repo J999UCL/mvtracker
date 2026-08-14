@@ -37,9 +37,9 @@ def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
 
     # use half of dimensions to encode grid_h
     B, S, N, _ = grid.shape
-    gridx = grid[..., 0].view(B * S * N).detach().cpu().numpy()
-    gridy = grid[..., 1].view(B * S * N).detach().cpu().numpy()
-    gridz = grid[..., 2].view(B * S * N).detach().cpu().numpy()
+    gridx = grid[..., 0].reshape(B * S * N).detach().cpu().numpy()
+    gridy = grid[..., 1].reshape(B * S * N).detach().cpu().numpy()
+    gridz = grid[..., 2].reshape(B * S * N).detach().cpu().numpy()
 
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, gridx)  # (N, D/3)
     emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, gridy)  # (N, D/3)
