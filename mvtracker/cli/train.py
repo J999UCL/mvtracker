@@ -390,6 +390,8 @@ def forward_batch_multi_view(
     valid_tracks_per_frame = batch.valid
     track_upscaling_factor = batch.track_upscaling_factor
     track_padding_mask = getattr(batch, "track_padding_mask", None)
+    if track_padding_mask is not None:
+        track_padding_mask = track_padding_mask.bool()
 
     batch_size, num_views, num_frames, _, height, width = rgbs.shape
     num_points = gt_trajectories_2d_pixelspace_w_z_cameraspace.shape[3]
