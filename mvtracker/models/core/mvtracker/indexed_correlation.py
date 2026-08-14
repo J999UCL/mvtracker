@@ -15,8 +15,11 @@ import triton.language as tl
 @lru_cache(maxsize=1)
 def _cuda_extension():
     bundled_cuda = Path(sys.prefix) / "cuda-toolkit"
+    venv_bin = Path(sys.prefix) / "bin"
     if "CUDA_HOME" not in os.environ and bundled_cuda.is_dir():
         os.environ["CUDA_HOME"] = str(bundled_cuda)
+    if (venv_bin / "ninja").is_file():
+        os.environ["PATH"] = f"{venv_bin}:{os.environ['PATH']}"
     from torch.utils import cpp_extension
 
     if cpp_extension.CUDA_HOME is None and bundled_cuda.is_dir():
