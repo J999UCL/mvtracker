@@ -241,6 +241,10 @@ def mocked_knn(neighbor_indices: torch.Tensor) -> Callable:
 
 def load_current_pointcloud_corr_block():
     """Load only the current production class, without importing its dependencies."""
+    from mvtracker.models.core.mvtracker.indexed_correlation import (
+        indexed_grouped_correlation,
+    )
+
     source_path = (
         __file__.replace("scripts/indexed_grouped_correlation_benchmark.py", "")
         + "mvtracker/models/core/mvtracker/mvtracker.py"
@@ -262,6 +266,7 @@ def load_current_pointcloud_corr_block():
         "time_now": lambda: "test",
         "torch": torch,
         "knn": None,
+        "indexed_grouped_correlation": indexed_grouped_correlation,
     }
     module = ast.Module(body=[class_node], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
