@@ -117,6 +117,24 @@ python -m cupyx.tools.install_library --cuda 12.x --library nccl
 python -m cupyx.tools.install_library --cuda 12.x --library cudnn
 ```
 
+CUDA training uses a fused indexed-correlation extension that is compiled lazily
+on first use. Its build requires Ninja, Python development headers, a CUDA 12.1
+toolkit with `nvcc`, and GCC/G++ 12 or older. The loader uses the system toolkit,
+or automatically detects a toolkit installed at `<venv>/cuda-toolkit`. A
+venv-local toolchain can be installed without root access with:
+
+```bash
+conda install -y -p "$VIRTUAL_ENV/cuda-toolkit" -c nvidia \
+  cuda-nvcc=12.1 cuda-cudart-dev=12.1 cuda-cccl=12.1
+conda install -y -p "$VIRTUAL_ENV/cuda-toolkit" -c conda-forge \
+  gcc_linux-64=12 gxx_linux-64=12
+```
+
+Install the matching Python development headers through the host package manager
+when they are not already present. CUDA execution has no eager fallback: an
+invalid compiler setup fails at extension load instead of silently reverting to
+the memory-heavy implementation.
+
 
 ## Datasets
 
