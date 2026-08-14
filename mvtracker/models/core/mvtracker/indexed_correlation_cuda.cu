@@ -6,11 +6,16 @@
 #include <torch/extension.h>
 
 #include <cmath>
+#include <type_traits>
 
 namespace {
 
 template <typename scalar_t>
 __device__ inline void atomic_add_feature(scalar_t* address, float value);
+
+template <typename scalar_t>
+__device__ inline void atomic_add_feature_pair(
+    scalar_t* address, float first, float second);
 
 template <>
 __device__ inline void atomic_add_feature<float>(float* address, float value) {
@@ -36,6 +41,22 @@ __device__ inline void atomic_add_feature<at::BFloat16>(
   atomicAdd(
       reinterpret_cast<__nv_bfloat16*>(address),
       __float2bfloat16_rn(value));
+}
+
+template <>
+__device__ inline void atomic_add_feature_pair<at::Half>(
+    at::Half* address, float first, float second) {
+  atomicAdd(
+      reinterpret_cast<__half2*>(address),
+      __floats2half2_rn(first, second));
+}
+
+template <>
+__device__ inline void atomic_add_feature_pair<at::BFloat16>(
+    at::BFloat16* address, float first, float second) {
+  atomicAdd(
+      reinterpret_cast<__nv_bfloat162*>(address),
+      __floats2bfloat162_rn(first, second));
 }
 
 template <typename scalar_t, typename index_t>
@@ -94,6 +115,68 @@ __global__ void source_backward_kernel(
   atomic_add_feature(destination, target_value * output_gradient / normalization);
 }
 
+template <typename scalar_t, typename index_t>
+__global__ void source_backward_pair_kernel(
+    const scalar_t* targets,
+    const index_t* neighbor_indices,
+    const scalar_t* grad_output,
+    scalar_t* grad_source,
+    int64_t total_pairs,
+    int64_t num_queries,
+    int64_t neighbors,
+    int64_t groups,
+    int64_t channels_per_group,
+    int64_t target_stride_b,
+    int64_t target_stride_m,
+    int64_t target_stride_c,
+    int64_t index_stride_b,
+    int64_t index_stride_m,
+    int64_t index_stride_k,
+    int64_t grad_output_stride_b,
+    int64_t grad_output_stride_m,
+    int64_t grad_output_stride_k,
+    int64_t grad_output_stride_g,
+    int64_t grad_source_stride_b,
+    int64_t grad_source_stride_n,
+    int64_t grad_source_stride_c,
+    float normalization) {
+  const int64_t linear =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= total_pairs) {
+    return;
+  }
+
+  int64_t remainder = linear;
+  const int64_t pair = remainder % (channels_per_group / 2);
+  remainder /= channels_per_group / 2;
+  const int64_t group = remainder % groups;
+  remainder /= groups;
+  const int64_t neighbor = remainder % neighbors;
+  remainder /= neighbors;
+  const int64_t query = remainder % num_queries;
+  const int64_t batch = remainder / num_queries;
+  const int64_t first_channel = group * channels_per_group + pair * 2;
+
+  const index_t source_index = neighbor_indices[
+      batch * index_stride_b + query * index_stride_m
+      + neighbor * index_stride_k];
+  const int64_t target_offset = batch * target_stride_b
+      + query * target_stride_m + first_channel * target_stride_c;
+  const float first_target = static_cast<float>(targets[target_offset]);
+  const float second_target =
+      static_cast<float>(targets[target_offset + target_stride_c]);
+  const float output_gradient = static_cast<float>(grad_output[
+      batch * grad_output_stride_b + query * grad_output_stride_m
+      + neighbor * grad_output_stride_k + group * grad_output_stride_g]);
+  scalar_t* destination = grad_source + batch * grad_source_stride_b
+      + static_cast<int64_t>(source_index) * grad_source_stride_n
+      + first_channel * grad_source_stride_c;
+  atomic_add_feature_pair(
+      destination,
+      first_target * output_gradient / normalization,
+      second_target * output_gradient / normalization);
+}
+
 }  // namespace
 
 torch::Tensor indexed_correlation_source_backward_cuda(
@@ -136,8 +219,46 @@ torch::Tensor indexed_correlation_source_backward_cuda(
             neighbor_indices.scalar_type(),
             "indexed_correlation_source_backward_indices",
             [&] {
-              source_backward_kernel<scalar_t, index_t>
-                  <<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+              if constexpr (
+                  std::is_same_v<scalar_t, at::Half>
+                  || std::is_same_v<scalar_t, at::BFloat16>) {
+                if (channels_per_group % 2 == 0 && grad_source.stride(2) == 1) {
+                  const int64_t total_pairs = total / 2;
+                  const int64_t pair_blocks =
+                      (total_pairs + threads - 1) / threads;
+                  source_backward_pair_kernel<scalar_t, index_t>
+                      <<<pair_blocks,
+                         threads,
+                         0,
+                         c10::cuda::getCurrentCUDAStream()>>>(
+                          targets.data_ptr<scalar_t>(),
+                          neighbor_indices.data_ptr<index_t>(),
+                          grad_output.data_ptr<scalar_t>(),
+                          grad_source.data_ptr<scalar_t>(),
+                          total_pairs,
+                          num_queries,
+                          neighbors,
+                          groups,
+                          channels_per_group,
+                          targets.stride(0),
+                          targets.stride(1),
+                          targets.stride(2),
+                          neighbor_indices.stride(0),
+                          neighbor_indices.stride(1),
+                          neighbor_indices.stride(2),
+                          grad_output.stride(0),
+                          grad_output.stride(1),
+                          grad_output.stride(2),
+                          grad_output.stride(3),
+                          grad_source.stride(0),
+                          grad_source.stride(1),
+                          grad_source.stride(2),
+                          normalization);
+                  return;
+                }
+              }
+              source_backward_kernel<scalar_t, index_t><<<
+                  blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
                       targets.data_ptr<scalar_t>(),
                       neighbor_indices.data_ptr<index_t>(),
                       grad_output.data_ptr<scalar_t>(),
