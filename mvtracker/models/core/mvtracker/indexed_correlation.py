@@ -34,14 +34,18 @@ def _cuda_extension():
         cpp_extension.CUDA_HOME = str(bundled_cuda)
 
     source_dir = Path(__file__).resolve().parent
+    python_include = bundled_cuda / "include" / (
+        f"python{sys.version_info.major}.{sys.version_info.minor}"
+    )
+    include_flag = f"-I{python_include}"
     return cpp_extension.load(
         name="mvtracker_indexed_correlation_cuda",
         sources=[
             str(source_dir / "indexed_correlation_cuda.cpp"),
             str(source_dir / "indexed_correlation_cuda.cu"),
         ],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3"],
+        extra_cflags=["-O3", include_flag],
+        extra_cuda_cflags=["-O3", include_flag],
         verbose=False,
     )
 
