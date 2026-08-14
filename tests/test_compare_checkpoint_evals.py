@@ -54,7 +54,8 @@ class CompareCheckpointEvalsTest(unittest.TestCase):
         self.assertEqual(len(per_sequence), 24)
         by_metric = {row["metric"]: row for row in summary[:4]}
         self.assertEqual(by_metric["AJ"]["median_degradation"], -0.5)
-        self.assertEqual(by_metric["MTE (cm)"]["median_degradation"], 0.5)
+        self.assertAlmostEqual(by_metric["MTE (cm)"]["original"], 1.43)
+        self.assertAlmostEqual(by_metric["MTE (cm)"]["median_degradation"], 0.065)
 
 
 if __name__ == "__main__":

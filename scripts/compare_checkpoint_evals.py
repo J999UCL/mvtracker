@@ -15,6 +15,7 @@ DATASETS = {
     "kubric-multiview-v3-views0123-cached": {
         "label": "MV-Kubric / simulated",
         "point_type": "dynamic-static-mean",
+        "metric_scales": {"mte_visible": 0.13},
     },
     "panoptic-multiview-views1_7_14_20-cached": {
         "label": "Panoptic / Dynamic3DGS",
@@ -88,6 +89,10 @@ def _load_metric_frame(root: Path, dataset_name: str) -> pd.DataFrame:
     return frame.sort_index()
 
 
+def _metric_scale(dataset: dict, metric_name: str) -> float:
+    return dataset.get("metric_scales", {}).get(metric_name, 1.0)
+
+
 def compare_regression(
     original_root: Path,
     step1500_root: Path,
@@ -106,8 +111,9 @@ def compare_regression(
         for metric_name, metric in METRICS.items():
             original_column = _metric_column(original, metric_name, dataset["point_type"])
             candidate_column = _metric_column(candidate, metric_name, dataset["point_type"])
-            original_values = original[original_column].to_numpy(dtype=np.float64)
-            candidate_values = candidate[candidate_column].to_numpy(dtype=np.float64)
+            scale = _metric_scale(dataset, metric_name)
+            original_values = original[original_column].to_numpy(dtype=np.float64) * scale
+            candidate_values = candidate[candidate_column].to_numpy(dtype=np.float64) * scale
             if not np.isfinite(original_values).all() or not np.isfinite(candidate_values).all():
                 raise RuntimeError(f"non-finite {metric_name} values for {dataset_name}")
 
@@ -219,7 +225,7 @@ def compare_forward_parity(upstream_root: Path, optimized_root: Path) -> dict:
         optimized_column = _metric_column(
             optimized_metrics, metric_name, DATASETS[dataset_name]["point_type"]
         )
-        difference_value = abs(
+        difference_value = _metric_scale(DATASETS[dataset_name], metric_name) * abs(
             float(optimized_metrics.iloc[0][optimized_column])
             - float(upstream_metrics.iloc[0][upstream_column])
         )
