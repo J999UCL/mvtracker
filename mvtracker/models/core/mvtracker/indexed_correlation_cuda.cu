@@ -1,6 +1,6 @@
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
@@ -137,7 +137,7 @@ torch::Tensor indexed_correlation_source_backward_cuda(
             "indexed_correlation_source_backward_indices",
             [&] {
               source_backward_kernel<scalar_t, index_t>
-                  <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                  <<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
                       targets.data_ptr<scalar_t>(),
                       neighbor_indices.data_ptr<index_t>(),
                       grad_output.data_ptr<scalar_t>(),
