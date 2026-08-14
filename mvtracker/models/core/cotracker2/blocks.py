@@ -452,9 +452,18 @@ class EfficientUpdateFormer(nn.Module):
         if self.linear_layer_for_vis_conf:
             self.vis_conf_head.apply(trunc_init)
 
-    def forward(self, input_tensor, mask=None):
+    def forward(self, input_tensor, point_mask=None):
         tokens = self.input_transform(input_tensor)
         B, _, T, _ = tokens.shape
+        if point_mask is None:
+            point_mask = torch.ones(
+                B, tokens.shape[1], dtype=torch.bool, device=tokens.device
+            )
+        if point_mask.shape != (B, tokens.shape[1]):
+            raise ValueError(
+                f"point_mask must have shape {(B, tokens.shape[1])}, "
+                f"got {tuple(point_mask.shape)}"
+            )
         virtual_tokens = self.virual_tracks.repeat(B, 1, T, 1)
         tokens = torch.cat([tokens, virtual_tokens], dim=1)
         _, N, _, _ = tokens.shape
@@ -473,13 +482,22 @@ class EfficientUpdateFormer(nn.Module):
                 )  # B N T C -> (B T) N C
                 point_tokens = space_tokens[:, : N - self.num_virtual_tracks]
                 virtual_tokens = space_tokens[:, N - self.num_virtual_tracks:]
+                point_mask_bt = (
+                    point_mask[:, None, :]
+                    .expand(B, T, -1)
+                    .reshape(B * T, -1)
+                )
+                point_key_mask = point_mask_bt[:, None, None, :]
 
                 virtual_tokens = self.space_virtual2point_blocks[j](
-                    virtual_tokens, point_tokens, attn_mask=mask
+                    virtual_tokens, point_tokens, attn_mask=point_key_mask
                 )
                 virtual_tokens = self.space_virtual_blocks[j](virtual_tokens)
                 point_tokens = self.space_point2virtual_blocks[j](
-                    point_tokens, virtual_tokens, attn_mask=mask
+                    point_tokens, virtual_tokens
+                )
+                point_tokens = point_tokens.masked_fill(
+                    ~point_mask_bt[:, :, None], 0
                 )
                 space_tokens = torch.cat([point_tokens, virtual_tokens], dim=1)
                 tokens = space_tokens.view(B, T, N, -1).permute(0, 2, 1, 3)  # (B T) N C -> B N T C

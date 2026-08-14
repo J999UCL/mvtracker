@@ -120,8 +120,18 @@ class PerSceneLossWeightingRedTests(unittest.TestCase):
         valid[0, :, :3] = 1
         valid[1, :, :] = 1
         visibility = valid.clone()
-        actual = sequence_loss_3d([[pred]], [gt], [visibility], [valid], gamma=1.0)
-        self.assertAlmostEqual(actual.item(), 2.0, places=5)
+        actual = sequence_loss_3d([[pred.clone()]], [gt], [visibility], [valid], gamma=1.0)
+        serial_losses = [
+            sequence_loss_3d(
+                [[pred[index:index + 1].clone()]],
+                [gt[index:index + 1]],
+                [visibility[index:index + 1]],
+                [valid[index:index + 1]],
+                gamma=1.0,
+            )
+            for index in range(2)
+        ]
+        torch.testing.assert_close(actual, torch.stack(serial_losses).mean())
 
 
 class SpatialPaddingIsolationRedTests(unittest.TestCase):
@@ -189,6 +199,63 @@ class FullModelSerialBatchedParityRedTests(unittest.TestCase):
                 rtol=1e-3,
                 atol=1e-3,
             )
+
+    def test_three_scene_ragged_batch_matches_serial_forwards(self):
+        from mvtracker.models.core.mvtracker.mvtracker import MVTracker
+
+        torch.manual_seed(17)
+        model = MVTracker(
+            fmaps_dim=32, hidden_size=64, num_heads=4, space_depth=1,
+            time_depth=1, num_virtual_tracks=8, sliding_window_len=4, stride=2,
+            corr_n_levels=1, corr_neighbors=1,
+        ).cuda().eval()
+        batch_size, views, frames, height, width = 3, 1, 4, 32, 32
+        counts = (3, 5, 8)
+        rgb = torch.randn(
+            batch_size, views, frames, 3, height, width, device="cuda"
+        )
+        depth = torch.ones(
+            batch_size, views, frames, 1, height, width, device="cuda"
+        )
+        intrs = torch.eye(3, device="cuda").view(1, 1, 1, 3, 3).expand(
+            batch_size, views, frames, -1, -1
+        )
+        extrs = torch.zeros(batch_size, views, frames, 3, 4, device="cuda")
+        extrs[..., :3, :3] = torch.eye(3, device="cuda")
+        queries = torch.zeros(batch_size, max(counts), 4, device="cuda")
+        queries[..., 1:] = torch.randn_like(queries[..., 1:])
+        padding = torch.ones(
+            batch_size, max(counts), dtype=torch.bool, device="cuda"
+        )
+        for scene_index, count in enumerate(counts):
+            padding[scene_index, :count] = False
+
+        with torch.no_grad():
+            batched = model(
+                rgb, depth, queries, intrs, extrs, iters=1,
+                track_padding_mask=padding,
+            )
+            for scene_index, count in enumerate(counts):
+                serial = model(
+                    rgb[scene_index:scene_index + 1],
+                    depth[scene_index:scene_index + 1],
+                    queries[scene_index:scene_index + 1, :count],
+                    intrs[scene_index:scene_index + 1],
+                    extrs[scene_index:scene_index + 1],
+                    iters=1,
+                )
+                torch.testing.assert_close(
+                    batched["traj_e"][scene_index:scene_index + 1, :, :count],
+                    serial["traj_e"],
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
+                torch.testing.assert_close(
+                    batched["vis_e"][scene_index:scene_index + 1, :, :count],
+                    serial["vis_e"],
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
 
 
 if __name__ == "__main__":

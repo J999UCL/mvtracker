@@ -253,6 +253,7 @@ class MVTracker(nn.Module):
             coords_init,
             vis_init,
             track_mask,
+            track_padding_mask=None,
             iters=4,
             feat_init=None,
             save_debug_logs=False,
@@ -275,7 +276,6 @@ class MVTracker(nn.Module):
                 track_mask,
                 torch.zeros_like(track_mask[:, 0]).repeat(1, S - track_mask.shape[1], 1, 1),
             ], dim=1)
-        assert B == 1
         assert D == self.latent_dim
         assert fmaps.shape == (B, V, S, D, H, W)
         assert depths.shape == (B, V, S, 1, H, W)
@@ -285,9 +285,15 @@ class MVTracker(nn.Module):
         assert vis_init.shape == (B, S, N, 1)
         assert track_mask.shape == (B, S, N, 1)
         assert feat_init is None or feat_init.shape == (B, S, N, self.latent_dim)
+        if track_padding_mask is None:
+            track_padding_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+        assert track_padding_mask.shape == (B, N)
 
         if save_debug_logs:
-            assert track_mask.any(1).all(), "All points should be requested to be tracked at least for one frame"
+            requested = track_mask.any(1).squeeze(-1)
+            assert (requested | track_padding_mask).all(), (
+                "All real points should be requested to be tracked at least once"
+            )
 
         fcorr_fns = {}
         for lvl in range(self.corr_n_levels):
@@ -385,7 +391,7 @@ class MVTracker(nn.Module):
             x = rearrange(x, "(b n) t d -> b n t d", b=B)
 
             with torch.profiler.record_function("mvtracker/update_transformer"):
-                delta = self.updateformer(x)
+                delta = self.updateformer(x, point_mask=~track_padding_mask)
             delta = rearrange(delta, " b n t d -> (b n) t d")
 
             d_coord = delta[:, :, :3].reshape(B, N, S, 3).permute(0, 2, 1, 3)
@@ -415,6 +421,7 @@ class MVTracker(nn.Module):
             query_points,
             intrs,
             extrs,
+            track_padding_mask=None,
             iters=4,
             image_features=None,
             is_train=False,
@@ -441,6 +448,75 @@ class MVTracker(nn.Module):
         assert query_points.shape == (batch_size, num_points, 4)
         assert intrs.shape == (batch_size, num_views, num_frames, 3, 3)
         assert extrs.shape == (batch_size, num_views, num_frames, 3, 4)
+        if track_padding_mask is None:
+            track_padding_mask = torch.zeros(
+                batch_size, num_points, dtype=torch.bool, device=query_points.device
+            )
+        else:
+            track_padding_mask = track_padding_mask.to(
+                device=query_points.device, dtype=torch.bool
+            )
+        if track_padding_mask.shape != (batch_size, num_points):
+            raise ValueError(
+                f"track_padding_mask must have shape {(batch_size, num_points)}, "
+                f"got {tuple(track_padding_mask.shape)}"
+            )
+        if track_padding_mask.all(dim=1).any():
+            raise ValueError("every scene must contain at least one real trajectory")
+
+        query_frames_for_schedule = query_points[:, :, 0].long().masked_fill(
+            track_padding_mask, num_frames
+        )
+        schedule_starts = query_frames_for_schedule.amin(dim=1).detach().cpu().tolist()
+        if batch_size > 1 and len(set(schedule_starts)) > 1:
+            if self.normalize_scene_in_fwd_pass:
+                raise ValueError("batched VGGT scene normalization is not supported")
+            if save_rerun_logs:
+                raise ValueError("batched Rerun logging requires aligned query schedules")
+            grouped_results = {}
+            for schedule_start in sorted(set(schedule_starts)):
+                scene_indices = [
+                    index for index, value in enumerate(schedule_starts)
+                    if value == schedule_start
+                ]
+                index = torch.tensor(scene_indices, device=query_points.device)
+                result = self.forward(
+                    rgbs=rgbs.index_select(0, index),
+                    depths=depths.index_select(0, index),
+                    query_points=query_points.index_select(0, index),
+                    intrs=intrs.index_select(0, index),
+                    extrs=extrs.index_select(0, index),
+                    track_padding_mask=track_padding_mask.index_select(0, index),
+                    iters=iters,
+                    image_features=None,
+                    is_train=is_train,
+                    save_debug_logs=save_debug_logs,
+                    debug_logs_path=debug_logs_path,
+                )
+                for local_index, scene_index in enumerate(scene_indices):
+                    grouped_results[scene_index] = {
+                        "traj_e": result["traj_e"][local_index],
+                        "vis_e": result["vis_e"][local_index],
+                        "feat_init": result["feat_init"][local_index],
+                        "train_data": (
+                            result["train_data"]["scenes"][local_index]
+                            if is_train else None
+                        ),
+                    }
+            results = {
+                name: torch.stack([
+                    grouped_results[index][name] for index in range(batch_size)
+                ])
+                for name in ("traj_e", "vis_e", "feat_init")
+            }
+            if is_train:
+                results["train_data"] = {
+                    "scenes": [
+                        grouped_results[index]["train_data"]
+                        for index in range(batch_size)
+                    ]
+                }
+            return results
 
         if save_debug_logs:
             os.makedirs(debug_logs_path, exist_ok=True)
@@ -486,36 +562,56 @@ class MVTracker(nn.Module):
         self.is_train = is_train
 
         # Unpack the query points
-        query_points_t = query_points[:, :, :1].long()
+        query_points_t = query_points[:, :, 0].long()
         query_points_xyz_worldspace = query_points[:, :, 1:]
 
         # Interpolate the rgbs and depthmaps to the stride of the SpaTracker
         strided_height = height // self.stride
         strided_width = width // self.stride
 
-        # Filter the points that never appear during 1 - T
-        assert batch_size == 1, "Batch size > 1 is not supported yet"
-        query_points_t = query_points_t.squeeze(0).squeeze(-1)  # BN1 --> N
-        ind_array = torch.arange(num_frames, device=query_points.device)
-        ind_array = ind_array[None, :, None].repeat(batch_size, 1, num_points)
-        track_mask = (ind_array >= query_points_t[None, None, :]).unsqueeze(-1)  # TODO: >= or >?
+        ind_array = torch.arange(num_frames, device=query_points.device)[None, :, None]
+        track_mask = (
+            (ind_array >= query_points_t[:, None, :])
+            & ~track_padding_mask[:, None, :]
+        ).unsqueeze(-1)
 
         # Prepare the initial coordinates and visibility
         coords_init = query_points_xyz_worldspace.unsqueeze(1).repeat(1, self.S, 1, 1)
         vis_init = query_points.new_ones((batch_size, self.S, num_points, 1)) * 10
 
-        # Sort the queries via their first appeared time
-        _, sort_inds = torch.sort(query_points_t, dim=0, descending=False)
-        inv_sort_inds = torch.argsort(sort_inds, dim=0)
-        if save_debug_logs:
-            assert torch.allclose(query_points_t, query_points_t[sort_inds][inv_sort_inds])
+        # Sort each scene independently. Padded tracks stay at the end.
+        query_points_t_for_sort = query_points_t.masked_fill(
+            track_padding_mask, num_frames + 1
+        )
+        sort_inds = torch.argsort(query_points_t_for_sort, dim=1)
+        inv_sort_inds = torch.argsort(sort_inds, dim=1)
 
-        query_points_t_ = query_points_t[sort_inds]
-        query_points_xyz_worldspace_ = query_points_xyz_worldspace[..., sort_inds, :]
-        coords_init_ = coords_init[..., sort_inds, :].clone()
-        vis_init_ = vis_init[:, :, sort_inds].clone()
-        track_mask_ = track_mask[:, :, sort_inds].clone()
-        query_times = query_points_t_.detach().cpu().tolist()
+        def gather_tracks(value, track_dim):
+            shape = [1] * value.ndim
+            shape[0] = batch_size
+            shape[track_dim] = num_points
+            index = sort_inds.view(shape)
+            expand_shape = list(value.shape)
+            expand_shape[track_dim] = num_points
+            return torch.gather(value, track_dim, index.expand(expand_shape))
+
+        if save_debug_logs:
+            restored = torch.gather(
+                torch.gather(query_points_t, 1, sort_inds), 1, inv_sort_inds
+            )
+            assert torch.equal(query_points_t, restored)
+
+        query_points_t_ = gather_tracks(query_points_t, 1)
+        query_points_xyz_worldspace_ = gather_tracks(query_points_xyz_worldspace, 1)
+        coords_init_ = gather_tracks(coords_init, 2).clone()
+        vis_init_ = gather_tracks(vis_init, 2).clone()
+        track_mask_ = gather_tracks(track_mask, 2).clone()
+        track_padding_mask_ = gather_tracks(track_padding_mask, 1)
+        real_track_counts = (~track_padding_mask_).sum(dim=1).detach().cpu().tolist()
+        query_times = [
+            query_points_t_[batch_index, :count].detach().cpu().tolist()
+            for batch_index, count in enumerate(real_track_counts)
+        ]
 
         # Delete the unsorted variables (for safety)
         del coords_init, vis_init, query_points_t, query_points, query_points_xyz_worldspace, track_mask
@@ -524,16 +620,30 @@ class MVTracker(nn.Module):
         traj_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points, 3))
         vis_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points))
 
-        w_idx_start = query_times[0]
-        p_idx_start = 0
-        vis_predictions = []
-        coord_predictions = []
-        p_idx_end_list = []
+        w_idx_start = query_times[0][0]
+        if any(times[0] != w_idx_start for times in query_times):
+            raise RuntimeError("internal schedule grouping failed")
+        p_idx_starts = [0] * batch_size
+        scene_records = [
+            {
+                "coord_predictions": [],
+                "vis_predictions": [],
+                "p_idx_end_list": [],
+                "window_starts": [],
+                "sort_inds": sort_inds[index],
+                "real_track_count": real_track_counts[index],
+            }
+            for index in range(batch_size)
+        ]
         fmaps_seq, depths_seq, feat_init, rerun_fmap_coloring_fn = None, None, None, None
         while w_idx_start < num_frames - self.S // 2:
-            p_idx_end = bisect_left(query_times, w_idx_start + self.S)
-            assert p_idx_end > 0
-            p_idx_end_list.append(p_idx_end)
+            p_idx_ends = [
+                bisect_left(times, w_idx_start + self.S)
+                for times in query_times
+            ]
+            p_idx_end = max(p_idx_ends)
+            if p_idx_end == 0:
+                raise RuntimeError("window contains no query trajectories")
 
             intrs_seq = intrs[:, :, w_idx_start:w_idx_start + self.S]
             extrs_seq = extrs[:, :, w_idx_start:w_idx_start + self.S]
@@ -572,6 +682,10 @@ class MVTracker(nn.Module):
                 strided_width,
             )
             fmaps_seq = smart_cat(fmaps_seq, _fmaps_seq_new, dim=2)
+            if feat_init is None:
+                feat_init = _fmaps_seq_new.new_zeros(
+                    batch_size, self.S, num_points, self.latent_dim
+                )
 
             if save_rerun_logs and rerun_fmap_coloring_fn is None:
                 valid_depths_mask = depths_seq.detach().cpu().squeeze(3) > 0
@@ -603,8 +717,8 @@ class MVTracker(nn.Module):
                 intrs_seq = torch.cat([intrs_seq, intrs_seq[:, :, -1:].repeat(1, 1, diff, 1, 1)], 2)
                 extrs_seq = torch.cat([extrs_seq, extrs_seq[:, :, -1:].repeat(1, 1, diff, 1, 1)], 2)
 
-            # Compute the feature vector initialization for the new query points
-            if p_idx_end - p_idx_start > 0:
+            # Compute query features independently per scene and query frame.
+            if any(end > start for start, end in zip(p_idx_starts, p_idx_ends)):
                 with torch.profiler.record_function("mvtracker/query_feature_pointcloud"):
                     rgbd_xyz, rgbd_fvec = init_pointcloud_from_rgbd(
                         fmaps=_fmaps_seq_new,
@@ -619,46 +733,61 @@ class MVTracker(nn.Module):
                 rgbd_fvec = rgbd_fvec.reshape(batch_size, new_num_frames, num_views, strided_height * strided_width,
                                               self.latent_dim)
 
-                _feat_init_new = torch.zeros(batch_size, p_idx_end - p_idx_start, self.latent_dim,
-                                             device=_fmaps_seq_new.device, dtype=_fmaps_seq_new.dtype)
-                assert batch_size == 1
-                batch_idx = 0
-                for t in range(new_seq_t0, new_seq_t1):
-                    query_start = max(p_idx_start, bisect_left(query_times, t))
-                    query_end = min(p_idx_end, bisect_left(query_times, t + 1))
-                    if query_start == query_end:
-                        continue
-                    query_points_world = query_points_xyz_worldspace_[batch_idx, query_start:query_end]
-
-                    rgbd_xyz_current = rgbd_xyz[batch_idx, t - new_seq_t0].reshape(-1, 3)  # Combine views for frame
-                    rgbd_fvec_current = rgbd_fvec[batch_idx, t - new_seq_t0].reshape(-1, self.latent_dim)
-
-                    k = 1
-                    with torch.profiler.record_function("mvtracker/query_feature_knn"):
-                        neighbor_dists, neighbor_indices = knn(
-                            k,
-                            rgbd_xyz_current[None],
-                            query_points_world[None],
+                for batch_idx in range(batch_size):
+                    for t in range(new_seq_t0, new_seq_t1):
+                        query_start = max(
+                            p_idx_starts[batch_idx],
+                            bisect_left(query_times[batch_idx], t),
                         )
-                    assert k == 1, "If k > 1, the code below should be modified to handle multiple neighbors -- how to combine the features of multiple neighbors?"
-                    neighbor_xyz = rgbd_xyz_current[neighbor_indices[0, :, 0]]
-                    neighbor_fvec = rgbd_fvec_current[neighbor_indices[0, :, 0]]
-
-                    local_start = query_start - p_idx_start
-                    local_end = query_end - p_idx_start
-                    _feat_init_new[batch_idx, local_start:local_end] = neighbor_fvec
-
-                feat_init = smart_cat(feat_init, _feat_init_new.repeat(1, self.S, 1, 1), dim=2)
+                        query_end = min(
+                            p_idx_ends[batch_idx],
+                            bisect_left(query_times[batch_idx], t + 1),
+                        )
+                        if query_start == query_end:
+                            continue
+                        query_points_world = query_points_xyz_worldspace_[
+                            batch_idx, query_start:query_end
+                        ]
+                        rgbd_xyz_current = rgbd_xyz[
+                            batch_idx, t - new_seq_t0
+                        ].reshape(-1, 3)
+                        rgbd_fvec_current = rgbd_fvec[
+                            batch_idx, t - new_seq_t0
+                        ].reshape(-1, self.latent_dim)
+                        with torch.profiler.record_function("mvtracker/query_feature_knn"):
+                            _, neighbor_indices = knn(
+                                1,
+                                rgbd_xyz_current[None],
+                                query_points_world[None],
+                            )
+                        neighbor_fvec = rgbd_fvec_current[neighbor_indices[0, :, 0]]
+                        feat_init[
+                            batch_idx, :, query_start:query_end
+                        ] = neighbor_fvec[None].expand(self.S, -1, -1)
 
             # Update the initial coordinates and visibility for non-first windows
-            if p_idx_start > 0:
-                last_coords = coords[-1][:, self.S // 2:].clone()  # Take the predicted coords from the last window
-                coords_init_[:, : self.S // 2, :p_idx_start] = last_coords
-                coords_init_[:, self.S // 2:, :p_idx_start] = last_coords[:, -1].repeat(1, self.S // 2, 1, 1)
+            for batch_idx, previous_count in enumerate(p_idx_starts):
+                if previous_count == 0:
+                    continue
+                last_coords = coords[-1][
+                    batch_idx:batch_idx + 1, self.S // 2:, :previous_count
+                ].clone()
+                coords_init_[
+                    batch_idx:batch_idx + 1, :self.S // 2, :previous_count
+                ] = last_coords
+                coords_init_[
+                    batch_idx:batch_idx + 1, self.S // 2:, :previous_count
+                ] = last_coords[:, -1:].expand(-1, self.S // 2, -1, -1)
 
-                last_vis = vis[:, self.S // 2:][..., None]
-                vis_init_[:, : self.S // 2, :p_idx_start] = last_vis
-                vis_init_[:, self.S // 2:, :p_idx_start] = last_vis[:, -1].repeat(1, self.S // 2, 1, 1)
+                last_vis = vis[
+                    batch_idx:batch_idx + 1, self.S // 2:, :previous_count
+                ][..., None]
+                vis_init_[
+                    batch_idx:batch_idx + 1, :self.S // 2, :previous_count
+                ] = last_vis
+                vis_init_[
+                    batch_idx:batch_idx + 1, self.S // 2:, :previous_count
+                ] = last_vis[:, -1:].expand(-1, self.S // 2, -1, -1)
 
             track_mask_current = track_mask_[:, w_idx_start: w_idx_start + self.S, :p_idx_end]
             if S_local < self.S:
@@ -666,6 +795,13 @@ class MVTracker(nn.Module):
                     track_mask_current,
                     track_mask_current[:, -1:].repeat(1, self.S - S_local, 1, 1),
                 ], 1)
+
+            active_counts = torch.tensor(
+                p_idx_ends, device=device
+            )[:, None]
+            active_padding_mask = (
+                torch.arange(p_idx_end, device=device)[None] >= active_counts
+            ) | track_padding_mask_[:, :p_idx_end]
 
             coords, vis, _ = self.forward_iteration(
                 fmaps=fmaps_seq,
@@ -676,32 +812,47 @@ class MVTracker(nn.Module):
                 feat_init=feat_init[:, :, :p_idx_end],
                 vis_init=vis_init_[:, :, :p_idx_end],
                 track_mask=track_mask_current,
+                track_padding_mask=active_padding_mask,
                 iters=iters,
                 save_debug_logs=save_debug_logs,
                 debug_logs_path=debug_logs_path,
-                debug_logs_prefix=f"__widx-{w_idx_start}_pidx-{p_idx_start}-{p_idx_end}",
+                debug_logs_prefix=f"__widx-{w_idx_start}_pidx-{p_idx_end}",
                 debug_logs_window_idx=w_idx_start,
                 save_rerun_logs=save_rerun_logs,
                 rerun_fmap_coloring_fn=rerun_fmap_coloring_fn,
             )
 
             if is_train:
-                coord_predictions.append([
-                    coord[:, :S_local]
-                    if not self.normalize_scene_in_fwd_pass
-                    else transform_scene(T_scale_inv, T_rot_inv, T_translation_inv,
-                                         None, None, None, coord[:, :S_local][0], None)[2][None]
-                    for coord in coords
-                ])
-                vis_predictions.append(vis[:, :S_local])
+                for batch_idx, count in enumerate(p_idx_ends):
+                    record = scene_records[batch_idx]
+                    record["coord_predictions"].append([
+                        coord[batch_idx:batch_idx + 1, :S_local, :count]
+                        if not self.normalize_scene_in_fwd_pass
+                        else transform_scene(
+                            T_scale_inv, T_rot_inv, T_translation_inv,
+                            None, None, None,
+                            coord[batch_idx, :S_local, :count], None,
+                        )[2][None]
+                        for coord in coords
+                    ])
+                    record["vis_predictions"].append(
+                        vis[batch_idx:batch_idx + 1, :S_local, :count]
+                    )
+                    record["p_idx_end_list"].append(count)
+                    record["window_starts"].append(w_idx_start)
 
-            traj_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = coords[-1][:, :S_local]
-            vis_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = torch.sigmoid(vis[:, :S_local])
-
-            track_mask_[:, : w_idx_start + self.S, :p_idx_end] = 0.0
+            for batch_idx, count in enumerate(p_idx_ends):
+                traj_e_[
+                    batch_idx, w_idx_start:w_idx_start + S_local, :count
+                ] = coords[-1][batch_idx, :S_local, :count]
+                vis_e_[
+                    batch_idx, w_idx_start:w_idx_start + S_local, :count
+                ] = torch.sigmoid(vis[batch_idx, :S_local, :count])
+                track_mask_[
+                    batch_idx, :w_idx_start + self.S, :count
+                ] = 0.0
             w_idx_start = w_idx_start + self.S // 2
-
-            p_idx_start = p_idx_end
+            p_idx_starts = p_idx_ends
 
         if save_debug_logs:
             import gpustat
@@ -713,8 +864,14 @@ class MVTracker(nn.Module):
             rr.save(save_rerun_logs_output_rrd_path)
             logging.info(f"Saved Rerun recording to: {os.path.abspath(save_rerun_logs_output_rrd_path)}.")
 
-        traj_e = traj_e_[:, :, inv_sort_inds]
-        vis_e = vis_e_[:, :, inv_sort_inds]
+        traj_e = torch.gather(
+            traj_e_, 2,
+            inv_sort_inds[:, None, :, None].expand(-1, num_frames, -1, 3),
+        )
+        vis_e = torch.gather(
+            vis_e_, 2,
+            inv_sort_inds[:, None, :].expand(-1, num_frames, -1),
+        )
 
         # Un-normalize the scene
         if self.normalize_scene_in_fwd_pass:
@@ -727,14 +884,7 @@ class MVTracker(nn.Module):
             "vis_e": vis_e,
         }
         if self.is_train:
-            results["train_data"] = {
-                "vis_predictions": vis_predictions,
-                "coord_predictions": coord_predictions,
-                "attn_predictions": None,
-                "p_idx_end_list": p_idx_end_list,
-                "sort_inds": sort_inds,
-                "Rigid_ln_total": None,
-            }
+            results["train_data"] = {"scenes": scene_records}
         return results
 
 
