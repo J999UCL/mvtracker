@@ -12,7 +12,7 @@ datasets:
   train:
     name: tapvid3d-multiview-training
     batch_size: 2
-    traj_per_sample: 256
+    traj_per_sample: 128
   eval:
     names:
       - tapvid3d-multiview-validation
