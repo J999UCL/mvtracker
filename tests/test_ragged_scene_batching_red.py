@@ -148,6 +148,7 @@ class FullModelSerialBatchedParityRedTests(unittest.TestCase):
         model = MVTracker(
             fmaps_dim=32, hidden_size=64, num_heads=4, space_depth=1,
             time_depth=1, num_virtual_tracks=8, sliding_window_len=4, stride=2,
+            corr_n_levels=1, corr_neighbors=1,
         ).cuda().eval()
         views, frames, height, width = 1, 4, 32, 32
         counts = (3, 5, 8)
@@ -159,13 +160,34 @@ class FullModelSerialBatchedParityRedTests(unittest.TestCase):
         padded = torch.zeros(1, 8, 4, device="cuda")
         padded[:, :, 0] = 0
         padded[:, :, 1:] = torch.randn(1, 8, 3, device="cuda")
-        mask = torch.zeros(1, 8, dtype=torch.bool, device="cuda")
         for count in counts:
+            mask = torch.zeros(1, 8, dtype=torch.bool, device="cuda")
             mask[:, count:] = True
+            poisoned = padded.clone()
+            poisoned[:, count:, 1:] = torch.randn_like(poisoned[:, count:, 1:]) * 10000
             batched = model(rgb, depth, padded, intrs, extrs, iters=1, track_padding_mask=mask)
+            poisoned_batched = model(
+                rgb, depth, poisoned, intrs, extrs, iters=1,
+                track_padding_mask=mask,
+            )
             serial = model(rgb, depth, padded[:, :count], intrs, extrs, iters=1)
             torch.testing.assert_close(
-                batched[0][-1][:, :, :count], serial[0][-1], rtol=1e-3, atol=1e-3
+                batched["traj_e"][:, :, :count], serial["traj_e"], rtol=1e-3, atol=1e-3
+            )
+            torch.testing.assert_close(
+                batched["vis_e"][:, :, :count], serial["vis_e"], rtol=1e-3, atol=1e-3
+            )
+            torch.testing.assert_close(
+                poisoned_batched["traj_e"][:, :, :count],
+                batched["traj_e"][:, :, :count],
+                rtol=1e-3,
+                atol=1e-3,
+            )
+            torch.testing.assert_close(
+                poisoned_batched["vis_e"][:, :, :count],
+                batched["vis_e"][:, :, :count],
+                rtol=1e-3,
+                atol=1e-3,
             )
 
 
