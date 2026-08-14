@@ -21,7 +21,12 @@ from mvtracker.datasets.kubric_multiview_dataset import (
     KubricMultiViewDataset,
     _legal_contiguous_window_starts,
 )
-from mvtracker.datasets.utils import Datapoint, aug_depth
+from mvtracker.datasets.utils import (
+    Datapoint,
+    HomogeneousViewBatchSampler,
+    SampleRequest,
+    aug_depth,
+)
 
 
 _DATASET_PREFIX = "tapvid3d-multiview-"
@@ -854,7 +859,8 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
 
     def __getitem__(self, index):
         load_started = time.perf_counter()
-        virtual_index = int(index)
+        request = index if isinstance(index, SampleRequest) else None
+        virtual_index = request.virtual_index if request is not None else int(index)
         scene_index = virtual_index % self.real_len
         sequence = self.seq_names[scene_index]
         if self.seed is None:
@@ -870,14 +876,25 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         available_views = list(manifest["views"])
         if getattr(self, "enable_variable_num_views_augs", False):
             maximum_views = min(4, len(available_views))
-            probabilities = np.asarray(
-                getattr(self, "view_count_probabilities", (0.25,) * 4)[:maximum_views],
-                dtype=np.float64,
-            )
-            probabilities /= probabilities.sum()
-            view_count = int(rng.choice(np.arange(1, maximum_views + 1), p=probabilities))
+            if request is None:
+                probabilities = np.asarray(
+                    getattr(self, "view_count_probabilities", (0.25,) * 4)[:maximum_views],
+                    dtype=np.float64,
+                )
+                probabilities /= probabilities.sum()
+                view_count = int(rng.choice(np.arange(1, maximum_views + 1), p=probabilities))
+            else:
+                view_count = int(request.view_count)
+                if not 1 <= view_count <= maximum_views:
+                    raise ValueError(
+                        f"requested view count {view_count} is outside [1, {maximum_views}]"
+                    )
         else:
             view_count = len(available_views) if self.num_views == -1 else int(self.num_views)
+            if request is not None and request.view_count != view_count:
+                raise ValueError(
+                    f"requested view count {request.view_count} does not match fixed count {view_count}"
+                )
         if len(available_views) < view_count:
             raise ValueError(f"{source_root}: requires {view_count} views")
         views = sorted(rng.choice(available_views, view_count, replace=False).tolist())
@@ -1049,6 +1066,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "window_start": start,
                 "window_end_exclusive": start + self.seq_len,
                 "selected_views": views,
+                "requested_view_count": request.view_count if request is not None else None,
                 "gotit": True,
                 "worker_prepare_seconds": time.perf_counter() - load_started,
                 **motion_statistics,
@@ -1131,25 +1149,50 @@ def decode_tapvid3d_batch(
         videos.append(rgb.reshape(views, frames, 3, output_h, output_w))
         depths.append(depth.reshape(views, frames, 1, output_h, output_w))
 
-    def stack(name: str, *, floating=True):
-        result = torch.stack([getattr(sample, name) for sample in batch.samples]).to(device, non_blocking=True)
+    track_counts = [sample.trajectory.shape[-2] for sample in batch.samples]
+    max_tracks = max(track_counts)
+
+    def padded(value: torch.Tensor, axis: int, target: int) -> torch.Tensor:
+        count = value.shape[axis]
+        if count == target:
+            return value
+        shape = list(value.shape)
+        shape[axis] = target - count
+        return torch.cat((value, value.new_zeros(shape)), dim=axis)
+
+    def stack(name: str, axis: int | None = None, *, floating=True):
+        values = [getattr(sample, name) for sample in batch.samples]
+        if axis is not None:
+            values = [padded(value, axis, max_tracks) for value in values]
+        result = torch.stack(values).to(device, non_blocking=True)
         return result.float() if floating else result
+
+    track_padding_mask = torch.zeros(
+        len(batch.samples), max_tracks, dtype=torch.bool, device=device
+    )
+    for scene_index, count in enumerate(track_counts):
+        track_padding_mask[scene_index, count:] = True
 
     result = Datapoint(
         video=torch.stack(videos),
         videodepth=torch.stack(depths),
         segmentation=None,
-        trajectory=stack("trajectory"),
-        trajectory_3d=stack("trajectory_3d"),
-        visibility=stack("visibility"),
-        valid=stack("valid"),
+        trajectory=stack("trajectory", -2),
+        trajectory_3d=stack("trajectory_3d", -2),
+        visibility=stack("visibility", -1),
+        valid=stack("valid", -1),
         seq_name=[sample.seq_name for sample in batch.samples],
         intrs=stack("intrs"),
         extrs=stack("extrs"),
         query_points=None,
-        query_points_3d=stack("query_points_3d"),
+        query_points_3d=stack("query_points_3d", -2),
         sample_metadata=[sample.metadata for sample in batch.samples],
-        track_upscaling_factor=batch.samples[0].track_upscaling_factor,
+        track_padding_mask=track_padding_mask,
+        track_upscaling_factor=torch.tensor(
+            [sample.track_upscaling_factor for sample in batch.samples],
+            dtype=torch.float32,
+            device=device,
+        ),
     )
     if timing_events is not None:
         timing_events[2].record()

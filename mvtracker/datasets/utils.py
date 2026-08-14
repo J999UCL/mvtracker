@@ -8,7 +8,7 @@ import dataclasses
 import json
 import pathlib
 from dataclasses import dataclass
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Sequence
 
 import numpy as np
 import png
@@ -17,6 +17,75 @@ from torch.nn import functional as F
 from torchvision.transforms import functional as TF
 
 from mvtracker.utils.basic import to_homogeneous, from_homogeneous
+
+
+@dataclass(frozen=True)
+class SampleRequest:
+    virtual_index: int
+    view_count: int
+
+
+class HomogeneousViewBatchSampler(torch.utils.data.Sampler[list[SampleRequest]]):
+    """Yield rank-local batches whose requests all use one view count."""
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        *,
+        world_size: int = 1,
+        rank: int = 0,
+        seed: int = 0,
+        view_count_probabilities: Sequence[float] = (0.25,) * 4,
+        drop_last: bool = True,
+    ):
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least one")
+        if world_size < 1 or not 0 <= rank < world_size:
+            raise ValueError("rank must be in [0, world_size)")
+        probabilities = np.asarray(view_count_probabilities, dtype=np.float64)
+        if probabilities.ndim != 1 or probabilities.size == 0:
+            raise ValueError("view_count_probabilities must be a non-empty sequence")
+        if not np.isfinite(probabilities).all() or (probabilities < 0).any():
+            raise ValueError("view_count_probabilities must be finite and non-negative")
+        if probabilities.sum() <= 0:
+            raise ValueError("view_count_probabilities must have positive mass")
+        self.dataset_size = len(dataset)
+        self.batch_size = int(batch_size)
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.view_counts = tuple(range(1, len(probabilities) + 1))
+        self.view_count_probabilities = probabilities / probabilities.sum()
+        self.drop_last = bool(drop_last)
+        global_batch_size = self.world_size * self.batch_size
+        self.num_batches = (
+            self.dataset_size // global_batch_size
+            if self.drop_last
+            else (self.dataset_size + global_batch_size - 1) // global_batch_size
+        )
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.RandomState(self.seed + self.epoch)
+        global_batch_size = self.world_size * self.batch_size
+        for batch_index in range(self.num_batches):
+            view_count = int(rng.choice(self.view_counts, p=self.view_count_probabilities))
+            start = batch_index * global_batch_size
+            global_requests = [
+                SampleRequest(virtual_index=start + offset, view_count=view_count)
+                for offset in range(global_batch_size)
+            ]
+            local_start = self.rank * self.batch_size
+            yield global_requests[local_start : local_start + self.batch_size]
 
 
 @dataclass(eq=False)
@@ -43,13 +112,17 @@ class Datapoint:
     # code may ignore this field; it does not affect sampling or model inputs.
     sample_metadata: Optional[Any] = None
 
+    # True marks trajectory slots added by collation to equalize scene track
+    # counts. The shape is [N] per scene and [B, N] after collation.
+    track_padding_mask: Optional[torch.Tensor] = None
+
     trajectory: Optional[torch.Tensor] = None  # B, S, N, 2
     visibility: Optional[torch.Tensor] = None  # B, S, N
     trajectory_3d: Optional[torch.Tensor] = None  # B, S, 4, 4
     trajectory_category: Optional[torch.Tensor] = None  # B, S, 1
     extrs: Optional[torch.Tensor] = None  # B, S, 4, 4
 
-    track_upscaling_factor: Optional[float] = 1.0
+    track_upscaling_factor: Optional[torch.Tensor | float] = 1.0
 
     novel_video: Optional[torch.Tensor] = None  # B, S, C, H, W
     novel_intrs: Optional[torch.Tensor] = torch.eye(3).unsqueeze(0)  # B, 3, 3
@@ -57,12 +130,69 @@ class Datapoint:
 
 
 def collate_fn(batch):
+    def pad_track_axis(values, axis):
+        target = max(value.shape[axis] for value in values)
+        padded = []
+        masks = []
+        for value in values:
+            count = value.shape[axis]
+            pad = target - count
+            if pad:
+                shape = list(value.shape)
+                shape[axis] = pad
+                value = torch.cat((value, value.new_zeros(shape)), dim=axis)
+            padded.append(value)
+            mask = torch.zeros(target, dtype=torch.bool, device=value.device)
+            mask[count:] = True
+            masks.append(mask)
+        return torch.stack(padded, dim=0), torch.stack(masks, dim=0)
+
+    def stack_optional(name, axis):
+        values = [getattr(scene, name) for scene, _ in batch]
+        if values[0] is None:
+            return None, None
+        return pad_track_axis(values, axis)
+
     gotit = [gotit for _, gotit in batch]
     video = torch.stack([b.video for b, _ in batch], dim=0)
     videodepth = torch.stack([b.videodepth for b, _ in batch], dim=0)
     segmentation = torch.stack([b.segmentation for b, _ in batch], dim=0)
     seq_name = [b.seq_name for b, _ in batch]
     intrs = torch.stack([b.intrs for b, _ in batch], dim=0)
+
+    trajectory, trajectory_padding = stack_optional("trajectory", -2)
+    trajectory_3d, trajectory_3d_padding = stack_optional("trajectory_3d", -2)
+    visibility, visibility_padding = stack_optional("visibility", -1)
+    valid, valid_padding = stack_optional("valid", -1)
+    query_points, query_points_padding = stack_optional("query_points", -2)
+    query_points_3d, query_points_3d_padding = stack_optional("query_points_3d", -2)
+    padding_masks = [
+        mask for mask in (
+            trajectory_padding,
+            trajectory_3d_padding,
+            visibility_padding,
+            valid_padding,
+            query_points_padding,
+            query_points_3d_padding,
+        ) if mask is not None
+    ]
+    if padding_masks:
+        max_tracks = max(mask.shape[1] for mask in padding_masks)
+        track_padding_mask = torch.zeros(
+            len(batch), max_tracks, dtype=torch.bool, device=padding_masks[0].device
+        )
+        for mask in padding_masks:
+            track_padding_mask[:, : mask.shape[1]] |= mask
+    else:
+        track_padding_mask = None
+    for scene_index, (scene, _) in enumerate(batch):
+        scene_padding_mask = getattr(scene, "track_padding_mask", None)
+        if scene_padding_mask is not None:
+            if track_padding_mask is None:
+                track_padding_mask = torch.zeros(
+                    len(batch), scene_padding_mask.shape[0], dtype=torch.bool
+                )
+            track_padding_mask[scene_index, : scene_padding_mask.shape[0]] |= scene_padding_mask
 
     videodepthconf = (
         torch.stack([b.videodepthconf for b, _ in batch], dim=0)
@@ -74,44 +204,21 @@ def collate_fn(batch):
         if batch[0][0].feats is not None
         else None
     )
-    trajectory = (
-        torch.stack([b.trajectory for b, _ in batch], dim=0)
-        if batch[0][0].trajectory is not None
-        else None
-    )
-    valid = (
-        torch.stack([b.valid for b, _ in batch], dim=0)
-        if batch[0][0].valid is not None
-        else None
-    )
-    visibility = (
-        torch.stack([b.visibility for b, _ in batch], dim=0)
-        if batch[0][0].visibility is not None
-        else None
-    )
-    trajectory_3d = (
-        torch.stack([b.trajectory_3d for b, _ in batch], dim=0)
-        if batch[0][0].trajectory_3d is not None
-        else None
-    )
     extrs = (
         torch.stack([b.extrs for b, _ in batch], dim=0)
         if batch[0][0].extrs is not None
         else None
     )
-    query_points = (
-        torch.stack([b.query_points for b, _ in batch], dim=0)
-        if batch[0][0].query_points is not None
-        else None
-    )
-    query_points_3d = (
-        torch.stack([b.query_points_3d for b, _ in batch], dim=0)
-        if batch[0][0].query_points_3d is not None
-        else None
-    )
     sample_metadata = [b.sample_metadata for b, _ in batch]
 
-    track_upscaling_factor = batch[0][0].track_upscaling_factor
+    factor_values = [float(b.track_upscaling_factor) for b, _ in batch]
+    # Keep the AST-level loader benchmark's minimal torch stub usable while
+    # producing a real tensor with the runtime torch module.
+    track_upscaling_factor = (
+        torch.tensor(factor_values, dtype=torch.float32)
+        if hasattr(torch, "tensor")
+        else torch.stack(factor_values, dim=0)
+    )
 
     novel_video = None
     novel_intrs = None
@@ -138,6 +245,7 @@ def collate_fn(batch):
             query_points=query_points,
             query_points_3d=query_points_3d,
             sample_metadata=sample_metadata,
+            track_padding_mask=track_padding_mask,
             track_upscaling_factor=track_upscaling_factor,
             novel_video=novel_video,
             novel_intrs=novel_intrs,
