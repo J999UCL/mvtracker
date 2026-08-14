@@ -2,9 +2,29 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
+
 import torch
 import triton
 import triton.language as tl
+
+
+@lru_cache(maxsize=1)
+def _cuda_extension():
+    from torch.utils.cpp_extension import load
+
+    source_dir = Path(__file__).resolve().parent
+    return load(
+        name="mvtracker_indexed_correlation_cuda",
+        sources=[
+            str(source_dir / "indexed_correlation_cuda.cpp"),
+            str(source_dir / "indexed_correlation_cuda.cu"),
+        ],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3"],
+        verbose=False,
+    )
 
 
 @triton.jit
@@ -216,7 +236,6 @@ class _IndexedGroupedCorrelation(torch.autograd.Function):
         groups = ctx.groups
         channels_per_group = channels // groups
         grad_targets = torch.empty_like(targets)
-        grad_source = torch.zeros_like(source_features)
         block_channels = triton.next_power_of_2(channels_per_group)
 
         _correlation_target_backward_kernel[(batch_size * num_queries * groups,)](
@@ -236,26 +255,12 @@ class _IndexedGroupedCorrelation(torch.autograd.Function):
             BLOCK_K=triton.next_power_of_2(neighbors),
             BLOCK_C=block_channels,
         )
-        flat_grad_source = grad_source.view(-1, channels)
-        grouped_targets = targets.view(
-            batch_size, num_queries, groups, channels_per_group
+        grad_source = _cuda_extension().source_backward(
+            targets,
+            neighbor_indices,
+            grad_output,
+            source_features.shape[1],
         )
-        batch_offsets = (
-            torch.arange(batch_size, device=targets.device) * source_features.shape[1]
-        )[:, None]
-        neighbor_chunk = 8
-        for neighbor_start in range(0, neighbors, neighbor_chunk):
-            neighbor_end = min(neighbor_start + neighbor_chunk, neighbors)
-            flat_indices = (
-                neighbor_indices[:, :, neighbor_start:neighbor_end].to(torch.int64)
-                + batch_offsets[:, :, None]
-            ).reshape(-1)
-            contributions = grouped_targets[:, :, None] * grad_output[
-                :, :, neighbor_start:neighbor_end, :, None
-            ]
-            contributions = contributions.reshape(-1, channels)
-            contributions = contributions / (channels_per_group**0.5)
-            flat_grad_source.index_add_(0, flat_indices, contributions)
         return grad_targets, grad_source, None, None
 
 
