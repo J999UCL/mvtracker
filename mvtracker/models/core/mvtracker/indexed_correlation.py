@@ -243,12 +243,15 @@ class _IndexedGroupedCorrelation(torch.autograd.Function):
         batch_offsets = (
             torch.arange(batch_size, device=targets.device) * source_features.shape[1]
         )[:, None]
-        for neighbor in range(neighbors):
+        neighbor_chunk = 4
+        for neighbor_start in range(0, neighbors, neighbor_chunk):
+            neighbor_end = min(neighbor_start + neighbor_chunk, neighbors)
             flat_indices = (
-                neighbor_indices[:, :, neighbor].to(torch.int64) + batch_offsets
+                neighbor_indices[:, :, neighbor_start:neighbor_end].to(torch.int64)
+                + batch_offsets[:, :, None]
             ).reshape(-1)
-            contributions = grouped_targets * grad_output[
-                :, :, neighbor, :, None
+            contributions = grouped_targets[:, :, None] * grad_output[
+                :, :, neighbor_start:neighbor_end, :, None
             ]
             contributions = contributions.reshape(-1, channels)
             contributions = contributions / (channels_per_group**0.5)
