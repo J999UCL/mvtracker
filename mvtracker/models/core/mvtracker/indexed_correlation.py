@@ -58,75 +58,50 @@ def _cuda_extension():
                 os.environ[key] = value
 
 
-@triton.jit
-def _correlation_forward_kernel(
-    targets,
-    source,
-    indices,
-    output,
-    target_stride_b,
-    target_stride_m,
-    target_stride_c,
-    source_stride_b,
-    source_stride_n,
-    source_stride_c,
-    index_stride_b,
-    index_stride_m,
-    index_stride_k,
-    output_stride_b,
-    output_stride_m,
-    output_stride_k,
-    output_stride_g,
-    M,
-    K: tl.constexpr,
-    G: tl.constexpr,
-    C_PER_GROUP: tl.constexpr,
-    NORMALIZATION: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    group = pid % G
-    pid //= G
-    neighbor = pid % K
-    pid //= K
-    query = pid % M
-    batch = pid // M
+def _compiled_forward_expression(
+    targets: torch.Tensor,
+    source_features: torch.Tensor,
+    neighbor_indices: torch.Tensor,
+    groups: int,
+) -> torch.Tensor:
+    batch_size, num_queries, channels = targets.shape
+    num_points = source_features.shape[1]
+    neighbors = neighbor_indices.shape[-1]
+    channels_per_group = channels // groups
+    batch_offsets = (
+        torch.arange(
+            batch_size,
+            device=neighbor_indices.device,
+            dtype=neighbor_indices.dtype,
+        )
+        * num_points
+    )[:, None, None]
+    flat_indices = (neighbor_indices + batch_offsets).reshape(-1)
+    neighbor_features = source_features.reshape(
+        batch_size * num_points, channels
+    ).index_select(0, flat_indices)
+    neighbor_features = neighbor_features.view(
+        batch_size,
+        num_queries,
+        neighbors,
+        groups,
+        channels_per_group,
+    )
+    grouped_targets = targets.view(
+        batch_size, num_queries, groups, channels_per_group
+    )
+    correlations = torch.einsum(
+        "BMGc,BMKGc->BMKG", grouped_targets, neighbor_features
+    )
+    return correlations / (channels_per_group**0.5)
 
-    channels = tl.arange(0, BLOCK_C)
-    channel_mask = channels < C_PER_GROUP
-    source_index = tl.load(
-        indices
-        + batch * index_stride_b
-        + query * index_stride_m
-        + neighbor * index_stride_k
-    )
-    grouped_channels = group * C_PER_GROUP + channels
-    target_values = tl.load(
-        targets
-        + batch * target_stride_b
-        + query * target_stride_m
-        + grouped_channels * target_stride_c,
-        mask=channel_mask,
-        other=0.0,
-    ).to(tl.float32)
-    source_values = tl.load(
-        source
-        + batch * source_stride_b
-        + source_index * source_stride_n
-        + grouped_channels * source_stride_c,
-        mask=channel_mask,
-        other=0.0,
-    ).to(tl.float32)
-    correlation = tl.sum(target_values * source_values, axis=0)
-    correlation /= NORMALIZATION
-    tl.store(
-        output
-        + batch * output_stride_b
-        + query * output_stride_m
-        + neighbor * output_stride_k
-        + group * output_stride_g,
-        correlation,
-    )
+
+_compiled_forward = torch.compile(
+    _compiled_forward_expression,
+    backend="inductor",
+    fullgraph=True,
+    dynamic=True,
+)
 
 
 @triton.jit
@@ -228,32 +203,8 @@ def _eager_cpu_correlation(
 class _IndexedGroupedCorrelation(torch.autograd.Function):
     @staticmethod
     def forward(ctx, targets, source_features, neighbor_indices, groups):
-        batch_size, num_queries, channels = targets.shape
-        neighbors = neighbor_indices.shape[-1]
-        channels_per_group = channels // groups
-        output = torch.empty(
-            batch_size,
-            num_queries,
-            neighbors,
-            groups,
-            device=targets.device,
-            dtype=targets.dtype,
-        )
-        _correlation_forward_kernel[(batch_size * num_queries * neighbors * groups,)](
-            targets,
-            source_features,
-            neighbor_indices,
-            output,
-            *targets.stride(),
-            *source_features.stride(),
-            *neighbor_indices.stride(),
-            *output.stride(),
-            M=num_queries,
-            K=neighbors,
-            G=groups,
-            C_PER_GROUP=channels_per_group,
-            NORMALIZATION=channels_per_group**0.5,
-            BLOCK_C=triton.next_power_of_2(channels_per_group),
+        output = _compiled_forward(
+            targets, source_features, neighbor_indices, groups
         )
         ctx.save_for_backward(targets, source_features, neighbor_indices)
         ctx.groups = groups
