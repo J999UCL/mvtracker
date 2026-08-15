@@ -77,6 +77,7 @@ def _runtime_image() -> modal.Image:
         .env(
             {
                 "CUDA_HOME": "/usr/local/cuda",
+                "MVTRACKER_MODAL_COMMIT": commit,
                 "PYTHONPATH": f"{SOURCE_ROOT}:{SOURCE_ROOT / 'tools'}",
                 "TORCH_CUDA_ARCH_LIST": "9.0",
                 "TORCH_EXTENSIONS_DIR": "/tmp/torch-extensions",
