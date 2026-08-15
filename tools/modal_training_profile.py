@@ -73,7 +73,8 @@ def _runtime_image() -> modal.Image:
         .pip_install(
             "hf-xet",
             "nvidia-ml-py",
-            "spconv-cu120==2.3.8",
+            # Modal's mirror currently publishes cu120 through 2.3.6.
+            "spconv-cu120==2.3.6",
         )
         .run_commands(
             "python -m pip install --no-build-isolation flash-attn==2.8.3.post1",
