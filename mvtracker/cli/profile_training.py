@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import statistics
 import threading
 import time
@@ -102,6 +104,96 @@ def _build_loader(cfg, fabric, arguments):
         persistent_workers=arguments.workers > 0,
     )
     return loader
+
+
+def prepare_profile_batch(
+    *,
+    data_root: Path,
+    output: Path,
+    views: int,
+    batch_size: int,
+    trajectories: int = 2048,
+) -> dict:
+    arguments = SimpleNamespace(
+        data_root=data_root,
+        output=output,
+        checkpoint=output.with_suffix(".pth"),
+        views=views,
+        batch_size=batch_size,
+        trajectories=trajectories,
+        workers=0,
+        accumulation=1,
+        warmup_updates=0,
+        measure_updates=1,
+    )
+    cfg = _compose_config(arguments)
+    fabric = SimpleNamespace(world_size=1)
+    kwargs = KubricMultiViewDataset.from_name(
+        cfg.datasets.train.name,
+        cfg.datasets.root,
+        training_args=cfg,
+        fabric=fabric,
+        just_return_kwargs=True,
+    )
+    kwargs.update(
+        num_views=views,
+        views_to_return=None,
+        enable_variable_num_views_augs=False,
+        virtual_dataset_size=1000,
+    )
+    dataset = KubricMultiViewDataset(**kwargs)
+    accepted = []
+    attempted = 0
+    for virtual_index in range(len(dataset)):
+        attempted += 1
+        sample, gotit = dataset[virtual_index]
+        if not gotit or sample.trajectory.shape[-2] != trajectories:
+            continue
+        accepted.append((sample, True))
+        if len(accepted) == batch_size:
+            break
+    if len(accepted) != batch_size:
+        raise RuntimeError(
+            f"found {len(accepted)}/{batch_size} exact {trajectories}-track samples "
+            f"after {attempted} attempts"
+        )
+    batch, gotit = collate_fn(accepted)
+    if not all(gotit) or batch.video.shape[:2] != (batch_size, views):
+        raise RuntimeError("prepared profile batch has an unexpected shape")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(batch, output)
+    return {
+        "path": str(output),
+        "views": views,
+        "batch_size": batch_size,
+        "trajectories": trajectories,
+        "attempted_samples": attempted,
+        "bytes": output.stat().st_size,
+    }
+
+
+def _slice_cached_batch(batch, trajectories: int):
+    track_axes = {
+        "trajectory": -2,
+        "trajectory_3d": -2,
+        "visibility": -1,
+        "valid": -1,
+        "query_points": -2,
+        "query_points_3d": -2,
+        "track_padding_mask": -1,
+    }
+    for name, axis in track_axes.items():
+        value = getattr(batch, name)
+        if value is None:
+            continue
+        if value.shape[axis] < trajectories:
+            raise ValueError(
+                f"cached batch has only {value.shape[axis]} tracks in {name}"
+            )
+        index = [slice(None)] * value.ndim
+        index[axis] = slice(0, trajectories)
+        setattr(batch, name, value[tuple(index)])
+    return batch
 
 
 def _events(count: int) -> list[torch.cuda.Event]:
@@ -227,8 +319,13 @@ def run(arguments) -> dict:
     model, optimizer = fabric.setup(model, optimizer)
     fabric.load_raw(str(arguments.checkpoint), model)
     model.train()
-    loader = _build_loader(cfg, fabric, arguments)
-    iterator = iter(loader)
+    if arguments.batch_cache is None:
+        loader = _build_loader(cfg, fabric, arguments)
+        iterator = iter(loader)
+    else:
+        batch = torch.load(arguments.batch_cache, map_location="cpu", weights_only=False)
+        batch = _slice_cached_batch(batch, arguments.trajectories)
+        iterator = itertools.repeat((batch, [True] * arguments.batch_size))
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -286,6 +383,7 @@ def _arguments():
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--batch-cache", type=Path)
     parser.add_argument("--views", type=int, required=True)
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--accumulation", type=int, required=True)

@@ -22,6 +22,7 @@ PROFILE_GPU = "H100!"
 SOURCE_ROOT = Path("/opt/mvtracker")
 DATA_ROOT = Path("/mnt/mvtracker-data")
 RUN_ROOT = Path("/mnt/mvtracker-runs")
+PROFILE_BATCH_ROOT = DATA_ROOT / "profile-batches"
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -131,6 +132,55 @@ def setup_data_remote() -> dict:
     return manifest
 
 
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): data_volume},
+    cpu=8,
+    memory=32768,
+    timeout=4 * 60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def prepare_profile_batches_remote() -> dict:
+    import wandb
+
+    from mvtracker.cli.profile_training import prepare_profile_batch
+    from mvtracker.profiling.modal_training import PROFILE_CASES, ProfileCase
+
+    run = wandb.init(
+        project="mvtracker-modal-profiling",
+        job_type="batch-preparation",
+        tags=["modal", "cpu", "mv-kubric-micro"],
+        config={"source_commit": _source_commit(), "trajectories": 2048},
+    )
+    results = []
+    cases = (ProfileCase(views=1, batch_size=1, accumulation=1), *PROFILE_CASES)
+    for case in cases:
+        results.append(
+            prepare_profile_batch(
+                data_root=DATA_ROOT / "datasets",
+                output=PROFILE_BATCH_ROOT / f"{case.name}.pt",
+                views=case.views,
+                batch_size=case.batch_size,
+            )
+        )
+    data_volume.commit()
+    for index, result in enumerate(results):
+        run.log(
+            {
+                "batch/index": index,
+                "batch/views": result["views"],
+                "batch/batch_size": result["batch_size"],
+                "batch/attempted_samples": result["attempted_samples"],
+                "batch/bytes": result["bytes"],
+            },
+            step=index,
+        )
+    run.finish()
+    return {"batches": results}
+
+
 def _trial_command(case, trajectories, warmup, measured, output):
     return [
         sys.executable,
@@ -142,6 +192,8 @@ def _trial_command(case, trajectories, warmup, measured, output):
         str(DATA_ROOT / "checkpoints/mvtracker_200000_june2025_cleandepth.pth"),
         "--output",
         str(output),
+        "--batch-cache",
+        str(PROFILE_BATCH_ROOT / f"{case.name}.pt"),
         "--views",
         str(case.views),
         "--batch-size",
@@ -335,6 +387,11 @@ def setup_data() -> None:
 def smoke(run_name: str = "") -> None:
     selected = run_name or _default_run_name("smoke")
     print(json.dumps(profile_remote.remote("smoke", selected), indent=2))
+
+
+@app.local_entrypoint(name="prepare-batches")
+def prepare_batches() -> None:
+    print(json.dumps(prepare_profile_batches_remote.remote(), indent=2))
 
 
 @app.local_entrypoint(name="run-profile")
