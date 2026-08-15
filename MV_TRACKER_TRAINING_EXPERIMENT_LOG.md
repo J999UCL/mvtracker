@@ -334,3 +334,57 @@ This experiment succeeded as a proof of training signal but failed as a retentio
 - Its performance timings should not be compared directly with the current optimized training path.
 
 The clean follow-up experiment is therefore DIEGESIS fine-tuning with MV-Kubric replay, keeping the total update budget fixed and measuring both held-out DIEGESIS adaptation and MV-Kubric retention.
+
+## 2026-08-15 — Modal H100 single-device capacity profile
+
+### Question
+
+Measure how many trajectories per scene fit for the four proposed homogeneous-view microbatch shapes on one H100, without using DDP or more than one GPU. Every shape represents four scenes per optimizer update:
+
+| Views per scene | Physical batch | Accumulation |
+|---:|---:|---:|
+| 1 | 4 | 1 |
+| 2 | 4 | 1 |
+| 3 | 2 | 2 |
+| 4 | 2 | 2 |
+
+The search used the real clean-depth checkpoint, BF16 mixed precision, the optimized hybrid forward, real forward/loss/backward/gradient clipping/optimizer steps, 24 frames, and 384×512 MV-Kubric training samples. Candidate trajectory counts were 256 through 2,048 in increments of 256. A candidate was accepted only when observed peak GPU memory was no more than 90% of physical memory. The ceiling was probed first, followed by binary search and a confirmation run with two warm-up and three measured updates.
+
+### Data and execution
+
+The source revision was `5d450f267b40cfba32bb11a3e2800d592d4dccd1`. Modal used exactly one H100; no DDP or second GPU was launched. Before every GPU launch, active UCL Prism containers were counted and the launch was held unless a workspace slot was visibly free.
+
+To prevent an H100 from waiting on repeated MV-Kubric decoding, a CPU-only job first selected exact 2,048-trajectory samples and saved one reusable batch per shape. Smaller candidate counts used a deterministic prefix of the same batch. This makes the reported timing a model-step benchmark; it intentionally excludes steady-state dataset and JPEG decoding throughput.
+
+Artifacts:
+
+```text
+Modal data volume: jeet-mvtracker-data-v2/profile-batches/
+Modal run volume:  jeet-mvtracker-runs-v2/profile-20260815T210133Z/
+Summary:           jeet-mvtracker-runs-v2/profile-20260815T210133Z/summary.json
+```
+
+W&B:
+
+- Data setup: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/uzdjjkyk
+- CPU batch preparation: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/494gjy7f
+- Final cached smoke: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/ksrsqedm
+- Final capacity sweep: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/4dzchbit
+
+### Results
+
+| Views | Batch | Accum. | Selected trajectories/scene | Peak memory | Peak fraction | Median update | Scenes/s | Trajectories/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 1 | 768 | 73.87 GB | 86.89% | 1,124.6 ms | 3.56 | 2,732 |
+| 2 | 4 | 1 | 512 | 71.46 GB | 84.05% | 1,199.6 ms | 3.33 | 1,707 |
+| 3 | 2 | 2 | 1,280 | 72.16 GB | 84.87% | 2,444.6 ms | 1.64 | 2,094 |
+| 4 | 2 | 2 | 1,024 | 70.68 GB | 83.13% | 2,539.6 ms | 1.58 | 1,613 |
+
+Observed upper boundaries:
+
+- 1 view: 1,024 trajectories OOM; 768 confirmed safe.
+- 2 views: 768 trajectories OOM; 512 confirmed safe.
+- 3 views: 1,536 trajectories reached 97.11% memory and was rejected; 1,280 confirmed safe.
+- 4 views: 1,280 trajectories reached 94.28% memory and was rejected; 1,024 confirmed safe.
+
+The selected counts are the largest safe values on the tested 256-trajectory grid, not mathematical maxima. These are per-device capacities. With two-GPU DDP, each rank should use the same local shape; DDP should not assign different view-count shapes to different ranks within one synchronized optimizer step.
