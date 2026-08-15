@@ -193,6 +193,7 @@ def _slice_cached_batch(batch, trajectories: int):
         index = [slice(None)] * value.ndim
         index[axis] = slice(0, trajectories)
         setattr(batch, name, value[tuple(index)])
+    batch.track_padding_mask = batch.track_padding_mask.bool()
     return batch
 
 
@@ -230,7 +231,7 @@ def _run_update(
                 ) from error
             if all(gotit):
                 counts = [
-                    int((~batch.track_padding_mask[index]).sum().item())
+                    int((~batch.track_padding_mask[index].bool()).sum().item())
                     for index in range(arguments.batch_size)
                 ]
                 if all(count == arguments.trajectories for count in counts):
