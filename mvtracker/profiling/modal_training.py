@@ -6,25 +6,29 @@ from dataclasses import dataclass
 from typing import Callable
 
 
-TRAJECTORY_CANDIDATES = (256, 512, 768, 1024, 1280, 1536, 1792, 2048)
+TRAJECTORY_CANDIDATES = (1024, 2048)
+BATCH_CANDIDATES = tuple(range(1, 9))
 
 
 @dataclass(frozen=True)
 class ProfileCase:
     views: int
-    batch_size: int
-    accumulation: int
+    trajectories: int
+    batch_size: int = 1
+    accumulation: int = 1
 
     @property
     def name(self) -> str:
-        return f"views{self.views}-batch{self.batch_size}-accum{self.accumulation}"
+        return (
+            f"views{self.views}-traj{self.trajectories}-"
+            f"batch{self.batch_size}-accum{self.accumulation}"
+        )
 
 
-PROFILE_CASES = (
-    ProfileCase(views=1, batch_size=4, accumulation=1),
-    ProfileCase(views=2, batch_size=4, accumulation=1),
-    ProfileCase(views=3, batch_size=2, accumulation=2),
-    ProfileCase(views=4, batch_size=2, accumulation=2),
+PROFILE_CASES = tuple(
+    ProfileCase(views=views, trajectories=trajectories)
+    for views in range(1, 5)
+    for trajectories in TRAJECTORY_CANDIDATES
 )
 
 
@@ -43,8 +47,13 @@ class TrialResult:
 
 @dataclass(frozen=True)
 class SearchResult:
-    selected_trajectories: int | None
+    selected: int | None
     trials: tuple[TrialResult, ...]
+
+    @property
+    def selected_trajectories(self) -> int | None:
+        """Compatibility alias for callers of the original search helper."""
+        return self.selected
 
 
 def is_memory_safe(
@@ -92,6 +101,14 @@ def find_largest_safe(
         else:
             high = middle - 1
     return SearchResult(selected, tuple(trials))
+
+
+def find_largest_safe_batch(
+    probe: Callable[[int], TrialResult],
+    candidates: tuple[int, ...] = BATCH_CANDIDATES,
+) -> SearchResult:
+    """Find the largest safe physical batch using a monotonic search."""
+    return find_largest_safe(probe, candidates)
 
 
 def validate_gpu_request(spec: str, *, max_gpus: int = 1) -> int:

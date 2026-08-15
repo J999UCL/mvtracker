@@ -4,10 +4,13 @@ import torch
 
 from mvtracker.models.core.embeddings import get_3d_sincos_pos_embed_from_grid
 from mvtracker.profiling.modal_training import (
+    BATCH_CANDIDATES,
     TRAJECTORY_CANDIDATES,
+    PROFILE_CASES,
     SearchResult,
     TrialResult,
     find_largest_safe,
+    find_largest_safe_batch,
     is_memory_safe,
     validate_gpu_request,
 )
@@ -28,8 +31,16 @@ class ModalTrainingProfileTests(unittest.TestCase):
     def test_trajectory_candidates_cover_planned_search_space(self):
         self.assertEqual(
             TRAJECTORY_CANDIDATES,
-            (256, 512, 768, 1024, 1280, 1536, 1792, 2048),
+            (1024, 2048),
         )
+
+    def test_profile_matrix_is_four_views_by_two_trajectory_targets(self):
+        self.assertEqual(len(PROFILE_CASES), 8)
+        self.assertEqual(
+            {(case.views, case.trajectories) for case in PROFILE_CASES},
+            {(views, trajectories) for views in range(1, 5) for trajectories in (1024, 2048)},
+        )
+        self.assertEqual(BATCH_CANDIDATES, tuple(range(1, 9)))
 
     def test_memory_safety_includes_ninety_percent_boundary(self):
         total_bytes = 80_000
@@ -42,13 +53,13 @@ class ModalTrainingProfileTests(unittest.TestCase):
 
         def probe(trajectories):
             probed.append(trajectories)
-            status = "safe" if trajectories <= 1280 else "unsafe"
+            status = "safe" if trajectories <= 1024 else "unsafe"
             return TrialResult(trajectories=trajectories, status=status)
 
         result = find_largest_safe(probe)
 
-        self.assertEqual(result.selected_trajectories, 1280)
-        self.assertEqual(probed, [2048, 1024, 1536, 1280])
+        self.assertEqual(result.selected_trajectories, 1024)
+        self.assertEqual(probed, [2048, 1024])
         self.assertEqual(
             tuple(trial.trajectories for trial in result.trials),
             tuple(probed),
@@ -62,9 +73,9 @@ class ModalTrainingProfileTests(unittest.TestCase):
         self.assertEqual(result.selected_trajectories, 2048)
         self.assertEqual(result.trials, (TrialResult(2048, "safe"),))
 
-    def test_oom_trial_is_recorded_and_search_continues(self):
+    def test_batch_search_uses_eight_as_ceiling_and_continues_after_oom(self):
         def probe(trajectories):
-            if trajectories == 1536:
+            if trajectories == 6:
                 return TrialResult(
                     trajectories=trajectories,
                     status="oom",
@@ -72,20 +83,20 @@ class ModalTrainingProfileTests(unittest.TestCase):
                     total_memory_bytes=80_000,
                     result_path="trials/1536.json",
                 )
-            status = "safe" if trajectories <= 1280 else "unsafe"
+            status = "safe" if trajectories <= 4 else "unsafe"
             return TrialResult(trajectories=trajectories, status=status)
 
-        result = find_largest_safe(probe)
+        result = find_largest_safe_batch(probe)
 
         self.assertIsInstance(result, SearchResult)
-        self.assertEqual(result.selected_trajectories, 1280)
+        self.assertEqual(result.selected_trajectories, 4)
         self.assertEqual(
             [(trial.trajectories, trial.status) for trial in result.trials],
             [
-                (2048, "unsafe"),
-                (1024, "safe"),
-                (1536, "oom"),
-                (1280, "safe"),
+                (8, "unsafe"),
+                (4, "safe"),
+                (6, "oom"),
+                (5, "unsafe"),
             ],
         )
         oom_trial = result.trials[2]
@@ -95,7 +106,8 @@ class ModalTrainingProfileTests(unittest.TestCase):
 
     def test_search_returns_none_when_no_candidate_is_safe(self):
         result = find_largest_safe(
-            lambda trajectories: TrialResult(trajectories, "oom")
+            lambda trajectories: TrialResult(trajectories, "oom"),
+            candidates=BATCH_CANDIDATES,
         )
 
         self.assertIsNone(result.selected_trajectories)

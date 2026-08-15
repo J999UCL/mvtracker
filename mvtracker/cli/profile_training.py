@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import itertools
 import json
 import os
@@ -172,7 +173,25 @@ def prepare_profile_batch(
     }
 
 
-def _slice_cached_batch(batch, trajectories: int):
+def _slice_cached_batch(batch, batch_size: int, trajectories: int):
+    cached_batch_size = int(batch.video.shape[0])
+    if not 1 <= batch_size <= cached_batch_size:
+        raise ValueError(
+            f"requested batch size {batch_size} is outside cached batch size "
+            f"{cached_batch_size}"
+        )
+    for field in dataclasses.fields(batch):
+        value = getattr(batch, field.name)
+        if isinstance(value, torch.Tensor) and value.ndim > 0:
+            if value.shape[0] != cached_batch_size:
+                raise ValueError(
+                    f"cached batch field {field.name} has leading shape "
+                    f"{value.shape[0]}, expected {cached_batch_size}"
+                )
+            setattr(batch, field.name, value[:batch_size])
+        elif isinstance(value, list) and len(value) == cached_batch_size:
+            setattr(batch, field.name, value[:batch_size])
+
     track_axes = {
         "trajectory": -2,
         "trajectory_3d": -2,
@@ -305,6 +324,14 @@ def run(arguments) -> dict:
     if not 1 <= arguments.views <= 4:
         raise ValueError("views must be between one and four")
 
+    if arguments.gpu_lane is not None:
+        expected_name = arguments.gpu_lane.rstrip("!").upper()
+        actual_name = torch.cuda.get_device_name().upper()
+        if expected_name not in actual_name:
+            raise RuntimeError(
+                f"requested GPU lane {arguments.gpu_lane!r}, got {actual_name!r}"
+            )
+
     import flash_attn  # noqa: F401
     from mvtracker.models.core.mvtracker import mvtracker as mvtracker_module
 
@@ -325,7 +352,9 @@ def run(arguments) -> dict:
         iterator = iter(loader)
     else:
         batch = torch.load(arguments.batch_cache, map_location="cpu", weights_only=False)
-        batch = _slice_cached_batch(batch, arguments.trajectories)
+        batch = _slice_cached_batch(
+            batch, arguments.batch_size, arguments.trajectories
+        )
         iterator = itertools.repeat((batch, [True] * arguments.batch_size))
 
     torch.cuda.empty_cache()
@@ -379,19 +408,46 @@ def run(arguments) -> dict:
     }
 
 
+def compatibility_check(gpu_lane: str | None = None) -> dict[str, str | bool]:
+    """Import every required compiled backend on exactly one visible GPU."""
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError("compatibility check requires exactly one visible GPU")
+    actual_name = torch.cuda.get_device_name().upper()
+    if gpu_lane is not None and gpu_lane.rstrip("!").upper() not in actual_name:
+        raise RuntimeError(
+            f"requested GPU lane {gpu_lane!r}, got {actual_name!r}"
+        )
+    import flash_attn
+    import pointops
+    import spconv
+
+    from mvtracker.models.core.mvtracker import indexed_correlation
+
+    return {
+        "gpu": actual_name,
+        "torch": torch.__version__,
+        "flash_attn": getattr(flash_attn, "__version__", "unknown"),
+        "pointops": getattr(pointops, "__version__", "installed"),
+        "spconv": getattr(spconv, "__version__", "installed"),
+        "indexed_correlation_source": str(indexed_correlation.__file__),
+    }
+
+
 def _arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-cache", type=Path)
-    parser.add_argument("--views", type=int, required=True)
-    parser.add_argument("--batch-size", type=int, required=True)
-    parser.add_argument("--accumulation", type=int, required=True)
-    parser.add_argument("--trajectories", type=int, required=True)
-    parser.add_argument("--warmup-updates", type=int, required=True)
-    parser.add_argument("--measure-updates", type=int, required=True)
+    parser.add_argument("--views", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--accumulation", type=int)
+    parser.add_argument("--trajectories", type=int)
+    parser.add_argument("--warmup-updates", type=int)
+    parser.add_argument("--measure-updates", type=int)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--gpu-lane", choices=("H100!", "H200", "B200"))
+    parser.add_argument("--compatibility-only", action="store_true")
     return parser.parse_args()
 
 
@@ -399,7 +455,27 @@ def main() -> None:
     arguments = _arguments()
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     try:
-        result = run(arguments)
+        if arguments.compatibility_only:
+            result = {
+                "status": "compatible",
+                **compatibility_check(arguments.gpu_lane),
+            }
+        else:
+            required = (arguments.data_root, arguments.checkpoint)
+            required += (
+                arguments.views,
+                arguments.batch_size,
+                arguments.accumulation,
+                arguments.trajectories,
+                arguments.warmup_updates,
+                arguments.measure_updates,
+            )
+            if any(value is None for value in required):
+                raise ValueError(
+                    "all data, shape, and measurement arguments are required "
+                    "for profiling"
+                )
+            result = run(arguments)
     except torch.cuda.OutOfMemoryError as error:
         total_memory = int(torch.cuda.get_device_properties(0).total_memory)
         result = {
