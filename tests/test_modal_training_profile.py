@@ -1,5 +1,8 @@
 import unittest
 
+import torch
+
+from mvtracker.models.core.embeddings import get_3d_sincos_pos_embed_from_grid
 from mvtracker.profiling.modal_training import (
     TRAJECTORY_CANDIDATES,
     SearchResult,
@@ -11,6 +14,17 @@ from mvtracker.profiling.modal_training import (
 
 
 class ModalTrainingProfileTests(unittest.TestCase):
+    def test_3d_embedding_accepts_bfloat16_coordinates(self):
+        grid = torch.tensor(
+            [[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]],
+            dtype=torch.bfloat16,
+        )
+
+        actual = get_3d_sincos_pos_embed_from_grid(12, grid)
+        expected = get_3d_sincos_pos_embed_from_grid(12, grid.float())
+
+        torch.testing.assert_close(actual, expected)
+
     def test_trajectory_candidates_cover_planned_search_space(self):
         self.assertEqual(
             TRAJECTORY_CANDIDATES,
