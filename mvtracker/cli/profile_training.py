@@ -18,12 +18,12 @@ import torch
 
 from mvtracker.cli.train import (
     _scale_microbatch_loss,
+    dataclass_to_cuda_,
     fetch_optimizer,
     forward_batch_multi_view,
 )
-from mvtracker.datasets import TapVid3DMultiViewDataset
-from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
-from mvtracker.datasets.utils import HomogeneousViewBatchSampler
+from mvtracker.datasets import KubricMultiViewDataset
+from mvtracker.datasets.utils import collate_fn
 from mvtracker.profiling.modal_training import is_memory_safe
 
 
@@ -57,22 +57,20 @@ class _NvmlPeak:
 
 
 def _compose_config(arguments):
-    os.environ["DIEGESIS_MVTRACKER_ROOT"] = str(arguments.data_root)
     config_dir = Path(__file__).resolve().parents[2] / "configs"
-    probabilities = [0.0] * 4
-    probabilities[arguments.views - 1] = 1.0
     overrides = [
         "+experiment=diegesis",
         f"experiment_path={arguments.output.parent}",
         f"restore_ckpt_path={arguments.checkpoint}",
         f"datasets.root={arguments.data_root}",
+        "datasets.train.name=kubric-multiview-v3-training",
         f"datasets.train.batch_size={arguments.batch_size}",
         f"datasets.train.traj_per_sample={arguments.trajectories}",
         f"datasets.train.num_workers={arguments.workers}",
         f"trainer.gradient_accumulation_steps={arguments.accumulation}",
         f"trainer.num_steps={arguments.warmup_updates + arguments.measure_updates + 10}",
-        f"datasets.tapvid3d_view_count_probabilities={probabilities}",
         "augmentations.variable_trajpersample=false",
+        "augmentations.variable_num_views=false",
         "logging.log_wandb=false",
         "datasets.eval.names=[]",
     ]
@@ -81,28 +79,29 @@ def _compose_config(arguments):
 
 
 def _build_loader(cfg, fabric, arguments):
-    dataset = TapVid3DMultiViewDataset.from_name(
+    kwargs = KubricMultiViewDataset.from_name(
         cfg.datasets.train.name,
         cfg.datasets.root,
-        cfg,
-        fabric,
+        training_args=cfg,
+        fabric=fabric,
+        just_return_kwargs=True,
     )
-    sampler = HomogeneousViewBatchSampler(
-        dataset,
-        arguments.batch_size,
-        seed=int(cfg.reproducibility.seed),
-        view_count_probabilities=cfg.datasets.tapvid3d_view_count_probabilities,
+    kwargs.update(
+        num_views=arguments.views,
+        views_to_return=None,
+        enable_variable_num_views_augs=False,
     )
+    dataset = KubricMultiViewDataset(**kwargs)
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_sampler=sampler,
+        batch_size=arguments.batch_size,
         num_workers=arguments.workers,
         pin_memory=True,
-        collate_fn=dataset.collate_fn,
+        collate_fn=collate_fn,
         prefetch_factor=2,
         persistent_workers=arguments.workers > 0,
     )
-    return CudaPrefetchLoader(loader, fabric.device)
+    return loader
 
 
 def _events(count: int) -> list[torch.cuda.Event]:
@@ -130,26 +129,34 @@ def _run_update(
 
     for _ in range(arguments.accumulation):
         load_started = time.perf_counter()
-        batch, gotit = next(iterator)
+        for _ in range(16):
+            try:
+                batch, gotit = next(iterator)
+            except StopIteration as error:
+                raise RuntimeError(
+                    "profile dataset exhausted before producing an exact batch"
+                ) from error
+            if all(gotit):
+                counts = [
+                    int((~batch.track_padding_mask[index]).sum().item())
+                    for index in range(arguments.batch_size)
+                ]
+                if all(count == arguments.trajectories for count in counts):
+                    break
+        else:
+            raise RuntimeError(
+                "profile dataset did not produce an exact batch in 16 attempts"
+            )
         data_wait_seconds += time.perf_counter() - load_started
-        if not all(gotit):
-            raise RuntimeError("profile dataset returned an invalid sample")
         if batch.video.shape[0] != arguments.batch_size:
             raise RuntimeError("profile batch size differs from the request")
         if batch.video.shape[1] != arguments.views:
             raise RuntimeError("profile view count differs from the request")
-        source_tracks.extend(
-            int((~batch.track_padding_mask[index]).sum().item())
-            for index in range(arguments.batch_size)
-        )
-        if any(count != arguments.trajectories for count in source_tracks):
-            raise RuntimeError(
-                "profile samples did not realize the requested trajectory count: "
-                f"requested={arguments.trajectories}, actual={source_tracks}"
-            )
-        for metadata in batch.sample_metadata:
-            jpeg_decode_ms += float(metadata["gpu_jpeg_decode_ms"])
-            gpu_prepare_ms += float(metadata["gpu_prepare_total_ms"])
+        source_tracks.extend(counts)
+        for metadata in batch.sample_metadata or ():
+            jpeg_decode_ms += float(metadata.get("gpu_jpeg_decode_ms", 0.0))
+            gpu_prepare_ms += float(metadata.get("gpu_prepare_total_ms", 0.0))
+        dataclass_to_cuda_(batch)
 
         forward_start, forward_end, backward_end = _events(3)
         forward_start.record()

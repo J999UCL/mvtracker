@@ -137,7 +137,7 @@ def _trial_command(case, trajectories, warmup, measured, output):
         "-m",
         "mvtracker.cli.profile_training",
         "--data-root",
-        str(DATA_ROOT / "datasets/diegesis-mvtracker"),
+        str(DATA_ROOT / "datasets"),
         "--checkpoint",
         str(DATA_ROOT / "checkpoints/mvtracker_200000_june2025_cleandepth.pth"),
         "--output",
@@ -199,7 +199,7 @@ def profile_remote(mode: str, run_name: str) -> dict:
         project="mvtracker-modal-profiling",
         job_type="training-shape-profile",
         name=run_name,
-        tags=["modal", "h100", mode, "diegesis"],
+        tags=["modal", "h100", mode, "mv-kubric-micro"],
         config={
             "source_commit": _source_commit(),
             "gpu": PROFILE_GPU,
