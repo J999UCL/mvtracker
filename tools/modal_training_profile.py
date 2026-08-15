@@ -67,7 +67,12 @@ def _runtime_image() -> modal.Image:
         .run_commands(
             "python -m pip install --no-build-isolation flash-attn==2.8.3.post1",
             "python -m pip install 'git+https://github.com/ethz-vlg/pointcept.git@2082918#subdirectory=libs/pointops'",
-            env={"CUDA_HOME": "/usr/local/cuda", "TORCH_CUDA_ARCH_LIST": "9.0"},
+            env={
+                "CC": "gcc",
+                "CXX": "g++",
+                "CUDA_HOME": "/usr/local/cuda",
+                "TORCH_CUDA_ARCH_LIST": "9.0",
+            },
         )
         .env(
             {
