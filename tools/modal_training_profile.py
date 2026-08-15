@@ -19,6 +19,7 @@ RUN_VOLUME_NAME = "jeet-mvtracker-runs-v2"
 HF_SECRET_NAME = "jeet-mvtracker-huggingface"
 WANDB_SECRET_NAME = "jeet-mvtracker-wandb"
 PROFILE_GPU = "H100!"
+RUNTIME_BASE_IMAGE_ID = "im-CzTntvGDwmbFTwu4p6U8Hf"
 SOURCE_ROOT = Path("/opt/mvtracker")
 DATA_ROOT = Path("/mnt/mvtracker-data")
 RUN_ROOT = Path("/mnt/mvtracker-runs")
@@ -44,37 +45,8 @@ def _runtime_image() -> modal.Image:
         f'test "$(git -C /opt/mvtracker rev-parse HEAD)" = "{commit}"'
     )
     return (
-        modal.Image.from_registry(
-            "nvidia/cuda:12.1.1-devel-ubuntu22.04",
-            add_python="3.11",
-        )
-        .apt_install(
-            "build-essential",
-            "ffmpeg",
-            "git",
-            "libgl1",
-            "libglib2.0-0",
-            "ninja-build",
-            "python3-dev",
-        )
-        .pip_install(
-            "torch==2.5.1",
-            "torchvision==0.20.1",
-            index_url="https://download.pytorch.org/whl/cu121",
-        )
-        .run_commands(clone)
-        .run_commands("python -m pip install -r /opt/mvtracker/requirements.full.txt")
-        .pip_install("hf-xet", "nvidia-ml-py")
-        .run_commands(
-            "python -m pip install --no-build-isolation flash-attn==2.8.3.post1",
-            "python -m pip install 'git+https://github.com/ethz-vlg/pointcept.git@2082918#subdirectory=libs/pointops'",
-            env={
-                "CC": "gcc",
-                "CXX": "g++",
-                "CUDA_HOME": "/usr/local/cuda",
-                "TORCH_CUDA_ARCH_LIST": "9.0",
-            },
-        )
+        modal.Image.from_id(RUNTIME_BASE_IMAGE_ID)
+        .run_commands("rm -rf /opt/mvtracker", clone)
         .env(
             {
                 "CUDA_HOME": "/usr/local/cuda",
