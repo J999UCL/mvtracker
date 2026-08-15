@@ -94,7 +94,7 @@ def find_largest_safe(
     return SearchResult(selected, tuple(trials))
 
 
-def validate_gpu_request(spec: str, *, max_gpus: int = 2) -> int:
+def validate_gpu_request(spec: str, *, max_gpus: int = 1) -> int:
     """Return the requested GPU count after enforcing the project ceiling."""
     if not spec or isinstance(spec, (list, tuple)):
         raise ValueError("GPU request must be one explicit Modal GPU string")

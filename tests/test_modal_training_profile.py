@@ -88,13 +88,12 @@ class ModalTrainingProfileTests(unittest.TestCase):
         self.assertTrue(result.trials)
         self.assertTrue(all(trial.status == "oom" for trial in result.trials))
 
-    def test_gpu_request_parser_enforces_two_gpu_hard_limit(self):
+    def test_gpu_request_parser_enforces_one_gpu_hard_limit(self):
         self.assertEqual(validate_gpu_request("H100!"), 1)
-        self.assertEqual(validate_gpu_request("H100!:2"), 2)
 
-        with self.assertRaisesRegex(ValueError, "hard limit of 2"):
-            validate_gpu_request("H100!:3")
-        with self.assertRaisesRegex(ValueError, "hard limit of 2"):
+        with self.assertRaisesRegex(ValueError, "hard limit of 1"):
+            validate_gpu_request("H100!:2")
+        with self.assertRaisesRegex(ValueError, "hard limit of 1"):
             validate_gpu_request("H100!:8")
 
     def test_gpu_request_cap_is_configurable_but_never_implicit(self):
