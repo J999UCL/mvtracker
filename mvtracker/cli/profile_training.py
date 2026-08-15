@@ -425,7 +425,7 @@ def compatibility_check(gpu_lane: str | None = None) -> dict[str, str | bool]:
 
     return {
         "gpu": actual_name,
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "flash_attn": getattr(flash_attn, "__version__", "unknown"),
         "pointops": getattr(pointops, "__version__", "installed"),
         "spconv": getattr(spconv, "__version__", "installed"),

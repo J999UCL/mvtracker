@@ -173,14 +173,14 @@ def validate_common_image_remote() -> dict:
 
     versions = {
         "python": __import__("platform").python_version(),
-        "torch": torch.__version__,
+        "torch": str(torch.__version__),
         "torchvision": importlib.metadata.version("torchvision"),
         "torchaudio": importlib.metadata.version("torchaudio"),
         "flash_attn": getattr(flash_attn, "__version__", "unknown"),
         "pointops": getattr(pointops, "__version__", "installed"),
         "spconv": getattr(spconv, "__version__", "installed"),
         "triton": triton.__version__,
-        "cuda_runtime": torch.version.cuda,
+        "cuda_runtime": str(torch.version.cuda),
         "cuda_available": torch.cuda.is_available(),
     }
     run = wandb.init(
