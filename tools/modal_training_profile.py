@@ -100,7 +100,7 @@ wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME, required_keys=["WANDB_A
     volumes={str(DATA_ROOT): data_volume},
     cpu=8,
     memory=32768,
-    ephemeral_disk=100 * 1024,
+    ephemeral_disk=512 * 1024,
     timeout=4 * 60 * 60,
     max_containers=1,
     include_source=False,
