@@ -77,7 +77,7 @@ def _runtime_image() -> modal.Image:
         .env(
             {
                 "CUDA_HOME": "/usr/local/cuda",
-                "PYTHONPATH": str(SOURCE_ROOT),
+                "PYTHONPATH": f"{SOURCE_ROOT}:{SOURCE_ROOT / 'tools'}",
                 "TORCH_CUDA_ARCH_LIST": "9.0",
                 "TORCH_EXTENSIONS_DIR": "/tmp/torch-extensions",
                 "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor",
