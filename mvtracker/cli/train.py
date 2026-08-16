@@ -37,6 +37,7 @@ from mvtracker.datasets import (
     TapVid3DMultiViewDataset,
 )
 from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
+from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
 from mvtracker.datasets import TapVidDataset
 from mvtracker.datasets import kubric_multiview_dataset
 from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
@@ -249,9 +250,12 @@ def _reduce_scalar(fabric, value, reduce_op="mean"):
     return float(fabric.all_reduce(tensor, reduce_op=reduce_op).item())
 
 
-def _reduce_scalar_dict(fabric, values):
+def _reduce_scalar_dict(fabric, values, reduce_op="mean"):
     """Reduce a same-key scalar mapping, including future per-source metrics."""
-    return {name: _reduce_scalar(fabric, value) for name, value in values.items()}
+    return {
+        name: _reduce_scalar(fabric, value, reduce_op=reduce_op)
+        for name, value in values.items()
+    }
 
 
 def _all_ranks_succeeded(fabric, succeeded):
@@ -288,11 +292,14 @@ def _write_latest_checkpoint_manifest(experiment_path, checkpoint_path, complete
     temporary_path.replace(manifest_path)
 
 
-def _get_or_create_wandb_run_id(experiment_path):
+def _get_or_create_wandb_run_id(experiment_path, configured_run_id=None):
     run_id_path = Path(experiment_path) / WANDB_RUN_ID_FILE
     if run_id_path.is_file():
-        return run_id_path.read_text(encoding="utf-8").strip()
-    run_id = wandb.util.generate_id()
+        persisted_run_id = run_id_path.read_text(encoding="utf-8").strip()
+        if configured_run_id and configured_run_id != persisted_run_id:
+            raise ValueError("configured W&B run ID does not match wandb_run_id.txt")
+        return persisted_run_id
+    run_id = configured_run_id or wandb.util.generate_id()
     run_id_path.write_text(run_id + "\n", encoding="utf-8")
     return run_id
 
@@ -307,6 +314,8 @@ def _save_training_checkpoint(
     completed_steps,
     master_seed,
     wandb_run_id,
+    mixed_schedule_state=None,
+    source_cursors=None,
 ):
     state = AttributeDict(
         model=model,
@@ -316,6 +325,9 @@ def _save_training_checkpoint(
         master_seed=int(master_seed),
         wandb_run_id=wandb_run_id or "",
     )
+    if mixed_schedule_state is not None:
+        state.mixed_schedule_state = mixed_schedule_state
+        state.source_cursors = dict(source_cursors)
     fabric.save(checkpoint_path, state)
     fabric.barrier()
     if fabric.global_rank == 0:
@@ -325,6 +337,114 @@ def _save_training_checkpoint(
             completed_steps,
         )
     fabric.barrier()
+
+
+class _ScheduledSourceSampler(torch.utils.data.Sampler):
+    """Feed one source loader deterministic rank-local scene requests."""
+
+    def __init__(self, schedule, source, rank, request_count):
+        self.schedule = schedule
+        self.source = source
+        self.rank = int(rank)
+        self.request_count = int(request_count)
+        self.start_cursor = 0
+
+    def __len__(self):
+        return self.request_count
+
+    def set_start_cursor(self, cursor):
+        self.start_cursor = int(cursor)
+
+    def __iter__(self):
+        for offset in range(self.request_count):
+            yield self.schedule.sample_source(
+                self.source,
+                self.start_cursor + offset,
+                self.rank,
+            ).request
+
+
+def _mixed_source_name(cfg):
+    return cfg.datasets.train.name == "mixed-diegesis-mvkubric-training"
+
+
+def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=None):
+    include_scene_ids = (
+        source_cfg.get("include_scene_ids") if source_cfg is not None else None
+    )
+    exclude_scene_ids = (
+        source_cfg.get("exclude_scene_ids", ()) if source_cfg is not None else ()
+    )
+    if dataset_name.startswith("kubric-multiview-v3"):
+        return KubricMultiViewDataset.from_name(
+            dataset_name,
+            dataset_root,
+            cfg,
+            fabric,
+            include_scene_ids=include_scene_ids,
+            exclude_scene_ids=exclude_scene_ids,
+        )
+    if dataset_name.startswith("pointodyssey-multiview-"):
+        return PointOdysseyMultiViewDataset.from_name(
+            dataset_name, dataset_root, cfg, fabric
+        )
+    if dataset_name.startswith("tapvid3d-multiview-"):
+        kwargs = TapVid3DMultiViewDataset.from_name(
+            dataset_name,
+            dataset_root,
+            cfg,
+            fabric,
+            just_return_kwargs=True,
+            include_scene_ids=include_scene_ids,
+            exclude_scene_ids=exclude_scene_ids,
+        )
+        if source_cfg is not None and "view_count_probabilities" in source_cfg:
+            kwargs["view_count_probabilities"] = tuple(
+                source_cfg.view_count_probabilities
+            )
+        return TapVid3DMultiViewDataset(**kwargs)
+    raise ValueError(f"Dataset {dataset_name} not supported for training")
+
+
+def _source_batch_shape_metrics(batch):
+    view_count = int(batch.video.shape[1])
+    if batch.track_padding_mask is not None:
+        track_count = float((~batch.track_padding_mask).sum(dim=1).float().mean().item())
+    else:
+        track_count = float(batch.trajectory.shape[-2])
+    return view_count, track_count
+
+
+def _build_source_train_loader(dataset, sampler, cfg, fabric):
+    requires_cuda_prefetch = getattr(dataset, "requires_cuda_prefetch", False)
+    if requires_cuda_prefetch:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    loader_type = torch.utils.data.DataLoader if requires_cuda_prefetch else StatefulDataLoader
+    loader_kwargs = {}
+    if not requires_cuda_prefetch:
+        loader_kwargs["in_order"] = cfg.reproducibility.deterministic
+    loader = loader_type(
+        dataset,
+        batch_size=int(cfg.datasets.train.batch_size),
+        sampler=sampler,
+        num_workers=cfg.datasets.train.num_workers,
+        pin_memory=True,
+        collate_fn=getattr(dataset, "collate_fn", collate_fn),
+        prefetch_factor=(
+            cfg.datasets.train.get("prefetch_factor", 2)
+            if cfg.datasets.train.num_workers > 0 else None
+        ),
+        persistent_workers=cfg.datasets.train.num_workers > 0,
+        **loader_kwargs,
+    )
+    loader = fabric.setup_dataloaders(
+        loader,
+        move_to_device=not requires_cuda_prefetch,
+        use_distributed_sampler=False,
+    )
+    if requires_cuda_prefetch:
+        loader = CudaPrefetchLoader(loader, device=fabric.device)
+    return loader
 
 
 def _run_rank_zero_eval(fabric, cfg, evaluator, model, dataloaders, writer, step):
@@ -983,8 +1103,13 @@ def main(cfg: DictConfig):
 
     wandb_run_id = None
     if cfg.logging.get("log_wandb", False) and fabric.global_rank == 0:
-        wandb_run_id = _get_or_create_wandb_run_id(cfg.experiment_path)
-        exp_name = cfg.experiment_path.replace("./logs/", "").replace("/", "_").replace("\\", "_")
+        wandb_run_id = _get_or_create_wandb_run_id(
+            cfg.experiment_path,
+            cfg.logging.get("wandb_run_id"),
+        )
+        exp_name = cfg.logging.get("wandb_run_name") or cfg.experiment_path.replace(
+            "./logs/", ""
+        ).replace("/", "_").replace("\\", "_")
         wandb.init(
             project=cfg.logging.wandb_project,
             entity=cfg.logging.get("wandb_entity"),
@@ -996,6 +1121,8 @@ def main(cfg: DictConfig):
             id=wandb_run_id,
             resume="allow",
         )
+    if cfg.logging.get("log_wandb", False):
+        wandb_run_id = fabric.broadcast(wandb_run_id, src=0)
 
     original_numpy = torch.Tensor.numpy
 
@@ -1008,7 +1135,34 @@ def main(cfg: DictConfig):
 
     eval_dataloaders = []
     for dataset_name in cfg.datasets.eval.names:
-        if dataset_name.startswith("tapvid2d-davis-"):
+        if _mixed_source_name(cfg) and dataset_name == "tapvid3d-multiview-validation":
+            source_cfg = cfg.datasets.eval.sources.diegesis
+            eval_dataset = TapVid3DMultiViewDataset.from_name(
+                dataset_name,
+                source_cfg.root,
+                cfg,
+                include_scene_ids=source_cfg.include_scene_ids,
+            )
+            expected_views = list(source_cfg.views)
+            if any(
+                list(manifest["views"]) != expected_views
+                for manifest in eval_dataset._manifests.values()
+            ):
+                raise ValueError("DIEGESIS validation scenes do not match fixed views")
+        elif _mixed_source_name(cfg) and dataset_name == "kubric-multiview-v3":
+            source_cfg = cfg.datasets.eval.sources.mvkubric
+            kubric_kwargs = KubricMultiViewDataset.from_name(
+                dataset_name,
+                source_cfg.root,
+                cfg,
+                subset="train",
+                include_scene_ids=source_cfg.include_scene_ids,
+                just_return_kwargs=True,
+            )
+            kubric_kwargs["views_to_return"] = list(source_cfg.views)
+            kubric_kwargs["num_views"] = len(source_cfg.views)
+            eval_dataset = KubricMultiViewDataset(**kubric_kwargs)
+        elif dataset_name.startswith("tapvid2d-davis-"):
             eval_dataset = TapVidDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("kubric-multiview-v3-25views"):
             kubric_kwargs = {
@@ -1165,23 +1319,65 @@ def main(cfg: DictConfig):
     else:
         pretraining_dataloader = None
 
+    mixed_training = not cfg.modes.eval_only and _mixed_source_name(cfg)
+    mixed_schedule = None
+    source_cursors = None
+    source_samplers = None
+    train_loaders = None
     if cfg.modes.eval_only:
         train_dataset = None
-    elif cfg.datasets.train.name.startswith("kubric-multiview-v3"):
-        train_dataset = KubricMultiViewDataset.from_name(cfg.datasets.train.name, cfg.datasets.root, cfg, fabric)
-    elif cfg.datasets.train.name.startswith("pointodyssey-multiview-"):
-        train_dataset = PointOdysseyMultiViewDataset.from_name(
-            cfg.datasets.train.name, cfg.datasets.root, cfg, fabric
+    elif mixed_training:
+        source_pattern = tuple(cfg.datasets.train.source_schedule)
+        if source_pattern != ("diegesis", "mvkubric", "diegesis", "mvkubric"):
+            raise ValueError("mixed training requires source_schedule D/K/D/K")
+        if gradient_accumulation_steps != len(source_pattern):
+            raise ValueError(
+                "gradient accumulation must match the mixed source schedule length"
+            )
+        train_datasets = {
+            source: _build_training_dataset(
+                source_cfg.name,
+                source_cfg.root,
+                cfg,
+                fabric,
+                source_cfg,
+            )
+            for source, source_cfg in cfg.datasets.train.sources.items()
+        }
+        mixed_schedule = BalancedMixedSourceSchedule(
+            {source: dataset.real_len for source, dataset in train_datasets.items()},
+            source_pattern,
+            world_size=fabric.world_size,
+            master_seed=int(cfg.reproducibility.seed),
         )
-    elif cfg.datasets.train.name.startswith("tapvid3d-multiview-"):
-        train_dataset = TapVid3DMultiViewDataset.from_name(
-            cfg.datasets.train.name, cfg.datasets.root, cfg, fabric
-        )
+        source_cursors = {source: 0 for source in train_datasets}
+        source_samplers = {
+            source: _ScheduledSourceSampler(
+                mixed_schedule,
+                source,
+                fabric.global_rank,
+                len(dataset),
+            )
+            for source, dataset in train_datasets.items()
+        }
+        train_loaders = {
+            source: _build_source_train_loader(
+                dataset, source_samplers[source], cfg, fabric
+            )
+            for source, dataset in train_datasets.items()
+        }
+        train_dataset = None
     else:
-        raise ValueError(f"Dataset {cfg.datasets.train.name} not supported for training")
+        train_dataset = _build_training_dataset(
+            cfg.datasets.train.name, cfg.datasets.root, cfg, fabric
+        )
 
     train_batch_sampler = None
-    if not cfg.modes.eval_only:
+    if mixed_training:
+        train_loader = None
+        optimizer_steps_per_epoch = max(1, int(cfg.trainer.num_steps))
+        num_epochs = 1
+    elif not cfg.modes.eval_only:
         requires_cuda_prefetch = getattr(train_dataset, "requires_cuda_prefetch", False)
         if requires_cuda_prefetch:
             torch.multiprocessing.set_sharing_strategy("file_system")
@@ -1280,6 +1476,9 @@ def main(cfg: DictConfig):
             master_seed=int(cfg.reproducibility.seed),
             wandb_run_id=wandb_run_id or "",
         )
+        if mixed_training:
+            state.mixed_schedule_state = mixed_schedule.state_dict()
+            state.source_cursors = dict(source_cursors)
         fabric.load(latest_checkpoint, state)
         total_steps = int(state.total_steps)
         if int(state.master_seed) != int(cfg.reproducibility.seed):
@@ -1288,7 +1487,15 @@ def main(cfg: DictConfig):
             )
         if state.wandb_run_id and state.wandb_run_id != (wandb_run_id or ""):
             raise ValueError("resume W&B run ID does not match wandb_run_id.txt")
-        if train_loader is not None:
+        if mixed_training:
+            mixed_schedule.load_state_dict(state.mixed_schedule_state)
+            source_cursors = {
+                source: int(cursor)
+                for source, cursor in state.source_cursors.items()
+            }
+            for source, sampler in source_samplers.items():
+                sampler.set_start_cursor(source_cursors[source])
+        elif train_loader is not None:
             epoch = total_steps // optimizer_steps_per_epoch - 1
         logging.info(
             "Resumed canonical checkpoint %s at %d completed steps",
@@ -1308,8 +1515,19 @@ def main(cfg: DictConfig):
                 scheduler=scheduler,
                 total_steps=total_steps,
             )
+            if mixed_training:
+                state.mixed_schedule_state = mixed_schedule.state_dict()
+                state.source_cursors = dict(source_cursors)
             fabric.load(restore_ckpt_path, state, strict=True)
             total_steps = int(state.total_steps)
+            if mixed_training:
+                mixed_schedule.load_state_dict(state.mixed_schedule_state)
+                source_cursors = {
+                    source: int(cursor)
+                    for source, cursor in state.source_cursors.items()
+                }
+                for source, sampler in source_samplers.items():
+                    sampler.set_start_cursor(source_cursors[source])
             logging.info(
                 "Resumed explicit training checkpoint %s at %d completed steps",
                 restore_ckpt_path,
@@ -1323,6 +1541,7 @@ def main(cfg: DictConfig):
         if fabric.global_rank == 0
         else None
     )
+    last_eval_step = None
     if cfg.modes.eval_only or cfg.modes.validate_at_start:
         _run_rank_zero_eval(
             fabric,
@@ -1333,6 +1552,7 @@ def main(cfg: DictConfig):
             tb_writer,
             total_steps,
         )
+        last_eval_step = total_steps
         if cfg.modes.eval_only:
             gradient_diagnostics.close()
             if tb_writer is not None:
@@ -1354,6 +1574,9 @@ def main(cfg: DictConfig):
     sync_durations = deque()
     bwd_durations = deque()
     timing_log_freq = 100
+    checkpoint_source_cursors = (
+        dict(source_cursors) if mixed_training else None
+    )
 
     def handle_sigterm(signum, frame):
         logging.error(f"Signal {signum} received, saving checkpoint and exiting...")
@@ -1368,6 +1591,8 @@ def main(cfg: DictConfig):
             total_steps,
             cfg.reproducibility.seed,
             wandb_run_id,
+            mixed_schedule.state_dict() if mixed_training else None,
+            checkpoint_source_cursors,
         )
         logging.info(f"Saved checkpoint to {save_path}")
         logging.info(f"Calling sys.exit(0) now.")
@@ -1408,7 +1633,16 @@ def main(cfg: DictConfig):
         if train_batch_sampler is not None:
             train_batch_sampler.set_epoch(epoch)
 
-        if cfg.modes.do_initial_static_pretrain and not had_run_pretraining_epoch:
+        if mixed_training:
+            for source, sampler in source_samplers.items():
+                sampler.set_start_cursor(source_cursors[source])
+            data_iters = {
+                source: iter(loader) for source, loader in train_loaders.items()
+            }
+            n_batches = (
+                int(cfg.trainer.num_steps) - total_steps
+            ) * gradient_accumulation_steps
+        elif cfg.modes.do_initial_static_pretrain and not had_run_pretraining_epoch:
             had_run_pretraining_epoch = True
             data_iter = iter(pretraining_dataloader)
             n_batches = len(pretraining_dataloader)
@@ -1442,6 +1676,12 @@ def main(cfg: DictConfig):
         accumulated_loss_value = None
         accumulated_component_losses = {}
         accumulated_metrics = {}
+        accumulated_source_losses = {}
+        accumulated_source_components = {}
+        accumulated_source_metrics = {}
+        accumulated_source_counts = {}
+        accumulated_source_view_counts = {}
+        accumulated_source_track_counts = {}
         microbatch_gradient_norms = []
         microbatch_gradient_cosines = []
 
@@ -1451,13 +1691,28 @@ def main(cfg: DictConfig):
                 optimizer.zero_grad()
             start_time_1 = time.time()
             logging.info(f"Gonna load batch {i_batch + 1}/{n_batches} (rank={fabric.global_rank})")
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                n_batches = len(train_loader)
-                n_batches -= n_batches % gradient_accumulation_steps
-                batch = next(data_iter)
+            current_source = None
+            if mixed_training:
+                current_source = mixed_schedule.source_pattern[
+                    microbatches_accumulated
+                ]
+                try:
+                    batch = next(data_iters[current_source])
+                except StopIteration:
+                    source_samplers[current_source].set_start_cursor(
+                        source_cursors[current_source]
+                    )
+                    data_iters[current_source] = iter(train_loaders[current_source])
+                    batch = next(data_iters[current_source])
+                source_cursors[current_source] += 1
+            else:
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_loader)
+                    n_batches = len(train_loader)
+                    n_batches -= n_batches % gradient_accumulation_steps
+                    batch = next(data_iter)
 
             batch, gotit = batch
             total_batches_loaded += 1
@@ -1506,6 +1761,8 @@ def main(cfg: DictConfig):
                             accumulated_sampling_metrics.get(name, 0.0)
                             + float(np.mean([item[name] for item in metadata]))
                         )
+            if current_source is not None:
+                source_view_count, source_track_count = _source_batch_shape_metrics(batch)
 
             train_iters = cfg.trainer.train_iters
             if cfg.trainer.augment_train_iters:
@@ -1550,6 +1807,9 @@ def main(cfg: DictConfig):
                     scheduler=scheduler,
                     total_steps=total_steps,
                 )
+                if mixed_training:
+                    state.mixed_schedule_state = mixed_schedule.state_dict()
+                    state.source_cursors = dict(checkpoint_source_cursors)
                 fabric._strategy.checkpoint_io.save_checkpoint(
                     checkpoint=fabric._strategy._convert_stateful_objects_in_state(_unwrap_objects(state), filter={}),
                     path=save_path,
@@ -1580,6 +1840,34 @@ def main(cfg: DictConfig):
                 if accumulated_loss_value is None
                 else accumulated_loss_value + microbatch_loss
             )
+            if current_source is not None:
+                accumulated_source_counts[current_source] = (
+                    accumulated_source_counts.get(current_source, 0) + 1
+                )
+                accumulated_source_losses[current_source] = (
+                    accumulated_source_losses.get(current_source, 0.0)
+                    + microbatch_loss
+                )
+                accumulated_source_view_counts[current_source] = (
+                    accumulated_source_view_counts.get(current_source, 0.0)
+                    + source_view_count
+                )
+                accumulated_source_track_counts[current_source] = (
+                    accumulated_source_track_counts.get(current_source, 0.0)
+                    + source_track_count
+                )
+                for component_name, component_loss in component_losses.items():
+                    key = (current_source, component_name)
+                    accumulated_source_components[key] = (
+                        accumulated_source_components.get(key, 0.0)
+                        + component_loss
+                    )
+                for metric_name, metric_value in microbatch_metrics.items():
+                    key = (current_source, metric_name)
+                    accumulated_source_metrics[key] = (
+                        accumulated_source_metrics.get(key, 0.0)
+                        + metric_value
+                    )
             accumulated_fwd_duration += forward_duration
             accumulated_bwd_duration += backward_duration
             if microbatch_gradient is not None:
@@ -1611,6 +1899,46 @@ def main(cfg: DictConfig):
                     for name, total in accumulated_component_losses.items()
                 },
             )
+            reduced_source_values = {}
+            if mixed_training:
+                for source, local_count in accumulated_source_counts.items():
+                    source_values = {
+                        f"source/{source}/loss": (
+                            accumulated_source_losses[source] / local_count
+                        ),
+                        f"source/{source}/view_count": (
+                            accumulated_source_view_counts[source] / local_count
+                        ),
+                        f"source/{source}/track_count": (
+                            accumulated_source_track_counts[source] / local_count
+                        ),
+                    }
+                    source_values.update({
+                        f"source/{source}/component/{component}": total / local_count
+                        for (candidate, component), total
+                        in accumulated_source_components.items()
+                        if candidate == source
+                    })
+                    source_values.update({
+                        f"source/{source}/metric/{metric}": total / local_count
+                        for (candidate, metric), total
+                        in accumulated_source_metrics.items()
+                        if candidate == source
+                    })
+                    reduced_source_values.update(
+                        _reduce_scalar_dict(fabric, source_values)
+                    )
+                    reduced_source_values[f"source/{source}/sample_count"] = (
+                        _reduce_scalar(fabric, local_count, reduce_op="sum")
+                    )
+                    expected_count = (
+                        mixed_schedule.source_pattern.count(source)
+                        * fabric.world_size
+                    )
+                    if reduced_source_values[f"source/{source}/sample_count"] != expected_count:
+                        raise RuntimeError(
+                            f"source {source} contributed an unexpected global sample count"
+                        )
             if tb_writer is not None:
                 for metric_name, metric_value in reduced_metrics.items():
                     tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
@@ -1620,6 +1948,8 @@ def main(cfg: DictConfig):
                         component_value,
                         total_steps + 1,
                     )
+                for metric_name, metric_value in reduced_source_values.items():
+                    tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
 
             # Log a limited number of grad + optimizer state pairs, also log current learning rate
             if (total_steps <= 10) or (total_steps % cfg.trainer.viz_freq == 0):
@@ -1680,6 +2010,8 @@ def main(cfg: DictConfig):
                 scheduler.step()
             accumulated_bwd_duration += time.time() - optimizer_update_started_at
             total_steps += 1
+            if mixed_training:
+                checkpoint_source_cursors = dict(source_cursors)
 
             microbatch_gradient_norm_mean = (
                 statistics.fmean(microbatch_gradient_norms)
@@ -1775,8 +2107,11 @@ def main(cfg: DictConfig):
             bwd_duration = accumulated_bwd_duration
 
             if fabric.global_rank == 0:
-                if (total_steps % cfg.trainer.viz_freq == 0) or (
-                        total_steps == cfg.trainer.num_steps) or total_steps in [1, 10, 100]:
+                if not mixed_training and (
+                    total_steps % cfg.trainer.viz_freq == 0
+                    or total_steps == cfg.trainer.num_steps
+                    or total_steps in [1, 10, 100]
+                ):
                     logging.info(f"Creating training viz logs (rank: {fabric.global_rank}, step: {total_steps})")
                     # Training visualization intentionally shows scene zero;
                     # the loss path above handles every scene in the batch.
@@ -1887,6 +2222,8 @@ def main(cfg: DictConfig):
                     total_steps,
                     cfg.reproducibility.seed,
                     wandb_run_id,
+                    mixed_schedule.state_dict() if mixed_training else None,
+                    source_cursors,
                 )
 
             if total_steps % cfg.trainer.eval_freq == 0:
@@ -1899,6 +2236,7 @@ def main(cfg: DictConfig):
                     tb_writer,
                     total_steps,
                 )
+                last_eval_step = total_steps
 
             if fabric.global_rank == 0:
                 tqdm_epoch.update(1)
@@ -2075,6 +2413,12 @@ def main(cfg: DictConfig):
             accumulated_loss_value = None
             accumulated_component_losses = {}
             accumulated_metrics = {}
+            accumulated_source_losses = {}
+            accumulated_source_components = {}
+            accumulated_source_metrics = {}
+            accumulated_source_counts = {}
+            accumulated_source_view_counts = {}
+            accumulated_source_track_counts = {}
             microbatch_gradient_norms = []
             microbatch_gradient_cosines = []
 
@@ -2108,16 +2452,19 @@ def main(cfg: DictConfig):
         total_steps,
         cfg.reproducibility.seed,
         wandb_run_id,
+        mixed_schedule.state_dict() if mixed_training else None,
+        source_cursors,
     )
-    _run_rank_zero_eval(
-        fabric,
-        cfg,
-        evaluator,
-        model,
-        eval_dataloaders,
-        tb_writer,
-        total_steps,
-    )
+    if last_eval_step != total_steps:
+        _run_rank_zero_eval(
+            fabric,
+            cfg,
+            evaluator,
+            model,
+            eval_dataloaders,
+            tb_writer,
+            total_steps,
+        )
     for thread in threads:
         thread.join()
     if tb_writer is not None:
