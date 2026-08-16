@@ -1,7 +1,10 @@
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+
+import numpy as np
 
 from mvtracker.profiling.modal_continual_data import (
     CHECKPOINT_FILE,
@@ -49,10 +52,16 @@ class ModalContinualDataTests(unittest.TestCase):
             (index_root / "scenes").mkdir(parents=True)
             index_entries = {}
             for scene in EXPECTED_MVKUBRIC_SCENES:
-                (index_root / "scenes" / f"{scene}.npz").write_bytes(b"index")
+                np.savez(index_root / "scenes" / f"{scene}.npz", index=np.zeros(1))
                 index_entries[scene] = {"arrays": f"scenes/{scene}.npz"}
             (index_root / "manifest.json").write_text(
-                json.dumps({"version": 1, "scenes": index_entries})
+                json.dumps(
+                    {
+                        "version": 1,
+                        "source_fingerprint": hashlib.sha256().hexdigest(),
+                        "scenes": index_entries,
+                    }
+                )
             )
 
             self.assertEqual(_require_existing_profile_data(root), manifest)
@@ -91,13 +100,29 @@ class ModalContinualDataTests(unittest.TestCase):
             (index_root / "scenes").mkdir(parents=True)
             entries = {}
             for scene in EXPECTED_MVKUBRIC_SCENES:
-                (index_root / "scenes" / f"{scene}.npz").write_bytes(b"index")
+                np.savez(index_root / "scenes" / f"{scene}.npz", index=np.zeros(1))
                 entries[scene] = {"arrays": f"scenes/{scene}.npz"}
             (index_root / "manifest.json").write_text(
-                json.dumps({"version": 1, "scenes": entries})
+                json.dumps(
+                    {
+                        "version": 1,
+                        "source_fingerprint": hashlib.sha256().hexdigest(),
+                        "scenes": entries,
+                    }
+                )
             )
 
             bundle = prepare_continual_training_bundle(root)
+            self.assertEqual(
+                bundle["inputs"].count("datasets/kubric-multiview/train"), 1
+            )
+            self.assertNotIn(
+                "datasets/kubric-multiview/train/MVTracker_index", bundle["inputs"]
+            )
+            reused_archive = Path(directory) / "reused.tar"
+            reused = prepare_continual_training_bundle(root, bundle_path=reused_archive)
+            self.assertTrue(reused["reused"])
+            self.assertEqual(reused["archive"]["size_bytes"], bundle["archive"]["size_bytes"])
             staging = extract_continual_training_bundle(
                 root, local_data_root=extracted, bundle_manifest=bundle
             )

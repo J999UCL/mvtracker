@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import modal
 
@@ -147,13 +148,27 @@ def prepare_training_bundle_remote() -> dict:
         config={"source_commit": _source_commit(), **PROFILE_TAGS},
     )
     local_archive = Path("/tmp/continual-training-data.tar")
-    if local_archive.exists():
-        local_archive.unlink()
-    manifest = prepare_continual_training_bundle(DATA_ROOT, bundle_path=local_archive)
     destination = DATA_ROOT / "bundles/continual-training-data.tar"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(local_archive, destination)
-    manifest["archive"]["relative_path"] = "bundles/continual-training-data.tar"
+    try:
+        manifest = prepare_continual_training_bundle(
+            DATA_ROOT, bundle_path=destination, reuse_only=True
+        )
+    except RuntimeError as error:
+        if str(error) != "no compatible continual-training bundle is available":
+            raise
+        if local_archive.exists():
+            local_archive.unlink()
+        manifest = prepare_continual_training_bundle(DATA_ROOT, bundle_path=local_archive)
+        copy_started = time.perf_counter()
+        shutil.copyfile(local_archive, destination)
+        copy_seconds = time.perf_counter() - copy_started
+        manifest["archive"]["relative_path"] = "bundles/continual-training-data.tar"
+        manifest.setdefault("timing", {})["copy_seconds"] = copy_seconds
+        manifest["timing"]["total_seconds"] = (
+            manifest["timing"].get("build_seconds", 0.0) + copy_seconds
+        )
+        manifest["elapsed_seconds"] = manifest["timing"]["total_seconds"]
     (DATA_ROOT / "bundles/continual-training-data-manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
@@ -370,7 +385,6 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
                 Path(LOCAL_DATA_ROOT)
                 / "datasets/kubric-multiview/train/MVTracker_index"
             ),
-            "MVTRACKER_TRAINING_STAGING_MANIFEST": str(stage_manifest_path),
             "MVTRACKER_TRAINING_SEED": str(seed),
             "MVTRACKER_WANDB_RUN_NAME": run_name,
             "MVTRACKER_WANDB_RUN_ID": wandb_run_id,
@@ -453,6 +467,7 @@ def profile_cpu_loader() -> None:
 def profile_h100_loader() -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
     app.set_tags({**PROFILE_TAGS, "experiment": "encoded-loader-h100", "gpu": "h100"})
     print(json.dumps(profile_h100_loader_remote.remote(), indent=2))
 

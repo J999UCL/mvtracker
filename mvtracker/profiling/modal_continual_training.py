@@ -84,6 +84,8 @@ def require_training_capacity(
 
 def preflight_active_containers(
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    *,
+    required_free_slots: int = REQUIRED_FREE_SLOTS,
 ) -> tuple[ActiveContainer, ...]:
     completed = runner(
         ["modal", "container", "list", "--json"],
@@ -92,7 +94,7 @@ def preflight_active_containers(
         text=True,
     )
     containers = parse_active_containers(completed.stdout)
-    require_training_capacity(containers)
+    require_training_capacity(containers, required_free_slots=required_free_slots)
     return containers
 
 

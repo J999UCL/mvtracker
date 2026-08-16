@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -131,6 +132,16 @@ def _validate_mvkubric_index(
         arrays_path = index_root / entry["arrays"]
         if not arrays_path.is_file():
             raise FileNotFoundError(f"MV-Kubric indexed arrays are missing: {arrays_path}")
+    index_module_path = Path(__file__).resolve().parents[1] / "datasets/kubric_metadata_index.py"
+    spec = importlib.util.spec_from_file_location("mvtracker_kubric_metadata_index", index_module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"unable to load MV-Kubric index validator: {index_module_path}")
+    index_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(index_module)
+
+    index_module.KubricMetadataIndex(index_root).validate_source(
+        data_root / "datasets/kubric-multiview/train"
+    )
     return {
         "relative_path": str(MVKUBRIC_INDEX_RELATIVE),
         "manifest": manifest,
@@ -148,7 +159,7 @@ def _tree_stats(root: Path) -> dict[str, int]:
     }
 
 
-def _bundle_inputs(data_root: Path, index_relative: Path) -> tuple[Path, ...]:
+def _bundle_inputs() -> tuple[Path, ...]:
     """Return archive members, relative to ``data_root``.
 
     Raw DIEGESIS scenes are symlinks into ``source/diegesis``.  Keeping both
@@ -161,7 +172,6 @@ def _bundle_inputs(data_root: Path, index_relative: Path) -> tuple[Path, ...]:
         Path("source/diegesis"),
         Path("datasets/diegesis-mvtracker"),
         Path("datasets/kubric-multiview/train"),
-        index_relative,
         Path("checkpoints/mvtracker_200000_june2025.pth"),
     )
 
@@ -171,6 +181,7 @@ def prepare_continual_training_bundle(
     *,
     bundle_path: Path | None = None,
     index_relative: Path = MVKUBRIC_INDEX_RELATIVE,
+    reuse_only: bool = False,
 ) -> dict:
     """Create an immutable tar bundle for local-SSD extraction in GPU jobs.
 
@@ -186,13 +197,58 @@ def prepare_continual_training_bundle(
         )
     profile_manifest = _require_existing_profile_data(data_root)
     index = _validate_mvkubric_index(data_root)
-    members = _bundle_inputs(data_root, index_relative)
+    members = _bundle_inputs()
     missing = [member for member in members if not (data_root / member).exists()]
     if missing:
         raise FileNotFoundError(f"bundle inputs are missing: {', '.join(map(str, missing))}")
 
     archive = Path(bundle_path) if bundle_path is not None else data_root / BUNDLE_RELATIVE_PATH
     archive.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = data_root / BUNDLE_MANIFEST_RELATIVE_PATH
+    existing = None
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = None
+        if not isinstance(existing, dict):
+            existing = None
+    expected_inputs = [str(member) for member in members]
+    existing_source = (existing or {}).get("source_profile_manifest", {})
+    existing_index = (existing or {}).get("mvkubric_index", {})
+    existing_archive = (existing or {}).get("archive", {})
+    compatible = (
+        (existing or {}).get("schema_version") == BUNDLE_SCHEMA_VERSION
+        and (existing or {}).get("format") == "tar"
+        and existing_source.get("schema_version") == profile_manifest.get("schema_version")
+        and existing_source.get("diegesis_revision") == profile_manifest.get("diegesis_revision")
+        and existing_source.get("mvkubric_revision") == profile_manifest.get("mvkubric_revision")
+        and existing_source.get("checkpoint_revision") == profile_manifest.get("checkpoint_revision")
+        and existing_source.get("diegesis", {}).get("splits")
+        == profile_manifest.get("diegesis", {}).get("splits")
+        and existing_index.get("manifest_sha256") == index.get("manifest_sha256")
+        and existing.get("inputs") == expected_inputs
+    )
+    if compatible:
+        relative = Path(existing_archive.get("relative_path", ""))
+        source_archive = relative if relative.is_absolute() else data_root / relative
+        expected_size = existing_archive.get("size_bytes")
+        if source_archive.is_file() and expected_size == source_archive.stat().st_size:
+            copy_started = time.perf_counter()
+            if source_archive.resolve() != archive.resolve():
+                shutil.copyfile(source_archive, archive)
+            copy_seconds = time.perf_counter() - copy_started
+            reused = dict(existing)
+            reused["reused"] = True
+            reused["timing"] = {
+                "build_seconds": 0.0,
+                "copy_seconds": copy_seconds,
+                "total_seconds": copy_seconds,
+            }
+            return reused
+    if reuse_only:
+        raise RuntimeError("no compatible continual-training bundle is available")
+
     temporary = archive.with_name(f".{archive.name}.tmp-{os.getpid()}")
     if temporary.exists():
         temporary.unlink()
@@ -211,7 +267,9 @@ def prepare_continual_training_bundle(
     )
     os.replace(temporary, archive)
     archive_size = archive.stat().st_size
+    build_seconds = time.perf_counter() - started
     manifest = {
+        "reused": False,
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "format": "tar",
         "archive": {
@@ -226,9 +284,13 @@ def prepare_continual_training_bundle(
         "diegesis": profile_manifest["diegesis"],
         "mvkubric": profile_manifest["mvkubric"],
         "mvkubric_index": index,
-        "elapsed_seconds": time.perf_counter() - started,
+        "elapsed_seconds": build_seconds,
+        "timing": {
+            "build_seconds": build_seconds,
+            "copy_seconds": 0.0,
+            "total_seconds": build_seconds,
+        },
     }
-    manifest_path = data_root / BUNDLE_MANIFEST_RELATIVE_PATH
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
