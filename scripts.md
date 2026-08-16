@@ -8,7 +8,11 @@ the pinned DIEGESIS snapshot directly from Hugging Face onto container-local
 SSD (about 90 seconds), and copies only MV-Kubric scenes `900`--`903` with
 `rgba_*.png` plus `metadata.json` from the read-only Modal Volume.  Inference
 and temporary profile outputs stay on local SSD; only the small report is
-committed to `jeet-mvtracker-runs-v2` and metrics go to W&B.
+committed to `jeet-mvtracker-runs-v2` and metrics go to W&B.  Each dataset
+tries loader workers `1`, `4`, and `8` at scene batch `1`, then sweeps the
+scene-batch candidates with the fastest loader.  The measured depth, mask,
+intrinsics, extrinsics, and scale arrays are overwritten in one local temp
+directory so write time is included in the throughput result.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
