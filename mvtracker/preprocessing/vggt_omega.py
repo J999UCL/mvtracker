@@ -692,7 +692,7 @@ def preprocess_scene(
                 "last_frame": frame_indices[-1],
                 "sequence_length": len(frame_indices) * views,
                 "scale": result.scale,
-                "alignment_residual": result.alignment_residual,
+                "camera_center_alignment_rmse_m": result.alignment_residual,
                 "cleaned_coverage": result.cleaned_coverage,
             }
         )
@@ -704,7 +704,7 @@ def preprocess_scene(
             temporal_chunk_size=len(frame_indices),
             sequence_length=len(frame_indices) * views,
             alignment_scale=result.scale,
-            alignment_residual=result.alignment_residual,
+            camera_center_alignment_rmse_m=result.alignment_residual,
             elapsed_seconds=time.perf_counter() - started,
         )
 
@@ -727,8 +727,8 @@ def preprocess_scene(
         "metrics": {
             "duration_seconds": duration,
             "timestamps_per_second": frames / duration,
-            "mean_camera_baseline_residual": float(np.mean(residuals)),
-            "max_camera_baseline_residual": float(np.max(residuals)),
+            "mean_camera_center_alignment_rmse_m": float(np.mean(residuals)),
+            "max_camera_center_alignment_rmse_m": float(np.max(residuals)),
             "mean_cleaned_coverage": float(np.mean(coverages)),
             "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated(device)),
             "peak_cuda_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
