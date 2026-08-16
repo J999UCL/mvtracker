@@ -27,6 +27,7 @@ SOURCE_ARCHIVE = "kubric-multiview--train.full.0031-1000.tar.gz"
 SOURCE_ARCHIVE_SIZE_BYTES = 394_716_348_566
 RANGE_BYTES = 1 << 30
 VALIDATION_SCENES = ("101", "102")
+EXPECTED_VALIDATION_VIEWS = [f"view_{index}" for index in range(10)]
 TRAIN_ROOT = DATA_ROOT / "datasets/kubric-multiview/train"
 INDEX_ROOT = TRAIN_ROOT / "MVTracker_index"
 
@@ -60,7 +61,7 @@ def _validate_scene(root: Path, scene_id: str) -> dict[str, object]:
     if not (scene / "tracks_3d.npz").is_file():
         raise RuntimeError(f"scene {scene_id} is missing tracks_3d.npz")
     views = sorted(path.parent.name for path in scene.glob("view_*/metadata.json"))
-    if views != ["view_0", "view_1", "view_2", "view_3"]:
+    if views != EXPECTED_VALIDATION_VIEWS:
         raise RuntimeError(f"scene {scene_id} has unexpected views: {views}")
     for view in views:
         view_root = scene / view
