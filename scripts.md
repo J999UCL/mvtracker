@@ -66,6 +66,21 @@ It never stops another app. Data setup verifies the existing DIEGESIS and
 100-scene MV-Kubric micro pool, then materializes the pinned, checksummed
 published mixed-depth checkpoint into the existing data Volume.
 
+Validation scenes `101` and `102` use the pinned upstream
+`kubric-multiview--train.full.0031-1000.tar.gz` archive. The tagged setup
+entrypoint streams only the ordered prefix needed to extract those two scenes,
+copies them into `datasets/kubric-multiview/train`, and rebuilds one combined
+102-scene `MVTracker_index`. It is a CPU/data setup job, not training; inspect
+`modal container list --json` before launching because the source archive is
+very large even when streamed selectively.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
+modal container list --json
+modal run --timestamps tools/modal_mvkubric_validation.py
+```
+
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
