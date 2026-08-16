@@ -11,10 +11,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from mvtracker.preprocessing.vggt_omega import MVKubricSceneSource, TapVid3DSceneSource
+from mvtracker.preprocessing.vggt_omega import (
+    MVKubricSceneSource,
+    SCHEMA_VERSION,
+    TapVid3DSceneSource,
+)
 from mvtracker.preprocessing.vggt_omega_quality import (
+    chunk_sample_positions,
     depth_quality_metrics,
     representative_frame_indices,
+    sidecar_frame_indices,
 )
 
 
@@ -219,16 +225,22 @@ def main() -> None:
     args = parse_args()
     sidecar = args.sidecar_root / args.scene_root.name
     manifest = json.loads((sidecar / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("complete") is not True or manifest.get("provider") != "vggt_omega":
+    if (
+        manifest.get("complete") is not True
+        or manifest.get("provider") != "vggt_omega"
+        or manifest.get("schema_version") != SCHEMA_VERSION
+    ):
         raise ValueError(f"{sidecar}: not a complete VGGT-Omega sidecar")
     available_views = tuple(int(view) for view in manifest["view_ids"])
     view_ids = available_views if args.views is None else tuple(args.views)
     view_positions = [available_views.index(view) for view in view_ids]
-    frames = representative_frame_indices(int(manifest["frame_count"]))
+    available_frames = sidecar_frame_indices(manifest)
+    representative_positions = representative_frame_indices(len(available_frames))
+    frames = tuple(available_frames[position] for position in representative_positions)
     rgbs, ground_truth, gt_intrinsics, gt_w2c = _load_source(
         args.dataset, args.scene_root, view_ids, frames
     )
-    frame_positions = list(frames)
+    frame_positions = list(chunk_sample_positions(manifest, frames))
     estimated_all = np.load(sidecar / "depth.npy", mmap_mode="r")
     cleaned_all = np.load(sidecar / "cleaned_mask.npy", mmap_mode="r")
     predicted_intrinsics_all = np.load(sidecar / "predicted_intrinsics.npy", mmap_mode="r")
@@ -249,6 +261,7 @@ def main() -> None:
         predicted_w2c,
         gt_w2c,
         frames,
+        scale_frame_indices=available_frames,
     )
     report = {"scene": args.scene_root.name, "dataset": args.dataset, "view_ids": list(view_ids), **metrics}
     args.output_dir.mkdir(parents=True, exist_ok=True)

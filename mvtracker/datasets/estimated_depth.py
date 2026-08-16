@@ -10,7 +10,7 @@ import numpy as np
 
 
 ESTIMATED_DEPTH_FORMAT = "mvtracker_estimated_depth"
-ESTIMATED_DEPTH_SCHEMA_VERSION = 1
+ESTIMATED_DEPTH_SCHEMA_VERSION = 2
 ESTIMATED_DEPTH_TYPE_PROBABILITIES = {
     "gt": 0.70,
     "estimated": 0.20,
@@ -64,9 +64,10 @@ class EstimatedDepthStore:
         manifest_views = [int(view) for view in manifest["view_ids"]]
         depth = self._mmap(scene_root / "depth.npy")
         cleaned_mask = self._mmap(scene_root / "cleaned_mask.npy")
+        manifest_frame_count = int(manifest["frame_count"])
         expected_shape = (
             len(manifest_views),
-            int(manifest["frame_count"]),
+            manifest_frame_count,
             *tuple(int(value) for value in manifest["resolution_hw"]),
         )
         if depth.shape != expected_shape or depth.dtype != np.float32:
@@ -80,7 +81,11 @@ class EstimatedDepthStore:
         except ValueError as error:
             raise ValueError(f"{scene_root}: selected view is absent from sidecar") from error
         if frame_indices is not None:
-            index = np.ix_(selected_views, np.asarray(frame_indices, dtype=np.int64))
+            requested_frames = [int(frame) for frame in frame_indices]
+            selected_frames = requested_frames
+            if any(frame < 0 or frame >= manifest_frame_count for frame in selected_frames):
+                raise ValueError(f"{scene_root}: requested frame is outside sidecar bounds")
+            index = np.ix_(selected_views, np.asarray(selected_frames, dtype=np.int64))
             selected_depth = depth[index]
             selected_mask = cleaned_mask[index]
         else:

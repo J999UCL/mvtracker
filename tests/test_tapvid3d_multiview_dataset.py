@@ -147,7 +147,7 @@ def _write_estimated_depth(root: Path, *, frames=6, views=(2, 0, 3, 1), height=8
     np.save(scene / "cleaned_mask.npy", cleaned_mask)
     (scene / "manifest.json").write_text(json.dumps({
         "format": "mvtracker_estimated_depth",
-        "schema_version": 1,
+        "schema_version": 2,
         "provider": "vggt_omega",
         "view_ids": list(views),
         "frame_count": frames,
@@ -205,6 +205,19 @@ class EstimatedDepthTests(unittest.TestCase):
             self.assertTrue(np.all(depth[1] == 12))
             self.assertTrue(np.all(mask[..., 5:]))
             self.assertIsInstance(store._arrays[root / "scene-alpha/depth.npy"], np.memmap)
+
+    def test_schema_v1_sidecar_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_estimated_depth(root, frames=3)
+            scene = root / "scene-alpha"
+            manifest_path = scene / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["schema_version"] = 1
+            manifest_path.write_text(json.dumps(manifest))
+            store = loader.EstimatedDepthStore(root, "vggt_omega")
+            with self.assertRaisesRegex(ValueError, "incompatible estimated-depth manifest"):
+                store.load("scene-alpha", [0])
 
     def test_manifest_provider_is_checked(self):
         with tempfile.TemporaryDirectory() as directory:
