@@ -10,6 +10,7 @@ import os
 import shutil
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -602,6 +603,7 @@ def infer_temporal_chunks(
     *,
     device: torch.device,
     image_resolution: int,
+    loader_workers: int = 1,
     confidence_percentile: float = 20.0,
     edge_rtol: float = 0.03,
 ) -> TemporalChunkBatchResult:
@@ -612,25 +614,40 @@ def infer_temporal_chunks(
         raise ValueError("sources must not be empty")
     if not frame_indices:
         raise ValueError("frame_indices must not be empty")
+    if loader_workers < 1:
+        raise ValueError("loader_workers must be positive")
     view_counts = {len(source.description.view_ids) for source in sources}
     resolutions = {source.description.resolution_hw for source in sources}
     if len(view_counts) != 1 or len(resolutions) != 1:
         raise ValueError("batched scenes must have matching view counts and resolutions")
 
     started = time.perf_counter()
+
+    def prepare(item):
+        source, frame = item
+        images = [source.load_rgb(view, frame) for view in source.description.view_ids]
+        return preprocess_images(images, resolution=image_resolution)
+
+    tasks = [(source, frame) for source in sources for frame in frame_indices]
+    if loader_workers == 1:
+        prepared = list(map(prepare, tasks))
+    else:
+        with ThreadPoolExecutor(max_workers=loader_workers) as executor:
+            prepared = list(executor.map(prepare, tasks))
     batch_tensors = []
     batch_transforms = []
-    for source in sources:
-        sequence_tensors = []
-        sequence_transforms = []
-        for frame in frame_indices:
-            images = [source.load_rgb(view, frame) for view in source.description.view_ids]
-            tensors, transforms = preprocess_images(images, resolution=image_resolution)
-            sequence_tensors.extend(tensors)
-            sequence_transforms.extend(transforms)
-        batch_tensors.append(torch.stack(sequence_tensors))
-        batch_transforms.append(tuple(sequence_transforms))
+    frames_per_scene = len(frame_indices)
+    for scene_index in range(len(sources)):
+        scene_prepared = prepared[
+            scene_index * frames_per_scene : (scene_index + 1) * frames_per_scene
+        ]
+        batch_tensors.append(torch.cat([item[0] for item in scene_prepared]))
+        batch_transforms.append(
+            tuple(transform for item in scene_prepared for transform in item[1])
+        )
     images = torch.stack(batch_tensors)
+    if device.type == "cuda":
+        images = images.pin_memory()
     load_preprocess_seconds = time.perf_counter() - started
 
     model_started = time.perf_counter()
@@ -676,6 +693,7 @@ def infer_temporal_chunk(
     *,
     device: torch.device,
     image_resolution: int,
+    loader_workers: int = 1,
     confidence_percentile: float = 20.0,
     edge_rtol: float = 0.03,
 ) -> TemporalChunkResult:
@@ -686,6 +704,7 @@ def infer_temporal_chunk(
         model,
         device=device,
         image_resolution=image_resolution,
+        loader_workers=loader_workers,
         confidence_percentile=confidence_percentile,
         edge_rtol=edge_rtol,
     ).scenes[0]

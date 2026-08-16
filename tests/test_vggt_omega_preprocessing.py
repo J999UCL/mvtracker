@@ -143,6 +143,72 @@ class VGGTOmegaPreprocessingTests(unittest.TestCase):
             np.testing.assert_allclose(result.depth.mean(), 2 * (index + 1))
             self.assertEqual(result.scale, 2.0)
 
+    def test_parallel_loader_preserves_serial_order_and_results(self):
+        class FakeSource(SceneSource):
+            def __init__(self, value):
+                super().__init__(Path("."))
+                self.value = value
+
+            @property
+            def description(self):
+                return SceneDescription(str(self.value), 2, (0, 1), (6, 8), str(self.value))
+
+            def load_rgb(self, view_id, frame_index):
+                value = self.value + frame_index * 10 + view_id
+                return Image.new("RGB", (8, 6), (value, value, value))
+
+            def extrinsics_w2c(self, frame_indices):
+                result = np.repeat(
+                    np.eye(4, dtype=np.float32)[None, None], len(frame_indices), axis=0
+                ).repeat(2, axis=1)
+                result[:, 1, 0, 3] = -1
+                return result
+
+        observed = []
+
+        def fake_model_batch(_model, images, _device):
+            observed.append(images[:, :, 0, 0, 0].numpy().copy())
+            batch, sequence = images.shape[:2]
+            depth = np.ones((batch, sequence, 32, 32, 1), dtype=np.float32)
+            confidence = np.ones_like(depth)
+            intrinsics = np.repeat(
+                np.eye(3, dtype=np.float32)[None, None], batch, axis=0
+            ).repeat(sequence, axis=1)
+            extrinsics = np.repeat(
+                np.eye(4, dtype=np.float32)[None, None], batch, axis=0
+            ).repeat(sequence, axis=1)
+            extrinsics[:, 1::2, 0, 3] = -1
+            return depth, confidence, intrinsics, extrinsics[:, :, :3]
+
+        sources = [FakeSource(0), FakeSource(20)]
+        with mock.patch(
+            "mvtracker.preprocessing.vggt_omega._model_batch",
+            side_effect=fake_model_batch,
+        ):
+            serial = infer_temporal_chunks(
+                sources,
+                [0, 1],
+                object(),
+                device=torch.device("cpu"),
+                image_resolution=32,
+                loader_workers=1,
+            )
+            parallel = infer_temporal_chunks(
+                sources,
+                [0, 1],
+                object(),
+                device=torch.device("cpu"),
+                image_resolution=32,
+                loader_workers=2,
+            )
+
+        np.testing.assert_array_equal(observed[0], observed[1])
+        for serial_scene, parallel_scene in zip(serial.scenes, parallel.scenes):
+            np.testing.assert_array_equal(serial_scene.depth, parallel_scene.depth)
+            np.testing.assert_array_equal(
+                serial_scene.cleaned_mask, parallel_scene.cleaned_mask
+            )
+
     def test_metric_scale_uses_corresponding_camera_baselines(self):
         predicted = np.repeat(np.eye(4, dtype=np.float32)[None], 3, axis=0)
         known = predicted.copy()
