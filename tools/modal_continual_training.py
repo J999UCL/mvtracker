@@ -24,6 +24,8 @@ from modal_training_profile import (
 )
 
 from mvtracker.profiling.modal_continual_training import (
+    CONTINUAL_RUN_SUBDIR,
+    EPHEMERAL_DISK_MIB,
     GPU_REQUEST,
     MAIN_CONFIRMATION,
     MAX_CONTAINERS,
@@ -79,7 +81,7 @@ def _run_identity(run_name: str, commit: str) -> tuple[int, str]:
     volumes={str(DATA_ROOT): data_volume},
     cpu=16,
     memory=32768,
-    ephemeral_disk=64 * 1024,
+    ephemeral_disk=EPHEMERAL_DISK_MIB,
     timeout=24 * 60 * 60,
     max_containers=MAX_CONTAINERS,
     include_source=False,
@@ -121,6 +123,7 @@ def setup_training_data_remote() -> dict:
     gpu=GPU_REQUEST,
     cpu=32,
     memory=65536,
+    ephemeral_disk=EPHEMERAL_DISK_MIB,
     timeout=6 * 60 * 60,
     max_containers=MAX_CONTAINERS,
     include_source=False,
@@ -132,7 +135,7 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
     validate_run_name(run_name)
     commit = _source_commit()
     seed, wandb_run_id = _run_identity(run_name, commit)
-    run_dir = RUN_ROOT / "continual-training" / run_name
+    run_dir = RUN_ROOT / CONTINUAL_RUN_SUBDIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "modal-run-manifest.json"
     manifest = {

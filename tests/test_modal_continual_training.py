@@ -100,10 +100,26 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertEqual(contract.GPU_REQUEST, "H100!:2")
         self.assertEqual(contract.GPU_COUNT, 2)
         self.assertEqual(contract.MAX_CONTAINERS, 1)
+        self.assertEqual(contract.EPHEMERAL_DISK_MIB, 512 * 1024)
+        self.assertEqual(contract.CONTINUAL_RUN_SUBDIR, "continual-training")
         self.assertEqual(
             contract.MODAL_TAGS,
             {"owner": "jeet", "project": "mvtracker", "purpose": "training"},
         )
+
+    def test_results_volume_is_rw_at_the_canonical_run_root(self):
+        profile_source = (
+            ROOT / "tools/modal_training_profile.py"
+        ).read_text(encoding="utf-8")
+        continual_source = (
+            ROOT / "tools/modal_continual_training.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('RUN_VOLUME_NAME = "jeet-mvtracker-runs-v2"', profile_source)
+        self.assertIn('RUN_ROOT = Path("/mnt/mvtracker-runs")', profile_source)
+        self.assertIn("str(RUN_ROOT): run_volume,", continual_source)
+        self.assertNotIn("str(RUN_ROOT): run_volume.with_mount_options", continual_source)
+        self.assertEqual(continual_source.count("ephemeral_disk=EPHEMERAL_DISK_MIB"), 2)
 
     def test_main_launch_requires_explicit_confirmation(self):
         contract.require_main_confirmation("smoke", False)

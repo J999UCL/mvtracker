@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -22,6 +23,26 @@ from mvtracker.profiling.modal_training import (
 
 
 class ModalTrainingProfileTests(unittest.TestCase):
+    def test_dependency_layers_precede_commit_specific_source_checkout(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "tools/modal_training_profile.py"
+        ).read_text(encoding="utf-8")
+        dependency_start = source.index("def _dependency_image()")
+        runtime_start = source.index("def _runtime_image()")
+        dependency = source[dependency_start:runtime_start]
+        runtime = source[runtime_start:source.index("\n\napp = modal.App", runtime_start)]
+
+        self.assertIn("pip_install_from_requirements", dependency)
+        self.assertIn("flash-attn==2.8.3.post1", dependency)
+        self.assertIn("pointops", dependency)
+        self.assertNotIn("_source_commit()", dependency)
+        self.assertLess(
+            runtime.index("_dependency_image()"),
+            runtime.index(".run_commands(clone)"),
+        )
+        self.assertIn("checkout --detach FETCH_HEAD", runtime)
+        self.assertIn("rev-parse HEAD", runtime)
+
     def test_3d_embedding_accepts_bfloat16_coordinates(self):
         grid = torch.tensor(
             [[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]],

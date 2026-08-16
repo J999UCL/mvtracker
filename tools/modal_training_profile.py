@@ -30,6 +30,7 @@ RUN_ROOT = Path("/mnt/mvtracker-runs")
 PROFILE_BATCH_ROOT = DATA_ROOT / "profile-batches"
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+REQUIREMENTS_FILE = Path(__file__).resolve().parents[1] / "requirements.full.txt"
 
 
 def _source_commit() -> str:
@@ -39,15 +40,7 @@ def _source_commit() -> str:
     return commit
 
 
-def _runtime_image() -> modal.Image:
-    commit = _source_commit()
-    clone = (
-        "git init /opt/mvtracker && "
-        "git -C /opt/mvtracker remote add origin https://github.com/J999UCL/mvtracker.git && "
-        f"git -C /opt/mvtracker fetch --depth=1 origin {commit} && "
-        "git -C /opt/mvtracker checkout --detach FETCH_HEAD && "
-        f'test "$(git -C /opt/mvtracker rev-parse HEAD)" = "{commit}"'
-    )
+def _dependency_image() -> modal.Image:
     return (
         modal.Image.from_registry(
             "nvidia/cuda:12.8.1-devel-ubuntu22.04",
@@ -68,8 +61,7 @@ def _runtime_image() -> modal.Image:
             "torchaudio==2.7.1",
             index_url="https://download.pytorch.org/whl/cu128",
         )
-        .run_commands(clone)
-        .run_commands("python -m pip install -r /opt/mvtracker/requirements.full.txt")
+        .pip_install_from_requirements(str(REQUIREMENTS_FILE))
         .pip_install(
             "hf-xet",
             "nvidia-ml-py",
@@ -88,6 +80,21 @@ def _runtime_image() -> modal.Image:
                 "MAX_JOBS": "8",
             },
         )
+    )
+
+
+def _runtime_image() -> modal.Image:
+    commit = _source_commit()
+    clone = (
+        "git init /opt/mvtracker && "
+        "git -C /opt/mvtracker remote add origin https://github.com/J999UCL/mvtracker.git && "
+        f"git -C /opt/mvtracker fetch --depth=1 origin {commit} && "
+        "git -C /opt/mvtracker checkout --detach FETCH_HEAD && "
+        f'test "$(git -C /opt/mvtracker rev-parse HEAD)" = "{commit}"'
+    )
+    return (
+        _dependency_image()
+        .run_commands(clone)
         .env(
             {
                 "CUDA_HOME": "/usr/local/cuda",
