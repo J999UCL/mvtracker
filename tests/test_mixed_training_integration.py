@@ -34,6 +34,21 @@ class AttrDict(dict):
 
 
 class MixedTrainingIntegrationTests(unittest.TestCase):
+    def test_source_shape_metrics_accept_float_padding_masks(self):
+        metrics = _load(
+            "_source_batch_shape_metrics",
+            {"torch": torch},
+        )
+        batch = SimpleNamespace(
+            video=torch.empty(2, 4, 3),
+            trajectory=torch.empty(2, 3, 5, 3),
+            track_padding_mask=torch.tensor(
+                [[0.0, 0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0, 1.0]]
+            ),
+        )
+
+        self.assertEqual(metrics(batch), (4, 3.5))
+
     def test_source_sampler_uses_persisted_rank_local_cursor(self):
         sampler_class = _load(
             "_ScheduledSourceSampler",

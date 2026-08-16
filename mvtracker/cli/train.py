@@ -409,7 +409,8 @@ def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=
 def _source_batch_shape_metrics(batch):
     view_count = int(batch.video.shape[1])
     if batch.track_padding_mask is not None:
-        track_count = float((~batch.track_padding_mask).sum(dim=1).float().mean().item())
+        padding_mask = batch.track_padding_mask.to(dtype=torch.bool)
+        track_count = float((~padding_mask).sum(dim=1).float().mean().item())
     else:
         track_count = float(batch.trajectory.shape[-2])
     return view_count, track_count
