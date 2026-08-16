@@ -3,6 +3,10 @@ defaults:
   - diegesis_mvkubric_gt_ddp
   - _self_
 
+datasets:
+  eval:
+    names: []
+
 trainer:
   num_steps: 5
   eval_freq: 10000

@@ -87,6 +87,7 @@ class ContinualTrainingConfigTests(unittest.TestCase):
 
         self.assertEqual(config["trainer"]["num_steps"], 5)
         self.assertFalse(config["modes"]["validate_at_start"])
+        self.assertEqual(config["datasets"]["eval"]["names"], [])
 
         phase1_path = ROOT / "configs/experiment/diegesis_mvkubric_gt_ddp_smoke_phase1.yaml"
         phase1 = yaml.safe_load(phase1_path.read_text(encoding="utf-8"))
