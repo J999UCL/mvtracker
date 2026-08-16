@@ -510,6 +510,7 @@ def preprocess_scene(
         staging / "predicted_extrinsics_w2c.npy", mode="w+", dtype=np.float32, shape=(views, frames, 4, 4)
     )
 
+    torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
     residuals = []
     coverages = []
