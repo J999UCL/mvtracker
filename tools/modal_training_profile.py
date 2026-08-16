@@ -269,8 +269,7 @@ def prepare_frontier_batches_remote() -> dict:
     from mvtracker.cli.profile_training import prepare_profile_batch
     from mvtracker.profiling.modal_training import FRONTIER_VIEWS
 
-    trajectories = 6144
-    batch_size = 12
+    cache_shapes = ((2048, 12), (6144, 1))
     run = wandb.init(
         project="mvtracker-modal-profiling",
         job_type="batch-preparation",
@@ -278,34 +277,34 @@ def prepare_frontier_batches_remote() -> dict:
         config={
             "source_commit": _source_commit(),
             "views": list(FRONTIER_VIEWS),
-            "trajectories": trajectories,
-            "batch_size": batch_size,
+            "cache_shapes": [list(shape) for shape in cache_shapes],
             **BASE_TAGS,
         },
     )
     results = []
     for views in FRONTIER_VIEWS:
-        result = prepare_profile_batch(
-            data_root=DATA_ROOT / "datasets",
-            output=(
-                PROFILE_BATCH_ROOT
-                / f"views{views}-traj{trajectories}-batch{batch_size}-accum1.pt"
-            ),
-            views=views,
-            batch_size=batch_size,
-            trajectories=trajectories,
-        )
-        results.append(result)
-        run.log(
-            {
-                "batch/views": views,
-                "batch/batch_size": batch_size,
-                "batch/trajectories": trajectories,
-                "batch/attempted_samples": result["attempted_samples"],
-                "batch/bytes": result["bytes"],
-            },
-            step=len(results),
-        )
+        for trajectories, batch_size in cache_shapes:
+            result = prepare_profile_batch(
+                data_root=DATA_ROOT / "datasets",
+                output=(
+                    PROFILE_BATCH_ROOT
+                    / f"views{views}-traj{trajectories}-batch{batch_size}-accum1.pt"
+                ),
+                views=views,
+                batch_size=batch_size,
+                trajectories=trajectories,
+            )
+            results.append(result)
+            run.log(
+                {
+                    "batch/views": views,
+                    "batch/batch_size": batch_size,
+                    "batch/trajectories": trajectories,
+                    "batch/attempted_samples": result["attempted_samples"],
+                    "batch/bytes": result["bytes"],
+                },
+                step=len(results),
+            )
     data_volume.commit()
     run.finish()
     return {"batches": results}
@@ -313,7 +312,10 @@ def prepare_frontier_batches_remote() -> dict:
 
 def _trial_command(case, warmup, measured, output, gpu_spec):
     if case.views in (5, 6):
-        cache_name = f"views{case.views}-traj6144-batch12-accum1.pt"
+        if case.trajectories > 2048:
+            cache_name = f"views{case.views}-traj6144-batch1-accum1.pt"
+        else:
+            cache_name = f"views{case.views}-traj2048-batch12-accum1.pt"
     else:
         cache_name = f"views{case.views}-traj2048-batch8-accum1.pt"
     return [
