@@ -77,20 +77,25 @@ def _benchmark_dataset(
     sources,
     candidates: tuple[int, ...],
     *,
+    loader_workers: tuple[int, ...],
+    write_root: Path,
     model,
     device,
     infer_temporal_chunks,
     log,
 ) -> dict:
-    """Run one warm-up and three timed chunks for each physical scene batch."""
+    """Choose a small loader setting, then sweep physical scene batch sizes."""
+    import time
+
+    import numpy as np
     import torch
 
     frame_indices = tuple(range(24))
     total_memory = torch.cuda.get_device_properties(device).total_memory
-    trials = []
-    for batch_size in candidates:
+    write_root.mkdir(parents=True, exist_ok=True)
+    def measure(batch_size: int, workers: int) -> dict:
         selected_sources = tuple(sources[:batch_size])
-        trial = {"dataset": name, "batch_size": batch_size}
+        trial = {"dataset": name, "batch_size": batch_size, "loader_workers": workers}
         try:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
@@ -100,6 +105,7 @@ def _benchmark_dataset(
                 model,
                 device=device,
                 image_resolution=512,
+                loader_workers=workers,
             )
             torch.cuda.synchronize(device)
             measurements = []
@@ -110,25 +116,50 @@ def _benchmark_dataset(
                     model,
                     device=device,
                     image_resolution=512,
+                    loader_workers=workers,
                 )
                 torch.cuda.synchronize(device)
                 measurements.append(result.timings)
+                write_started = time.perf_counter()
+                for scene_index, scene in enumerate(result.scenes):
+                    prefix = write_root / f"{name}-{scene_index}"
+                    np.save(prefix.with_name(prefix.name + "-depth.npy"), scene.depth)
+                    np.save(
+                        prefix.with_name(prefix.name + "-cleaned-mask.npy"),
+                        scene.cleaned_mask,
+                    )
+                    np.save(
+                        prefix.with_name(prefix.name + "-intrinsics.npy"),
+                        scene.intrinsics,
+                    )
+                    np.save(
+                        prefix.with_name(prefix.name + "-extrinsics-w2c.npy"),
+                        scene.extrinsics_w2c,
+                    )
+                    np.save(
+                        prefix.with_name(prefix.name + "-scales.npy"),
+                        np.asarray(scene.scale, dtype=np.float32),
+                    )
+                result_write_seconds = time.perf_counter() - write_started
+                measurements[-1] = (result.timings, result_write_seconds)
                 del result
-            total = sorted(item.total_seconds for item in measurements)[1]
-            load = sorted(item.load_preprocess_seconds for item in measurements)[1]
-            model_seconds = sorted(item.model_seconds for item in measurements)[1]
-            post = sorted(item.postprocess_seconds for item in measurements)[1]
+            total = sorted(item.total_seconds + write for item, write in measurements)[1]
+            load = sorted(item.load_preprocess_seconds for item, _ in measurements)[1]
+            model_seconds = sorted(item.model_seconds for item, _ in measurements)[1]
+            post = sorted(item.postprocess_seconds for item, _ in measurements)[1]
+            write_seconds = sorted(write for _, write in measurements)[1]
             peak_reserved = torch.cuda.max_memory_reserved(device)
             safe = peak_reserved <= total_memory * 0.90
             trial.update(
                 {
                     "status": "ok" if safe else "unsafe_vram",
                     "scene_count": batch_size,
-                    "image_count": measurements[0].image_count,
+                    "image_count": measurements[0][0].image_count,
                     "total_seconds": total,
                     "load_preprocess_seconds": load,
                     "model_seconds": model_seconds,
                     "postprocess_seconds": post,
+                    "write_seconds": write_seconds,
                     "scenes_per_second": batch_size / total,
                     "peak_reserved_bytes": int(peak_reserved),
                     "peak_vram_fraction": peak_reserved / total_memory,
@@ -137,13 +168,33 @@ def _benchmark_dataset(
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             trial["status"] = "oom"
-        trials.append(trial)
         log({f"profile/{name}/{key}": value for key, value in trial.items() if isinstance(value, (int, float))})
+        return trial
+
+    worker_trials = []
+    for workers in loader_workers:
+        trial = measure(1, workers)
+        worker_trials.append(trial)
+    safe_workers = [trial for trial in worker_trials if trial["status"] == "ok"]
+    worker_choice = max(safe_workers, key=lambda trial: trial["scenes_per_second"])
+    trials = []
+    for batch_size in candidates:
+        trial = measure(batch_size, worker_choice["loader_workers"])
+        trials.append(trial)
         if trial["status"] in {"oom", "unsafe_vram"}:
             break
-    safe = [trial for trial in trials if trial["status"] == "ok"]
-    selected = max(safe, key=lambda trial: trial["scenes_per_second"]) if safe else None
-    return {"trials": trials, "selected": selected}
+    return {
+        "loader_trials": worker_trials,
+        "selected_loader_workers": worker_choice["loader_workers"],
+        "batch_trials": trials,
+        "selected": max(
+            (trial for trial in trials if trial["status"] == "ok"),
+            key=lambda trial: trial["scenes_per_second"],
+            default=None,
+        ),
+    }
+
+
 app = modal.App(APP_NAME, tags={**BASE_TAGS, "experiment": "vggt-omega-throughput"})
 image = _image()
 data_volume = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=False, version=2)
@@ -263,6 +314,8 @@ def profile(run_name: str = "vggt-omega-h100-throughput") -> dict:
             "diegesis",
             diegesis_sources,
             (1, 2, 4, 6, 8),
+            loader_workers=(1, 4, 8),
+            write_root=LOCAL_ROOT / "profile-output",
             model=model,
             device=device,
             infer_temporal_chunks=infer_temporal_chunks,
@@ -272,16 +325,14 @@ def profile(run_name: str = "vggt-omega-h100-throughput") -> dict:
             "mv-kubric",
             mvkubric_sources,
             (1, 2, 3),
+            loader_workers=(1, 4, 8),
+            write_root=LOCAL_ROOT / "profile-output",
             model=model,
             device=device,
             infer_temporal_chunks=infer_temporal_chunks,
             log=run.log,
         ),
-        "loader": {
-            "source": "local container SSD",
-            "workers": 1,
-            "note": "infer_temporal_chunks currently performs synchronous local decode",
-        },
+        "loader": {"source": "local container SSD", "candidates": [1, 4, 8]},
     }
     report = {
         "format": "mvtracker_vggt_omega_modal_profile",
