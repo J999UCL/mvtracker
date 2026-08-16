@@ -87,10 +87,10 @@ Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
 directory.
 
-Each compute container copies the existing `datasets/`, `source/`, and
-`checkpoints/` directories directly from the Modal data Volume to
-`/tmp/mvtracker-continual-data`, then loads from that local SSD. Staging time and
-copied bytes are logged to W&B.
+Training containers copy the DIEGESIS archive and four MV-Kubric tar.zst shards
+from the Modal data Volume, extract them concurrently under
+`/tmp/mvtracker-continual-data`, and copy only the prepared cache/index and
+checkpoint sidecars. Staging time and copied bytes are logged to W&B.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
@@ -100,9 +100,10 @@ modal run --timestamps tools/modal_continual_training.py::profile-cpu-loader
 modal run --timestamps tools/modal_continual_training.py::profile-h100-loader
 ```
 
-The loader profiles use four warm-ups and 32 measured samples. The CPU profile
-reports DIEGESIS and MV-Kubric separately; the H100 profile uses the production
-CUDA prefetch/nvJPEG path for DIEGESIS. Both profile entrypoints carry
+The CPU loader profile uses four warm-ups and 32 measured samples. The H100
+profile stages only the first 25-scene MV-Kubric shard, then measures 20 warm-up
+and 100 production-path samples using batched nvImageCodec PNG/TIFF decoding.
+Both profile entrypoints carry
 `owner=jeet`, `project=mvtracker`, `purpose=profiling` tags.
 
 To measure archive transfer, extraction, and one CPU sample per dataset without

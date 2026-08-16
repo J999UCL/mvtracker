@@ -18,6 +18,7 @@ from mvtracker.profiling.modal_continual_data import (
     MVKUBRIC_SHARDS,
     _require_existing_profile_data,
     stage_continual_training_data,
+    stage_mvkubric_profile_shard,
 )
 
 
@@ -151,6 +152,34 @@ class ModalContinualDataTests(unittest.TestCase):
             self.assertTrue(
                 (extracted / "datasets/diegesis-mvtracker/TAPVid3D_raw/train").is_dir()
             )
+
+    def test_profile_staging_uses_only_one_mvkubric_shard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            destination = Path(directory) / "local"
+            shard = root / MVKUBRIC_SHARDS[0]
+            shard.parent.mkdir(parents=True)
+            shard.write_bytes(b"shard")
+            index = root / MVKUBRIC_INDEX_RELATIVE
+            index.mkdir(parents=True)
+            (index / "manifest.json").write_text("{}")
+
+            def extract(command, check):
+                self.assertTrue(check)
+                train_root = Path(command[command.index("--directory") + 1])
+                for scene in range(900, 925):
+                    (train_root / str(scene)).mkdir()
+
+            with mock.patch(
+                "mvtracker.profiling.modal_continual_data.subprocess.run",
+                side_effect=extract,
+            ):
+                result = stage_mvkubric_profile_shard(
+                    root, local_data_root=destination
+                )
+
+            self.assertEqual(result["scene_ids"], [str(scene) for scene in range(900, 925)])
+            self.assertEqual(result["copied_size_bytes"], 5)
 
 
 if __name__ == "__main__":

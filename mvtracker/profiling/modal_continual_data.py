@@ -268,6 +268,54 @@ def stage_continual_training_data(
     }
 
 
+def stage_mvkubric_profile_shard(
+    data_root: Path,
+    *,
+    local_data_root: Path,
+    shard_index: int = 0,
+) -> dict:
+    """Stage one 25-scene MV-Kubric shard for a short loader benchmark."""
+    if not 0 <= shard_index < len(MVKUBRIC_SHARDS):
+        raise ValueError("shard_index must be in [0, 4)")
+    data_root = Path(data_root)
+    local_data_root = Path(local_data_root)
+    shard = data_root / MVKUBRIC_SHARDS[shard_index]
+    index = data_root / MVKUBRIC_INDEX_RELATIVE
+    if not shard.is_file() or not index.is_dir():
+        raise FileNotFoundError("MV-Kubric shard or metadata index is missing")
+    if local_data_root.exists():
+        shutil.rmtree(local_data_root)
+    archive = local_data_root / "archives" / shard.name
+    archive.parent.mkdir(parents=True)
+    started = time.perf_counter()
+    shutil.copyfile(shard, archive)
+    train_root = local_data_root / "datasets/kubric-multiview/train"
+    train_root.mkdir(parents=True)
+    subprocess.run(
+        [
+            "tar", "--extract", "--zstd", "--strip-components=3",
+            "--file", str(archive), "--directory", str(train_root),
+        ],
+        check=True,
+    )
+    shutil.copytree(index, train_root / "MVTracker_index")
+    first_scene = 900 + shard_index * 25
+    scenes = tuple(str(scene) for scene in range(first_scene, first_scene + 25))
+    observed = tuple(sorted(
+        (path.name for path in train_root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=int,
+    ))
+    if observed != scenes:
+        raise RuntimeError(f"MV-Kubric shard inventory mismatch: {observed}")
+    return {
+        "local_data_root": str(local_data_root),
+        "copied_size_bytes": archive.stat().st_size,
+        "elapsed_seconds": time.perf_counter() - started,
+        "mvkubric_index": str(train_root / "MVTracker_index"),
+        "scene_ids": list(scenes),
+    }
+
+
 def profile_encoded_loader(
     data_root: Path,
     *,
@@ -276,6 +324,7 @@ def profile_encoded_loader(
     measured: int = 32,
     workers: int = 0,
     use_cuda: bool = False,
+    mvkubric_scene_ids=None,
 ) -> dict:
     """Measure encoded TAPVid-3D samples after local extraction.
 
@@ -332,7 +381,11 @@ def profile_encoded_loader(
             str(data_root),
             training_args=config,
             fabric=SimpleNamespace(world_size=1),
-            include_scene_ids=[str(scene) for scene in range(900, 998)],
+            include_scene_ids=(
+                list(mvkubric_scene_ids)
+                if mvkubric_scene_ids is not None
+                else [str(scene) for scene in range(900, 998)]
+            ),
         )
     if use_cuda:
         if not torch.cuda.is_available():

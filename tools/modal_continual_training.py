@@ -47,6 +47,8 @@ APP_NAME = "jeet-mvtracker-continual-training"
 SOURCE_ROOT = Path("/opt/mvtracker")
 LOADER_PROFILE_WARMUP = 4
 LOADER_PROFILE_MEASURED = 32
+H100_LOADER_PROFILE_WARMUP = 20
+H100_LOADER_PROFILE_MEASURED = 100
 EXPERIMENT_PHASES = {
     "smoke": (
         {
@@ -139,6 +141,28 @@ def _profile_loader(use_cuda: bool) -> dict:
     return {"profiles": profiles, "staging": staging}
 
 
+def _profile_h100_mvkubric_loader() -> dict:
+    from mvtracker.profiling.modal_continual_data import (
+        profile_encoded_loader,
+        stage_mvkubric_profile_shard,
+    )
+
+    staging = stage_mvkubric_profile_shard(
+        DATA_ROOT,
+        local_data_root=Path(LOCAL_DATA_ROOT),
+    )
+    profile = profile_encoded_loader(
+        Path(LOCAL_DATA_ROOT) / "datasets",
+        source="mvkubric",
+        warmup=H100_LOADER_PROFILE_WARMUP,
+        measured=H100_LOADER_PROFILE_MEASURED,
+        workers=8,
+        use_cuda=True,
+        mvkubric_scene_ids=staging["scene_ids"],
+    )
+    return {"profiles": {"mvkubric": profile}, "staging": staging}
+
+
 def _profile_summary(result: dict) -> dict:
     summary = {
         "staging/elapsed_seconds": result["staging"]["elapsed_seconds"],
@@ -209,7 +233,7 @@ def profile_h100_loader_remote() -> dict:
         tags=["modal", "encoded-loader", "local-ssd", "h100"],
         config={"source_commit": _source_commit(), **PROFILE_TAGS},
     )
-    result = _profile_loader(use_cuda=True)
+    result = _profile_h100_mvkubric_loader()
     run.summary.update(_profile_summary(result))
     run.finish()
     return result
