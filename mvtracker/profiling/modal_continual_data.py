@@ -20,7 +20,17 @@ CHECKPOINT_FILE = "mvtracker_200000_june2025.pth"
 CHECKPOINT_SHA256 = "a7fa86f2a7223e3e0aa4c1d3eff0dec5fe8a9227a48572ce943b8e49d8a4f8e6"
 MANIFEST_VERSION = 1
 EXPECTED_DIEGESIS_SPLITS = {"train": 17, "validation": 2, "test": 2}
+EXPECTED_MVKUBRIC_TRAIN_SCENES = {str(scene) for scene in range(900, 998)}
+EXPECTED_MVKUBRIC_POOL_SCENES = {
+    *EXPECTED_MVKUBRIC_TRAIN_SCENES,
+    "998",
+    "999",
+    "101",
+    "102",
+}
+# Keep the old name as the archive/manifest's 100-scene pool contract.
 EXPECTED_MVKUBRIC_SCENES = {str(scene) for scene in range(900, 1000)}
+MVKUBRIC_VALIDATION_SCENES = {"101", "102"}
 MVKUBRIC_INDEX_RELATIVE = Path("datasets/kubric-multiview/train/MVTracker_index")
 DIEGESIS_ARCHIVE_RELATIVE = Path(
     "archives/diegesis/"
@@ -97,9 +107,11 @@ def _require_existing_profile_data(data_root: Path) -> dict:
         for path in mvkubric_root.iterdir()
         if path.is_dir() and path.name.isdigit()
     }
-    if mvkubric != EXPECTED_MVKUBRIC_SCENES:
-        raise RuntimeError("existing MV-Kubric micro pool must be exactly scenes 900..999")
-    _validate_mvkubric_index(data_root, EXPECTED_MVKUBRIC_SCENES)
+    if mvkubric != EXPECTED_MVKUBRIC_POOL_SCENES:
+        raise RuntimeError(
+            "existing MV-Kubric pool must contain scenes 900..999 plus validation 101/102"
+        )
+    _validate_mvkubric_index(data_root, EXPECTED_MVKUBRIC_POOL_SCENES)
     return manifest
 
 
@@ -228,6 +240,13 @@ def stage_continual_training_data(
         for task in tasks:
             task.result()
 
+    for scene_id in sorted(MVKUBRIC_VALIDATION_SCENES):
+        source = data_root / "datasets/kubric-multiview/train" / scene_id
+        destination = mvkubric_root / scene_id
+        if not source.is_dir():
+            raise FileNotFoundError(source)
+        shutil.copytree(source, destination)
+
     for relative in LOCAL_STAGING_SIDECARS:
         source = data_root / relative
         destination = local_data_root / relative
@@ -258,8 +277,10 @@ def stage_continual_training_data(
         path.name for path in mvkubric_root.iterdir()
         if path.is_dir() and path.name.isdigit()
     }
-    if observed_mvkubric != EXPECTED_MVKUBRIC_SCENES:
-        raise RuntimeError("staged MV-Kubric pool must be exactly scenes 900..999")
+    if observed_mvkubric != EXPECTED_MVKUBRIC_POOL_SCENES:
+        raise RuntimeError(
+            "staged MV-Kubric pool must contain scenes 900..999 plus validation 101/102"
+        )
     return {
         "local_data_root": str(local_data_root),
         "copied_size_bytes": _tree_stats(local_data_root)["size_bytes"],

@@ -13,6 +13,7 @@ from mvtracker.profiling.modal_continual_data import (
     CHECKPOINT_SHA256,
     DIEGESIS_ARCHIVE_RELATIVE,
     EXPECTED_DIEGESIS_SPLITS,
+    EXPECTED_MVKUBRIC_POOL_SCENES,
     EXPECTED_MVKUBRIC_SCENES,
     MVKUBRIC_INDEX_RELATIVE,
     MVKUBRIC_SHARDS,
@@ -49,12 +50,12 @@ class ModalContinualDataTests(unittest.TestCase):
                     (raw_root / split / str(index)).mkdir(parents=True)
                     (cache_root / split / str(index)).mkdir(parents=True)
             mvkubric = root / "datasets/kubric-multiview/train"
-            for scene in EXPECTED_MVKUBRIC_SCENES:
+            for scene in EXPECTED_MVKUBRIC_POOL_SCENES:
                 (mvkubric / scene).mkdir(parents=True)
             index_root = root / MVKUBRIC_INDEX_RELATIVE
             (index_root / "scenes").mkdir(parents=True)
             index_entries = {}
-            for scene in EXPECTED_MVKUBRIC_SCENES:
+            for scene in EXPECTED_MVKUBRIC_POOL_SCENES:
                 np.savez(index_root / "scenes" / f"{scene}.npz", index=np.zeros(1))
                 index_entries[scene] = {"arrays": f"scenes/{scene}.npz"}
             (index_root / "manifest.json").write_text(
@@ -75,7 +76,7 @@ class ModalContinualDataTests(unittest.TestCase):
             (cache_root / "train" / "0").mkdir()
 
             (mvkubric / "999").rename(mvkubric / "1000")
-            with self.assertRaisesRegex(RuntimeError, "exactly scenes 900..999"):
+            with self.assertRaisesRegex(RuntimeError, "contain scenes 900..999"):
                 _require_existing_profile_data(root)
 
     def test_archive_staging_extracts_sources_and_copies_sidecars(self):
@@ -106,7 +107,7 @@ class ModalContinualDataTests(unittest.TestCase):
             index_root = root / MVKUBRIC_INDEX_RELATIVE
             (index_root / "scenes").mkdir(parents=True)
             entries = {}
-            for scene in EXPECTED_MVKUBRIC_SCENES:
+            for scene in EXPECTED_MVKUBRIC_POOL_SCENES:
                 np.savez(index_root / "scenes" / f"{scene}.npz", index=np.zeros(1))
                 entries[scene] = {"arrays": f"scenes/{scene}.npz"}
             (index_root / "manifest.json").write_text(
@@ -125,6 +126,10 @@ class ModalContinualDataTests(unittest.TestCase):
                 if "--strip-components=3" in command:
                     for scene in EXPECTED_MVKUBRIC_SCENES:
                         (destination / scene).mkdir(parents=True, exist_ok=True)
+                    for scene in ("101", "102"):
+                        (root / "datasets/kubric-multiview/train" / scene).mkdir(
+                            parents=True, exist_ok=True
+                        )
                 else:
                     for scenes in split_document["splits"].values():
                         for scene in scenes:
@@ -147,7 +152,7 @@ class ModalContinualDataTests(unittest.TestCase):
                     for path in (extracted / "datasets/kubric-multiview/train").iterdir()
                     if path.name.isdigit()
                 },
-                EXPECTED_MVKUBRIC_SCENES,
+                EXPECTED_MVKUBRIC_POOL_SCENES,
             )
             self.assertTrue(
                 (extracted / "datasets/diegesis-mvtracker/TAPVid3D_raw/train").is_dir()
