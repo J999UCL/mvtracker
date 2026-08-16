@@ -12,6 +12,13 @@ import time
 
 import modal
 
+from modal_training_profile import (
+    _runtime_image,
+    data_volume,
+    hf_secret,
+    wandb_secret,
+)
+
 
 DATA_ROOT = Path("/mnt/mvtracker-data")
 MVKUBRIC_REPO = "ethz-vlg/mv3dpt-datasets"
@@ -25,16 +32,8 @@ app = modal.App(
     "jeet-mvkubric-validation",
     tags={"owner": "jeet", "project": "mvtracker", "purpose": "profiling"},
 )
-image = modal.Image.debian_slim(python_version="3.11").pip_install(
-    "huggingface_hub", "numpy", "torch", "wandb"
-)
-volume = modal.Volume.from_name("jeet-mvtracker-data-v2", version=2)
-hf_secret = modal.Secret.from_name(
-    "jeet-mvtracker-huggingface", required_keys=["HF_TOKEN"]
-)
-wandb_secret = modal.Secret.from_name(
-    "jeet-mvtracker-wandb", required_keys=["WANDB_API_KEY"]
-)
+image = _runtime_image()
+volume = data_volume
 
 
 def _sha256(path: Path) -> str:
