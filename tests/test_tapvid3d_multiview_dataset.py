@@ -70,6 +70,15 @@ def _load_module():
     package.__path__ = []
     datasets = types.ModuleType("mvtracker.datasets")
     datasets.__path__ = []
+    estimated_path = (
+        Path(__file__).resolve().parents[1]
+        / "mvtracker/datasets/estimated_depth.py"
+    )
+    estimated_spec = importlib.util.spec_from_file_location(
+        "mvtracker.datasets.estimated_depth", estimated_path
+    )
+    estimated = importlib.util.module_from_spec(estimated_spec)
+    estimated_spec.loader.exec_module(estimated)
     path = Path(__file__).resolve().parents[1] / "mvtracker/datasets/tapvid3d_multiview_dataset.py"
     name = "_tapvid3d_loader_under_test"
     spec = importlib.util.spec_from_file_location(name, path)
@@ -78,11 +87,13 @@ def _load_module():
         "mvtracker": package,
         "mvtracker.datasets": datasets,
         "mvtracker.datasets.kubric_multiview_dataset": kubric,
+        "mvtracker.datasets.estimated_depth": estimated,
         "mvtracker.datasets.utils": utils,
         name: module,
     }
     with mock.patch.dict(sys.modules, stubs):
         spec.loader.exec_module(module)
+    module.EstimatedDepthStore = estimated.EstimatedDepthStore
     return module
 
 
@@ -123,6 +134,27 @@ def _write_raw(root: Path, *, frames=6, points=6, views=2, height=8, width=10):
     return sequence
 
 
+def _write_estimated_depth(root: Path, *, frames=6, views=(2, 0, 3, 1), height=8, width=10):
+    scene = root / "scene-alpha"
+    scene.mkdir(parents=True)
+    depth = np.stack([
+        np.full((frames, height, width), 10 + view, dtype=np.float32)
+        for view in views
+    ])
+    cleaned_mask = np.ones(depth.shape, dtype=np.bool_)
+    cleaned_mask[..., : width // 2] = False
+    np.save(scene / "depth.npy", depth)
+    np.save(scene / "cleaned_mask.npy", cleaned_mask)
+    (scene / "manifest.json").write_text(json.dumps({
+        "format": "mvtracker_estimated_depth",
+        "schema_version": 1,
+        "provider": "vggt_omega",
+        "view_ids": list(views),
+        "frame_count": frames,
+        "resolution_hw": [height, width],
+    }))
+
+
 def _dataset(root: Path, *, points=16, views=4):
     _write_raw(root / "raw", points=points, views=views)
     loader.prepare_tapvid3d_cache(root / "raw", root / "cache")
@@ -155,7 +187,31 @@ def _dataset(root: Path, *, points=16, views=4):
     dataset.replace_max = 10
     dataset.replace_bounds = [2, 100]
     dataset.max_depth = 24
+    dataset.enable_variable_depth_type_augs = False
+    dataset.estimated_depth_store = loader.EstimatedDepthStore(None, None)
     return dataset
+
+
+class EstimatedDepthTests(unittest.TestCase):
+    def test_sidecar_mmaps_and_slices_views_and_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_estimated_depth(root)
+            store = loader.EstimatedDepthStore(root, "vggt_omega")
+            depth, mask = store.load("scene-alpha", [1, 2], [1, 4])
+            self.assertEqual(depth.shape, (2, 2, 8, 10))
+            self.assertTrue(np.all(depth[0] == 11))
+            self.assertTrue(np.all(depth[1] == 12))
+            self.assertTrue(np.all(mask[..., 5:]))
+            self.assertIsInstance(store._arrays[root / "scene-alpha/depth.npy"], np.memmap)
+
+    def test_manifest_provider_is_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_estimated_depth(root)
+            store = loader.EstimatedDepthStore(root, "another_provider")
+            with self.assertRaisesRegex(ValueError, "incompatible estimated-depth manifest"):
+                store.load("scene-alpha", [0])
 
 
 class CacheTests(unittest.TestCase):
@@ -195,6 +251,33 @@ class CacheTests(unittest.TestCase):
 
 
 class SelectiveLoaderTests(unittest.TestCase):
+    def test_samples_gt_raw_and_cleaned_estimated_depth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = _dataset(root)
+            estimated_root = root / "estimated"
+            _write_estimated_depth(estimated_root)
+            dataset.estimated_depth_store = loader.EstimatedDepthStore(
+                estimated_root, "vggt_omega"
+            )
+            dataset.enable_variable_depth_type_augs = True
+            dataset.augmentation_probability = 0.0
+
+            samples = {}
+            for index in range(100):
+                sample, gotit = dataset[index]
+                self.assertTrue(gotit)
+                samples.setdefault(sample.metadata["depth_source"], sample)
+                if len(samples) == 3:
+                    break
+
+            self.assertEqual(set(samples), {"gt", "estimated", "estimated_cleaned"})
+            self.assertTrue(torch.all(samples["gt"].depth == 2))
+            self.assertGreater(float(samples["estimated"].depth.min()), 9)
+            cleaned = samples["estimated_cleaned"].depth
+            self.assertTrue(torch.all(cleaned[..., :5] == 0))
+            self.assertGreater(float(cleaned[..., 5:].min()), 9)
+
     def test_collate_keeps_rejected_samples_out_of_the_pinned_batch(self):
         encoded, gotit = loader.collate_encoded_tapvid3d([(None, False)])
         self.assertEqual(encoded.samples, [])
@@ -284,6 +367,8 @@ class FromNameTests(unittest.TestCase):
             "tapvid3d_raw_dir": "raw-data",
             "tapvid3d_cache_dir": "indexed-data",
             "tapvid3d_num_views": 3,
+            "estimated_depth_root": "estimated/validation",
+            "estimated_depth_provider": "vggt_omega",
         })
         kwargs = loader.TapVid3DMultiViewDataset.from_name(
             "tapvid3d-multiview-validation",
@@ -294,6 +379,8 @@ class FromNameTests(unittest.TestCase):
         self.assertEqual(kwargs["data_root"], "/datasets/indexed-data/validation")
         self.assertEqual(kwargs["raw_root"], "/datasets/raw-data/validation")
         self.assertEqual(kwargs["num_views"], 3)
+        self.assertEqual(kwargs["estimated_depth_root"], "/datasets/estimated/validation")
+        self.assertEqual(kwargs["estimated_depth_provider"], "vggt_omega")
 
     def test_training_keeps_rgb_depth_and_variable_view_augmentations(self):
         config = types.SimpleNamespace(

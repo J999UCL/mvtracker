@@ -17,6 +17,7 @@ from torch.nn import functional as F
 from torchvision.io import ImageReadMode, decode_jpeg
 from torchvision.transforms import functional as TF
 
+from mvtracker.datasets.estimated_depth import ESTIMATED_DEPTH_TYPE_PROBABILITIES
 from mvtracker.datasets.kubric_multiview_dataset import (
     KubricMultiViewDataset,
     _legal_contiguous_window_starts,
@@ -846,8 +847,17 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             "clean_duster_depths": False,
             "duster_views": None,
             "supported_duster_views_sets": None,
-            "enable_variable_depth_type_augs": False,
+            "enable_variable_depth_type_augs": bool(
+                requested == "training"
+                and kwargs.get("enable_variable_depth_type_augs")
+                and datasets_cfg.get("estimated_depth_root")
+            ),
         })
+        estimated_depth_root = datasets_cfg.get("estimated_depth_root")
+        if estimated_depth_root is not None and not os.path.isabs(estimated_depth_root):
+            estimated_depth_root = os.path.join(dataset_root, estimated_depth_root)
+        kwargs["estimated_depth_root"] = estimated_depth_root
+        kwargs["estimated_depth_provider"] = datasets_cfg.get("estimated_depth_provider")
         if requested == "training" and kwargs.get("enable_variable_num_views_augs"):
             kwargs["num_views"] = None
         if kwargs.get("normalize_scene_following_vggt"):
@@ -898,6 +908,13 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             raise ValueError(f"{source_root}: requires {view_count} views")
         views = sorted(rng.choice(available_views, view_count, replace=False).tolist())
 
+        depth_type = "gt"
+        if getattr(self, "enable_variable_depth_type_augs", False):
+            depth_type = str(rng.choice(
+                tuple(ESTIMATED_DEPTH_TYPE_PROBABILITIES),
+                p=tuple(ESTIMATED_DEPTH_TYPE_PROBABILITIES.values()),
+            ))
+
         tracks_all = np.asarray(self._mmap(source_root / "tracks_xyz.npy"), dtype=np.float32)
         visibility_all = np.stack(
             [
@@ -927,13 +944,31 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         visibility = []
         depths = []
         encoded = []
-        for view in views:
+        source_size = tuple(int(value) for value in manifest["resolution_hw"])
+        estimated_depths = cleaned_mask = None
+        if depth_type != "gt":
+            estimated_depths, cleaned_mask = self.estimated_depth_store.load(
+                sequence, views, frame_indices
+            )
+            if estimated_depths.shape != (view_count, self.seq_len, *source_size):
+                raise ValueError(
+                    f"estimated depth shape {estimated_depths.shape} does not match "
+                    f"sample shape {(view_count, self.seq_len, *source_size)}"
+                )
+            if depth_type == "estimated_cleaned":
+                estimated_depths = estimated_depths * cleaned_mask
+        for view_position, view in enumerate(views):
             raw_view = source_root / str(view)
             extrinsics.append(np.asarray(self._mmap(raw_view / "extrinsics_w2c.npy")[frame_indices, :3, :4], dtype=np.float32))
             k = _intrinsics_matrix(self._mmap(raw_view / "intrinsics.npy"))
             intrinsics.append(np.repeat(k[None], self.seq_len, axis=0))
             visibility.append(visibility_all[views.index(view), frame_indices][:, preselected])
-            depths.append(torch.from_numpy(np.asarray(self._mmap(raw_view / "depth.npy")[frame_indices], dtype=np.float32).copy()))
+            depth = (
+                self._mmap(raw_view / "depth.npy")[frame_indices]
+                if estimated_depths is None
+                else estimated_depths[view_position]
+            )
+            depths.append(torch.from_numpy(np.asarray(depth, dtype=np.float32).copy()))
             cache_view = cache_root / f"view_{view}"
             encoded.extend(_read_encoded_frames(
                 self._jpeg_descriptor(cache_view / "jpeg_bytes.bin"),
@@ -946,7 +981,6 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         visibility_np = np.stack(visibility)
         xy, camera_z = _project(tracks, extrinsics_np, intrinsics_np)
         visibility_np &= np.isfinite(xy).all(axis=-1) & np.isfinite(camera_z) & (camera_z > 0)
-        source_size = tuple(int(value) for value in manifest["resolution_hw"])
         augment_this_datapoint = bool(
             self.augmentation_probability > 0
             and rng.rand() <= self.augmentation_probability
@@ -1065,6 +1099,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "window_start": start,
                 "window_end_exclusive": start + self.seq_len,
                 "selected_views": views,
+                "depth_source": depth_type,
                 "requested_view_count": request.view_count if request is not None else None,
                 "gotit": True,
                 "worker_prepare_seconds": time.perf_counter() - load_started,

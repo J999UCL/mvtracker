@@ -20,6 +20,10 @@ from torch.utils.data import get_worker_info
 from torchvision.transforms import ColorJitter, GaussianBlur
 from torchvision.transforms import functional as F_torchvision
 
+from mvtracker.datasets.estimated_depth import (
+    ESTIMATED_DEPTH_TYPE_PROBABILITIES,
+    EstimatedDepthStore,
+)
 from mvtracker.datasets.utils import Datapoint, read_json, read_tiff, read_png, transform_scene, add_camera_noise, \
     aug_depth
 
@@ -252,6 +256,14 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             kubric_kwargs["enable_variable_vggt_crop_size_augs"] = training_args.augmentations.variable_vggt_crop_size
             kubric_kwargs["keep_principal_point_centered"] = training_args.augmentations.keep_principal_point_centered
 
+            estimated_depth_root = training_args.datasets.get("estimated_depth_root")
+            if estimated_depth_root is not None and not os.path.isabs(estimated_depth_root):
+                estimated_depth_root = os.path.join(dataset_root, estimated_depth_root)
+            kubric_kwargs["estimated_depth_root"] = estimated_depth_root
+            kubric_kwargs["estimated_depth_provider"] = training_args.datasets.get(
+                "estimated_depth_provider"
+            )
+
             if training_args.modes.pretrain_only:
                 kubric_kwargs["ratio_dynamic"] = 0.0
                 kubric_kwargs["ratio_very_dynamic"] = 0.0
@@ -312,10 +324,15 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             perform_sanity_checks=False,
             use_cached_tracks=False,
             cache_version="v3",
+            estimated_depth_root=None,
+            estimated_depth_provider=None,
     ):
         super(KubricMultiViewDataset, self).__init__()
 
         self.data_root = data_root
+        self.estimated_depth_store = EstimatedDepthStore(
+            estimated_depth_root, estimated_depth_provider
+        )
         self.views_to_return = views_to_return
         self.novel_views = novel_views
         self.use_duster_depths = use_duster_depths
@@ -592,17 +609,27 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         if self.enable_variable_depth_type_augs:
             assert self.use_duster_depths is False, "Cannot force depth type when using variable depth type augs."
             assert self.clean_duster_depths is False, "Cannot force depth type when using variable depth type augs."
+            depth_probabilities = (
+                ESTIMATED_DEPTH_TYPE_PROBABILITIES
+                if self.estimated_depth_store.enabled
+                else self.enable_variable_depth_type_augs__depth_type_probability
+            )
             depth_type = rnd_np.choice(
-                a=list(self.enable_variable_depth_type_augs__depth_type_probability.keys()),
+                a=list(depth_probabilities.keys()),
                 size=1,
-                p=list(self.enable_variable_depth_type_augs__depth_type_probability.values()),
+                p=list(depth_probabilities.values()),
             )[0]
             use_duster_depths, clean_duster_depths = {
                 "gt": (False, False),
                 "duster": (True, False),
                 "duster_cleaned": (True, True),
+                "estimated": (False, False),
+                "estimated_cleaned": (False, False),
             }[depth_type]
         else:
+            depth_type = "duster_cleaned" if self.clean_duster_depths else (
+                "duster" if self.use_duster_depths else "gt"
+            )
             use_duster_depths = self.use_duster_depths
             clean_duster_depths = self.clean_duster_depths
 
@@ -699,6 +726,18 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         duster_root = pathlib.Path(self.data_root) / self.seq_names[index] / f'duster-views-{duster_views_str}'
 
         num_views, n_frames, h, w, _ = rgbs.shape
+        if depth_type in {"estimated", "estimated_cleaned"}:
+            estimated_depths, cleaned_mask = self.estimated_depth_store.load(
+                self.seq_names[index], views_to_return
+            )
+            if estimated_depths.shape != (num_views, n_frames, h, w):
+                raise ValueError(
+                    f"estimated depth shape {estimated_depths.shape} does not match "
+                    f"scene shape {(num_views, n_frames, h, w)}"
+                )
+            if depth_type == "estimated_cleaned":
+                estimated_depths = estimated_depths * cleaned_mask
+            depths = np.asarray(estimated_depths[..., None], dtype=np.float32)
         feats = None
         feat_dim = None
         feat_stride = None
@@ -1193,6 +1232,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                 "window_start": int(start_ind),
                 "window_end_exclusive": int(start_ind + self.seq_len),
                 "selected_views": [int(view) for view in views_to_return],
+                "depth_source": depth_type,
                 "gotit": True,
             },
             track_upscaling_factor=1 / scale,
