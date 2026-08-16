@@ -15,7 +15,7 @@ from mvtracker.preprocessing.vggt_omega import (
     checkpoint_sha256,
     load_model,
     preprocess_scene,
-    profile_batch_sizes,
+    profile_temporal_chunk_sizes,
 )
 
 
@@ -40,8 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--scenes", nargs="*", help="scene directory names; defaults to every scene")
     parser.add_argument("--views", type=_csv_ints)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--profile-batch-sizes", type=_csv_ints)
+    parser.add_argument("--temporal-chunk-size", type=int, default=24)
+    parser.add_argument("--profile-temporal-chunk-sizes", type=_csv_ints)
     parser.add_argument("--max-vram-fraction", type=float, default=0.9)
     parser.add_argument("--image-resolution", type=int, default=512)
     parser.add_argument("--device", default="cuda:0")
@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be positive")
+    if args.temporal_chunk_size < 1:
+        raise ValueError("--temporal-chunk-size must be positive")
     if not 0 < args.max_vram_fraction <= 1:
         raise ValueError("--max-vram-fraction must be in (0, 1]")
     device = torch.device(args.device)
@@ -68,12 +68,12 @@ def main() -> None:
     first_source = source_type(scene_paths[0], args.views)
     model = load_model(args.checkpoint, device)
     digest = checkpoint_sha256(args.checkpoint)
-    batch_size = args.batch_size
-    if args.profile_batch_sizes:
-        batch_size = profile_batch_sizes(
+    temporal_chunk_size = args.temporal_chunk_size
+    if args.profile_temporal_chunk_sizes:
+        temporal_chunk_size = profile_temporal_chunk_sizes(
             first_source,
             model,
-            batch_sizes=args.profile_batch_sizes,
+            temporal_chunk_sizes=args.profile_temporal_chunk_sizes,
             device=device,
             image_resolution=args.image_resolution,
             max_vram_fraction=args.max_vram_fraction,
@@ -85,7 +85,7 @@ def main() -> None:
                 "event": "run_started",
                 "dataset": args.dataset,
                 "scene_count": len(scene_paths),
-                "batch_size": batch_size,
+                "temporal_chunk_size": temporal_chunk_size,
                 "checkpoint_sha256": digest,
             },
             sort_keys=True,
@@ -100,7 +100,7 @@ def main() -> None:
             model,
             args.checkpoint,
             digest,
-            batch_size=batch_size,
+            temporal_chunk_size=temporal_chunk_size,
             device=device,
             image_resolution=args.image_resolution,
         )

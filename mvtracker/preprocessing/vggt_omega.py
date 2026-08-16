@@ -21,7 +21,7 @@ from PIL import Image
 
 
 FORMAT = "mvtracker_estimated_depth"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROVIDER = "vggt_omega"
 VGGT_OMEGA_SOURCE_REVISION = "39a0cb8af88554f15ddcb5354cd52bde588fa014"
 VGGT_OMEGA_CHECKPOINT_REVISION = "ba9db085d6b7349b738fa2e37d198bb4dd077954"
@@ -41,6 +41,14 @@ class SceneDescription:
     view_ids: tuple[int, ...]
     resolution_hw: tuple[int, int]
     source_fingerprint: str
+
+
+@dataclass(frozen=True)
+class SimilarityAlignment:
+    scale: float
+    rotation: np.ndarray
+    translation: np.ndarray
+    residual: float
 
 
 class SceneSource(ABC):
@@ -362,6 +370,61 @@ def scale_extrinsics(extrinsics_w2c: np.ndarray, scale: float) -> np.ndarray:
     return result
 
 
+def align_camera_centres_sim3(
+    predicted_w2c: np.ndarray,
+    known_w2c: np.ndarray,
+) -> SimilarityAlignment:
+    """Fit ``known = scale * rotation @ predicted + translation``."""
+    predicted = camera_centres(predicted_w2c).reshape(-1, 3)
+    known = camera_centres(known_w2c).reshape(-1, 3)
+    if predicted.shape != known.shape or len(predicted) < 2:
+        raise ValueError("camera alignment requires corresponding camera centres")
+    if not np.isfinite(predicted).all() or not np.isfinite(known).all():
+        raise ValueError("camera alignment received non-finite camera centres")
+    predicted_mean = predicted.mean(axis=0)
+    known_mean = known.mean(axis=0)
+    predicted_centered = predicted - predicted_mean
+    known_centered = known - known_mean
+    predicted_variance = np.mean(np.sum(predicted_centered * predicted_centered, axis=1))
+    if predicted_variance <= 1e-12:
+        raise ValueError("predicted camera centres have zero variance")
+    covariance = known_centered.T @ predicted_centered / len(predicted)
+    left, singular_values, right_t = np.linalg.svd(covariance)
+    signs = np.ones(3, dtype=np.float64)
+    if np.linalg.det(left @ right_t) < 0:
+        signs[-1] = -1
+    rotation = left @ np.diag(signs) @ right_t
+    scale = float(np.sum(singular_values * signs) / predicted_variance)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f"invalid camera-centre similarity scale: {scale}")
+    translation = known_mean - scale * (rotation @ predicted_mean)
+    aligned = scale * np.einsum("ij,nj->ni", rotation, predicted) + translation
+    residual = float(np.sqrt(np.mean(np.sum((aligned - known) ** 2, axis=1))))
+    return SimilarityAlignment(
+        scale=scale,
+        rotation=rotation.astype(np.float32),
+        translation=translation.astype(np.float32),
+        residual=residual,
+    )
+
+
+def apply_similarity_to_extrinsics(
+    predicted_w2c: np.ndarray,
+    alignment: SimilarityAlignment,
+) -> np.ndarray:
+    """Express scaled predicted cameras as rigid W2C matrices in the known world."""
+    predicted = np.asarray(predicted_w2c, dtype=np.float32)
+    rotation = predicted[..., :3, :3] @ alignment.rotation.T
+    translation = (
+        alignment.scale * predicted[..., :3, 3]
+        - np.einsum("...ij,j->...i", rotation, alignment.translation)
+    )
+    result = np.broadcast_to(np.eye(4, dtype=np.float32), predicted.shape[:-2] + (4, 4)).copy()
+    result[..., :3, :3] = rotation
+    result[..., :3, 3] = translation
+    return result
+
+
 def depth_edges(depth: np.ndarray, rtol: float = 0.03, kernel_size: int = 3) -> np.ndarray:
     """VGGT-Omega's published local relative depth-jump filter."""
     depth = np.asarray(depth)
@@ -430,7 +493,7 @@ def _emit(event: str, **fields) -> None:
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
-def _model_batch(
+def _model_sequence(
     model,
     images: torch.Tensor,
     device: torch.device,
@@ -443,7 +506,7 @@ def _model_batch(
             predictions["pose_enc"], predictions["images"].shape[-2:]
         )
     return tuple(
-        value.detach().float().cpu().numpy()
+        value[0].detach().float().cpu().numpy()
         for value in (predictions["depth"], predictions["depth_conf"], intrinsics, extrinsics)
     )
 
@@ -455,14 +518,22 @@ def preprocess_scene(
     checkpoint_path: Path,
     checkpoint_hash: str,
     *,
-    batch_size: int,
+    temporal_chunk_size: int,
     device: torch.device,
     image_resolution: int = 512,
     confidence_percentile: float = 20.0,
     edge_rtol: float = 0.03,
 ) -> dict:
+    if temporal_chunk_size < 1:
+        raise ValueError("temporal_chunk_size must be positive")
     description = source.description
-    preprocessing = {"mode": "balanced", "image_resolution": image_resolution, "patch_size": 16}
+    preprocessing = {
+        "mode": "balanced",
+        "image_resolution": image_resolution,
+        "patch_size": 16,
+        "temporal_chunk_size": temporal_chunk_size,
+        "sequence_order": "timestamp_major_views_minor",
+    }
     cleaning = {
         "confidence_percentile": confidence_percentile,
         "depth_edge_relative_tolerance": edge_rtol,
@@ -514,60 +585,80 @@ def preprocess_scene(
     started = time.perf_counter()
     residuals = []
     coverages = []
-    for first in range(0, frames, batch_size):
-        frame_indices = list(range(first, min(first + batch_size, frames)))
-        batch_tensors = []
-        batch_transforms = []
+    chunk_records = []
+    for first in range(0, frames, temporal_chunk_size):
+        frame_indices = list(range(first, min(first + temporal_chunk_size, frames)))
+        sequence_tensors = []
+        sequence_transforms = []
         for frame in frame_indices:
             images = [source.load_rgb(view, frame) for view in description.view_ids]
             tensors, transforms = preprocess_images(images, resolution=image_resolution)
-            batch_tensors.append(tensors)
-            batch_transforms.append(transforms)
-        images = torch.stack(batch_tensors)
-        predicted_depth, confidence, intrinsics, predicted_w2c = _model_batch(model, images, device)
+            sequence_tensors.extend(tensors)
+            sequence_transforms.extend(transforms)
+        images = torch.stack(sequence_tensors).unsqueeze(0)
+        predicted_depth, confidence, intrinsics, predicted_w2c = _model_sequence(
+            model, images, device
+        )
         if predicted_depth.shape[-1] == 1:
             predicted_depth = predicted_depth[..., 0]
         if confidence.shape[-1] == 1:
             confidence = confidence[..., 0]
         known_w2c = source.extrinsics_w2c(frame_indices)
-        for batch_index, frame in enumerate(frame_indices):
-            scale, residual = metric_scale_from_camera_baselines(
-                predicted_w2c[batch_index], known_w2c[batch_index]
-            )
-            restored_depth = []
-            restored_confidence = []
-            restored_intrinsics = []
-            for view_index, transform in enumerate(batch_transforms[batch_index]):
-                restored_depth.append(
-                    _resize_to_source(predicted_depth[batch_index, view_index] * scale, transform)
-                )
-                restored_confidence.append(
-                    _resize_to_source(confidence[batch_index, view_index], transform)
-                )
-                restored_intrinsics.append(
-                    _intrinsics_to_source(intrinsics[batch_index, view_index], transform)
-                )
-            restored_depth = np.stack(restored_depth)
-            restored_confidence = np.stack(restored_confidence)
-            clean_mask = cleaned_depth_mask(
-                restored_depth,
-                restored_confidence,
-                confidence_percentile=confidence_percentile,
-                edge_rtol=edge_rtol,
-            )
-            depth_output[:, frame] = restored_depth
-            mask_output[:, frame] = clean_mask
-            scales_output[frame] = scale
-            intrinsics_output[:, frame] = np.stack(restored_intrinsics)
-            extrinsics_output[:, frame] = scale_extrinsics(predicted_w2c[batch_index], scale)
-            residuals.append(residual)
-            coverages.append(float(clean_mask.mean()))
+        alignment = align_camera_centres_sim3(predicted_w2c, known_w2c.reshape(-1, 4, 4))
+        aligned_w2c = apply_similarity_to_extrinsics(predicted_w2c, alignment)
+        restored_depth = np.stack(
+            [
+                _resize_to_source(depth * alignment.scale, transform)
+                for depth, transform in zip(predicted_depth, sequence_transforms)
+            ]
+        ).reshape(len(frame_indices), views, height, width)
+        restored_confidence = np.stack(
+            [
+                _resize_to_source(conf, transform)
+                for conf, transform in zip(confidence, sequence_transforms)
+            ]
+        ).reshape(len(frame_indices), views, height, width)
+        restored_intrinsics = np.stack(
+            [
+                _intrinsics_to_source(intrinsic, transform)
+                for intrinsic, transform in zip(intrinsics, sequence_transforms)
+            ]
+        ).reshape(len(frame_indices), views, 3, 3)
+        aligned_w2c = aligned_w2c.reshape(len(frame_indices), views, 4, 4)
+        clean_mask = cleaned_depth_mask(
+            restored_depth,
+            restored_confidence,
+            confidence_percentile=confidence_percentile,
+            edge_rtol=edge_rtol,
+        )
+        for chunk_index, frame in enumerate(frame_indices):
+            depth_output[:, frame] = restored_depth[chunk_index]
+            mask_output[:, frame] = clean_mask[chunk_index]
+            scales_output[frame] = alignment.scale
+            intrinsics_output[:, frame] = restored_intrinsics[chunk_index]
+            extrinsics_output[:, frame] = aligned_w2c[chunk_index]
+        residuals.append(alignment.residual)
+        cleaned_coverage = float(clean_mask.mean())
+        coverages.append(cleaned_coverage)
+        chunk_records.append(
+            {
+                "first_frame": frame_indices[0],
+                "last_frame": frame_indices[-1],
+                "sequence_length": len(frame_indices) * views,
+                "scale": alignment.scale,
+                "alignment_residual": alignment.residual,
+                "cleaned_coverage": cleaned_coverage,
+            }
+        )
         _emit(
-            "batch_complete",
+            "temporal_chunk_complete",
             scene=description.name,
             first_frame=frame_indices[0],
             last_frame=frame_indices[-1],
-            batch_size=len(frame_indices),
+            temporal_chunk_size=len(frame_indices),
+            sequence_length=len(frame_indices) * views,
+            alignment_scale=alignment.scale,
+            alignment_residual=alignment.residual,
             elapsed_seconds=time.perf_counter() - started,
         )
 
@@ -586,6 +677,7 @@ def preprocess_scene(
             "predicted_intrinsics.npy": {"shape": [views, frames, 3, 3], "dtype": "float32"},
             "predicted_extrinsics_w2c.npy": {"shape": [views, frames, 4, 4], "dtype": "float32"},
         },
+        "temporal_chunks": chunk_records,
         "metrics": {
             "duration_seconds": duration,
             "timestamps_per_second": frames / duration,
@@ -605,51 +697,70 @@ def preprocess_scene(
     return manifest["metrics"]
 
 
-def profile_batch_sizes(
+def profile_temporal_chunk_sizes(
     source: SceneSource,
     model,
     *,
-    batch_sizes: Sequence[int],
+    temporal_chunk_sizes: Sequence[int],
     device: torch.device,
     image_resolution: int = 512,
     max_vram_fraction: float = 0.9,
 ) -> int:
-    """Measure candidate timestamp batch sizes and return the largest safe one."""
+    """Measure candidate temporal reconstruction sizes and return the largest safe one."""
+    if not temporal_chunk_sizes or any(size < 1 for size in temporal_chunk_sizes):
+        raise ValueError("temporal_chunk_sizes must contain positive integers")
     results = []
     total_memory = torch.cuda.get_device_properties(device).total_memory
-    for batch_size in batch_sizes:
-        frame_indices = [index % source.description.frame_count for index in range(batch_size)]
-        tensors = []
+    views = len(source.description.view_ids)
+    for temporal_chunk_size in temporal_chunk_sizes:
+        frame_indices = [
+            index % source.description.frame_count for index in range(temporal_chunk_size)
+        ]
+        sequence_tensors = []
         for frame in frame_indices:
             images = [source.load_rgb(view, frame) for view in source.description.view_ids]
-            tensors.append(preprocess_images(images, resolution=image_resolution)[0])
-        images = torch.stack(tensors)
+            sequence_tensors.extend(preprocess_images(images, resolution=image_resolution)[0])
+        images = torch.stack(sequence_tensors).unsqueeze(0)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
         try:
-            _model_batch(model, images, device)
+            _model_sequence(model, images, device)
             torch.cuda.synchronize(device)
             duration = time.perf_counter() - started
             peak_allocated = torch.cuda.max_memory_allocated(device)
             peak_reserved = torch.cuda.max_memory_reserved(device)
             safe = peak_reserved <= total_memory * max_vram_fraction
             result = {
-                "batch_size": batch_size,
+                "temporal_chunk_size": temporal_chunk_size,
+                "sequence_length": temporal_chunk_size * views,
                 "duration_seconds": duration,
-                "timestamps_per_second": batch_size / duration,
+                "timestamps_per_second": temporal_chunk_size / duration,
                 "peak_cuda_memory_bytes": int(peak_allocated),
                 "peak_cuda_reserved_bytes": int(peak_reserved),
                 "safe": safe,
             }
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            result = {"batch_size": batch_size, "oom": True, "safe": False}
+            result = {
+                "temporal_chunk_size": temporal_chunk_size,
+                "sequence_length": temporal_chunk_size * views,
+                "oom": True,
+                "safe": False,
+            }
         results.append(result)
-        _emit("batch_profile", scene=source.description.name, **result)
-    safe_sizes = [result["batch_size"] for result in results if result["safe"]]
+        _emit("temporal_chunk_profile", scene=source.description.name, **result)
+    safe_sizes = [
+        result["temporal_chunk_size"] for result in results if result["safe"]
+    ]
     if not safe_sizes:
-        raise RuntimeError("no profiled batch size stayed within the requested VRAM limit")
+        raise RuntimeError(
+            "no profiled temporal chunk size stayed within the requested VRAM limit"
+        )
     selected = max(safe_sizes)
-    _emit("batch_profile_selected", scene=source.description.name, batch_size=selected)
+    _emit(
+        "temporal_chunk_profile_selected",
+        scene=source.description.name,
+        temporal_chunk_size=selected,
+    )
     return selected
