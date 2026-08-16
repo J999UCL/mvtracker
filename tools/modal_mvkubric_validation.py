@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import tarfile
@@ -117,12 +116,7 @@ def materialize_validation() -> dict[str, object]:
             repo_type="dataset",
             revision=MVKUBRIC_REVISION,
         )
-        response = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {os.environ['HF_TOKEN']}"},
-            stream=True,
-            timeout=120,
-        )
+        response = requests.get(url, stream=True, timeout=120)
         response.raise_for_status()
         source_root = staging / "kubric-multiview/train"
         source_root.mkdir(parents=True)
