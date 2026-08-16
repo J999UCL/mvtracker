@@ -635,7 +635,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         indexed_scene = None
         metadata_index = getattr(self, "metadata_index", None)
         if metadata_index is not None:
-            indexed_scene, indexed_arrays_path = metadata_index.scene(self.seq_names[index])
+            indexed_scene, indexed_arrays = metadata_index.scene(self.seq_names[index])
             with np.load(os.path.join(scene_path, "tracks_3d.npz")) as tracks_file:
                 tracks_3d = tracks_file["tracks_3d"].copy()
             datapoint = {
@@ -764,7 +764,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             views = self.getitem_indexed_views(
                 scene_path,
                 indexed_scene,
-                indexed_arrays_path,
+                indexed_arrays,
                 sorted(views_needed),
             )
 
@@ -1331,17 +1331,16 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         return datapoint, gotit
 
     @staticmethod
-    def getitem_indexed_views(scene_path, scene_entry, arrays_path, view_indices, frame_indices=None):
+    def getitem_indexed_views(scene_path, scene_entry, arrays, view_indices, frame_indices=None):
         """Load only requested native views (and optionally requested frames)."""
         n_frames = int(scene_entry["n_frames"])
         if frame_indices is None:
             frame_indices = range(n_frames)
         frame_indices = list(frame_indices)
-        with np.load(arrays_path) as arrays:
-            intrinsics = arrays["intrinsics"].copy()
-            extrinsics = arrays["extrinsics"].copy()
-            sensor_widths = arrays["sensor_widths"].copy()
-            focal_lengths = arrays["focal_lengths"].copy()
+        intrinsics = arrays["intrinsics"]
+        extrinsics = arrays["extrinsics"]
+        sensor_widths = arrays["sensor_widths"]
+        focal_lengths = arrays["focal_lengths"]
 
         views = [None] * len(scene_entry["view_names"])
         for view_index in view_indices:

@@ -95,24 +95,24 @@ class KubricMetadataIndexTests(unittest.TestCase):
             manifest_path = INDEX.build_kubric_metadata_index(root)
 
             index = INDEX.KubricMetadataIndex(manifest_path.parent)
-            scene, arrays_path = index.scene("900")
+            scene, arrays = index.scene("900")
             self.assertEqual(scene["view_names"], ["view_0", "view_1"])
             self.assertEqual(scene["invalid_frame_indices"], [1])
             self.assertEqual(scene["rgba_files"][0][2], "rgba_00002.png")
-            with np.load(arrays_path) as arrays:
-                self.assertEqual(arrays["intrinsics"].shape, (2, 3, 3))
-                self.assertEqual(arrays["extrinsics"].shape, (2, 3, 3, 4))
+            self.assertEqual(arrays["intrinsics"].shape, (2, 3, 3))
+            self.assertEqual(arrays["extrinsics"].shape, (2, 3, 3, 4))
+            index.validate_source(root)
 
     def test_indexed_loader_opens_only_requested_view_and_frames(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._make_scene(root)
             index_root = INDEX.build_kubric_metadata_index(root).parent
-            entry, arrays_path = INDEX.KubricMetadataIndex(index_root).scene("900")
+            entry, arrays = INDEX.KubricMetadataIndex(index_root).scene("900")
             calls = []
             load = _indexed_view_loader(calls)
 
-            views = load(root / "900", entry, arrays_path, [1], frame_indices=[0, 2])
+            views = load(root / "900", entry, arrays, [1], frame_indices=[0, 2])
 
             self.assertIsNone(views[0])
             self.assertEqual(views[1]["rgba"].shape[0], 2)
@@ -125,6 +125,30 @@ class KubricMetadataIndexTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(FileNotFoundError):
                 INDEX.KubricMetadataIndex(Path(tmp) / "missing")
+
+    def test_source_validation_rejects_stale_frame_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene = self._make_scene(root)
+            index = INDEX.KubricMetadataIndex(INDEX.build_kubric_metadata_index(root).parent)
+            with (scene / "view_0" / "rgba_00000.png").open("ab") as handle:
+                handle.write(b"changed")
+
+            with self.assertRaisesRegex(ValueError, "index is stale"):
+                index.validate_source(root)
+
+    def test_camera_arrays_are_preloaded_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_scene(root)
+            manifest = INDEX.build_kubric_metadata_index(root)
+            index = INDEX.KubricMetadataIndex(manifest.parent)
+            arrays_file = manifest.parent / "scenes" / "900.npz"
+            arrays_file.unlink()
+
+            _, first = index.scene("900")
+            _, second = index.scene("900")
+            self.assertIs(first, second)
 
 
 if __name__ == "__main__":

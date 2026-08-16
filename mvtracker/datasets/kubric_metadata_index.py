@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -65,6 +66,36 @@ def _invalid_frames(scene_path: Path):
     return _read_json(scene_json).get("output", {}).get("rgb", {}).get(
         "invalid_frame_indices", []
     )
+
+
+def compute_source_fingerprint(data_root, scene_names):
+    """Hash the native file inventory without reading multi-gigabyte frame payloads."""
+    data_root = Path(data_root)
+    digest = hashlib.sha256()
+    for scene_name in sorted(scene_names):
+        scene_path = data_root / scene_name
+        paths = [
+            scene_path / "tracks_3d.npz",
+            scene_path / "tracks_segmentation_ids.npz",
+            scene_path / "tracked_objects.json",
+            scene_path / "scene.json",
+            scene_path / "views.npz",
+            scene_path / "cameras.npz",
+        ]
+        for view_path in sorted(scene_path.glob("view_*")):
+            paths.extend((view_path / "metadata.json", view_path / "tracks_2d.npz"))
+            paths.extend(sorted(view_path.glob("rgba_*")))
+            paths.extend(sorted(view_path.glob("depth_*")))
+        for path in paths:
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            relative = path.relative_to(data_root).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def build_kubric_metadata_index(data_root, index_root=None, overwrite=False):
@@ -140,6 +171,7 @@ def build_kubric_metadata_index(data_root, index_root=None, overwrite=False):
 
     manifest = {
         "version": INDEX_VERSION,
+        "source_fingerprint": compute_source_fingerprint(data_root, scene_entries),
         "scenes": scene_entries,
     }
     temporary = manifest_path.with_suffix(".tmp")
@@ -161,16 +193,31 @@ class KubricMetadataIndex:
                 f"{manifest.get('version')!r}; expected {INDEX_VERSION}"
             )
         self.scenes = manifest.get("scenes", {})
+        self.source_fingerprint = manifest.get("source_fingerprint")
+        if not self.source_fingerprint:
+            raise ValueError(f"MV-Kubric metadata index has no source fingerprint: {manifest_path}")
+        self._arrays = {}
+        for name, entry in self.scenes.items():
+            arrays_path = self.root / entry["arrays"]
+            if not arrays_path.is_file():
+                raise FileNotFoundError(f"MV-Kubric indexed arrays are missing: {arrays_path}")
+            with np.load(arrays_path) as arrays:
+                self._arrays[name] = {key: arrays[key].copy() for key in arrays.files}
+
+    def validate_source(self, data_root):
+        actual = compute_source_fingerprint(data_root, self.scenes)
+        if actual != self.source_fingerprint:
+            raise ValueError(
+                f"MV-Kubric metadata index is stale: source fingerprint {actual} does not "
+                f"match indexed fingerprint {self.source_fingerprint}"
+            )
 
     def scene(self, name):
         try:
             entry = self.scenes[name]
         except KeyError as error:
             raise KeyError(f"Scene {name!r} is absent from {self.root / MANIFEST_NAME}") from error
-        arrays_path = self.root / entry["arrays"]
-        if not arrays_path.is_file():
-            raise FileNotFoundError(f"MV-Kubric indexed arrays are missing: {arrays_path}")
-        return entry, arrays_path
+        return entry, self._arrays[name]
 
 
 def main():
