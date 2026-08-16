@@ -17,10 +17,8 @@ from mvtracker.preprocessing.vggt_omega import (
     TapVid3DSceneSource,
 )
 from mvtracker.preprocessing.vggt_omega_quality import (
-    chunk_sample_positions,
     depth_quality_metrics,
     representative_frame_indices,
-    sidecar_frame_indices,
 )
 
 
@@ -234,13 +232,11 @@ def main() -> None:
     available_views = tuple(int(view) for view in manifest["view_ids"])
     view_ids = available_views if args.views is None else tuple(args.views)
     view_positions = [available_views.index(view) for view in view_ids]
-    available_frames = sidecar_frame_indices(manifest)
-    representative_positions = representative_frame_indices(len(available_frames))
-    frames = tuple(available_frames[position] for position in representative_positions)
+    frames = representative_frame_indices(int(manifest["frame_count"]))
     rgbs, ground_truth, gt_intrinsics, gt_w2c = _load_source(
         args.dataset, args.scene_root, view_ids, frames
     )
-    frame_positions = list(chunk_sample_positions(manifest, frames))
+    frame_positions = list(frames)
     estimated_all = np.load(sidecar / "depth.npy", mmap_mode="r")
     cleaned_all = np.load(sidecar / "cleaned_mask.npy", mmap_mode="r")
     predicted_intrinsics_all = np.load(sidecar / "predicted_intrinsics.npy", mmap_mode="r")
@@ -261,7 +257,6 @@ def main() -> None:
         predicted_w2c,
         gt_w2c,
         frames,
-        scale_frame_indices=available_frames,
     )
     report = {"scene": args.scene_root.name, "dataset": args.dataset, "view_ids": list(view_ids), **metrics}
     args.output_dir.mkdir(parents=True, exist_ok=True)

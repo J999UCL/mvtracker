@@ -16,30 +16,6 @@ def representative_frame_indices(frame_count: int) -> tuple[int, ...]:
     return tuple(dict.fromkeys((0, frame_count // 2, frame_count - 1)))
 
 
-def sidecar_frame_indices(manifest: dict) -> tuple[int, ...]:
-    """Return global frame IDs represented by a complete sidecar."""
-    frame_count = int(manifest["frame_count"])
-    values = manifest.get("frame_indices")
-    if values is None:
-        return tuple(range(frame_count))
-    frames = tuple(int(value) for value in values)
-    if len(frames) != frame_count or len(set(frames)) != len(frames):
-        raise ValueError("manifest frame_indices must be unique and match frame_count")
-    if any(frame < 0 for frame in frames):
-        raise ValueError("manifest frame_indices must be non-negative")
-    return frames
-
-
-def chunk_sample_positions(manifest: dict, frame_indices: Sequence[int]) -> tuple[int, ...]:
-    """Map global frame IDs to positions in a sidecar chunk."""
-    available = sidecar_frame_indices(manifest)
-    positions = {frame: position for position, frame in enumerate(available)}
-    try:
-        return tuple(positions[int(frame)] for frame in frame_indices)
-    except KeyError as error:
-        raise ValueError("requested frame is absent from the sidecar chunk") from error
-
-
 def depth_quality_metrics(
     estimated_depth: np.ndarray,
     cleaned_mask: np.ndarray,
@@ -48,7 +24,6 @@ def depth_quality_metrics(
     predicted_extrinsics_w2c: np.ndarray,
     known_extrinsics_w2c: np.ndarray,
     frame_indices: Sequence[int],
-    scale_frame_indices: Sequence[int] | None = None,
 ) -> dict:
     """Compare sampled sidecar depths with metric ground truth.
 
@@ -93,22 +68,16 @@ def depth_quality_metrics(
     for timestamp in range(timestamps):
         predicted_centres = camera_centres(predicted_w2c[:, timestamp])
         known_centres = camera_centres(known_w2c[:, timestamp])
-        residuals.append(float(np.sqrt(np.mean(np.sum((predicted_centres - known_centres) ** 2, axis=-1)))))
+        squared_error = np.sum((predicted_centres - known_centres) ** 2, axis=-1)
+        residuals.append(float(np.sqrt(np.mean(squared_error))))
 
     scales = np.asarray(scales, dtype=np.float64)
-    if scale_frame_indices is None:
-        if len(scales) == timestamps:
-            sampled_scales = scales
-        elif frame_indices and min(frame_indices) >= 0 and max(frame_indices) < len(scales):
-            sampled_scales = scales[np.asarray(frame_indices)]
-        else:
-            raise ValueError("scales must be aligned with frame_indices or sampled timestamps")
+    if len(scales) == timestamps:
+        sampled_scales = scales
+    elif frame_indices and min(frame_indices) >= 0 and max(frame_indices) < len(scales):
+        sampled_scales = scales[np.asarray(frame_indices)]
     else:
-        positions = {int(frame): position for position, frame in enumerate(scale_frame_indices)}
-        try:
-            sampled_scales = scales[[positions[int(frame)] for frame in frame_indices]]
-        except KeyError as error:
-            raise ValueError("scale_frame_indices do not cover frame_indices") from error
+        raise ValueError("scales must be aligned with frame_indices or sampled timestamps")
     return {
         "frame_indices": list(frame_indices),
         "view_count": views,

@@ -5,10 +5,8 @@ import numpy as np
 from scripts.smoke_vggt_omega_chunk import selected_chunk
 
 from mvtracker.preprocessing.vggt_omega_quality import (
-    chunk_sample_positions,
     depth_quality_metrics,
     representative_frame_indices,
-    sidecar_frame_indices,
 )
 
 
@@ -48,29 +46,6 @@ class VGGTQualityTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["cleaned_mean_absolute_relative_error"], 1 / 30)
         self.assertEqual(metrics["sampled_metric_scales"], [2.0, 2.0])
         self.assertAlmostEqual(metrics["cleaned_mask_fraction"], 15 / 16)
-
-    def test_chunk_frame_mapping_keeps_metric_scales_aligned(self):
-        manifest = {"frame_count": 3, "frame_indices": [10, 20, 30]}
-        self.assertEqual(sidecar_frame_indices(manifest), (10, 20, 30))
-        self.assertEqual(chunk_sample_positions(manifest, (30, 10)), (2, 0))
-
-        shape = (2, 2, 2, 2)
-        gt = np.full(shape, 2.0, dtype=np.float32)
-        cameras = np.repeat(np.eye(4, dtype=np.float32)[None, None], 4, axis=0).reshape(
-            2, 2, 4, 4
-        )
-        cameras[1, :, 0, 3] = -2.0
-        metrics = depth_quality_metrics(
-            gt,
-            np.ones(shape, dtype=bool),
-            gt,
-            np.array([1.0, 2.0, 3.0], dtype=np.float32),
-            cameras,
-            cameras,
-            (30, 10),
-            scale_frame_indices=(10, 20, 30),
-        )
-        self.assertEqual(metrics["sampled_metric_scales"], [3.0, 1.0])
 
     def test_rejects_non_overlapping_depth(self):
         shape = (2, 1, 2, 2)
