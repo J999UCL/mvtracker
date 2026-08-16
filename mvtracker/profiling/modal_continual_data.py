@@ -412,7 +412,7 @@ def profile_encoded_loader(
             if not all(gotit):
                 raise RuntimeError("encoded-loader profile produced an invalid sample")
             torch.cuda.synchronize()
-            return sum(len(sample.jpeg_bytes) for sample in batch.samples)
+            return int(batch.video.shape[0] * batch.video.shape[1])
         index = next(iterator)
         sample, gotit = dataset[index]
         if not gotit:
