@@ -1315,7 +1315,11 @@ class _CudaPrefetchIterator:
                         from nvidia import nvimgcodec
 
                         self.nvimagecodec_decoder = nvimgcodec.Decoder(
-                            device_id=device.index if device.index is not None else torch.cuda.current_device()
+                            device_id=(
+                                self.device.index
+                                if self.device.index is not None
+                                else torch.cuda.current_device()
+                            )
                         )
                 datapoint = decode_tapvid3d_batch(
                     encoded,
