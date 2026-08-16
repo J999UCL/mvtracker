@@ -104,7 +104,8 @@ def _create_diegesis_splits() -> None:
             )
 
 
-def _stage() -> dict:
+def _stage(emit) -> dict:
+    emit("staging_started")
     required = (DIEGESIS_ARCHIVE, MVKUBRIC_ARCHIVE, DIEGESIS_CACHE, MVKUBRIC_INDEX)
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -116,30 +117,52 @@ def _stage() -> dict:
     total_started = time.perf_counter()
     local_diegesis_archive = LOCAL_ROOT / "archives" / DIEGESIS_ARCHIVE.name
     local_mvkubric_archive = LOCAL_ROOT / "archives" / MVKUBRIC_ARCHIVE.name
+    emit("diegesis_archive_copy_started", {"bytes": DIEGESIS_ARCHIVE.stat().st_size})
     metrics = {
-        "diegesis_archive_copy": _copy_file(DIEGESIS_ARCHIVE, local_diegesis_archive),
-        "mvkubric_archive_copy": _copy_file(MVKUBRIC_ARCHIVE, local_mvkubric_archive),
+        "diegesis_archive_copy": _copy_file(DIEGESIS_ARCHIVE, local_diegesis_archive)
     }
+    emit("diegesis_archive_copy_complete", metrics["diegesis_archive_copy"])
+    emit("mvkubric_archive_copy_started", {"bytes": MVKUBRIC_ARCHIVE.stat().st_size})
+    metrics["mvkubric_archive_copy"] = _copy_file(
+        MVKUBRIC_ARCHIVE, local_mvkubric_archive
+    )
+    emit("mvkubric_archive_copy_complete", metrics["mvkubric_archive_copy"])
+    emit("diegesis_extract_started")
     metrics["diegesis_extract_seconds"] = _extract(
         local_diegesis_archive,
         LOCAL_ROOT / "source/diegesis",
         zstd=True,
     )
+    emit(
+        "diegesis_extract_complete",
+        {"seconds": metrics["diegesis_extract_seconds"]},
+    )
+    emit("mvkubric_extract_started")
     metrics["mvkubric_extract_seconds"] = _extract(
         local_mvkubric_archive,
         LOCAL_ROOT / "datasets",
         zstd=False,
     )
+    emit(
+        "mvkubric_extract_complete",
+        {"seconds": metrics["mvkubric_extract_seconds"]},
+    )
     cache_destination = (
         LOCAL_ROOT / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache"
     )
     cache_destination.parent.mkdir(parents=True)
+    emit("diegesis_cache_copy_started")
     metrics["diegesis_cache_copy"] = _copy_tree(DIEGESIS_CACHE, cache_destination)
+    emit("diegesis_cache_copy_complete", metrics["diegesis_cache_copy"])
+    emit("mvkubric_index_copy_started")
     metrics["mvkubric_index_copy"] = _copy_tree(
         MVKUBRIC_INDEX,
         LOCAL_ROOT / "datasets/kubric-multiview/train/MVTracker_index",
     )
+    emit("mvkubric_index_copy_complete", metrics["mvkubric_index_copy"])
+    emit("diegesis_split_setup_started")
     _create_diegesis_splits()
+    emit("diegesis_split_setup_complete")
     metrics["total_staging_seconds"] = time.perf_counter() - total_started
     metrics["diegesis_scene_count"] = len(
         list((LOCAL_ROOT / "source/diegesis/scenes").iterdir())
@@ -153,12 +176,21 @@ def _stage() -> dict:
     )
     if metrics["diegesis_scene_count"] != 21 or metrics["mvkubric_scene_count"] != 100:
         raise RuntimeError("staged dataset scene counts are incomplete")
+    emit(
+        "staging_complete",
+        {
+            "seconds": metrics["total_staging_seconds"],
+            "diegesis_scene_count": metrics["diegesis_scene_count"],
+            "mvkubric_scene_count": metrics["mvkubric_scene_count"],
+        },
+    )
     return metrics
 
 
-def _load_one_sample(source: str) -> dict:
+def _load_one_sample(source: str, emit) -> dict:
     from mvtracker.profiling.modal_continual_data import profile_encoded_loader
 
+    emit(f"{source}_loader_started")
     started = time.perf_counter()
     result = profile_encoded_loader(
         LOCAL_ROOT / "datasets",
@@ -169,12 +201,14 @@ def _load_one_sample(source: str) -> dict:
         use_cuda=False,
     )
     total = time.perf_counter() - started
-    return {
+    metrics = {
         "total_seconds": total,
         "first_sample_seconds": result["elapsed_seconds"],
         "initialization_seconds": total - result["elapsed_seconds"],
         "encoded_frames": result["encoded_frames"],
     }
+    emit(f"{source}_loader_complete", metrics)
+    return metrics
 
 
 @app.function(
@@ -199,14 +233,43 @@ def run_smoke() -> dict:
         tags=["modal", "cpu", "archive-staging"],
         config={"source_commit": _source_commit(), **PROFILE_TAGS},
     )
-    result = {
-        "staging": _stage(),
-        "diegesis_loader": _load_one_sample("diegesis"),
-        "mvkubric_loader": _load_one_sample("mvkubric"),
-    }
-    run.summary.update(result)
-    run.finish()
-    return result
+    smoke_started = time.perf_counter()
+
+    def emit(event: str, metrics: dict | None = None) -> None:
+        values = metrics or {}
+        elapsed = time.perf_counter() - smoke_started
+        print(
+            json.dumps(
+                {"event": event, "elapsed_seconds": elapsed, **values},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        wandb_values = {f"events/{event}/elapsed_seconds": elapsed}
+        wandb_values.update(
+            {
+                f"events/{event}/{key}": value
+                for key, value in values.items()
+                if isinstance(value, (int, float))
+            }
+        )
+        run.log(wandb_values)
+
+    try:
+        result = {
+            "staging": _stage(emit),
+            "diegesis_loader": _load_one_sample("diegesis", emit),
+            "mvkubric_loader": _load_one_sample("mvkubric", emit),
+        }
+        emit("smoke_complete", {"seconds": time.perf_counter() - smoke_started})
+        run.summary.update(result)
+        return result
+    except Exception as error:
+        emit("smoke_failed")
+        run.summary["failure"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        run.finish()
 
 
 @app.local_entrypoint()
