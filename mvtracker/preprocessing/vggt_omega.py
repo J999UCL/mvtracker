@@ -51,6 +51,17 @@ class SimilarityAlignment:
     residual: float
 
 
+@dataclass(frozen=True)
+class TemporalChunkResult:
+    depth: np.ndarray
+    cleaned_mask: np.ndarray
+    intrinsics: np.ndarray
+    extrinsics_w2c: np.ndarray
+    scale: float
+    alignment_residual: float
+    cleaned_coverage: float
+
+
 class SceneSource(ABC):
     """Common input contract for a synchronized multi-view scene."""
 
@@ -511,6 +522,76 @@ def _model_sequence(
     )
 
 
+def infer_temporal_chunk(
+    source: SceneSource,
+    frame_indices: Sequence[int],
+    model,
+    *,
+    device: torch.device,
+    image_resolution: int,
+    confidence_percentile: float = 20.0,
+    edge_rtol: float = 0.03,
+) -> TemporalChunkResult:
+    """Run one timestamp-major VGGT-Omega sequence and align it to known cameras."""
+    frame_indices = list(frame_indices)
+    if not frame_indices:
+        raise ValueError("frame_indices must not be empty")
+    description = source.description
+    views = len(description.view_ids)
+    height, width = description.resolution_hw
+    sequence_tensors = []
+    sequence_transforms = []
+    for frame in frame_indices:
+        images = [source.load_rgb(view, frame) for view in description.view_ids]
+        tensors, transforms = preprocess_images(images, resolution=image_resolution)
+        sequence_tensors.extend(tensors)
+        sequence_transforms.extend(transforms)
+    images = torch.stack(sequence_tensors).unsqueeze(0)
+    predicted_depth, confidence, intrinsics, predicted_w2c = _model_sequence(
+        model, images, device
+    )
+    if predicted_depth.shape[-1] == 1:
+        predicted_depth = predicted_depth[..., 0]
+    if confidence.shape[-1] == 1:
+        confidence = confidence[..., 0]
+    known_w2c = source.extrinsics_w2c(frame_indices)
+    alignment = align_camera_centres_sim3(predicted_w2c, known_w2c.reshape(-1, 4, 4))
+    aligned_w2c = apply_similarity_to_extrinsics(predicted_w2c, alignment)
+    depth = np.stack(
+        [
+            _resize_to_source(value * alignment.scale, transform)
+            for value, transform in zip(predicted_depth, sequence_transforms)
+        ]
+    ).reshape(len(frame_indices), views, height, width)
+    restored_confidence = np.stack(
+        [
+            _resize_to_source(value, transform)
+            for value, transform in zip(confidence, sequence_transforms)
+        ]
+    ).reshape(len(frame_indices), views, height, width)
+    restored_intrinsics = np.stack(
+        [
+            _intrinsics_to_source(value, transform)
+            for value, transform in zip(intrinsics, sequence_transforms)
+        ]
+    ).reshape(len(frame_indices), views, 3, 3)
+    cleaned_mask = cleaned_depth_mask(
+        depth,
+        restored_confidence,
+        confidence_percentile=confidence_percentile,
+        edge_rtol=edge_rtol,
+    )
+    return TemporalChunkResult(
+        depth=depth,
+        cleaned_mask=cleaned_mask,
+        intrinsics=restored_intrinsics,
+        extrinsics_w2c=aligned_w2c.reshape(len(frame_indices), views, 4, 4),
+        scale=alignment.scale,
+        alignment_residual=alignment.residual,
+        cleaned_coverage=float(cleaned_mask.mean()),
+    )
+
+
 def preprocess_scene(
     source: SceneSource,
     output_root: Path,
@@ -588,66 +669,31 @@ def preprocess_scene(
     chunk_records = []
     for first in range(0, frames, temporal_chunk_size):
         frame_indices = list(range(first, min(first + temporal_chunk_size, frames)))
-        sequence_tensors = []
-        sequence_transforms = []
-        for frame in frame_indices:
-            images = [source.load_rgb(view, frame) for view in description.view_ids]
-            tensors, transforms = preprocess_images(images, resolution=image_resolution)
-            sequence_tensors.extend(tensors)
-            sequence_transforms.extend(transforms)
-        images = torch.stack(sequence_tensors).unsqueeze(0)
-        predicted_depth, confidence, intrinsics, predicted_w2c = _model_sequence(
-            model, images, device
-        )
-        if predicted_depth.shape[-1] == 1:
-            predicted_depth = predicted_depth[..., 0]
-        if confidence.shape[-1] == 1:
-            confidence = confidence[..., 0]
-        known_w2c = source.extrinsics_w2c(frame_indices)
-        alignment = align_camera_centres_sim3(predicted_w2c, known_w2c.reshape(-1, 4, 4))
-        aligned_w2c = apply_similarity_to_extrinsics(predicted_w2c, alignment)
-        restored_depth = np.stack(
-            [
-                _resize_to_source(depth * alignment.scale, transform)
-                for depth, transform in zip(predicted_depth, sequence_transforms)
-            ]
-        ).reshape(len(frame_indices), views, height, width)
-        restored_confidence = np.stack(
-            [
-                _resize_to_source(conf, transform)
-                for conf, transform in zip(confidence, sequence_transforms)
-            ]
-        ).reshape(len(frame_indices), views, height, width)
-        restored_intrinsics = np.stack(
-            [
-                _intrinsics_to_source(intrinsic, transform)
-                for intrinsic, transform in zip(intrinsics, sequence_transforms)
-            ]
-        ).reshape(len(frame_indices), views, 3, 3)
-        aligned_w2c = aligned_w2c.reshape(len(frame_indices), views, 4, 4)
-        clean_mask = cleaned_depth_mask(
-            restored_depth,
-            restored_confidence,
+        result = infer_temporal_chunk(
+            source,
+            frame_indices,
+            model,
+            device=device,
+            image_resolution=image_resolution,
             confidence_percentile=confidence_percentile,
             edge_rtol=edge_rtol,
         )
         for chunk_index, frame in enumerate(frame_indices):
-            depth_output[:, frame] = restored_depth[chunk_index]
-            mask_output[:, frame] = clean_mask[chunk_index]
-            scales_output[frame] = alignment.scale
-            intrinsics_output[:, frame] = restored_intrinsics[chunk_index]
-            extrinsics_output[:, frame] = aligned_w2c[chunk_index]
-        residuals.append(alignment.residual)
-        cleaned_coverage = float(clean_mask.mean())
-        coverages.append(cleaned_coverage)
+            depth_output[:, frame] = result.depth[chunk_index]
+            mask_output[:, frame] = result.cleaned_mask[chunk_index]
+            scales_output[frame] = result.scale
+            intrinsics_output[:, frame] = result.intrinsics[chunk_index]
+            extrinsics_output[:, frame] = result.extrinsics_w2c[chunk_index]
+        residuals.append(result.alignment_residual)
+        coverages.append(result.cleaned_coverage)
         chunk_records.append(
             {
                 "first_frame": frame_indices[0],
                 "last_frame": frame_indices[-1],
                 "sequence_length": len(frame_indices) * views,
-                "scale": alignment.scale,
-                "alignment_residual": alignment.residual,
-                "cleaned_coverage": cleaned_coverage,
+                "scale": result.scale,
+                "alignment_residual": result.alignment_residual,
+                "cleaned_coverage": result.cleaned_coverage,
             }
         )
         _emit(
@@ -657,8 +703,8 @@ def preprocess_scene(
             last_frame=frame_indices[-1],
             temporal_chunk_size=len(frame_indices),
             sequence_length=len(frame_indices) * views,
-            alignment_scale=alignment.scale,
-            alignment_residual=alignment.residual,
+            alignment_scale=result.scale,
+            alignment_residual=result.alignment_residual,
             elapsed_seconds=time.perf_counter() - started,
         )
 

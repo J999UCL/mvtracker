@@ -3,15 +3,20 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
+import torch
 from PIL import Image
 
 from mvtracker.preprocessing.vggt_omega import (
     MVKubricSceneSource,
+    SceneDescription,
+    SceneSource,
     TapVid3DSceneSource,
     _manifest_matches,
     cleaned_depth_mask,
+    infer_temporal_chunk,
     metric_scale_from_camera_baselines,
 )
 
@@ -23,6 +28,56 @@ def _jpeg_bytes(value: int) -> np.ndarray:
 
 
 class VGGTOmegaPreprocessingTests(unittest.TestCase):
+    def test_temporal_chunk_uses_timestamp_major_sequence_and_returns_canonical_shapes(self):
+        class FakeSource(SceneSource):
+            @property
+            def description(self):
+                return SceneDescription("fake", 2, (0, 1), (6, 8), "fingerprint")
+
+            def load_rgb(self, view_id, frame_index):
+                value = frame_index * 10 + view_id
+                return Image.new("RGB", (8, 6), (value, value, value))
+
+            def extrinsics_w2c(self, frame_indices):
+                result = np.repeat(
+                    np.eye(4, dtype=np.float32)[None, None],
+                    len(frame_indices),
+                    axis=0,
+                ).repeat(2, axis=1)
+                result[:, 1, 0, 3] = -1
+                return result
+
+        def fake_model_sequence(_model, images, _device):
+            self.assertEqual(tuple(images.shape), (1, 4, 3, 32, 32))
+            observed = images[0, :, 0, 0, 0].numpy() * 255
+            np.testing.assert_allclose(observed, [0, 1, 10, 11], atol=1e-5)
+            depth = np.stack(
+                [np.full((32, 32, 1), value, dtype=np.float32) for value in (1, 2, 3, 4)]
+            )
+            confidence = np.ones_like(depth)
+            intrinsics = np.repeat(np.eye(3, dtype=np.float32)[None], 4, axis=0)
+            extrinsics = np.repeat(np.eye(4, dtype=np.float32)[None], 4, axis=0)
+            extrinsics[1::2, 0, 3] = -1
+            return depth, confidence, intrinsics, extrinsics[:, :3]
+
+        with mock.patch(
+            "mvtracker.preprocessing.vggt_omega._model_sequence",
+            side_effect=fake_model_sequence,
+        ):
+            result = infer_temporal_chunk(
+                FakeSource(Path(".")),
+                [0, 1],
+                object(),
+                device=torch.device("cpu"),
+                image_resolution=32,
+            )
+
+        self.assertEqual(result.depth.shape, (2, 2, 6, 8))
+        self.assertEqual(result.cleaned_mask.shape, result.depth.shape)
+        self.assertEqual(result.intrinsics.shape, (2, 2, 3, 3))
+        self.assertEqual(result.extrinsics_w2c.shape, (2, 2, 4, 4))
+        np.testing.assert_allclose(result.depth.mean(axis=(-1, -2)), [[1, 2], [3, 4]])
+
     def test_metric_scale_uses_corresponding_camera_baselines(self):
         predicted = np.repeat(np.eye(4, dtype=np.float32)[None], 3, axis=0)
         known = predicted.copy()
