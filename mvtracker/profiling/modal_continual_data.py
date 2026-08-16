@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from huggingface_hub import hf_hub_download
 
@@ -20,12 +22,21 @@ MANIFEST_VERSION = 1
 EXPECTED_DIEGESIS_SPLITS = {"train": 17, "validation": 2, "test": 2}
 EXPECTED_MVKUBRIC_SCENES = {str(scene) for scene in range(900, 1000)}
 MVKUBRIC_INDEX_RELATIVE = Path("datasets/kubric-multiview/train/MVTracker_index")
-LOCAL_STAGING_INPUTS = (
+DIEGESIS_ARCHIVE_RELATIVE = Path(
+    "archives/diegesis/"
+    "diegesis-81389015a6d713a848a120e34850f360621bcdce.tar.zst"
+)
+MVKUBRIC_SHARD_ROOT_RELATIVE = Path("archives/mvkubric/zstd")
+MVKUBRIC_SHARDS = tuple(
+    MVKUBRIC_SHARD_ROOT_RELATIVE / f"mvkubric-train-{index:02d}.tar.zst"
+    for index in range(4)
+)
+LOCAL_STAGING_SIDECARS = (
     Path("profile-data-manifest.json"),
     Path("continual-training-data-manifest.json"),
-    Path("source"),
-    Path("datasets"),
     Path("checkpoints"),
+    Path("datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache"),
+    MVKUBRIC_INDEX_RELATIVE,
 )
 
 
@@ -167,10 +178,11 @@ def stage_continual_training_data(
     *,
     local_data_root: Path,
 ) -> dict:
-    """Copy the prepared datasets directly from a Modal Volume to local SSD."""
+    """Stage compressed source data and compact sidecars onto local SSD."""
     data_root = Path(data_root)
     local_data_root = Path(local_data_root)
-    missing = [relative for relative in LOCAL_STAGING_INPUTS if not (data_root / relative).exists()]
+    inputs = (DIEGESIS_ARCHIVE_RELATIVE, *MVKUBRIC_SHARDS, *LOCAL_STAGING_SIDECARS)
+    missing = [relative for relative in inputs if not (data_root / relative).exists()]
     if missing:
         raise FileNotFoundError(f"local staging inputs are missing: {', '.join(map(str, missing))}")
     if local_data_root.exists():
@@ -178,7 +190,45 @@ def stage_continual_training_data(
     local_data_root.mkdir(parents=True, exist_ok=False)
 
     started = time.perf_counter()
-    for relative in LOCAL_STAGING_INPUTS:
+    archive_root = local_data_root / "archives"
+    archive_root.mkdir()
+    archive_sources = [data_root / DIEGESIS_ARCHIVE_RELATIVE, *(
+        data_root / relative for relative in MVKUBRIC_SHARDS
+    )]
+    archive_paths = [archive_root / source.name for source in archive_sources]
+    with ThreadPoolExecutor(max_workers=len(archive_sources)) as executor:
+        list(executor.map(shutil.copyfile, archive_sources, archive_paths))
+
+    diegesis_root = local_data_root / "source/diegesis"
+    mvkubric_root = local_data_root / "datasets/kubric-multiview/train"
+    diegesis_root.mkdir(parents=True)
+    mvkubric_root.mkdir(parents=True)
+
+    def extract_mvkubric(path: Path) -> None:
+        subprocess.run(
+            [
+                "tar", "--extract", "--zstd", "--strip-components=3",
+                "--file", str(path), "--directory", str(mvkubric_root),
+            ],
+            check=True,
+        )
+
+    def extract_diegesis() -> None:
+        subprocess.run(
+            [
+                "tar", "--extract", "--zstd", "--file", str(archive_paths[0]),
+                "--directory", str(diegesis_root),
+            ],
+            check=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(archive_paths)) as executor:
+        tasks = [executor.submit(extract_diegesis)]
+        tasks.extend(executor.submit(extract_mvkubric, path) for path in archive_paths[1:])
+        for task in tasks:
+            task.result()
+
+    for relative in LOCAL_STAGING_SIDECARS:
         source = data_root / relative
         destination = local_data_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -186,6 +236,30 @@ def stage_continual_training_data(
             shutil.copytree(source, destination, symlinks=True)
         else:
             shutil.copy2(source, destination)
+
+    split_document = json.loads(
+        (Path(__file__).resolve().parents[2] / "configs/diegesis_split_v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    raw_root = local_data_root / "datasets/diegesis-mvtracker/TAPVid3D_raw"
+    for split, scenes in split_document["splits"].items():
+        split_root = raw_root / split
+        split_root.mkdir(parents=True)
+        for scene in scenes:
+            sequence = diegesis_root / "scenes" / scene / "tracking/sequence"
+            if not sequence.is_dir():
+                raise FileNotFoundError(sequence)
+            (split_root / scene).symlink_to(
+                os.path.relpath(sequence, split_root), target_is_directory=True
+            )
+
+    observed_mvkubric = {
+        path.name for path in mvkubric_root.iterdir()
+        if path.is_dir() and path.name.isdigit()
+    }
+    if observed_mvkubric != EXPECTED_MVKUBRIC_SCENES:
+        raise RuntimeError("staged MV-Kubric pool must be exactly scenes 900..999")
     return {
         "local_data_root": str(local_data_root),
         "copied_size_bytes": _tree_stats(local_data_root)["size_bytes"],

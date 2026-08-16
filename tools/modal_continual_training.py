@@ -127,7 +127,7 @@ def _profile_loader(use_cuda: bool) -> dict:
         local_data_root=Path(LOCAL_DATA_ROOT),
     )
     profiles = {}
-    for source in ("diegesis",) if use_cuda else ("diegesis", "mvkubric"):
+    for source in ("diegesis", "mvkubric"):
         profiles[source] = profile_encoded_loader(
             Path(LOCAL_DATA_ROOT) / "datasets",
             source=source,

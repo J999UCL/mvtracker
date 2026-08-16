@@ -217,7 +217,7 @@ def prepare_tapvid3d_cache(
 @dataclass
 class EncodedTapVid3DSample:
     jpeg_bytes: tuple[torch.Tensor, ...]
-    depth: torch.Tensor
+    depth: torch.Tensor | None
     theta: torch.Tensor
     intrs: torch.Tensor
     extrs: torch.Tensor
@@ -237,6 +237,10 @@ class EncodedTapVid3DSample:
     track_upscaling_factor: float
     max_depth: float
     depth_patch_operations: tuple[tuple[int, ...], ...]
+    image_codec: str = "jpeg"
+    depth_bytes: tuple[bytes, ...] = ()
+    depth_sensor_widths: tuple[float, ...] = ()
+    depth_focal_lengths: tuple[float, ...] = ()
 
 
 @dataclass
@@ -245,12 +249,17 @@ class EncodedTapVid3DBatch:
 
     def pin_memory(self):
         for sample in self.samples:
-            sample.jpeg_bytes = tuple(value.pin_memory() for value in sample.jpeg_bytes)
+            sample.jpeg_bytes = tuple(
+                value.pin_memory() if isinstance(value, torch.Tensor) else value
+                for value in sample.jpeg_bytes
+            )
             for name in (
                 "depth", "theta", "intrs", "extrs", "trajectory",
                 "trajectory_3d", "visibility", "valid", "query_points_3d",
             ):
-                setattr(sample, name, getattr(sample, name).pin_memory())
+                value = getattr(sample, name)
+                if value is not None:
+                    setattr(sample, name, value.pin_memory())
         return self
 
 
@@ -1115,6 +1124,7 @@ def decode_tapvid3d_batch(
     device: torch.device,
     *,
     timing_events: tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event] | None = None,
+    nvimagecodec_decoder=None,
 ) -> Datapoint:
     if device.type != "cuda":
         raise RuntimeError("TAPVid-3D training requires CUDA nvJPEG decoding")
@@ -1123,29 +1133,78 @@ def decode_tapvid3d_batch(
         raise RuntimeError("batched CUDA JPEG decoding requires torchvision 0.20 or newer")
     if timing_events is not None:
         timing_events[0].record()
+    codecs = {sample.image_codec for sample in batch.samples}
+    if len(codecs) != 1:
+        raise ValueError(f"encoded batches cannot mix image codecs: {sorted(codecs)}")
+    codec = codecs.pop()
     flat_encoded = [encoded for sample in batch.samples for encoded in sample.jpeg_bytes]
-    decoded_all = decode_jpeg(flat_encoded, mode=ImageReadMode.RGB, device=device)
+    decoded_depths = None
+    if codec == "jpeg":
+        decoded_all = decode_jpeg(flat_encoded, mode=ImageReadMode.RGB, device=device)
+    elif codec == "nvimagecodec":
+        if nvimagecodec_decoder is None:
+            raise RuntimeError("MV-Kubric GPU decode requires an nvImageCodec decoder")
+        rgb_images = nvimagecodec_decoder.decode(flat_encoded)
+        depth_images = nvimagecodec_decoder.decode(
+            [encoded for sample in batch.samples for encoded in sample.depth_bytes]
+        )
+        decoded_all = [torch.from_dlpack(image.to_dlpack()) for image in rgb_images]
+        decoded_depths = [torch.from_dlpack(image.to_dlpack()) for image in depth_images]
+    else:
+        raise ValueError(f"unsupported encoded image codec: {codec}")
     if timing_events is not None:
         timing_events[1].record()
     videos = []
     depths = []
     decoded_offset = 0
+    depth_offset = 0
     for sample in batch.samples:
         decoded = decoded_all[decoded_offset:decoded_offset + len(sample.jpeg_bytes)]
         decoded_offset += len(sample.jpeg_bytes)
-        views, frames = sample.depth.shape[:2]
-        source_h, source_w = sample.depth.shape[-2:]
+        if sample.depth is not None:
+            views, frames = sample.depth.shape[:2]
+            source_h, source_w = sample.depth.shape[-2:]
+        else:
+            views = len(sample.depth_sensor_widths)
+            frames = len(sample.depth_bytes) // views
+            source_h, source_w = decoded[0].shape[:2]
         output_h, output_w = sample.output_size
-        rgb = torch.stack(decoded).float().reshape(
-            views, frames, 3, source_h, source_w
-        )
+        if codec == "jpeg":
+            rgb = torch.stack(decoded).float()
+        else:
+            rgb = torch.stack([
+                image[..., :3].permute(2, 0, 1) for image in decoded
+            ]).float()
+        rgb = rgb.reshape(views, frames, 3, source_h, source_w)
         if sample.apply_rgb_aug:
             rgb = _apply_rgb_augmentation(rgb, sample.rgb_augmentation)
         rgb = rgb.reshape(views * frames, 3, source_h, source_w)
         theta = sample.theta.to(device, non_blocking=True).reshape(-1, 2, 3)
         grid = F.affine_grid(theta, (views * frames, 3, output_h, output_w), align_corners=True)
         rgb = F.grid_sample(rgb, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-        depth = sample.depth.to(device, non_blocking=True).reshape(views * frames, 1, source_h, source_w)
+        if sample.depth is not None:
+            depth = sample.depth.to(device, non_blocking=True).reshape(
+                views * frames, 1, source_h, source_w
+            )
+        else:
+            native_depths = decoded_depths[depth_offset:depth_offset + views * frames]
+            depth_offset += views * frames
+            depth = torch.stack([
+                image[..., 0] if image.ndim == 3 else image for image in native_depths
+            ]).float().reshape(views, frames, source_h, source_w)
+            y = (torch.arange(source_h, device=device, dtype=torch.float32) - source_h / 2 + 0.5)
+            x = (torch.arange(source_w, device=device, dtype=torch.float32) - source_w / 2 + 0.5)
+            for view in range(views):
+                sensor_width = sample.depth_sensor_widths[view]
+                focal_length = sample.depth_focal_lengths[view]
+                sensor_height = sensor_width * source_h / source_w
+                yy, xx = torch.meshgrid(
+                    y / source_h * sensor_height,
+                    x / source_w * sensor_width,
+                    indexing="ij",
+                )
+                depth[view] /= torch.sqrt(1 + (xx.square() + yy.square()) / focal_length**2)
+            depth = depth.reshape(views * frames, 1, source_h, source_w)
         depth = F.grid_sample(depth, grid, mode="nearest", padding_mode="zeros", align_corners=True)
         depth[depth > sample.max_depth] = 0
         if sample.apply_depth_aug:
@@ -1236,6 +1295,7 @@ class _CudaPrefetchIterator:
         self.source = iter(source)
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
+        self.nvimagecodec_decoder = None
         self.next_item = None
         self._preload()
 
@@ -1250,10 +1310,18 @@ class _CudaPrefetchIterator:
         else:
             events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
             with torch.cuda.stream(self.stream):
+                if encoded.samples[0].image_codec == "nvimagecodec":
+                    if self.nvimagecodec_decoder is None:
+                        from nvidia import nvimgcodec
+
+                        self.nvimagecodec_decoder = nvimgcodec.Decoder(
+                            device_id=device.index if device.index is not None else torch.cuda.current_device()
+                        )
                 datapoint = decode_tapvid3d_batch(
                     encoded,
                     self.device,
                     timing_events=events,
+                    nvimagecodec_decoder=self.nvimagecodec_decoder,
                 )
                 self.next_item = (datapoint, gotit, events)
 
@@ -1272,6 +1340,7 @@ class _CudaPrefetchIterator:
             decode_ms = events[0].elapsed_time(events[1])
             prepare_ms = events[0].elapsed_time(events[2])
             for metadata in datapoint.sample_metadata:
+                metadata["gpu_image_decode_ms"] = decode_ms
                 metadata["gpu_jpeg_decode_ms"] = decode_ms
                 metadata["gpu_prepare_total_ms"] = prepare_ms
         self._preload()

@@ -293,6 +293,12 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         if just_return_kwargs:
             return kubric_kwargs
 
+        if training and bool(training_args.datasets.train.get("mvkubric_gpu_decode", False)):
+            from mvtracker.datasets.kubric_gpu_dataset import (
+                GpuDecodedKubricMultiViewDataset,
+            )
+
+            return GpuDecodedKubricMultiViewDataset(**kubric_kwargs)
         return KubricMultiViewDataset(**kubric_kwargs)
 
     def __init__(

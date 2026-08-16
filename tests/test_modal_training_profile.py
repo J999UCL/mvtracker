@@ -43,6 +43,14 @@ class ModalTrainingProfileTests(unittest.TestCase):
         self.assertIn("checkout --detach FETCH_HEAD", runtime)
         self.assertIn("rev-parse HEAD", runtime)
 
+    def test_runtime_installs_lossless_gpu_image_codecs_and_zstd(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "tools/modal_training_profile.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"zstd"', source)
+        self.assertIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20"', source)
+        self.assertIn('"nvidia-libnvcomp-cu12==5.3.0.16"', source)
+
     def test_3d_embedding_accepts_bfloat16_coordinates(self):
         grid = torch.tensor(
             [[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]],

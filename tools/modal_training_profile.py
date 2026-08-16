@@ -54,6 +54,7 @@ def _dependency_image() -> modal.Image:
             "libglib2.0-0",
             "ninja-build",
             "python3-dev",
+            "zstd",
         )
         .pip_install(
             "torch==2.7.1",
@@ -65,6 +66,8 @@ def _dependency_image() -> modal.Image:
         .pip_install(
             "hf-xet",
             "nvidia-ml-py",
+            "nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20",
+            "nvidia-libnvcomp-cu12==5.3.0.16",
             # Modal's mirror currently publishes cu120 through 2.3.6.
             "spconv-cu120==2.3.6",
         )

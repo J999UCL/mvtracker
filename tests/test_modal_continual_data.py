@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -10,9 +11,11 @@ from mvtracker.profiling.modal_continual_data import (
     CHECKPOINT_FILE,
     CHECKPOINT_REVISION,
     CHECKPOINT_SHA256,
+    DIEGESIS_ARCHIVE_RELATIVE,
     EXPECTED_DIEGESIS_SPLITS,
     EXPECTED_MVKUBRIC_SCENES,
     MVKUBRIC_INDEX_RELATIVE,
+    MVKUBRIC_SHARDS,
     _require_existing_profile_data,
     stage_continual_training_data,
 )
@@ -74,7 +77,7 @@ class ModalContinualDataTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exactly scenes 900..999"):
                 _require_existing_profile_data(root)
 
-    def test_direct_staging_copies_the_prepared_data_tree(self):
+    def test_archive_staging_extracts_sources_and_copies_sidecars(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "source"
             extracted = Path(directory) / "extracted"
@@ -86,15 +89,19 @@ class ModalContinualDataTests(unittest.TestCase):
             }
             (root / "profile-data-manifest.json").write_text(json.dumps(manifest))
             (root / "continual-training-data-manifest.json").write_text(json.dumps({}))
-            (root / "source/diegesis").mkdir(parents=True)
+            (root / DIEGESIS_ARCHIVE_RELATIVE).parent.mkdir(parents=True)
+            (root / DIEGESIS_ARCHIVE_RELATIVE).write_bytes(b"diegesis")
+            for shard in MVKUBRIC_SHARDS:
+                (root / shard).parent.mkdir(parents=True, exist_ok=True)
+                (root / shard).write_bytes(b"mvkubric")
             (root / "checkpoints").mkdir()
             (root / "checkpoints/mvtracker_200000_june2025.pth").write_bytes(b"checkpoint")
-            for split, count in EXPECTED_DIEGESIS_SPLITS.items():
-                for index in range(count):
-                    (root / "datasets/diegesis-mvtracker/TAPVid3D_raw" / split / str(index)).mkdir(parents=True)
-                    (root / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache" / split / str(index)).mkdir(parents=True)
-            for scene in EXPECTED_MVKUBRIC_SCENES:
-                (root / "datasets/kubric-multiview/train" / scene).mkdir(parents=True)
+            split_document = json.loads(
+                (Path(__file__).resolve().parents[1] / "configs/diegesis_split_v1.json").read_text()
+            )
+            for split, scenes in split_document["splits"].items():
+                for scene in scenes:
+                    (root / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache" / split / scene).mkdir(parents=True)
             index_root = root / MVKUBRIC_INDEX_RELATIVE
             (index_root / "scenes").mkdir(parents=True)
             entries = {}
@@ -111,7 +118,24 @@ class ModalContinualDataTests(unittest.TestCase):
                 )
             )
 
-            staging = stage_continual_training_data(root, local_data_root=extracted)
+            def extract(command, check):
+                self.assertTrue(check)
+                destination = Path(command[command.index("--directory") + 1])
+                if "--strip-components=3" in command:
+                    for scene in EXPECTED_MVKUBRIC_SCENES:
+                        (destination / scene).mkdir(parents=True, exist_ok=True)
+                else:
+                    for scenes in split_document["splits"].values():
+                        for scene in scenes:
+                            (destination / "scenes" / scene / "tracking/sequence").mkdir(
+                                parents=True, exist_ok=True
+                            )
+
+            with mock.patch(
+                "mvtracker.profiling.modal_continual_data.subprocess.run",
+                side_effect=extract,
+            ):
+                staging = stage_continual_training_data(root, local_data_root=extracted)
             self.assertEqual(staging["local_data_root"], str(extracted))
             self.assertTrue(
                 (extracted / "checkpoints/mvtracker_200000_june2025.pth").is_file()
@@ -123,6 +147,9 @@ class ModalContinualDataTests(unittest.TestCase):
                     if path.name.isdigit()
                 },
                 EXPECTED_MVKUBRIC_SCENES,
+            )
+            self.assertTrue(
+                (extracted / "datasets/diegesis-mvtracker/TAPVid3D_raw/train").is_dir()
             )
 
 

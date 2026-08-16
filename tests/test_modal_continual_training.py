@@ -36,6 +36,7 @@ class ContinualTrainingConfigTests(unittest.TestCase):
         self.assertEqual(train["batch_size"], 1)
         self.assertEqual(train["sequence_len"], 24)
         self.assertEqual(train["traj_per_sample"], 2048)
+        self.assertTrue(train["mvkubric_gpu_decode"])
         self.assertEqual(trainer["num_steps"], 1000)
         self.assertEqual(trainer["lr_schedule_steps"], 2000)
         self.assertEqual(trainer["gradient_accumulation_steps"], 4)
