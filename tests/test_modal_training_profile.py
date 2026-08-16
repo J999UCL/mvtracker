@@ -65,7 +65,7 @@ class ModalTrainingProfileTests(unittest.TestCase):
             )
         )
         self.assertEqual(HIGH_TRAJECTORY_CANDIDATES[0], 6144)
-        self.assertEqual(HIGH_TRAJECTORY_CANDIDATES[-1], 9216)
+        self.assertEqual(HIGH_TRAJECTORY_CANDIDATES[-1], 8192)
 
     def test_memory_safety_includes_ninety_percent_boundary(self):
         total_bytes = 80_000
