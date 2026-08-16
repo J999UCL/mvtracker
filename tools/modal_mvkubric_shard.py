@@ -66,10 +66,18 @@ def _create_shard(train_root: Path, scenes: tuple[str, ...], output: Path) -> di
     partial = output.with_suffix(output.suffix + ".partial")
     if partial.exists():
         partial.unlink()
-    source_prefix = train_root.relative_to(train_root.parents[2]).as_posix()
-    files = [f"{source_prefix}/{scene}" for scene in scenes]
     tar = subprocess.Popen(
-        ["tar", "--create", "--file", "-", "--directory", str(train_root.parents[2]), "--transform", "s,^kubric-multiview/,datasets/kubric-multiview/,", *files],
+        [
+            "tar",
+            "--create",
+            "--file",
+            "-",
+            "--directory",
+            str(train_root),
+            "--transform",
+            "s|^|datasets/kubric-multiview/train/|",
+            *scenes,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
