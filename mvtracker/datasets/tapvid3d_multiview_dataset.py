@@ -859,6 +859,9 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             "clean_duster_depths": False,
             "duster_views": None,
             "supported_duster_views_sets": None,
+            # This dataset has its own cache manifest. Never attach the native
+            # MV-Kubric metadata index inherited from the shared factory.
+            "metadata_index_root": None,
             "enable_variable_depth_type_augs": bool(
                 requested == "training"
                 and kwargs.get("enable_variable_depth_type_augs")

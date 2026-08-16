@@ -407,6 +407,7 @@ class FromNameTests(unittest.TestCase):
         self.assertEqual(kwargs["num_views"], 3)
         self.assertEqual(kwargs["estimated_depth_root"], "/datasets/estimated/validation")
         self.assertEqual(kwargs["estimated_depth_provider"], "vggt_omega")
+        self.assertIsNone(kwargs["metadata_index_root"])
 
     def test_training_keeps_rgb_depth_and_variable_view_augmentations(self):
         config = types.SimpleNamespace(
@@ -436,6 +437,7 @@ class FromNameTests(unittest.TestCase):
         self.assertTrue(kwargs["enable_variable_trajpersample_augs"])
         self.assertFalse(kwargs["enable_variable_depth_type_augs"])
         self.assertIsNone(kwargs["num_views"])
+        self.assertIsNone(kwargs["metadata_index_root"])
 
 
 class MvTrackerSamplingParityTests(unittest.TestCase):
