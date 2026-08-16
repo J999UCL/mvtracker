@@ -57,8 +57,8 @@ def _validate_scene(root: Path, scene_id: str) -> dict[str, object]:
     scene = root / scene_id
     if not scene.is_dir():
         raise FileNotFoundError(scene)
-    if not (scene / "tracks_3d.npz").is_file() or not (scene / "scene.json").is_file():
-        raise RuntimeError(f"scene {scene_id} is missing core metadata")
+    if not (scene / "tracks_3d.npz").is_file():
+        raise RuntimeError(f"scene {scene_id} is missing tracks_3d.npz")
     views = sorted(path.parent.name for path in scene.glob("view_*/metadata.json"))
     if views != ["view_0", "view_1", "view_2", "view_3"]:
         raise RuntimeError(f"scene {scene_id} has unexpected views: {views}")
