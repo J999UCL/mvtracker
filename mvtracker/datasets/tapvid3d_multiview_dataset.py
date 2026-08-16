@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import time
@@ -42,16 +41,6 @@ def _atomic_json(path: Path, value: Any) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
-
-
-def _source_stat(path: Path) -> dict[str, int]:
-    stat = path.stat()
-    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
-def _manifest_digest(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _numeric_view_dirs(sequence_root: Path) -> list[Path]:
@@ -115,8 +104,7 @@ def prepare_tapvid3d_cache(
     """Index raw JPEG object arrays into seekable byte stores.
 
     Numeric arrays stay in the canonical raw dataset and are memory-mapped by the
-    loader. Existing complete cache entries are retained when their source stat
-    fingerprint still matches.
+    loader. Existing complete cache entries are retained.
     """
 
     raw_root = raw_root.resolve()
@@ -140,7 +128,6 @@ def prepare_tapvid3d_cache(
                 raise ValueError(f"{queries_path}: expected {(point_count, 4)} float32")
 
             view_roots = _numeric_view_dirs(source)
-            source_files = {"tracks_xyz.npy": _source_stat(tracks_path), "queries_xytv.npy": _source_stat(queries_path)}
             resolution = None
             for view_root in view_roots:
                 view = int(view_root.name)
@@ -155,7 +142,6 @@ def prepare_tapvid3d_cache(
                     array = np.load(path, mmap_mode=None if dtype == np.dtype(object) else "r", allow_pickle=dtype == np.dtype(object))
                     if array.shape != shape or array.dtype != dtype:
                         raise ValueError(f"{path}: expected shape {shape} and dtype {dtype}")
-                    source_files[f"{view}/{name}"] = _source_stat(path)
                 for name, dtype in (("depth.npy", np.float32), ("foreground_mask.npy", np.bool_)):
                     path = view_root / name
                     array = np.load(path, mmap_mode="r", allow_pickle=False)
@@ -165,20 +151,14 @@ def prepare_tapvid3d_cache(
                         resolution = tuple(int(value) for value in array.shape[1:])
                     if tuple(array.shape[1:]) != resolution:
                         raise ValueError(f"{path}: inconsistent image resolution")
-                    source_files[f"{view}/{name}"] = _source_stat(path)
-
-            fingerprint = _manifest_digest(source_files)
             target = cache_root / split / source.name
             manifest_path = target / "manifest.json"
             if manifest_path.is_file():
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if (
-                    manifest.get("source_fingerprint") == fingerprint
-                    and _cache_files_complete(
-                        target,
-                        frame_count,
-                        [int(path.name) for path in view_roots],
-                    )
+                if _cache_files_complete(
+                    target,
+                    frame_count,
+                    [int(path.name) for path in view_roots],
                 ):
                     counts["reused"] += 1
                     continue
@@ -218,8 +198,6 @@ def prepare_tapvid3d_cache(
                 "schema_version": _CACHE_VERSION,
                 "source_split": split,
                 "source_sequence": source.name,
-                "source_fingerprint": fingerprint,
-                "source_files": source_files,
                 "frame_count": frame_count,
                 "point_count": point_count,
                 "views": [int(path.name) for path in view_roots],
@@ -772,13 +750,6 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         manifest = json.loads((cache_root / "manifest.json").read_text(encoding="utf-8"))
         if manifest.get("format") != _CACHE_FORMAT or manifest.get("schema_version") != _CACHE_VERSION:
             raise ValueError(f"{cache_root}: unsupported or missing cache manifest")
-        source_root = self.raw_root / manifest["source_sequence"]
-        current_files = {
-            name: _source_stat(source_root / name)
-            for name in manifest["source_files"]
-        }
-        if _manifest_digest(current_files) != manifest["source_fingerprint"]:
-            raise ValueError(f"{source_root}: cache is stale; rerun TAPVid-3D preparation")
         if not _cache_files_complete(
             cache_root,
             int(manifest["frame_count"]),

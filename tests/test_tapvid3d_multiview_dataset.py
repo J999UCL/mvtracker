@@ -354,7 +354,7 @@ class SelectiveLoaderTests(unittest.TestCase):
                 for call in np_load.call_args_list
             ))
 
-    def test_stale_cache_is_rejected(self):
+    def test_cache_ignores_source_timestamp_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = _write_raw(root / "raw")
@@ -383,8 +383,8 @@ class SelectiveLoaderTests(unittest.TestCase):
             dataset.ratio_dynamic = 0.0
             dataset.ratio_very_dynamic = 0.0
             dataset.max_tracks_to_preload = None
-            with self.assertRaisesRegex(ValueError, "cache is stale"):
-                dataset[0]
+            _, gotit = dataset[0]
+            self.assertTrue(gotit)
 
 
 class FromNameTests(unittest.TestCase):
