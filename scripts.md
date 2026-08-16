@@ -110,5 +110,13 @@ launching training or a GPU:
 
 ```bash
 MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) \
-  modal run --timestamps tools/modal_data_loading_smoke.py
+modal run --timestamps tools/modal_data_loading_smoke.py
+```
+
+To split the pinned MV-Kubric archive into four independently extractable
+`tar.zst` shards (CPU-only, one Modal container):
+
+```bash
+modal container list --json
+modal run --timestamps tools/modal_mvkubric_shard.py
 ```
