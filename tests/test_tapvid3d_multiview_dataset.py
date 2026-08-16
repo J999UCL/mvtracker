@@ -152,6 +152,7 @@ def _write_estimated_depth(root: Path, *, frames=6, views=(2, 0, 3, 1), height=8
         "view_ids": list(views),
         "frame_count": frames,
         "resolution_hw": [height, width],
+        "complete": True,
     }))
 
 
@@ -210,6 +211,18 @@ class EstimatedDepthTests(unittest.TestCase):
             root = Path(directory)
             _write_estimated_depth(root)
             store = loader.EstimatedDepthStore(root, "another_provider")
+            with self.assertRaisesRegex(ValueError, "incompatible estimated-depth manifest"):
+                store.load("scene-alpha", [0])
+
+    def test_incomplete_manifest_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_estimated_depth(root)
+            manifest_path = root / "scene-alpha/manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["complete"] = False
+            manifest_path.write_text(json.dumps(manifest))
+            store = loader.EstimatedDepthStore(root, "vggt_omega")
             with self.assertRaisesRegex(ValueError, "incompatible estimated-depth manifest"):
                 store.load("scene-alpha", [0])
 

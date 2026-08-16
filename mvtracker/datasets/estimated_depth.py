@@ -40,6 +40,7 @@ class EstimatedDepthStore:
                 manifest.get("format") != ESTIMATED_DEPTH_FORMAT
                 or manifest.get("schema_version") != ESTIMATED_DEPTH_SCHEMA_VERSION
                 or manifest.get("provider") != self.provider
+                or manifest.get("complete") is not True
             ):
                 raise ValueError(f"{path}: incompatible estimated-depth manifest")
             self._manifests[scene] = manifest
