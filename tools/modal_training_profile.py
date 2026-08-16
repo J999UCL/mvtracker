@@ -310,10 +310,65 @@ def prepare_frontier_batches_remote() -> dict:
     return {"batches": results}
 
 
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): data_volume},
+    cpu=8,
+    memory=32768,
+    timeout=4 * 60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def prepare_high_trajectory_batches_remote() -> dict:
+    import wandb
+
+    from mvtracker.cli.profile_training import prepare_profile_batch
+    from mvtracker.profiling.modal_training import FRONTIER_VIEWS
+
+    trajectories = 12288
+    run = wandb.init(
+        project="mvtracker-modal-profiling",
+        job_type="batch-preparation",
+        tags=["modal", "cpu", "mv-kubric-micro", "high-trajectory"],
+        config={
+            "source_commit": _source_commit(),
+            "views": list(FRONTIER_VIEWS),
+            "trajectories": trajectories,
+            **BASE_TAGS,
+        },
+    )
+    results = []
+    for views in FRONTIER_VIEWS:
+        result = prepare_profile_batch(
+            data_root=DATA_ROOT / "datasets",
+            output=(
+                PROFILE_BATCH_ROOT
+                / f"views{views}-traj{trajectories}-batch1-accum1.pt"
+            ),
+            views=views,
+            batch_size=1,
+            trajectories=trajectories,
+        )
+        results.append(result)
+        run.log(
+            {
+                "batch/views": views,
+                "batch/trajectories": trajectories,
+                "batch/attempted_samples": result["attempted_samples"],
+                "batch/bytes": result["bytes"],
+            },
+            step=len(results),
+        )
+    data_volume.commit()
+    run.finish()
+    return {"batches": results}
+
+
 def _trial_command(case, warmup, measured, output, gpu_spec):
     if case.views in (5, 6):
         if case.trajectories > 2048:
-            cache_name = f"views{case.views}-traj6144-batch1-accum1.pt"
+            cache_name = f"views{case.views}-traj12288-batch1-accum1.pt"
         else:
             cache_name = f"views{case.views}-traj2048-batch12-accum1.pt"
     else:
@@ -380,7 +435,13 @@ def _profile_remote(gpu_spec: str, mode: str, run_name: str) -> dict:
     )
 
     validate_gpu_request(gpu_spec)
-    if mode not in {"smoke", "sweep", "frontier56", "compatibility"}:
+    if mode not in {
+        "smoke",
+        "sweep",
+        "frontier56",
+        "trajectory56",
+        "compatibility",
+    }:
         raise ValueError("unsupported profiling mode")
     if _RUN_NAME.fullmatch(run_name) is None:
         raise ValueError("run name contains unsupported characters")
@@ -577,7 +638,7 @@ def _profile_remote(gpu_spec: str, mode: str, run_name: str) -> dict:
                 "gpu_lane": gpu_spec,
                 "cases": cases,
             }
-        else:
+        elif mode == "frontier56":
             from mvtracker.profiling.modal_training import (
                 FRONTIER_BATCH_CANDIDATES,
                 FRONTIER_CASES,
@@ -672,6 +733,57 @@ def _profile_remote(gpu_spec: str, mode: str, run_name: str) -> dict:
                 "trajectory_capacity": capacity,
                 "batch_capacity": cases,
             }
+        else:
+            from mvtracker.profiling.modal_training import (
+                HIGH_TRAJECTORY_CANDIDATES,
+                find_largest_safe,
+            )
+
+            views_to_profile = (5,) if gpu_spec == "H200" else (5, 6)
+            capacity = []
+            for views in views_to_profile:
+                search = find_largest_safe(
+                    lambda trajectories: execute(
+                        ProfileCase(
+                            views=views,
+                            trajectories=trajectories,
+                            batch_size=1,
+                        ),
+                        1,
+                        1,
+                        "high-trajectory-capacity",
+                        requested=trajectories,
+                    ),
+                    HIGH_TRAJECTORY_CANDIDATES,
+                )
+                selected = search.selected
+                confirmation = None
+                if selected is not None:
+                    confirmation = execute(
+                        ProfileCase(views=views, trajectories=selected, batch_size=1),
+                        2,
+                        3,
+                        "high-trajectory-confirm",
+                        requested=selected,
+                    )
+                    if not confirmation.safe:
+                        selected = None
+                capacity.append(
+                    {
+                        "views": views,
+                        "selected_trajectories": selected,
+                        "search_trials": [trial.__dict__ for trial in search.trials],
+                        "confirmation": (
+                            confirmation.__dict__ if confirmation is not None else None
+                        ),
+                    }
+                )
+            summary = {
+                "mode": mode,
+                "run_name": run_name,
+                "gpu_lane": gpu_spec,
+                "trajectory_capacity": capacity,
+            }
 
     summary_path = output_root / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -742,6 +854,12 @@ def prepare_frontier56_batches() -> None:
     print(json.dumps(prepare_frontier_batches_remote.remote(), indent=2))
 
 
+@app.local_entrypoint(name="prepare-high-trajectory-batches")
+def prepare_high_trajectory_batches() -> None:
+    _set_run_tags(experiment="high-trajectory-batch-preparation", gpu="cpu")
+    print(json.dumps(prepare_high_trajectory_batches_remote.remote(), indent=2))
+
+
 @app.local_entrypoint(name="run-profile")
 def run_profile(run_name: str = "", gpu: str = "H100!") -> None:
     selected = run_name or _default_run_name("profile")
@@ -763,6 +881,17 @@ def run_frontier56(run_name: str = "", gpu: str = "H200") -> None:
         "B200": profile_b200_remote,
     }[gpu]
     print(json.dumps(profile.remote("frontier56", selected), indent=2))
+
+
+@app.local_entrypoint(name="run-trajectory56")
+def run_trajectory56(run_name: str = "", gpu: str = "H200") -> None:
+    selected = run_name or _default_run_name("trajectory56")
+    _set_run_tags(experiment=selected, gpu=gpu)
+    profile = {
+        "H200": profile_h200_remote,
+        "B200": profile_b200_remote,
+    }[gpu]
+    print(json.dumps(profile.remote("trajectory56", selected), indent=2))
 
 
 @app.local_entrypoint(name="validate-image")

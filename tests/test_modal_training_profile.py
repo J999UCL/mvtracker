@@ -8,6 +8,7 @@ from mvtracker.profiling.modal_training import (
     FRONTIER_BATCH_CANDIDATES,
     FRONTIER_CASES,
     FRONTIER_TRAJECTORY_CANDIDATES,
+    HIGH_TRAJECTORY_CANDIDATES,
     TRAJECTORY_CANDIDATES,
     PROFILE_CASES,
     SearchResult,
@@ -63,6 +64,8 @@ class ModalTrainingProfileTests(unittest.TestCase):
                 )
             )
         )
+        self.assertEqual(HIGH_TRAJECTORY_CANDIDATES[0], 6144)
+        self.assertEqual(HIGH_TRAJECTORY_CANDIDATES[-1], 12288)
 
     def test_memory_safety_includes_ninety_percent_boundary(self):
         total_bytes = 80_000
