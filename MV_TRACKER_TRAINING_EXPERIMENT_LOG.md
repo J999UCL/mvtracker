@@ -479,3 +479,39 @@ Attempts to prepare unique 8,192–12,288-track samples were stopped after the r
 ### Takeaway
 
 B200 buys one extra scene at 1,024 tracks for both five and six views, but it does not increase the selected batch at 2,048 tracks. Its throughput gain over H200 is about 5–14% for these confirmed shapes while its hourly price is about 38% higher. H200 remains the better cost default; B200 is useful when the extra 1,024-track scene per update or higher per-device trajectory ceiling matters.
+
+## 2026-08-16 — VGGT-Omega temporal multi-view preprocessing smoke
+
+### Question and correction
+
+The first preprocessor treated timestamps as independent batch elements with
+input shape `[B=timestamps, S=views, 3, H, W]`. VGGT-Omega therefore exchanged
+information across cameras at one timestamp but never across time, and every
+timestamp received an independent reconstruction gauge and metric scale.
+
+The corrected path uses one scene sequence with timestamp-major ordering:
+`[B=1, S=timestamps×views, 3, H, W]`. It estimates one camera-centre Sim(3)
+alignment per temporal chunk, scales camera-Z depth into metres, and writes
+rigid world-to-camera matrices consistent with the scaled depth. Production
+defaults to 24 timestamps per chunk; the Dopey run below deliberately used
+smaller chunks and did not generate a complete sidecar.
+
+### Bounded Dopey smoke
+
+Source revision: `30dbd591bfbe74abab89267b6066c5b511ce9133`.
+Checkpoint SHA-256:
+`c02da418b18bb01d0392598d3f6147366bcde1bb70fd08a5e3bf7925b0667934`.
+Both trials ran sequentially on one RTX 3090 and left all other jobs untouched.
+
+| Dataset | Joint input | Inference | Cleaned AbsRel | Median estimated/GT | Cleaned coverage | Mean camera-centre RMSE |
+|---|---:|---:|---:|---:|---:|---:|
+| DIEGESIS `kitchen03` frames 0–7 | 8 timestamps × 4 views = 32 images | 3.70 s | 7.52% | 0.970 | 77.74% | 0.457 m |
+| MV-Kubric `900` frames 0–3 | 4 timestamps × 10 views = 40 images | 5.31 s | 1.45% | 1.000 | 78.98% | 0.156 m |
+
+Remote outputs are under
+`/media/data3/jthakwani/smoke/vggt-omega-temporal-20260816T142515Z`.
+Local JSON and contact sheets are under
+`artifacts/vggt-omega-temporal-smoke/`. The robust metric scale is correct on
+both datasets. DIEGESIS still has large absolute-error outliers at very distant
+window/background pixels, but its median depth and relative error remain
+well-scaled; those pixels were not clipped or replaced with ground truth.
