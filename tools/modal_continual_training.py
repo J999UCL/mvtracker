@@ -139,7 +139,7 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
         "mode": mode,
         "run_name": run_name,
         "source_commit": commit,
-        "phases": EXPERIMENT_PHASES[mode],
+        "phases": [dict(phase) for phase in EXPERIMENT_PHASES[mode]],
         "gpu": GPU_REQUEST,
         "max_containers": MAX_CONTAINERS,
         "master_seed": seed,
