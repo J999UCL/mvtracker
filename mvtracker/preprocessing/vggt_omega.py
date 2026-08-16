@@ -62,6 +62,22 @@ class TemporalChunkResult:
     cleaned_coverage: float
 
 
+@dataclass(frozen=True)
+class TemporalBatchTimings:
+    load_preprocess_seconds: float
+    model_seconds: float
+    postprocess_seconds: float
+    total_seconds: float
+    scene_count: int
+    image_count: int
+
+
+@dataclass(frozen=True)
+class TemporalChunkBatchResult:
+    scenes: tuple[TemporalChunkResult, ...]
+    timings: TemporalBatchTimings
+
+
 class SceneSource(ABC):
     """Common input contract for a synchronized multi-view scene."""
 
@@ -504,7 +520,7 @@ def _emit(event: str, **fields) -> None:
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
-def _model_sequence(
+def _model_batch(
     model,
     images: torch.Tensor,
     device: torch.device,
@@ -517,39 +533,26 @@ def _model_sequence(
             predictions["pose_enc"], predictions["images"].shape[-2:]
         )
     return tuple(
-        value[0].detach().float().cpu().numpy()
+        value.detach().float().cpu().numpy()
         for value in (predictions["depth"], predictions["depth_conf"], intrinsics, extrinsics)
     )
 
 
-def infer_temporal_chunk(
+def _postprocess_temporal_chunk(
     source: SceneSource,
     frame_indices: Sequence[int],
-    model,
+    sequence_transforms: Sequence[ImageTransform],
+    predicted_depth: np.ndarray,
+    confidence: np.ndarray,
+    intrinsics: np.ndarray,
+    predicted_w2c: np.ndarray,
     *,
-    device: torch.device,
-    image_resolution: int,
-    confidence_percentile: float = 20.0,
-    edge_rtol: float = 0.03,
+    confidence_percentile: float,
+    edge_rtol: float,
 ) -> TemporalChunkResult:
-    """Run one timestamp-major VGGT-Omega sequence and align it to known cameras."""
-    frame_indices = list(frame_indices)
-    if not frame_indices:
-        raise ValueError("frame_indices must not be empty")
     description = source.description
     views = len(description.view_ids)
     height, width = description.resolution_hw
-    sequence_tensors = []
-    sequence_transforms = []
-    for frame in frame_indices:
-        images = [source.load_rgb(view, frame) for view in description.view_ids]
-        tensors, transforms = preprocess_images(images, resolution=image_resolution)
-        sequence_tensors.extend(tensors)
-        sequence_transforms.extend(transforms)
-    images = torch.stack(sequence_tensors).unsqueeze(0)
-    predicted_depth, confidence, intrinsics, predicted_w2c = _model_sequence(
-        model, images, device
-    )
     if predicted_depth.shape[-1] == 1:
         predicted_depth = predicted_depth[..., 0]
     if confidence.shape[-1] == 1:
@@ -590,6 +593,102 @@ def infer_temporal_chunk(
         alignment_residual=alignment.residual,
         cleaned_coverage=float(cleaned_mask.mean()),
     )
+
+
+def infer_temporal_chunks(
+    sources: Sequence[SceneSource],
+    frame_indices: Sequence[int],
+    model,
+    *,
+    device: torch.device,
+    image_resolution: int,
+    confidence_percentile: float = 20.0,
+    edge_rtol: float = 0.03,
+) -> TemporalChunkBatchResult:
+    """Infer one homogeneous batch of timestamp-major multi-view scenes."""
+    sources = tuple(sources)
+    frame_indices = tuple(frame_indices)
+    if not sources:
+        raise ValueError("sources must not be empty")
+    if not frame_indices:
+        raise ValueError("frame_indices must not be empty")
+    view_counts = {len(source.description.view_ids) for source in sources}
+    resolutions = {source.description.resolution_hw for source in sources}
+    if len(view_counts) != 1 or len(resolutions) != 1:
+        raise ValueError("batched scenes must have matching view counts and resolutions")
+
+    started = time.perf_counter()
+    batch_tensors = []
+    batch_transforms = []
+    for source in sources:
+        sequence_tensors = []
+        sequence_transforms = []
+        for frame in frame_indices:
+            images = [source.load_rgb(view, frame) for view in source.description.view_ids]
+            tensors, transforms = preprocess_images(images, resolution=image_resolution)
+            sequence_tensors.extend(tensors)
+            sequence_transforms.extend(transforms)
+        batch_tensors.append(torch.stack(sequence_tensors))
+        batch_transforms.append(tuple(sequence_transforms))
+    images = torch.stack(batch_tensors)
+    load_preprocess_seconds = time.perf_counter() - started
+
+    model_started = time.perf_counter()
+    predicted_depth, confidence, intrinsics, predicted_w2c = _model_batch(
+        model, images, device
+    )
+    model_seconds = time.perf_counter() - model_started
+
+    postprocess_started = time.perf_counter()
+    results = tuple(
+        _postprocess_temporal_chunk(
+            source,
+            frame_indices,
+            transforms,
+            predicted_depth[index],
+            confidence[index],
+            intrinsics[index],
+            predicted_w2c[index],
+            confidence_percentile=confidence_percentile,
+            edge_rtol=edge_rtol,
+        )
+        for index, (source, transforms) in enumerate(zip(sources, batch_transforms))
+    )
+    postprocess_seconds = time.perf_counter() - postprocess_started
+    total_seconds = time.perf_counter() - started
+    return TemporalChunkBatchResult(
+        scenes=results,
+        timings=TemporalBatchTimings(
+            load_preprocess_seconds=load_preprocess_seconds,
+            model_seconds=model_seconds,
+            postprocess_seconds=postprocess_seconds,
+            total_seconds=total_seconds,
+            scene_count=len(sources),
+            image_count=int(images.shape[0] * images.shape[1]),
+        ),
+    )
+
+
+def infer_temporal_chunk(
+    source: SceneSource,
+    frame_indices: Sequence[int],
+    model,
+    *,
+    device: torch.device,
+    image_resolution: int,
+    confidence_percentile: float = 20.0,
+    edge_rtol: float = 0.03,
+) -> TemporalChunkResult:
+    """Run one timestamp-major VGGT-Omega sequence and align it to known cameras."""
+    return infer_temporal_chunks(
+        [source],
+        frame_indices,
+        model,
+        device=device,
+        image_resolution=image_resolution,
+        confidence_percentile=confidence_percentile,
+        edge_rtol=edge_rtol,
+    ).scenes[0]
 
 
 def preprocess_scene(
@@ -771,7 +870,7 @@ def profile_temporal_chunk_sizes(
         torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
         try:
-            _model_sequence(model, images, device)
+            _model_batch(model, images, device)
             torch.cuda.synchronize(device)
             duration = time.perf_counter() - started
             peak_allocated = torch.cuda.max_memory_allocated(device)
