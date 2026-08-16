@@ -8,6 +8,9 @@ from typing import Callable
 
 TRAJECTORY_CANDIDATES = (1024, 2048)
 BATCH_CANDIDATES = tuple(range(1, 9))
+FRONTIER_VIEWS = (5, 6)
+FRONTIER_BATCH_CANDIDATES = tuple(range(1, 13))
+FRONTIER_TRAJECTORY_CANDIDATES = tuple(range(1024, 6145, 512))
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,12 @@ class ProfileCase:
 PROFILE_CASES = tuple(
     ProfileCase(views=views, trajectories=trajectories)
     for views in range(1, 5)
+    for trajectories in TRAJECTORY_CANDIDATES
+)
+
+FRONTIER_CASES = tuple(
+    ProfileCase(views=views, trajectories=trajectories)
+    for views in FRONTIER_VIEWS
     for trajectories in TRAJECTORY_CANDIDATES
 )
 

@@ -5,6 +5,9 @@ import torch
 from mvtracker.models.core.embeddings import get_3d_sincos_pos_embed_from_grid
 from mvtracker.profiling.modal_training import (
     BATCH_CANDIDATES,
+    FRONTIER_BATCH_CANDIDATES,
+    FRONTIER_CASES,
+    FRONTIER_TRAJECTORY_CANDIDATES,
     TRAJECTORY_CANDIDATES,
     PROFILE_CASES,
     SearchResult,
@@ -41,6 +44,24 @@ class ModalTrainingProfileTests(unittest.TestCase):
             {(views, trajectories) for views in range(1, 5) for trajectories in (1024, 2048)},
         )
         self.assertEqual(BATCH_CANDIDATES, tuple(range(1, 9)))
+
+    def test_five_six_view_frontier_search_space(self):
+        self.assertEqual(
+            {(case.views, case.trajectories) for case in FRONTIER_CASES},
+            {(views, trajectories) for views in (5, 6) for trajectories in (1024, 2048)},
+        )
+        self.assertEqual(FRONTIER_BATCH_CANDIDATES, tuple(range(1, 13)))
+        self.assertEqual(FRONTIER_TRAJECTORY_CANDIDATES[0], 1024)
+        self.assertEqual(FRONTIER_TRAJECTORY_CANDIDATES[-1], 6144)
+        self.assertTrue(
+            all(
+                right - left == 512
+                for left, right in zip(
+                    FRONTIER_TRAJECTORY_CANDIDATES,
+                    FRONTIER_TRAJECTORY_CANDIDATES[1:],
+                )
+            )
+        )
 
     def test_memory_safety_includes_ninety_percent_boundary(self):
         total_bytes = 80_000
