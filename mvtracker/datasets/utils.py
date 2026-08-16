@@ -22,7 +22,8 @@ from mvtracker.utils.basic import to_homogeneous, from_homogeneous
 @dataclass(frozen=True)
 class SampleRequest:
     virtual_index: int
-    view_count: int
+    view_count: int | None = None
+    scene_index: int | None = None
 
 
 class HomogeneousViewBatchSampler(torch.utils.data.Sampler[list[SampleRequest]]):

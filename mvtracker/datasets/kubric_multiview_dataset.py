@@ -24,6 +24,7 @@ from mvtracker.datasets.estimated_depth import (
     ESTIMATED_DEPTH_TYPE_PROBABILITIES,
     EstimatedDepthStore,
 )
+from mvtracker.datasets.scene_selection import select_scene_names
 from mvtracker.datasets.utils import Datapoint, read_json, read_tiff, read_png, transform_scene, add_camera_noise, \
     aug_depth
 
@@ -96,6 +97,8 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             fabric=None,
             just_return_kwargs: bool = False,
             subset: str = "test",
+            include_scene_ids=None,
+            exclude_scene_ids=(),
     ):
         """
         Examples of evaluation datasets supported by this factory method:
@@ -217,6 +220,8 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             "use_cached_tracks": use_cached_tracks,
             # The released paper benchmark ships frozen v1 track selections.
             "cache_version": "v1" if use_cached_tracks else "v3",
+            "include_scene_ids": include_scene_ids,
+            "exclude_scene_ids": exclude_scene_ids,
         }
         if training:
             kubric_kwargs["virtual_dataset_size"] = _training_virtual_dataset_size(
@@ -326,6 +331,8 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             cache_version="v3",
             estimated_depth_root=None,
             estimated_depth_provider=None,
+            include_scene_ids=None,
+            exclude_scene_ids=(),
     ):
         super(KubricMultiViewDataset, self).__init__()
 
@@ -492,6 +499,12 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             seq_names_clean.append(seq_name)
         self.seq_names = seq_names_clean
 
+        self.seq_names = select_scene_names(
+            self.seq_names,
+            include=include_scene_ids,
+            exclude=exclude_scene_ids,
+        )
+
         if self.supported_duster_views_sets is not None:
             supported_duster_views_sets_cleaned = []
             for s in self.supported_duster_views_sets:
@@ -540,8 +553,15 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         return self.ratio_dynamic, self.ratio_very_dynamic
 
     def __getitem__(self, index):
-        virtual_index = int(index)
-        scene_index = virtual_index % self.real_len
+        request = index if hasattr(index, "virtual_index") else None
+        virtual_index = request.virtual_index if request is not None else int(index)
+        scene_index = (
+            request.scene_index
+            if request is not None and request.scene_index is not None
+            else virtual_index % self.real_len
+        )
+        if not 0 <= scene_index < self.real_len:
+            raise IndexError(f"scene index {scene_index} is outside [0, {self.real_len})")
 
         sample, gotit = self._getitem_helper(scene_index, seed_index=virtual_index)
 

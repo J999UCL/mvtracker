@@ -815,7 +815,15 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         return descriptors[path]
 
     @staticmethod
-    def from_name(dataset_name, dataset_root, training_args=None, fabric=None, just_return_kwargs=False):
+    def from_name(
+        dataset_name,
+        dataset_root,
+        training_args=None,
+        fabric=None,
+        just_return_kwargs=False,
+        include_scene_ids=None,
+        exclude_scene_ids=(),
+    ):
         if not dataset_name.startswith(_DATASET_PREFIX):
             raise ValueError(f"Unsupported TAPVid-3D dataset name: {dataset_name}")
         requested = dataset_name[len(_DATASET_PREFIX):]
@@ -825,11 +833,15 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             kwargs = KubricMultiViewDataset.from_name(
                 "kubric-multiview-v3-training", dataset_root,
                 training_args=training_args, fabric=fabric, just_return_kwargs=True,
+                include_scene_ids=include_scene_ids,
+                exclude_scene_ids=exclude_scene_ids,
             )
         else:
             kwargs = KubricMultiViewDataset.from_name(
                 "kubric-multiview-v3", dataset_root,
                 training_args=training_args, just_return_kwargs=True,
+                include_scene_ids=include_scene_ids,
+                exclude_scene_ids=exclude_scene_ids,
             )
         datasets_cfg = getattr(training_args, "datasets", {}) if training_args is not None else {}
         raw_dir = datasets_cfg.get("tapvid3d_raw_dir", "TAPVid3D_raw")
@@ -868,9 +880,15 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
 
     def __getitem__(self, index):
         load_started = time.perf_counter()
-        request = index if isinstance(index, SampleRequest) else None
+        request = index if hasattr(index, "virtual_index") else None
         virtual_index = request.virtual_index if request is not None else int(index)
-        scene_index = virtual_index % self.real_len
+        scene_index = (
+            request.scene_index
+            if request is not None and request.scene_index is not None
+            else virtual_index % self.real_len
+        )
+        if not 0 <= scene_index < self.real_len:
+            raise IndexError(f"scene index {scene_index} is outside [0, {self.real_len})")
         sequence = self.seq_names[scene_index]
         if self.seed is None:
             seed = int(torch.randint(0, 2**32 - 1, ()).item())
@@ -885,7 +903,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         available_views = list(manifest["views"])
         if getattr(self, "enable_variable_num_views_augs", False):
             maximum_views = min(4, len(available_views))
-            if request is None:
+            if request is None or request.view_count is None:
                 probabilities = np.asarray(
                     getattr(self, "view_count_probabilities", (0.25,) * 4)[:maximum_views],
                     dtype=np.float64,
@@ -900,7 +918,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                     )
         else:
             view_count = len(available_views) if self.num_views == -1 else int(self.num_views)
-            if request is not None and request.view_count != view_count:
+            if request is not None and request.view_count is not None and request.view_count != view_count:
                 raise ValueError(
                     f"requested view count {request.view_count} does not match fixed count {view_count}"
                 )
