@@ -4,7 +4,7 @@
 
 This profile requests exactly one H100 (`max_containers=1`) and carries the
 billing tags `owner=jeet`, `project=mvtracker`, `purpose=profiling`.  It stages
-the pinned DIEGESIS snapshot directly from Hugging Face onto container-local
+the pinned DIEGESIS snapshot directly from Hugging Face/Xet onto container-local
 SSD (about 90 seconds), and copies only MV-Kubric scenes `900`--`903` with
 `rgba_*.png` plus `metadata.json` from the read-only Modal Volume.  Inference
 and temporary profile outputs stay on local SSD; only the small report is
