@@ -23,6 +23,7 @@ DATA_ROOT = Path("/mnt/mvtracker-data")
 MVKUBRIC_REPO = "ethz-vlg/mv3dpt-datasets"
 MVKUBRIC_REVISION = "cccb9128fb95d302c662151e65a09377175c2a3a"
 SOURCE_ARCHIVE = "kubric-multiview--train.full.0031-1000.tar.gz"
+SOURCE_ARCHIVE_SIZE_BYTES = 394_716_348_566
 VALIDATION_SCENES = ("101", "102")
 TRAIN_ROOT = DATA_ROOT / "datasets/kubric-multiview/train"
 INDEX_ROOT = TRAIN_ROOT / "MVTracker_index"
@@ -116,7 +117,12 @@ def materialize_validation() -> dict[str, object]:
             repo_type="dataset",
             revision=MVKUBRIC_REVISION,
         )
-        response = requests.get(url, stream=True, timeout=120)
+        response = requests.get(
+            url,
+            headers={"Range": f"bytes=0-{SOURCE_ARCHIVE_SIZE_BYTES - 1}"},
+            stream=True,
+            timeout=120,
+        )
         response.raise_for_status()
         source_root = staging / "kubric-multiview/train"
         source_root.mkdir(parents=True)
