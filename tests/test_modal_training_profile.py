@@ -54,14 +54,14 @@ class ModalTrainingProfileTests(unittest.TestCase):
         def probe(trajectories):
             probed.append(trajectories)
             status = "safe" if trajectories <= 1024 else "unsafe"
-            return TrialResult(trajectories=trajectories, status=status)
+            return TrialResult(requested=trajectories, status=status)
 
         result = find_largest_safe(probe)
 
         self.assertEqual(result.selected_trajectories, 1024)
         self.assertEqual(probed, [2048, 1024])
         self.assertEqual(
-            tuple(trial.trajectories for trial in result.trials),
+            tuple(trial.requested for trial in result.trials),
             tuple(probed),
         )
 
@@ -77,21 +77,21 @@ class ModalTrainingProfileTests(unittest.TestCase):
         def probe(trajectories):
             if trajectories == 6:
                 return TrialResult(
-                    trajectories=trajectories,
+                    requested=trajectories,
                     status="oom",
                     peak_memory_bytes=80_000,
                     total_memory_bytes=80_000,
                     result_path="trials/1536.json",
                 )
             status = "safe" if trajectories <= 4 else "unsafe"
-            return TrialResult(trajectories=trajectories, status=status)
+            return TrialResult(requested=trajectories, status=status)
 
         result = find_largest_safe_batch(probe)
 
         self.assertIsInstance(result, SearchResult)
         self.assertEqual(result.selected_trajectories, 4)
         self.assertEqual(
-            [(trial.trajectories, trial.status) for trial in result.trials],
+            [(trial.requested, trial.status) for trial in result.trials],
             [
                 (8, "unsafe"),
                 (4, "safe"),

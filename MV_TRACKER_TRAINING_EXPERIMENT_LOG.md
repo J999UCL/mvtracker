@@ -388,3 +388,53 @@ Observed upper boundaries:
 - 4 views: 1,280 trajectories reached 94.28% memory and was rejected; 1,024 confirmed safe.
 
 The selected counts are the largest safe values on the tested 256-trajectory grid, not mathematical maxima. These are per-device capacities. With two-GPU DDP, each rank should use the same local shape; DDP should not assign different view-count shapes to different ranks within one synchronized optimizer step.
+
+## 2026-08-16 — Common-stack H100/H200/B200 economics profile
+
+### Question
+
+For homogeneous-view scene batching, compare the largest safe physical batch and confirmed training-update throughput on H100, H200, and B200 at exactly 1,024 and 2,048 trajectories per scene. The comparison must use one common software image, one GPU at a time, the same cached inputs, real forward/loss/backward/clipping/optimizer work, and no DDP.
+
+### Controlled setup
+
+The source revision was `bb4f4a18baf81b2cfc9e30c2ce2f9b456a68d8cc`. The common image used CUDA 12.8.1, Python 3.10.13, PyTorch 2.7.1+cu128, Triton 3.3.1, FlashAttention 2.8.3.post1 compiled for SM 90 and SM 100, PointOps at revision `2082918`, and SpConv 2.3.6. H100 was requested as `H100!` to prevent an automatic upgrade.
+
+The CPU preparation job cached batch 8 with 2,048 trajectories for each of 1–4 views. Every GPU trial sliced a deterministic scene and trajectory prefix from those same tensors. Physical batches 1–8 were searched at accumulation 1 under the 90% peak-memory rule; the selected batch was confirmed with two warm-ups and three measured updates. Data decoding and host input throughput are deliberately excluded.
+
+Only one profiler GPU ran at a time because unrelated Prism jobs occupied the other workspace slots. No unrelated container was stopped or interrupted.
+
+### Compatibility and artifacts
+
+All three GPUs passed import compatibility and a real 1-view, batch-1, 1,024-trajectory forward/backward/optimizer smoke.
+
+| GPU | Compatibility W&B | Smoke W&B | Full profile W&B | Modal run volume |
+|---|---|---|---|---|
+| H100 | `sq7jtdbr` | `3nnmd0t2` | `hlhmrkyn` | `profile-h100-20260816T010300Z/` |
+| H200 | `1punq4kx` | `63omrpoy` | `0rrq751k` | `profile-20260816T004050Z/` |
+| B200 | `y9szbc5z` | `7pcfhafd` | `sf6derbt` | `profile-20260816T002252Z/` |
+
+The paths above are under the `jeet-mvtracker-runs-v2` Modal Volume. Cached inputs are under `jeet-mvtracker-data-v2/profile-batches/`.
+
+### Confirmed results
+
+Each GPU cell is `selected batch / peak VRAM fraction / trajectories per second / nominal dollars per million trajectories`. Nominal economics use Modal rates observed for this run: H100 $3.95/h, H200 $4.54/h, and B200 $6.25/h.
+
+| Views | Tracks/scene | H100 | H200 | B200 |
+|---:|---:|---:|---:|---:|
+| 1 | 1,024 | 3 / 81.95% / 2,943 / $0.373 | 5 / 79.98% / 3,380 / $0.373 | 7 / 88.54% / 4,148 / $0.418 |
+| 1 | 2,048 | 1 / 51.58% / 2,792 / $0.393 | 3 / 85.61% / 3,941 / $0.320 | 3 / 67.19% / 4,595 / $0.378 |
+| 2 | 1,024 | 2 / 65.64% / 2,219 / $0.494 | 4 / 72.68% / 2,775 / $0.454 | 6 / 85.36% / 3,413 / $0.509 |
+| 2 | 2,048 | 1 / 56.69% / 2,504 / $0.438 | 2 / 62.97% / 3,276 / $0.385 | 3 / 73.86% / 4,086 / $0.425 |
+| 3 | 1,024 | 2 / 75.93% / 1,955 / $0.561 | 4 / 82.60% / 2,345 / $0.538 | 5 / 80.75% / 2,773 / $0.626 |
+| 3 | 2,048 | 1 / 61.61% / 2,338 / $0.469 | 2 / 68.28% / 2,917 / $0.432 | 3 / 79.81% / 3,641 / $0.477 |
+| 4 | 1,024 | 2 / 82.99% / 1,695 / $0.647 | 3 / 69.64% / 1,979 / $0.637 | 4 / 74.48% / 2,336 / $0.743 |
+| 4 | 2,048 | 1 / 65.32% / 2,144 / $0.512 | 2 / 72.92% / 2,650 / $0.476 | 3 / 86.87% / 3,260 / $0.533 |
+
+### Interpretation
+
+- B200 delivered the highest absolute throughput in every tested shape, about 38–65% above H100, and fit the largest batches.
+- H200 was the best economic choice at 2,048 trajectories for every view count and was best or tied at 1,024. Its modest price premium bought useful batch capacity without B200's larger hourly premium.
+- B200 is justified when elapsed time or per-device batch capacity matters more than lowest cost. H200 is the default recommendation for these short training experiments.
+- At all view counts, 2,048 trajectories per scene improved trajectory throughput economics over 1,024 on the same GPU, despite reducing the number of scenes in the physical batch.
+
+The tagged Modal billing report total for the common-image setup, cache preparation, compatibility checks, smokes, and all three full sweeps was $4.74. H100 was launched through the direct remote function during this run, so its fine-grained app tag inherited the old generic `gpu=cpu, experiment=common-stack` values; ownership/project/purpose tags and W&B metadata remained correct. The profiler was subsequently changed so direct invocations are truthfully `unclassified` and the documented local entrypoints attach exact GPU/experiment tags.

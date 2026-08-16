@@ -102,7 +102,10 @@ def _runtime_image() -> modal.Image:
     )
 
 
-app = modal.App(APP_NAME, tags={**BASE_TAGS, "experiment": "common-stack", "gpu": "cpu"})
+app = modal.App(
+    APP_NAME,
+    tags={**BASE_TAGS, "experiment": "unclassified", "gpu": "unclassified"},
+)
 image = _runtime_image()
 data_volume = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True, version=2)
 run_volume = modal.Volume.from_name(RUN_VOLUME_NAME, create_if_missing=True, version=2)
@@ -435,7 +438,7 @@ def _profile_remote(gpu_spec: str, mode: str, run_name: str) -> dict:
             run.log(metrics, step=trial_number)
             run_volume.commit()
             return TrialResult(
-                trajectories=case.batch_size,
+                requested=case.batch_size,
                 status=status,
                 peak_memory_bytes=peak,
                 total_memory_bytes=total,
@@ -445,7 +448,12 @@ def _profile_remote(gpu_spec: str, mode: str, run_name: str) -> dict:
         if mode == "smoke":
             case = ProfileCase(views=1, trajectories=1024, batch_size=1)
             result = execute(case, 1, 1, "smoke")
-            summary = {"mode": mode, "run_name": run_name, "trial": result.__dict__}
+            summary = {
+                "mode": mode,
+                "run_name": run_name,
+                "case": case.__dict__,
+                "trial": result.__dict__,
+            }
         else:
             cases = []
             for target in PROFILE_CASES:

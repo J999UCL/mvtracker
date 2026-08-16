@@ -34,7 +34,7 @@ PROFILE_CASES = tuple(
 
 @dataclass(frozen=True)
 class TrialResult:
-    trajectories: int
+    requested: int
     status: str
     peak_memory_bytes: int | None = None
     total_memory_bytes: int | None = None
@@ -80,10 +80,10 @@ def find_largest_safe(
     trials: list[TrialResult] = []
     ceiling = probe(candidates[-1])
     trials.append(ceiling)
-    if ceiling.trajectories != candidates[-1]:
-        raise ValueError("probe returned a result for the wrong trajectory count")
+    if ceiling.requested != candidates[-1]:
+        raise ValueError("probe returned a result for the wrong candidate")
     if ceiling.safe:
-        return SearchResult(ceiling.trajectories, tuple(trials))
+        return SearchResult(ceiling.requested, tuple(trials))
 
     low = 0
     high = len(candidates) - 2
@@ -93,8 +93,8 @@ def find_largest_safe(
         requested = candidates[middle]
         result = probe(requested)
         trials.append(result)
-        if result.trajectories != requested:
-            raise ValueError("probe returned a result for the wrong trajectory count")
+        if result.requested != requested:
+            raise ValueError("probe returned a result for the wrong candidate")
         if result.safe:
             selected = requested
             low = middle + 1

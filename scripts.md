@@ -11,15 +11,17 @@ cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
 
 modal container list --json
-modal run --timestamps tools/modal_training_profile.py::validate-image
-modal run --timestamps tools/modal_training_profile.py::setup-data
-modal run --timestamps tools/modal_training_profile.py::prepare-batches
+modal run --timestamps tools/modal_training_profile.py::validate_image
+modal run --timestamps tools/modal_training_profile.py::setup_data
+modal run --timestamps tools/modal_training_profile.py::prepare_batches
 
 # One exact lane at a time; compatibility is a GPU gate, not a fallback.
 modal container list --json
 modal run --timestamps tools/modal_training_profile.py::compatibility --gpu H100!
 modal container list --json
-modal run --timestamps tools/modal_training_profile.py::run-profile --gpu H100!
+modal run --timestamps tools/modal_training_profile.py::smoke --gpu H100!
+modal container list --json
+modal run --timestamps tools/modal_training_profile.py::run_profile --gpu H100!
 ```
 
 Use `--gpu H200` or `--gpu B200` for the other exact lanes. The profile uses
@@ -28,3 +30,6 @@ counts, slices scene and track prefixes for every trial, searches physical
 batches 1–8 at 1× accumulation for both 1,024 and 2,048 tracks, and confirms
 the selected batch with two warm-ups and three measured updates. Results and
 logs are committed to the `jeet-mvtracker-runs-v2` Volume under the run name.
+If batch 8 is safe, report the result as at least 8 rather than as an unbounded
+maximum. Always use these local entrypoints so the app receives the exact GPU
+and experiment billing tags.
