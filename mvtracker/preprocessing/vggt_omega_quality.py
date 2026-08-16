@@ -127,7 +127,7 @@ def depth_quality_metrics(
         ),
         "median_estimated_to_gt_depth_ratio": float(np.median(depth_ratio)),
         "sampled_metric_scales": sampled_scales.tolist(),
-        "sampled_camera_baseline_residuals_m": residuals,
-        "mean_camera_baseline_residual_m": float(np.mean(residuals)),
-        "max_camera_baseline_residual_m": float(np.max(residuals)),
+        "sampled_camera_center_rmse_m": residuals,
+        "mean_camera_center_rmse_m": float(np.mean(residuals)),
+        "max_camera_center_rmse_m": float(np.max(residuals)),
     }

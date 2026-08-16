@@ -44,7 +44,7 @@ class VGGTQualityTest(unittest.TestCase):
         )
         self.assertEqual(metrics["view_count"], 2)
         self.assertAlmostEqual(metrics["mean_absolute_error_m"], 1 / 16)
-        self.assertAlmostEqual(metrics["mean_camera_baseline_residual_m"], np.sqrt(0.5))
+        self.assertAlmostEqual(metrics["mean_camera_center_rmse_m"], np.sqrt(0.5))
         self.assertAlmostEqual(metrics["cleaned_mean_absolute_relative_error"], 1 / 30)
         self.assertEqual(metrics["sampled_metric_scales"], [2.0, 2.0])
         self.assertAlmostEqual(metrics["cleaned_mask_fraction"], 15 / 16)
