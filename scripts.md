@@ -104,3 +104,11 @@ The loader profiles use four warm-ups and 32 measured samples. The CPU profile
 reports DIEGESIS and MV-Kubric separately; the H100 profile uses the production
 CUDA prefetch/nvJPEG path for DIEGESIS. Both profile entrypoints carry
 `owner=jeet`, `project=mvtracker`, `purpose=profiling` tags.
+
+To measure archive transfer, extraction, and one CPU sample per dataset without
+launching training or a GPU:
+
+```bash
+MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) \
+  modal run --timestamps tools/modal_data_loading_smoke.py
+```
