@@ -14,8 +14,7 @@ from mvtracker.profiling.modal_continual_data import (
     EXPECTED_MVKUBRIC_SCENES,
     MVKUBRIC_INDEX_RELATIVE,
     _require_existing_profile_data,
-    extract_continual_training_bundle,
-    prepare_continual_training_bundle,
+    stage_continual_training_data,
 )
 
 
@@ -75,7 +74,7 @@ class ModalContinualDataTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exactly scenes 900..999"):
                 _require_existing_profile_data(root)
 
-    def test_bundle_round_trip_preserves_validated_tree(self):
+    def test_direct_staging_copies_the_prepared_data_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "source"
             extracted = Path(directory) / "extracted"
@@ -112,21 +111,11 @@ class ModalContinualDataTests(unittest.TestCase):
                 )
             )
 
-            bundle = prepare_continual_training_bundle(root)
-            self.assertEqual(
-                bundle["inputs"].count("datasets/kubric-multiview/train"), 1
-            )
-            self.assertNotIn(
-                "datasets/kubric-multiview/train/MVTracker_index", bundle["inputs"]
-            )
-            reused_archive = Path(directory) / "reused.tar"
-            reused = prepare_continual_training_bundle(root, bundle_path=reused_archive)
-            self.assertTrue(reused["reused"])
-            self.assertEqual(reused["archive"]["size_bytes"], bundle["archive"]["size_bytes"])
-            staging = extract_continual_training_bundle(
-                root, local_data_root=extracted, bundle_manifest=bundle
-            )
+            staging = stage_continual_training_data(root, local_data_root=extracted)
             self.assertEqual(staging["local_data_root"], str(extracted))
+            self.assertTrue(
+                (extracted / "checkpoints/mvtracker_200000_june2025.pth").is_file()
+            )
             self.assertEqual(
                 {
                     path.name

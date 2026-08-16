@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import time
 
 from huggingface_hub import hf_hub_download
@@ -21,9 +20,13 @@ MANIFEST_VERSION = 1
 EXPECTED_DIEGESIS_SPLITS = {"train": 17, "validation": 2, "test": 2}
 EXPECTED_MVKUBRIC_SCENES = {str(scene) for scene in range(900, 1000)}
 MVKUBRIC_INDEX_RELATIVE = Path("datasets/kubric-multiview/train/MVTracker_index")
-BUNDLE_SCHEMA_VERSION = 1
-BUNDLE_RELATIVE_PATH = Path("bundles/continual-training-data.tar")
-BUNDLE_MANIFEST_RELATIVE_PATH = Path("bundles/continual-training-data-manifest.json")
+LOCAL_STAGING_INPUTS = (
+    Path("profile-data-manifest.json"),
+    Path("continual-training-data-manifest.json"),
+    Path("source"),
+    Path("datasets"),
+    Path("checkpoints"),
+)
 
 
 def sha256(path: Path) -> str:
@@ -159,178 +162,33 @@ def _tree_stats(root: Path) -> dict[str, int]:
     }
 
 
-def _bundle_inputs() -> tuple[Path, ...]:
-    """Return archive members, relative to ``data_root``.
-
-    Raw DIEGESIS scenes are symlinks into ``source/diegesis``.  Keeping both
-    trees in the archive preserves the existing cache without dereferencing or
-    rebuilding it during setup.
-    """
-    return (
-        Path("profile-data-manifest.json"),
-        Path("continual-training-data-manifest.json"),
-        Path("source/diegesis"),
-        Path("datasets/diegesis-mvtracker"),
-        Path("datasets/kubric-multiview/train"),
-        Path("checkpoints/mvtracker_200000_june2025.pth"),
-    )
-
-
-def prepare_continual_training_bundle(
+def stage_continual_training_data(
     data_root: Path,
     *,
-    bundle_path: Path | None = None,
-    index_relative: Path = MVKUBRIC_INDEX_RELATIVE,
-    reuse_only: bool = False,
-) -> dict:
-    """Create an immutable tar bundle for local-SSD extraction in GPU jobs.
-
-    ``data_root`` is the existing Modal Volume tree.  No source data is
-    downloaded or regenerated here; the bundle is a transport representation
-    of the already validated DIEGESIS cache and MV-Kubric pool.
-    """
-    data_root = Path(data_root)
-    index_relative = Path(index_relative)
-    if index_relative != MVKUBRIC_INDEX_RELATIVE:
-        raise ValueError(
-            f"index_relative must be {MVKUBRIC_INDEX_RELATIVE}, got {index_relative}"
-        )
-    profile_manifest = _require_existing_profile_data(data_root)
-    index = _validate_mvkubric_index(data_root)
-    members = _bundle_inputs()
-    missing = [member for member in members if not (data_root / member).exists()]
-    if missing:
-        raise FileNotFoundError(f"bundle inputs are missing: {', '.join(map(str, missing))}")
-
-    archive = Path(bundle_path) if bundle_path is not None else data_root / BUNDLE_RELATIVE_PATH
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path = data_root / BUNDLE_MANIFEST_RELATIVE_PATH
-    existing = None
-    if manifest_path.is_file():
-        try:
-            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            existing = None
-        if not isinstance(existing, dict):
-            existing = None
-    expected_inputs = [str(member) for member in members]
-    existing_source = (existing or {}).get("source_profile_manifest", {})
-    existing_index = (existing or {}).get("mvkubric_index", {})
-    existing_archive = (existing or {}).get("archive", {})
-    compatible = (
-        (existing or {}).get("schema_version") == BUNDLE_SCHEMA_VERSION
-        and (existing or {}).get("format") == "tar"
-        and existing_source.get("schema_version") == profile_manifest.get("schema_version")
-        and existing_source.get("diegesis_revision") == profile_manifest.get("diegesis_revision")
-        and existing_source.get("mvkubric_revision") == profile_manifest.get("mvkubric_revision")
-        and existing_source.get("checkpoint_revision") == profile_manifest.get("checkpoint_revision")
-        and existing_source.get("diegesis", {}).get("splits")
-        == profile_manifest.get("diegesis", {}).get("splits")
-        and existing_index.get("manifest_sha256") == index.get("manifest_sha256")
-        and existing.get("inputs") == expected_inputs
-    )
-    if compatible:
-        relative = Path(existing_archive.get("relative_path", ""))
-        source_archive = relative if relative.is_absolute() else data_root / relative
-        expected_size = existing_archive.get("size_bytes")
-        if source_archive.is_file() and expected_size == source_archive.stat().st_size:
-            copy_started = time.perf_counter()
-            if source_archive.resolve() != archive.resolve():
-                shutil.copyfile(source_archive, archive)
-            copy_seconds = time.perf_counter() - copy_started
-            reused = dict(existing)
-            reused["reused"] = True
-            reused["timing"] = {
-                "build_seconds": 0.0,
-                "copy_seconds": copy_seconds,
-                "total_seconds": copy_seconds,
-            }
-            return reused
-    if reuse_only:
-        raise RuntimeError("no compatible continual-training bundle is available")
-
-    temporary = archive.with_name(f".{archive.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        temporary.unlink()
-    started = time.perf_counter()
-    subprocess.run(
-        [
-            "tar",
-            "--create",
-            "--file",
-            str(temporary),
-            "--directory",
-            str(data_root),
-            *(str(member) for member in members),
-        ],
-        check=True,
-    )
-    os.replace(temporary, archive)
-    archive_size = archive.stat().st_size
-    build_seconds = time.perf_counter() - started
-    manifest = {
-        "reused": False,
-        "schema_version": BUNDLE_SCHEMA_VERSION,
-        "format": "tar",
-        "archive": {
-            "relative_path": str(archive.relative_to(data_root))
-            if archive.is_relative_to(data_root)
-            else str(archive),
-            "size_bytes": archive_size,
-            "sha256": sha256(archive),
-        },
-        "source_profile_manifest": profile_manifest,
-        "inputs": [str(member) for member in members],
-        "diegesis": profile_manifest["diegesis"],
-        "mvkubric": profile_manifest["mvkubric"],
-        "mvkubric_index": index,
-        "elapsed_seconds": build_seconds,
-        "timing": {
-            "build_seconds": build_seconds,
-            "copy_seconds": 0.0,
-            "total_seconds": build_seconds,
-        },
-    }
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    return manifest
-
-
-def extract_continual_training_bundle(
-    bundle_root: Path,
-    *,
     local_data_root: Path,
-    bundle_path: Path | None = None,
-    bundle_manifest: dict | None = None,
 ) -> dict:
-    """Extract the validated bundle into a container's local ephemeral disk."""
-    bundle_root = Path(bundle_root)
+    """Copy the prepared datasets directly from a Modal Volume to local SSD."""
+    data_root = Path(data_root)
     local_data_root = Path(local_data_root)
-    manifest = bundle_manifest
-    if manifest is None:
-        manifest_path = bundle_root / BUNDLE_MANIFEST_RELATIVE_PATH
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != BUNDLE_SCHEMA_VERSION or manifest.get("format") != "tar":
-        raise RuntimeError("unsupported continual-training bundle manifest")
-    archive = Path(bundle_path) if bundle_path is not None else bundle_root / manifest["archive"]["relative_path"]
-    if not archive.is_file():
-        raise FileNotFoundError(f"continual-training bundle archive is missing: {archive}")
-    expected_size = int(manifest["archive"]["size_bytes"])
-    if archive.stat().st_size != expected_size:
-        raise RuntimeError("continual-training bundle archive size mismatch")
+    missing = [relative for relative in LOCAL_STAGING_INPUTS if not (data_root / relative).exists()]
+    if missing:
+        raise FileNotFoundError(f"local staging inputs are missing: {', '.join(map(str, missing))}")
     if local_data_root.exists():
         shutil.rmtree(local_data_root)
     local_data_root.mkdir(parents=True, exist_ok=False)
+
     started = time.perf_counter()
-    subprocess.run(
-        ["tar", "--extract", "--file", str(archive), "--directory", str(local_data_root), "--no-same-owner"],
-        check=True,
-    )
-    _require_existing_profile_data(local_data_root)
+    for relative in LOCAL_STAGING_INPUTS:
+        source = data_root / relative
+        destination = local_data_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            shutil.copy2(source, destination)
     return {
         "local_data_root": str(local_data_root),
-        "archive_size_bytes": expected_size,
-        "extracted_size_bytes": _tree_stats(local_data_root)["size_bytes"],
+        "copied_size_bytes": _tree_stats(local_data_root)["size_bytes"],
         "elapsed_seconds": time.perf_counter() - started,
         "mvkubric_index": str(local_data_root / MVKUBRIC_INDEX_RELATIVE),
     }

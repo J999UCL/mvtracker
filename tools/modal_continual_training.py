@@ -7,10 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
-import time
 
 import modal
 
@@ -47,8 +45,6 @@ from mvtracker.profiling.modal_continual_training import (
 
 APP_NAME = "jeet-mvtracker-continual-training"
 SOURCE_ROOT = Path("/opt/mvtracker")
-CHECKPOINT = DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth"
-BUNDLE_MANIFEST = DATA_ROOT / "bundles/continual-training-data-manifest.json"
 LOADER_PROFILE_WARMUP = 4
 LOADER_PROFILE_MEASURED = 32
 EXPERIMENT_PHASES = {
@@ -120,80 +116,13 @@ def setup_training_data_remote() -> dict:
     return manifest
 
 
-@app.function(
-    image=image,
-    secrets=[hf_secret, wandb_secret],
-    volumes={str(DATA_ROOT): data_volume},
-    cpu=16,
-    memory=32768,
-    ephemeral_disk=EPHEMERAL_DISK_MIB,
-    timeout=24 * 60 * 60,
-    max_containers=MAX_CONTAINERS,
-    include_source=False,
-)
-def prepare_training_bundle_remote() -> dict:
-    """Package already-materialized data for local-SSD extraction."""
-    import wandb
-
-    from mvtracker.profiling.modal_continual_data import (
-        prepare_continual_training_bundle,
-    )
-
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        group=WANDB_GROUP,
-        job_type="data-bundle",
-        tags=["modal", "data-bundle", "local-ssd", "gt-depth-replay-v1"],
-        config={"source_commit": _source_commit(), **PROFILE_TAGS},
-    )
-    local_archive = Path("/tmp/continual-training-data.tar")
-    destination = DATA_ROOT / "bundles/continual-training-data.tar"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        manifest = prepare_continual_training_bundle(
-            DATA_ROOT, bundle_path=destination, reuse_only=True
-        )
-    except RuntimeError as error:
-        if str(error) != "no compatible continual-training bundle is available":
-            raise
-        if local_archive.exists():
-            local_archive.unlink()
-        manifest = prepare_continual_training_bundle(DATA_ROOT, bundle_path=local_archive)
-        copy_started = time.perf_counter()
-        shutil.copyfile(local_archive, destination)
-        copy_seconds = time.perf_counter() - copy_started
-        manifest["archive"]["relative_path"] = "bundles/continual-training-data.tar"
-        manifest.setdefault("timing", {})["copy_seconds"] = copy_seconds
-        manifest["timing"]["total_seconds"] = (
-            manifest["timing"].get("build_seconds", 0.0) + copy_seconds
-        )
-        manifest["elapsed_seconds"] = manifest["timing"]["total_seconds"]
-    (DATA_ROOT / "bundles/continual-training-data-manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
-    data_volume.commit()
-    archive = manifest["archive"]
-    run.summary.update(
-        {
-            "bundle/archive_bytes": archive["size_bytes"],
-            "bundle/archive_sha256": archive["sha256"],
-            "bundle/elapsed_seconds": manifest["elapsed_seconds"],
-            "bundle/extracted_source_bytes": manifest["mvkubric"]["extracted"].get("size_bytes", 0),
-            "bundle/index_bytes": manifest["mvkubric_index"]["size_bytes"],
-        }
-    )
-    run.finish()
-    return manifest
-
-
 def _profile_loader(use_cuda: bool) -> dict:
     from mvtracker.profiling.modal_continual_data import (
-        extract_continual_training_bundle,
         profile_encoded_loader,
+        stage_continual_training_data,
     )
 
-    staging = extract_continual_training_bundle(
+    staging = stage_continual_training_data(
         DATA_ROOT,
         local_data_root=Path(LOCAL_DATA_ROOT),
     )
@@ -213,8 +142,7 @@ def _profile_loader(use_cuda: bool) -> dict:
 def _profile_summary(result: dict) -> dict:
     summary = {
         "staging/elapsed_seconds": result["staging"]["elapsed_seconds"],
-        "staging/archive_bytes": result["staging"]["archive_size_bytes"],
-        "staging/extracted_bytes": result["staging"]["extracted_size_bytes"],
+        "staging/copied_bytes": result["staging"]["copied_size_bytes"],
     }
     for source, profile in result["profiles"].items():
         prefix = f"loader/{source}"
@@ -337,7 +265,7 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
     environment = os.environ.copy()
     import wandb
 
-    from mvtracker.profiling.modal_continual_data import extract_continual_training_bundle
+    from mvtracker.profiling.modal_continual_data import stage_continual_training_data
 
     staging_run = wandb.init(
         entity=WANDB_ENTITY,
@@ -348,14 +276,13 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
         config={"source_commit": commit, "run_name": run_name, **MODAL_TAGS},
     )
     try:
-        staging = extract_continual_training_bundle(
+        staging = stage_continual_training_data(
             DATA_ROOT,
             local_data_root=Path(LOCAL_DATA_ROOT),
         )
         staging_run.summary.update(
             {
-                "staging/archive_bytes": staging["archive_size_bytes"],
-                "staging/extracted_bytes": staging["extracted_size_bytes"],
+                "staging/copied_bytes": staging["copied_size_bytes"],
                 "staging/elapsed_seconds": staging["elapsed_seconds"],
             }
         )
@@ -363,10 +290,9 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
         staging_run.finish()
     stage_manifest_path = run_dir / "local-ssd-staging-manifest.json"
     stage_manifest = {
-        "bundle_manifest": str(BUNDLE_MANIFEST),
+        "source_volume_root": str(DATA_ROOT),
         "local_data_root": staging["local_data_root"],
-        "archive_size_bytes": staging["archive_size_bytes"],
-        "extracted_size_bytes": staging["extracted_size_bytes"],
+        "copied_size_bytes": staging["copied_size_bytes"],
         "elapsed_seconds": staging["elapsed_seconds"],
         "mvkubric_index": staging["mvkubric_index"],
     }
@@ -445,14 +371,6 @@ def setup_data() -> None:
     require_pushed_main_commit(commit)
     app.set_tags({**MODAL_TAGS, "experiment": "data-setup", "gpu": "cpu"})
     print(json.dumps(setup_training_data_remote.remote(), indent=2))
-
-
-@app.local_entrypoint(name="prepare-bundle")
-def prepare_bundle() -> None:
-    commit = _source_commit()
-    require_pushed_main_commit(commit)
-    app.set_tags({**PROFILE_TAGS, "experiment": "data-bundle", "gpu": "cpu"})
-    print(json.dumps(prepare_training_bundle_remote.remote(), indent=2))
 
 
 @app.local_entrypoint(name="profile-cpu-loader")
