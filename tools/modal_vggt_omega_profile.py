@@ -60,7 +60,12 @@ def _image() -> modal.Image:
             index_url="https://download.pytorch.org/whl/cu128",
         )
         .pip_install_from_requirements(str(requirements))
-        .pip_install("huggingface-hub[hf_xet]==0.30.2", "wandb==0.19.9", "Pillow")
+        .pip_install(
+            "huggingface-hub==0.30.2",
+            "hf_xet==1.1.9",
+            "wandb==0.19.9",
+            "Pillow",
+        )
         .run_commands(clone)
         .env(
             {
