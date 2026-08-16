@@ -1,5 +1,25 @@
 # MV-Tracker Modal profiling runbook
 
+## VGGT-Omega H100 throughput profile
+
+This profile requests exactly one H100 (`max_containers=1`) and carries the
+billing tags `owner=jeet`, `project=mvtracker`, `purpose=profiling`.  It stages
+the pinned DIEGESIS snapshot directly from Hugging Face onto container-local
+SSD (about 90 seconds), and copies only MV-Kubric scenes `900`--`903` with
+`rgba_*.png` plus `metadata.json` from the read-only Modal Volume.  Inference
+and temporary profile outputs stay on local SSD; only the small report is
+committed to `jeet-mvtracker-runs-v2` and metrics go to W&B.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
+
+# Check the workspace before launching; never stop another app's container.
+modal container list --json
+modal run --timestamps tools/modal_vggt_omega_profile.py::profile \
+  --run-name vggt-omega-h100-throughput
+```
+
 All Modal runs use the `ucl-prism` profile. Check the workspace before every
 submission and do not stop containers whose app name is not `jeet-mvtracker-profile`.
 The profiler requests exactly one GPU per function and attaches the billing tags
