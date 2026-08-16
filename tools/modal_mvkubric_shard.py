@@ -157,6 +157,61 @@ def shard_archive() -> dict[str, object]:
     return manifest
 
 
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): volume.with_mount_options(read_only=True)},
+    cpu=16,
+    memory=32768,
+    ephemeral_disk=512 * 1024,
+    timeout=4 * 60 * 60,
+    max_containers=1,
+)
+def benchmark_shards() -> dict[str, object]:
+    import wandb
+
+    run = wandb.init(entity="jeetucl-ucl", project="mvtracker-modal-profiling", job_type="mvkubric-shard-benchmark", tags=["modal", "cpu", "mv-kubric", "archive-benchmark"], config={"owner": "jeet", "project": "mvtracker", "purpose": "profiling"})
+    local_root = Path("/tmp/mvkubric-shard-benchmark")
+    if local_root.exists():
+        shutil.rmtree(local_root)
+    local_root.mkdir()
+    source_paths = sorted((DATA_ROOT / "archives/mvkubric/zstd").glob("mvkubric-train-*.tar.zst"))
+    if len(source_paths) != 4:
+        raise RuntimeError(f"expected four MV-Kubric shards, found {source_paths}")
+    local_archives = [local_root / path.name for path in source_paths]
+    total_started = time.perf_counter()
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(shutil.copyfile, source_paths, local_archives))
+    copy_seconds = time.perf_counter() - started
+    copied_bytes = sum(path.stat().st_size for path in local_archives)
+    copy_result = {"bytes": copied_bytes, "seconds": copy_seconds, "gib_per_second": copied_bytes / (1024**3) / copy_seconds}
+    _log("benchmark_copy_complete", **copy_result)
+    run.log({"copy/bytes": copied_bytes, "copy/seconds": copy_seconds, "copy/gib_per_second": copy_result["gib_per_second"]})
+    train_root = local_root / "datasets/kubric-multiview/train"
+    train_root.mkdir(parents=True)
+    started = time.perf_counter()
+
+    def extract(path: Path) -> None:
+        subprocess.run(["tar", "--extract", "--zstd", "--strip-components=3", "--file", str(path), "--directory", str(train_root)], check=True)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(extract, local_archives))
+    extract_seconds = time.perf_counter() - started
+    extract_result = {"bytes": copied_bytes, "seconds": extract_seconds, "gib_per_second": copied_bytes / (1024**3) / extract_seconds}
+    observed = sorted(path.name for path in train_root.iterdir() if path.is_dir() and path.name.isdigit())
+    expected = list(SCENES)
+    if observed != expected:
+        raise RuntimeError(f"extracted scene inventory mismatch: {observed[:3]}..{observed[-3:]}")
+    _log("benchmark_extract_complete", **extract_result, scene_count=len(observed))
+    run.log({"extract/bytes": copied_bytes, "extract/seconds": extract_seconds, "extract/gib_per_second": extract_result["gib_per_second"], "extract/scene_count": len(observed)})
+    result = {"copy": copy_result, "extract": extract_result, "total_seconds": time.perf_counter() - total_started, "scene_count": len(observed), "scenes": observed}
+    _log("benchmark_complete", total_seconds=result["total_seconds"], scene_count=len(observed))
+    run.summary.update(result)
+    run.finish()
+    return result
+
+
 @app.local_entrypoint()
 def main() -> None:
     print(json.dumps(shard_archive.remote(), indent=2, sort_keys=True))

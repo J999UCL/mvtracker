@@ -120,3 +120,10 @@ To split the pinned MV-Kubric archive into four independently extractable
 modal container list --json
 modal run --timestamps tools/modal_mvkubric_shard.py
 ```
+
+To benchmark parallel local copy and extraction of the four MV-Kubric shards:
+
+```bash
+modal container list --json
+modal run --timestamps tools/modal_mvkubric_shard.py::benchmark_shards
+```
