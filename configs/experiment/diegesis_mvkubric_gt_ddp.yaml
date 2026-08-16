@@ -154,7 +154,7 @@ datasets:
         views: [0, 1, 2, 3]
       mvkubric:
         root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
-        include_scene_ids: ["998", "999"]
+        include_scene_ids: ["101", "102"]
         views: [0, 1, 2, 3]
 
 trainer:

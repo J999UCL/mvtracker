@@ -57,6 +57,10 @@ class ContinualTrainingConfigTests(unittest.TestCase):
             sources["mvkubric"]["include_scene_ids"],
             [str(scene) for scene in range(900, 998)],
         )
+        self.assertEqual(
+            self.config["datasets"]["eval"]["sources"]["mvkubric"]["include_scene_ids"],
+            ["101", "102"],
+        )
         self.assertFalse(self.config["augmentations"]["variable_depth_type"])
         self.assertTrue(self.config["augmentations"]["depth"])
         self.assertEqual(

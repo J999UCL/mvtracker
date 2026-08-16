@@ -90,13 +90,13 @@ class BalancedMixedSourceScheduleTests(unittest.TestCase):
 
 class SceneSelectionTests(unittest.TestCase):
     def test_mvkubric_training_and_validation_allowlists_are_disjoint(self):
-        available = [str(scene) for scene in range(900, 1000)]
+        available = ["101", "102", *[str(scene) for scene in range(900, 1000)]]
         training = select_scene_names(
             available, include=[str(scene) for scene in range(900, 998)]
         )
-        validation = select_scene_names(available, include=["998", "999"])
+        validation = select_scene_names(available, include=["101", "102"])
         self.assertEqual(training, [str(scene) for scene in range(900, 998)])
-        self.assertEqual(validation, ["998", "999"])
+        self.assertEqual(validation, ["101", "102"])
         self.assertFalse(set(training) & set(validation))
 
     def test_selection_preserves_canonical_order_and_supports_exclusion(self):
