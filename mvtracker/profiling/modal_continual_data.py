@@ -406,11 +406,11 @@ def profile_encoded_loader(
     else:
         iterator = itertools.cycle(range(dataset.real_len))
 
-    def consume() -> int:
+    def consume() -> int | None:
         if use_cuda:
             batch, gotit = next(iterator)
             if not all(gotit):
-                raise RuntimeError("encoded-loader profile produced an invalid sample")
+                return None
             torch.cuda.synchronize()
             return int(batch.video.shape[0] * batch.video.shape[1])
         index = next(iterator)
@@ -421,14 +421,23 @@ def profile_encoded_loader(
             return len(sample.jpeg_bytes)
         return int(sample.video.shape[0])
 
-    for _ in range(warmup):
-        consume()
+    warmup_done = 0
+    rejected = 0
+    while warmup_done < warmup:
+        if consume() is None:
+            rejected += 1
+        else:
+            warmup_done += 1
     sample_seconds = []
     encoded_frames = 0
     started = time.perf_counter()
-    for _ in range(measured):
+    while len(sample_seconds) < measured:
         sample_started = time.perf_counter()
-        encoded_frames += consume()
+        frame_count = consume()
+        if frame_count is None:
+            rejected += 1
+            continue
+        encoded_frames += frame_count
         sample_seconds.append(time.perf_counter() - sample_started)
     if use_cuda:
         torch.cuda.synchronize()
@@ -438,6 +447,7 @@ def profile_encoded_loader(
         "measured": measured,
         "workers": workers,
         "use_cuda": use_cuda,
+        "rejected": rejected,
         "elapsed_seconds": elapsed,
         "samples_per_second": measured / elapsed,
         "sample_seconds_median": sorted(sample_seconds)[len(sample_seconds) // 2],
