@@ -134,3 +134,8 @@ def validate_gpu_request(spec: str, *, max_gpus: int = 1) -> int:
             f"GPU request {spec!r} exceeds the hard limit of {max_gpus}"
         )
     return count
+
+
+def validate_view_count(views: int) -> None:
+    if not 1 <= views <= 6:
+        raise ValueError("views must be between one and six")

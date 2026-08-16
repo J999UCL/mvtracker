@@ -16,6 +16,7 @@ from mvtracker.profiling.modal_training import (
     find_largest_safe_batch,
     is_memory_safe,
     validate_gpu_request,
+    validate_view_count,
 )
 
 
@@ -147,6 +148,12 @@ class ModalTrainingProfileTests(unittest.TestCase):
         self.assertEqual(validate_gpu_request("H100!:1", max_gpus=1), 1)
         with self.assertRaisesRegex(ValueError, "hard limit of 1"):
             validate_gpu_request("H100!:2", max_gpus=1)
+
+    def test_profile_view_count_accepts_full_mv_kubric_range(self):
+        validate_view_count(1)
+        validate_view_count(6)
+        with self.assertRaisesRegex(ValueError, "between one and six"):
+            validate_view_count(7)
 
 
 if __name__ == "__main__":

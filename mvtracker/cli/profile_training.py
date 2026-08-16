@@ -27,7 +27,7 @@ from mvtracker.cli.train import (
 )
 from mvtracker.datasets import KubricMultiViewDataset
 from mvtracker.datasets.utils import collate_fn
-from mvtracker.profiling.modal_training import is_memory_safe
+from mvtracker.profiling.modal_training import is_memory_safe, validate_view_count
 
 
 class _NvmlPeak:
@@ -321,8 +321,7 @@ def _median_metrics(updates: list[dict[str, float | int]]) -> dict[str, float]:
 def run(arguments) -> dict:
     if torch.cuda.device_count() != 1:
         raise RuntimeError("training shape profiler requires exactly one visible GPU")
-    if not 1 <= arguments.views <= 4:
-        raise ValueError("views must be between one and four")
+    validate_view_count(arguments.views)
 
     if arguments.gpu_lane is not None:
         expected_name = arguments.gpu_lane.rstrip("!").upper()
