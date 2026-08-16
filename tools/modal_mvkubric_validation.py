@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -24,6 +25,7 @@ MVKUBRIC_REPO = "ethz-vlg/mv3dpt-datasets"
 MVKUBRIC_REVISION = "cccb9128fb95d302c662151e65a09377175c2a3a"
 SOURCE_ARCHIVE = "kubric-multiview--train.full.0031-1000.tar.gz"
 SOURCE_ARCHIVE_SIZE_BYTES = 394_716_348_566
+RANGE_BYTES = 1 << 30
 VALIDATION_SCENES = ("101", "102")
 TRAIN_ROOT = DATA_ROOT / "datasets/kubric-multiview/train"
 INDEX_ROOT = TRAIN_ROOT / "MVTracker_index"
@@ -72,6 +74,59 @@ def _validate_scene(root: Path, scene_id: str) -> dict[str, object]:
     }
 
 
+class _RangeStream(io.RawIOBase):
+    """Read a large signed Xet object through bounded HTTP ranges."""
+
+    def __init__(self, url: str, size: int):
+        self.url = url
+        self.size = size
+        self.offset = 0
+        self.response = None
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target) -> int:
+        if self.offset >= self.size:
+            return 0
+        if self.response is None:
+            end = min(self.size, self.offset + RANGE_BYTES) - 1
+            import requests
+
+            response = requests.get(
+                self.url,
+                headers={"Range": f"bytes={self.offset}-{end}"},
+                stream=True,
+                timeout=120,
+            )
+            response.raise_for_status()
+            expected = f"bytes {self.offset}-{end}/{self.size}"
+            if response.headers.get("Content-Range") != expected:
+                response.close()
+                raise RuntimeError(
+                    f"unexpected Xet range: {response.headers.get('Content-Range')!r}; "
+                    f"expected {expected!r}"
+                )
+            self.response = response
+        block = self.response.raw.read(len(target))
+        if not block:
+            self.response.close()
+            self.response = None
+            return self.readinto(target)
+        target[: len(block)] = block
+        self.offset += len(block)
+        if self.offset % RANGE_BYTES == 0:
+            self.response.close()
+            self.response = None
+        return len(block)
+
+    def close(self):
+        if self.response is not None:
+            self.response.close()
+            self.response = None
+        super().close()
+
+
 @app.function(
     image=image,
     secrets=[hf_secret, wandb_secret],
@@ -109,7 +164,6 @@ def materialize_validation() -> dict[str, object]:
             shutil.rmtree(staging)
         staging.mkdir()
         from huggingface_hub import hf_hub_url
-        import requests
 
         url = hf_hub_url(
             repo_id=MVKUBRIC_REPO,
@@ -117,17 +171,13 @@ def materialize_validation() -> dict[str, object]:
             repo_type="dataset",
             revision=MVKUBRIC_REVISION,
         )
-        response = requests.get(
-            url,
-            headers={"Range": f"bytes=0-{SOURCE_ARCHIVE_SIZE_BYTES - 1}"},
-            stream=True,
-            timeout=120,
-        )
-        response.raise_for_status()
         source_root = staging / "kubric-multiview/train"
         source_root.mkdir(parents=True)
         seen = set()
-        with tarfile.open(fileobj=response.raw, mode="r|gz") as archive:
+        stream = io.BufferedReader(
+            _RangeStream(url, SOURCE_ARCHIVE_SIZE_BYTES), buffer_size=8 * 1024 * 1024
+        )
+        with tarfile.open(fileobj=stream, mode="r|gz") as archive:
             for member in archive:
                 parts = Path(member.name).parts
                 if len(parts) < 3 or parts[:2] != ("kubric-multiview", "train"):
@@ -139,7 +189,7 @@ def materialize_validation() -> dict[str, object]:
                     continue
                 archive.extract(member, staging)
                 seen.add(scene_id)
-        response.close()
+        stream.close()
         if seen != set(VALIDATION_SCENES):
             raise RuntimeError(
                 f"{SOURCE_ARCHIVE} at {MVKUBRIC_REVISION} lacks validation scenes "
