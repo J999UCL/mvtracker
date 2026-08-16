@@ -121,6 +121,36 @@ class KubricMetadataIndexTests(unittest.TestCase):
             self.assertTrue(all("view_1" in str(path) for path in calls))
             self.assertFalse(any("00001" in path.name for path in calls))
 
+    def test_fixed_seed_indexed_view_payload_matches_native_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene_path = self._make_scene(root)
+            index_root = INDEX.build_kubric_metadata_index(root).parent
+            entry, arrays = INDEX.KubricMetadataIndex(index_root).scene("900")
+            selected_view = int(np.random.RandomState(72).choice([0, 1], 1)[0])
+            calls = []
+            indexed = _indexed_view_loader(calls)(
+                scene_path, entry, arrays, [selected_view]
+            )[selected_view]
+
+            view_path = scene_path / f"view_{selected_view}"
+            with np.load(view_path / "tracks_2d.npz") as tracks_file:
+                expected_tracks = torch.from_numpy(tracks_file["tracks_2d"].copy())
+                expected_occlusion = torch.from_numpy(tracks_file["occlusion"].copy())
+            metadata = json.loads((view_path / "metadata.json").read_text(encoding="utf-8"))
+            expected_intrinsics, expected_extrinsics = INDEX._camera_matrices(metadata)
+
+            torch.testing.assert_close(indexed["tracks_2d"], expected_tracks)
+            torch.testing.assert_close(indexed["occlusion"], expected_occlusion)
+            torch.testing.assert_close(
+                indexed["intrinsics"], torch.from_numpy(expected_intrinsics)
+            )
+            torch.testing.assert_close(
+                indexed["extrinsics"], torch.from_numpy(expected_extrinsics)
+            )
+            self.assertEqual(indexed["rgba"].shape, (3, 2, 3, 1))
+            self.assertEqual(indexed["depth"].shape, (3, 2, 3, 1))
+
     def test_explicit_index_mode_rejects_missing_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(FileNotFoundError):
