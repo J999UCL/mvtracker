@@ -9,6 +9,7 @@ from mvtracker.profiling.modal_continual_data import (
     CHECKPOINT_SHA256,
     EXPECTED_DIEGESIS_SPLITS,
     EXPECTED_MVKUBRIC_SCENES,
+    MVKUBRIC_INDEX_RELATIVE,
     _require_existing_profile_data,
 )
 
@@ -42,8 +43,22 @@ class ModalContinualDataTests(unittest.TestCase):
             mvkubric = root / "datasets/kubric-multiview/train"
             for scene in EXPECTED_MVKUBRIC_SCENES:
                 (mvkubric / scene).mkdir(parents=True)
+            index_root = root / MVKUBRIC_INDEX_RELATIVE
+            (index_root / "scenes").mkdir(parents=True)
+            index_entries = {}
+            for scene in EXPECTED_MVKUBRIC_SCENES:
+                (index_root / "scenes" / f"{scene}.npz").write_bytes(b"index")
+                index_entries[scene] = {"arrays": f"scenes/{scene}.npz"}
+            (index_root / "manifest.json").write_text(
+                json.dumps({"version": 1, "scenes": index_entries})
+            )
 
             self.assertEqual(_require_existing_profile_data(root), manifest)
+
+            (cache_root / "train" / "0").rmdir()
+            with self.assertRaisesRegex(RuntimeError, "existing DIEGESIS train data is incomplete"):
+                _require_existing_profile_data(root)
+            (cache_root / "train" / "0").mkdir()
 
             (mvkubric / "999").rename(mvkubric / "1000")
             with self.assertRaisesRegex(RuntimeError, "exactly scenes 900..999"):
