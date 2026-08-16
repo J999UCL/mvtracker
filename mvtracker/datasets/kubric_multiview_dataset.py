@@ -24,6 +24,7 @@ from mvtracker.datasets.estimated_depth import (
     ESTIMATED_DEPTH_TYPE_PROBABILITIES,
     EstimatedDepthStore,
 )
+from mvtracker.datasets.kubric_metadata_index import KubricMetadataIndex
 from mvtracker.datasets.scene_selection import select_scene_names
 from mvtracker.datasets.utils import Datapoint, read_json, read_tiff, read_png, transform_scene, add_camera_noise, \
     aug_depth
@@ -222,6 +223,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             "cache_version": "v1" if use_cached_tracks else "v3",
             "include_scene_ids": include_scene_ids,
             "exclude_scene_ids": exclude_scene_ids,
+            "metadata_index_root": None,
         }
         if training:
             kubric_kwargs["virtual_dataset_size"] = _training_virtual_dataset_size(
@@ -268,6 +270,12 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             kubric_kwargs["estimated_depth_provider"] = training_args.datasets.get(
                 "estimated_depth_provider"
             )
+            metadata_index_root = training_args.datasets.train.get(
+                "kubric_metadata_index_root"
+            )
+            if metadata_index_root is not None and not os.path.isabs(metadata_index_root):
+                metadata_index_root = os.path.join(dataset_root, metadata_index_root)
+            kubric_kwargs["metadata_index_root"] = metadata_index_root
 
             if training_args.modes.pretrain_only:
                 kubric_kwargs["ratio_dynamic"] = 0.0
@@ -333,10 +341,16 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             estimated_depth_provider=None,
             include_scene_ids=None,
             exclude_scene_ids=(),
+            metadata_index_root=None,
     ):
         super(KubricMultiViewDataset, self).__init__()
 
         self.data_root = data_root
+        self.metadata_index = (
+            KubricMetadataIndex(metadata_index_root)
+            if metadata_index_root is not None
+            else None
+        )
         self.estimated_depth_store = EstimatedDepthStore(
             estimated_depth_root, estimated_depth_provider
         )
@@ -472,13 +486,17 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                 self.pad_bounds = [0, 1]
                 self.resize_lim = [1.04, 1.04]
 
-        self.seq_names = [
-            fname
-            for fname in os.listdir(self.data_root)
-            if os.path.isdir(os.path.join(self.data_root, fname))
-               and not fname.startswith(".")
-               and not fname.startswith("_")
-        ]
+        self.seq_names = (
+            list(self.metadata_index.scenes)
+            if self.metadata_index is not None
+            else [
+                fname
+                for fname in os.listdir(self.data_root)
+                if os.path.isdir(os.path.join(self.data_root, fname))
+                   and not fname.startswith(".")
+                   and not fname.startswith("_")
+            ]
+        )
         self.seq_names = sorted(
             self.seq_names,
             key=lambda name: (0, int(name)) if name.isdigit() else (1, name),
@@ -486,10 +504,14 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         seq_names_clean = []
         for seq_name in self.seq_names:
             scene_path = os.path.join(self.data_root, seq_name)
-            view_folders = [
-                d for d in os.listdir(scene_path)
-                if os.path.isdir(os.path.join(scene_path, d)) and d.startswith('view_')
-            ]
+            if self.metadata_index is not None:
+                scene_entry, _ = self.metadata_index.scene(seq_name)
+                view_folders = scene_entry["view_names"]
+            else:
+                view_folders = [
+                    d for d in os.listdir(scene_path)
+                    if os.path.isdir(os.path.join(scene_path, d)) and d.startswith('view_')
+                ]
             if len(view_folders) == 0:
                 logging.warning(f"Skipping {scene_path} because it has no views.")
                 continue
@@ -607,8 +629,22 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         rnd_torch = torch.Generator().manual_seed(seed)
         rnd_np = np.random.RandomState(seed=seed)
 
-        # Load the data
-        datapoint = self.getitem_raw_datapoint(os.path.join(self.data_root, self.seq_names[index]))
+        # Indexed mode first loads only lightweight scene data. The selected views
+        # are materialized after view sampling below.
+        scene_path = os.path.join(self.data_root, self.seq_names[index])
+        indexed_scene = None
+        metadata_index = getattr(self, "metadata_index", None)
+        if metadata_index is not None:
+            indexed_scene, indexed_arrays_path = metadata_index.scene(self.seq_names[index])
+            with np.load(os.path.join(scene_path, "tracks_3d.npz")) as tracks_file:
+                tracks_3d = tracks_file["tracks_3d"].copy()
+            datapoint = {
+                "tracks_3d": torch.from_numpy(tracks_3d),
+                "views": [None] * len(indexed_scene["view_names"]),
+                "invalid_frame_indices": indexed_scene["invalid_frame_indices"],
+            }
+        else:
+            datapoint = self.getitem_raw_datapoint(scene_path)
 
         traj3d_world = datapoint["tracks_3d"].numpy()
         views = datapoint["views"]
@@ -720,6 +756,17 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                 duster_views = self.duster_views
             else:
                 duster_views = views_to_return
+
+        if indexed_scene is not None:
+            views_needed = set(views_to_return)
+            if self.novel_views is not None:
+                views_needed.update(self.novel_views)
+            views = self.getitem_indexed_views(
+                scene_path,
+                indexed_scene,
+                indexed_arrays_path,
+                sorted(views_needed),
+            )
 
         # Extract only the data we need
         rgbs = np.stack([views[v]["rgba"][..., :3].numpy() for v in views_to_return])
@@ -1282,6 +1329,60 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             return None, False
 
         return datapoint, gotit
+
+    @staticmethod
+    def getitem_indexed_views(scene_path, scene_entry, arrays_path, view_indices, frame_indices=None):
+        """Load only requested native views (and optionally requested frames)."""
+        n_frames = int(scene_entry["n_frames"])
+        if frame_indices is None:
+            frame_indices = range(n_frames)
+        frame_indices = list(frame_indices)
+        with np.load(arrays_path) as arrays:
+            intrinsics = arrays["intrinsics"].copy()
+            extrinsics = arrays["extrinsics"].copy()
+            sensor_widths = arrays["sensor_widths"].copy()
+            focal_lengths = arrays["focal_lengths"].copy()
+
+        views = [None] * len(scene_entry["view_names"])
+        for view_index in view_indices:
+            view_path = os.path.join(scene_path, scene_entry["view_names"][view_index])
+            rgba = torch.stack([
+                torch.from_numpy(np.asarray(read_png(os.path.join(
+                    view_path, scene_entry["rgba_files"][view_index][frame_index]
+                ))))
+                for frame_index in frame_indices
+            ])
+            depth_images = [
+                np.asarray(read_tiff(os.path.join(
+                    view_path, scene_entry["depth_files"][view_index][frame_index]
+                )))
+                for frame_index in frame_indices
+            ]
+            if depth_images[0].dtype == np.uint16:
+                depth_images = [image.astype(np.int32) for image in depth_images]
+            depth = torch.stack([torch.from_numpy(image) for image in depth_images])
+            depth = KubricMultiViewDataset.depth_from_euclidean_to_z(
+                depth=depth,
+                sensor_width=sensor_widths[view_index],
+                focal_length=focal_lengths[view_index],
+            )
+            too_far = depth > 1000
+            if too_far.any():
+                depth[too_far] = 0
+
+            with np.load(os.path.join(view_path, "tracks_2d.npz")) as tracks_file:
+                tracks_2d = torch.from_numpy(tracks_file["tracks_2d"].copy())
+                occlusion = torch.from_numpy(tracks_file["occlusion"].copy())
+            views[view_index] = {
+                "rgba": rgba,
+                "depth": depth,
+                "tracks_2d": tracks_2d[frame_indices],
+                "occlusion": occlusion[frame_indices],
+                "intrinsics": torch.from_numpy(intrinsics[view_index]),
+                "extrinsics": torch.from_numpy(extrinsics[view_index, frame_indices]),
+                "view_path": view_path,
+            }
+        return views
 
     @staticmethod
     def getitem_raw_datapoint(scene_path, perform_2d_projection_sanity_check=True):
