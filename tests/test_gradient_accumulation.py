@@ -33,6 +33,16 @@ def _load_train_main_ast():
     )
 
 
+def _load_function_ast(name):
+    path = Path(__file__).resolve().parents[1] / "mvtracker" / "cli" / "train.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
 class GradientAccumulationTests(unittest.TestCase):
     def test_eight_serial_microbatches_match_one_batch_mean(self):
         serial = torch.nn.Linear(2, 1, bias=False)
@@ -61,8 +71,9 @@ class GradientAccumulationTests(unittest.TestCase):
 
     def test_optimizer_update_occurs_after_full_accumulation_guard(self):
         main = _load_train_main_ast()
+        microbatch = _load_function_ast("_forward_backward_microbatch")
         calls = {}
-        for node in ast.walk(main):
+        for node in [*ast.walk(main), *ast.walk(microbatch)]:
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 continue
             owner = ast.unparse(node.func.value)
@@ -102,6 +113,13 @@ class GradientAccumulationTests(unittest.TestCase):
             "_scale_microbatch_loss(loss, gradient_accumulation_steps)",
         )
 
+        microbatch_source = ast.unparse(microbatch)
+        self.assertIn(
+            "fabric.no_backward_sync(model, enabled=not is_final_microbatch)",
+            microbatch_source,
+        )
+        self.assertNotIn("fabric.barrier()", ast.unparse(main))
+
     def test_expensive_diagnostics_use_optimizer_step_interval(self):
         main_source = ast.unparse(_load_train_main_ast())
 
@@ -113,7 +131,10 @@ class GradientAccumulationTests(unittest.TestCase):
             "run_expensive_diagnostics=run_expensive_diagnostics",
             main_source,
         )
-        self.assertIn("gradient_diagnostics.begin()", main_source)
+        self.assertIn(
+            "gradient_diagnostics.begin()",
+            ast.unparse(_load_function_ast("_forward_backward_microbatch")),
+        )
 
 
 if __name__ == "__main__":

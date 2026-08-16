@@ -62,6 +62,10 @@ from collections import deque
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 
+LATEST_CHECKPOINT_MANIFEST = "latest_checkpoint.json"
+WANDB_RUN_ID_FILE = "wandb_run_id.txt"
+
+
 def _scale_microbatch_loss(loss, gradient_accumulation_steps):
     """Scale one microbatch loss so accumulated gradients form a batch mean."""
     if gradient_accumulation_steps < 1:
@@ -215,13 +219,18 @@ def fetch_optimizer(trainer_cfg, model):
     """Create the optimizer and learning rate scheduler"""
     optimizer = optim.AdamW(model.parameters(), lr=trainer_cfg.lr, weight_decay=trainer_cfg.wdecay)
     if trainer_cfg.anneal_strategy in ["linear", "cos"]:
+        schedule_steps = int(trainer_cfg.lr_schedule_steps)
+        if schedule_steps < int(trainer_cfg.num_steps):
+            raise ValueError("trainer.lr_schedule_steps must be at least trainer.num_steps")
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
             trainer_cfg.lr,
-            trainer_cfg.num_steps + 100,
+            schedule_steps,
             pct_start=0.05,
             cycle_momentum=False,
             anneal_strategy=trainer_cfg.anneal_strategy,
+            div_factor=25.0,
+            final_div_factor=1.0e4,
         )
     elif trainer_cfg.anneal_strategy == "restarts":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -232,6 +241,105 @@ def fetch_optimizer(trainer_cfg, model):
         )
 
     return optimizer, scheduler
+
+
+def _reduce_scalar(fabric, value, reduce_op="mean"):
+    """Return the mean scalar across ranks on every rank."""
+    tensor = torch.as_tensor(value, device=fabric.device, dtype=torch.float64)
+    return float(fabric.all_reduce(tensor, reduce_op=reduce_op).item())
+
+
+def _reduce_scalar_dict(fabric, values):
+    """Reduce a same-key scalar mapping, including future per-source metrics."""
+    return {name: _reduce_scalar(fabric, value) for name, value in values.items()}
+
+
+def _all_ranks_succeeded(fabric, succeeded):
+    value = torch.tensor(int(bool(succeeded)), device=fabric.device)
+    return bool(fabric.all_reduce(value, reduce_op="min").item())
+
+
+def _latest_checkpoint_path(experiment_path):
+    manifest_path = Path(experiment_path) / LATEST_CHECKPOINT_MANIFEST
+    if not manifest_path.is_file():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    checkpoint_path = Path(experiment_path) / manifest["checkpoint"]
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"latest checkpoint manifest points to missing file: {checkpoint_path}"
+        )
+    return checkpoint_path
+
+
+def _write_latest_checkpoint_manifest(experiment_path, checkpoint_path, completed_steps):
+    manifest_path = Path(experiment_path) / LATEST_CHECKPOINT_MANIFEST
+    temporary_path = manifest_path.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(
+            {
+                "checkpoint": Path(checkpoint_path).name,
+                "completed_steps": int(completed_steps),
+            },
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(manifest_path)
+
+
+def _get_or_create_wandb_run_id(experiment_path):
+    run_id_path = Path(experiment_path) / WANDB_RUN_ID_FILE
+    if run_id_path.is_file():
+        return run_id_path.read_text(encoding="utf-8").strip()
+    run_id = wandb.util.generate_id()
+    run_id_path.write_text(run_id + "\n", encoding="utf-8")
+    return run_id
+
+
+def _save_training_checkpoint(
+    fabric,
+    experiment_path,
+    checkpoint_path,
+    model,
+    optimizer,
+    scheduler,
+    completed_steps,
+    master_seed,
+    wandb_run_id,
+):
+    state = AttributeDict(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        total_steps=int(completed_steps),
+        master_seed=int(master_seed),
+        wandb_run_id=wandb_run_id or "",
+    )
+    fabric.save(checkpoint_path, state)
+    fabric.barrier()
+    if fabric.global_rank == 0:
+        _write_latest_checkpoint_manifest(
+            experiment_path,
+            checkpoint_path,
+            completed_steps,
+        )
+    fabric.barrier()
+
+
+def _run_rank_zero_eval(fabric, cfg, evaluator, model, dataloaders, writer, step):
+    """Run validation once using the unwrapped model while other ranks wait."""
+    fabric.barrier()
+    if fabric.global_rank == 0:
+        run_test_eval(
+            cfg,
+            evaluator,
+            _unwrap_objects(model),
+            dataloaders,
+            writer,
+            step,
+        )
+    fabric.barrier()
 
 
 def _scene_scale(track_upscaling_factor, scene_index, batch_size, device, dtype):
@@ -641,6 +749,86 @@ def forward_batch_multi_view(
     return output
 
 
+def _forward_backward_microbatch(
+    *,
+    fabric,
+    model,
+    batch,
+    cfg,
+    completed_steps,
+    train_iters,
+    gradient_accumulation_steps,
+    is_final_microbatch,
+    run_expensive_diagnostics,
+    gradient_diagnostics,
+):
+    """Run one microbatch, suppressing DDP synchronization until the last one."""
+    with fabric.no_backward_sync(model, enabled=not is_final_microbatch):
+        forward_started_at = time.time()
+        with torch.profiler.record_function("train/model_and_loss_forward"):
+            output = forward_batch_multi_view(
+                batch=batch,
+                model=model,
+                cfg=cfg,
+                step=completed_steps,
+                train_iters=train_iters,
+                gamma=cfg.trainer.gamma,
+                save_debug_logs=(
+                    is_final_microbatch
+                    and (
+                        completed_steps % cfg.trainer.viz_freq
+                        == cfg.trainer.viz_freq - 1
+                        or completed_steps in (0, 10, 100, cfg.trainer.num_steps - 1)
+                    )
+                ),
+                debug_logs_path=os.path.join(
+                    cfg.experiment_path,
+                    "forward_pass__train_step-"
+                    f"{completed_steps}_global_rank-{fabric.global_rank}",
+                ),
+                run_expensive_diagnostics=run_expensive_diagnostics,
+            )
+
+        loss = torch.zeros((), device=fabric.device)
+        component_losses = {}
+        metrics = {}
+        for name, value in output.items():
+            if name == "metrics":
+                metrics.update({key: float(item) for key, item in value.items()})
+            elif "loss" in value:
+                loss = loss + value["loss"]
+                component_losses[name] = value["loss"].detach()
+            else:
+                raise ValueError(f"Unknown key {name} in output")
+        forward_duration = time.time() - forward_started_at
+
+        if run_expensive_diagnostics:
+            gradient_diagnostics.begin()
+        backward_started_at = time.time()
+        with torch.profiler.record_function("train/backward"):
+            fabric.backward(
+                _scale_microbatch_loss(loss, gradient_accumulation_steps)
+            )
+        microbatch_gradient = (
+            gradient_diagnostics.finish(
+                unscale_factor=gradient_accumulation_steps,
+            )
+            if run_expensive_diagnostics
+            else None
+        )
+        backward_duration = time.time() - backward_started_at
+
+    return (
+        output,
+        loss.detach(),
+        component_losses,
+        metrics,
+        microbatch_gradient,
+        forward_duration,
+        backward_duration,
+    )
+
+
 def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
     if len(dataloaders) == 0:
         return
@@ -793,14 +981,20 @@ def main(cfg: DictConfig):
         torch.backends.cudnn.deterministic = True
         torch.autograd.set_detect_anomaly(True)
 
+    wandb_run_id = None
     if cfg.logging.get("log_wandb", False) and fabric.global_rank == 0:
+        wandb_run_id = _get_or_create_wandb_run_id(cfg.experiment_path)
         exp_name = cfg.experiment_path.replace("./logs/", "").replace("/", "_").replace("\\", "_")
         wandb.init(
             project=cfg.logging.wandb_project,
+            entity=cfg.logging.get("wandb_entity"),
+            group=cfg.logging.get("wandb_group"),
             name=exp_name,
             tags=cfg.logging.get("tags", []),
             config=OmegaConf.to_container(cfg, resolve=True),
             sync_tensorboard=True,
+            id=wandb_run_id,
+            resume="allow",
         )
 
     original_numpy = torch.Tensor.numpy
@@ -1076,33 +1270,31 @@ def main(cfg: DictConfig):
     if expensive_diagnostics_interval < 1:
         raise ValueError("trainer.expensive_diagnostics_interval must be at least 1")
 
-    folder_ckpts = [
-        f
-        for f in os.listdir(cfg.experiment_path)
-        if f.endswith(".pth")
-           and not os.path.isdir(f)
-           and not "final" in f
-           and not "unwrap_model" in f
-           and not "unwrap_module" in f
-    ]
-    logging.info(f"Found {len(folder_ckpts)} checkpoints: {folder_ckpts}")
-    if len(folder_ckpts) > 0:
-        # We can load this checkpoint directly since we have saved it during training
-        ckpt_name = sorted(folder_ckpts)[-1]
-        experiment_path = os.path.join(cfg.experiment_path, ckpt_name)
+    latest_checkpoint = _latest_checkpoint_path(cfg.experiment_path)
+    if latest_checkpoint is not None:
         state = AttributeDict(
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
             total_steps=total_steps,
+            master_seed=int(cfg.reproducibility.seed),
+            wandb_run_id=wandb_run_id or "",
         )
-        logging.info(f"Total steps before loading checkpoint: {total_steps}")
-        fabric.load(experiment_path, state)
-        total_steps = state.total_steps  # Integers are immutable, so they cannot be changed inplace
+        fabric.load(latest_checkpoint, state)
+        total_steps = int(state.total_steps)
+        if int(state.master_seed) != int(cfg.reproducibility.seed):
+            raise ValueError(
+                "resume master seed does not match reproducibility.seed"
+            )
+        if state.wandb_run_id and state.wandb_run_id != (wandb_run_id or ""):
+            raise ValueError("resume W&B run ID does not match wandb_run_id.txt")
         if train_loader is not None:
             epoch = total_steps // optimizer_steps_per_epoch - 1
-        logging.info(f"Loaded checkpoint {experiment_path} (total_steps={total_steps})")
-        logging.info(f"Total steps after loading checkpoint: {total_steps}")
+        logging.info(
+            "Resumed canonical checkpoint %s at %d completed steps",
+            latest_checkpoint,
+            total_steps,
+        )
 
     elif cfg.restore_ckpt_path is not None:
         restore_ckpt_path = cfg.restore_ckpt_path
@@ -1110,25 +1302,41 @@ def main(cfg: DictConfig):
         logging.info(f"Restoring pre-trained weights from {os.path.abspath(restore_ckpt_path)}")
         training_ckpt = "total_steps" in torch.load(restore_ckpt_path)
         if training_ckpt:
-            # Loading a checkpoint saved by fabric during training
-            logging.info("Trying to load as a training checkpoint...")
-            state = AttributeDict(model=model)
-            try:
-                fabric.load(restore_ckpt_path, state, strict=True)
-            except RuntimeError as e:
-                logging.warning(f"Failed to load weights with from {restore_ckpt_path} with strict=True: {e}. "
-                                f"Trying again with strict=False.")
-                fabric.load(restore_ckpt_path, state, strict=False)
-            logging.info(f"Loaded checkpoint {restore_ckpt_path}")
+            state = AttributeDict(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                total_steps=total_steps,
+            )
+            fabric.load(restore_ckpt_path, state, strict=True)
+            total_steps = int(state.total_steps)
+            logging.info(
+                "Resumed explicit training checkpoint %s at %d completed steps",
+                restore_ckpt_path,
+                total_steps,
+            )
         else:
             fabric.load_raw(restore_ckpt_path, model)
 
-    tb_writer = SummaryWriter(log_dir=os.path.join(cfg.experiment_path, f"runs_{fabric.global_rank}"))
+    tb_writer = (
+        SummaryWriter(log_dir=os.path.join(cfg.experiment_path, "runs"))
+        if fabric.global_rank == 0
+        else None
+    )
     if cfg.modes.eval_only or cfg.modes.validate_at_start:
-        run_test_eval(cfg, evaluator, model, eval_dataloaders, tb_writer, total_steps - 1)
-        fabric.barrier()
+        _run_rank_zero_eval(
+            fabric,
+            cfg,
+            evaluator,
+            model,
+            eval_dataloaders,
+            tb_writer,
+            total_steps,
+        )
         if cfg.modes.eval_only:
             gradient_diagnostics.close()
+            if tb_writer is not None:
+                tb_writer.close()
             return
 
     torch_profiler = _create_torch_profiler(
@@ -1149,17 +1357,19 @@ def main(cfg: DictConfig):
 
     def handle_sigterm(signum, frame):
         logging.error(f"Signal {signum} received, saving checkpoint and exiting...")
-        ckpt_iter = "0" * (6 - len(str(total_steps))) + str(total_steps)
-        save_path = Path(f"{cfg.experiment_path}/model_{ckpt_iter}.pth")
-        state = AttributeDict(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            total_steps=total_steps,
+        save_path = Path(cfg.experiment_path) / f"model_{total_steps:06d}.pth"
+        _save_training_checkpoint(
+            fabric,
+            cfg.experiment_path,
+            save_path,
+            model,
+            optimizer,
+            scheduler,
+            total_steps,
+            cfg.reproducibility.seed,
+            wandb_run_id,
         )
-        fabric.save(save_path, state)
-        logging.info(f"Saved checkpoint to {save_path}. Waiting for all ranks to finish...")
-        fabric.barrier()
+        logging.info(f"Saved checkpoint to {save_path}")
         logging.info(f"Calling sys.exit(0) now.")
         sys.exit(0)
 
@@ -1258,7 +1468,7 @@ def main(cfg: DictConfig):
                 logging.info(f"Debugging hotfix: loaded batch {batch.seq_name} "
                              f"with {len(batch.video)} views and {batch.video.shape[2]} frames")
 
-            if not all(gotit):
+            if not _all_ranks_succeeded(fabric, all(gotit)):
                 total_batches_failed += 1
                 accumulated_dataloader_duration += time.time() - start_time_1
                 logging.info(f"batch is None: "
@@ -1309,27 +1519,26 @@ def main(cfg: DictConfig):
             )
 
             try:
-                with torch.profiler.record_function("train/model_and_loss_forward"):
-                    output = forward_batch_multi_view(
-                        batch=batch,
-                        model=model,
-                        cfg=cfg,
-                        step=total_steps,
-                        train_iters=train_iters,
-                        gamma=cfg.trainer.gamma,
-                        save_debug_logs=(
-                                is_final_microbatch
-                                and (
-                                    ((total_steps % cfg.trainer.viz_freq) == (cfg.trainer.viz_freq - 1))
-                                    or (total_steps in [0, 10, 100, cfg.trainer.num_steps - 1])
-                                )
-                        ),
-                        debug_logs_path=os.path.join(
-                            cfg.experiment_path,
-                            f'forward_pass__train_step-{total_steps}_global_rank-{fabric.global_rank}'
-                        ),
-                        run_expensive_diagnostics=run_expensive_diagnostics,
-                    )
+                (
+                    output,
+                    microbatch_loss,
+                    component_losses,
+                    microbatch_metrics,
+                    microbatch_gradient,
+                    forward_duration,
+                    backward_duration,
+                ) = _forward_backward_microbatch(
+                    fabric=fabric,
+                    model=model,
+                    batch=batch,
+                    cfg=cfg,
+                    completed_steps=total_steps,
+                    train_iters=train_iters,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    is_final_microbatch=is_final_microbatch,
+                    run_expensive_diagnostics=run_expensive_diagnostics,
+                    gradient_diagnostics=gradient_diagnostics,
+                )
             except Exception as e:
                 logging.critical(f"Forward pass crashed at step {total_steps}: {e}")
 
@@ -1357,77 +1566,60 @@ def main(cfg: DictConfig):
 
                 raise  # re-raise to crash the job after saving artifacts
 
-            loss = torch.tensor(0.0).cuda()
-            for k, v in output.items():
-                if k == "metrics":
-                    for metric_name, metric_value in v.items():
-                        accumulated_metrics[metric_name] = (
-                            accumulated_metrics.get(metric_name, 0.0)
-                            + float(metric_value)
-                        )
-                elif "loss" in v:
-                    loss += v["loss"]
-                    accumulated_component_losses[k] = (
-                        accumulated_component_losses.get(k, 0.0)
-                        + v["loss"].detach()
-                    )
-                else:
-                    raise ValueError(f"Unknown key {k} in output")
+            for metric_name, metric_value in microbatch_metrics.items():
+                accumulated_metrics[metric_name] = (
+                    accumulated_metrics.get(metric_name, 0.0) + metric_value
+                )
+            for component_name, component_loss in component_losses.items():
+                accumulated_component_losses[component_name] = (
+                    accumulated_component_losses.get(component_name, 0.0)
+                    + component_loss
+                )
             accumulated_loss_value = (
-                loss.detach()
+                microbatch_loss
                 if accumulated_loss_value is None
-                else accumulated_loss_value + loss.detach()
+                else accumulated_loss_value + microbatch_loss
             )
-
-            start_time_3 = time.time()
-            accumulated_fwd_duration += start_time_3 - start_time_2
-
-            fabric.barrier()
-
-            start_time_4 = time.time()
-            accumulated_sync_duration += start_time_4 - start_time_3
-
-            backward_started_at = time.time()
-            if run_expensive_diagnostics:
-                gradient_diagnostics.begin()
-            with torch.profiler.record_function("train/backward"):
-                fabric.backward(
-                    _scale_microbatch_loss(loss, gradient_accumulation_steps)
-                )
-            microbatch_gradient = (
-                gradient_diagnostics.finish(
-                    unscale_factor=gradient_accumulation_steps,
-                )
-                if run_expensive_diagnostics
-                else None
-            )
+            accumulated_fwd_duration += forward_duration
+            accumulated_bwd_duration += backward_duration
             if microbatch_gradient is not None:
                 microbatch_gradient_norms.append(microbatch_gradient["norm"])
                 cosine = microbatch_gradient["cosine_to_running_accumulator"]
                 if cosine is not None:
                     microbatch_gradient_cosines.append(cosine)
-            accumulated_bwd_duration += time.time() - backward_started_at
             microbatches_accumulated += 1
             if microbatches_accumulated < gradient_accumulation_steps:
                 if torch_profiler is not None:
                     torch_profiler.step()
                 continue
 
-            mean_loss_value = (
-                accumulated_loss_value / gradient_accumulation_steps
-            ).item()
-            for metric_name, metric_total in accumulated_metrics.items():
-                tb_writer.add_scalar(
-                    metric_name,
-                    metric_total / gradient_accumulation_steps,
-                    total_steps,
-                )
-            for component_name, component_total in accumulated_component_losses.items():
-                tb_writer.add_scalar(
-                    f"live_{component_name}_loss",
-                    (component_total / gradient_accumulation_steps).item(),
-                    total_steps,
-                )
+            mean_loss_value = _reduce_scalar(
+                fabric,
+                accumulated_loss_value / gradient_accumulation_steps,
+            )
+            reduced_metrics = _reduce_scalar_dict(
+                fabric,
+                {
+                    name: total / gradient_accumulation_steps
+                    for name, total in accumulated_metrics.items()
+                },
+            )
+            reduced_component_losses = _reduce_scalar_dict(
+                fabric,
+                {
+                    name: total / gradient_accumulation_steps
+                    for name, total in accumulated_component_losses.items()
+                },
+            )
+            if tb_writer is not None:
+                for metric_name, metric_value in reduced_metrics.items():
+                    tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
+                for component_name, component_value in reduced_component_losses.items():
+                    tb_writer.add_scalar(
+                        f"live_{component_name}_loss",
+                        component_value,
+                        total_steps + 1,
+                    )
 
             # Log a limited number of grad + optimizer state pairs, also log current learning rate
             if (total_steps <= 10) or (total_steps % cfg.trainer.viz_freq == 0):
@@ -1487,11 +1679,18 @@ def main(cfg: DictConfig):
                 optimizer.step()
                 scheduler.step()
             accumulated_bwd_duration += time.time() - optimizer_update_started_at
+            total_steps += 1
 
             microbatch_gradient_norm_mean = (
                 statistics.fmean(microbatch_gradient_norms)
                 if microbatch_gradient_norms
                 else None
+            )
+            microbatch_gradient_norm_min = (
+                min(microbatch_gradient_norms) if microbatch_gradient_norms else None
+            )
+            microbatch_gradient_norm_max = (
+                max(microbatch_gradient_norms) if microbatch_gradient_norms else None
             )
             microbatch_gradient_cosine_mean = (
                 statistics.fmean(microbatch_gradient_cosines)
@@ -1504,6 +1703,40 @@ def main(cfg: DictConfig):
                 else None
             )
             if run_expensive_diagnostics:
+                reduced_optimization = _reduce_scalar_dict(
+                    fabric,
+                    {
+                        "pre_clip_gradient_norm": pre_clip_gradient_norm,
+                        "post_clip_gradient_norm": post_clip_gradient_norm,
+                        "max_abs_gradient_pre_clip": max_abs_gradient_pre_clip,
+                        "gradient_norm_retention": gradient_norm_retention,
+                        "clipped_element_fraction": clipped_element_fraction,
+                        "clipped_step_fraction": clipped_step_fraction,
+                    },
+                )
+                pre_clip_gradient_norm = reduced_optimization["pre_clip_gradient_norm"]
+                post_clip_gradient_norm = reduced_optimization["post_clip_gradient_norm"]
+                max_abs_gradient_pre_clip = reduced_optimization["max_abs_gradient_pre_clip"]
+                gradient_norm_retention = reduced_optimization["gradient_norm_retention"]
+                clipped_element_fraction = reduced_optimization["clipped_element_fraction"]
+                clipped_step_fraction = reduced_optimization["clipped_step_fraction"]
+                if microbatch_gradient_norm_mean is not None:
+                    microbatch_gradient_norm_mean = _reduce_scalar(
+                        fabric, microbatch_gradient_norm_mean
+                    )
+                    microbatch_gradient_norm_min = _reduce_scalar(
+                        fabric, microbatch_gradient_norm_min, reduce_op="min"
+                    )
+                    microbatch_gradient_norm_max = _reduce_scalar(
+                        fabric, microbatch_gradient_norm_max, reduce_op="max"
+                    )
+                if microbatch_gradient_cosine_mean is not None:
+                    microbatch_gradient_cosine_mean = _reduce_scalar(
+                        fabric, microbatch_gradient_cosine_mean
+                    )
+                    microbatch_gradient_cosine_min = _reduce_scalar(
+                        fabric, microbatch_gradient_cosine_min, reduce_op="min"
+                    )
                 logging.info(
                     "[optimizer:%06d] loss=%.8f grad_pre=%.8f grad_post=%.8f "
                     "max_abs_pre=%.8f value_clip=%.8f norm_retention=%.8f "
@@ -1543,7 +1776,7 @@ def main(cfg: DictConfig):
 
             if fabric.global_rank == 0:
                 if (total_steps % cfg.trainer.viz_freq == 0) or (
-                        total_steps == cfg.trainer.num_steps - 1) or total_steps in [0, 10, 100]:
+                        total_steps == cfg.trainer.num_steps) or total_steps in [1, 10, 100]:
                     logging.info(f"Creating training viz logs (rank: {fabric.global_rank}, step: {total_steps})")
                     # Training visualization intentionally shows scene zero;
                     # the loss path above handles every scene in the batch.
@@ -1621,12 +1854,12 @@ def main(cfg: DictConfig):
                     )
                     tb_writer.add_scalar(
                         "optimization/microbatch_grad_norm_min",
-                        min(microbatch_gradient_norms),
+                        microbatch_gradient_norm_min,
                         total_steps,
                     )
                     tb_writer.add_scalar(
                         "optimization/microbatch_grad_norm_max",
-                        max(microbatch_gradient_norms),
+                        microbatch_gradient_norm_max,
                         total_steps,
                     )
                 if microbatch_gradient_cosines:
@@ -1642,22 +1875,31 @@ def main(cfg: DictConfig):
                     )
 
             if total_steps % cfg.trainer.save_ckpt_freq == 0:
-                ckpt_iter = "0" * (6 - len(str(total_steps))) + str(total_steps)
-                save_path = Path(f"{cfg.experiment_path}/model_{ckpt_iter}.pth")
+                save_path = Path(cfg.experiment_path) / f"model_{total_steps:06d}.pth"
                 logging.info(f"Saving file {save_path}")
-                state = AttributeDict(
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    total_steps=total_steps + 1,
+                _save_training_checkpoint(
+                    fabric,
+                    cfg.experiment_path,
+                    save_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    total_steps,
+                    cfg.reproducibility.seed,
+                    wandb_run_id,
                 )
-                fabric.save(save_path, state)
 
-            if total_steps % cfg.trainer.eval_freq == 0 and total_steps > 1:
-                run_test_eval(cfg, evaluator, model, eval_dataloaders, tb_writer, total_steps)
-                fabric.barrier()
+            if total_steps % cfg.trainer.eval_freq == 0:
+                _run_rank_zero_eval(
+                    fabric,
+                    cfg,
+                    evaluator,
+                    model,
+                    eval_dataloaders,
+                    tb_writer,
+                    total_steps,
+                )
 
-            total_steps += 1
             if fabric.global_rank == 0:
                 tqdm_epoch.update(1)
                 tqdm_total_steps.update(1)
@@ -1670,6 +1912,37 @@ def main(cfg: DictConfig):
                 )
 
             total_duration = time.time() - accumulation_started_at
+            reduced_timing = _reduce_scalar_dict(
+                fabric,
+                {
+                    "total": total_duration,
+                    "dataloader": dataloader_duration,
+                    "forward": fwd_duration,
+                    "sync": sync_duration,
+                    "backward": bwd_duration,
+                    "loader_worker": (
+                        accumulated_loader_worker_seconds / microbatches_accumulated
+                    ),
+                    "gpu_jpeg_decode": (
+                        accumulated_gpu_jpeg_decode_ms / microbatches_accumulated
+                    ),
+                    "gpu_prepare": (
+                        accumulated_gpu_prepare_ms / microbatches_accumulated
+                    ),
+                },
+            )
+            total_duration = reduced_timing["total"]
+            dataloader_duration = reduced_timing["dataloader"]
+            fwd_duration = reduced_timing["forward"]
+            sync_duration = reduced_timing["sync"]
+            bwd_duration = reduced_timing["backward"]
+            sampling_metrics = _reduce_scalar_dict(
+                fabric,
+                {
+                    name: value / microbatches_accumulated
+                    for name, value in accumulated_sampling_metrics.items()
+                },
+            )
             logging.info(
                 f"[timing:{total_steps:06d}] "
                 f"Total: {total_duration:>6.2f}s | "
@@ -1692,24 +1965,20 @@ def main(cfg: DictConfig):
                 tb_writer.add_scalar(f"timing/only_dataloader", dataloader_duration, total_steps)
                 tb_writer.add_scalar(
                     "timing/loader_worker_prepare_seconds",
-                    accumulated_loader_worker_seconds / microbatches_accumulated,
+                    reduced_timing["loader_worker"],
                     total_steps,
                 )
                 tb_writer.add_scalar(
                     "timing/gpu_jpeg_decode_ms",
-                    accumulated_gpu_jpeg_decode_ms / microbatches_accumulated,
+                    reduced_timing["gpu_jpeg_decode"],
                     total_steps,
                 )
                 tb_writer.add_scalar(
                     "timing/gpu_batch_prepare_ms",
-                    accumulated_gpu_prepare_ms / microbatches_accumulated,
+                    reduced_timing["gpu_prepare"],
                     total_steps,
                 )
-                if accumulated_sampling_metrics:
-                    sampling_metrics = {
-                        name: value / microbatches_accumulated
-                        for name, value in accumulated_sampling_metrics.items()
-                    }
+                if sampling_metrics:
                     for name, value in sampling_metrics.items():
                         tb_writer.add_scalar(f"sampling/{name}", value, total_steps)
                     logging.info(
@@ -1829,19 +2098,31 @@ def main(cfg: DictConfig):
 
     save_path = f"{cfg.experiment_path}/model_final.pth"
     logging.info(f"Saving file {save_path}")
-    state = AttributeDict(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        total_steps=total_steps,
+    _save_training_checkpoint(
+        fabric,
+        cfg.experiment_path,
+        save_path,
+        model,
+        optimizer,
+        scheduler,
+        total_steps,
+        cfg.reproducibility.seed,
+        wandb_run_id,
     )
-    fabric.save(save_path, state)
-    run_test_eval(cfg, evaluator, model, eval_dataloaders, tb_writer, total_steps)
+    _run_rank_zero_eval(
+        fabric,
+        cfg,
+        evaluator,
+        model,
+        eval_dataloaders,
+        tb_writer,
+        total_steps,
+    )
     for thread in threads:
         thread.join()
-    tb_writer.flush()
-    tb_writer.close()
-    fabric.barrier()
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
 
 
 if __name__ == "__main__":
