@@ -438,3 +438,44 @@ Each GPU cell is `selected batch / peak VRAM fraction / trajectories per second 
 - At all view counts, 2,048 trajectories per scene improved trajectory throughput economics over 1,024 on the same GPU, despite reducing the number of scenes in the physical batch.
 
 The tagged Modal billing report total for the common-image setup, cache preparation, compatibility checks, smokes, and all three full sweeps was $4.74. H100 was launched through the direct remote function during this run, so its fine-grained app tag inherited the old generic `gpu=cpu, experiment=common-stack` values; ownership/project/purpose tags and W&B metadata remained correct. The profiler was subsequently changed so direct invocations are truthfully `unclassified` and the documented local entrypoints attach exact GPU/experiment tags.
+
+## 2026-08-16 — Five/six-view H200 and B200 frontier
+
+### Question and setup
+
+Measure single-GPU H200 and B200 capacity for the six-view MV-Kubric training regime that was absent from the 1–4-view economics profile. The run used real cached MV-Kubric tensors, 24 frames, 384×512 images, BF16 mixed precision, the optimized hybrid forward, and complete forward/loss/backward/clipping/optimizer updates. Physical batch was searched through 12 at 1,024 and 2,048 trajectories per scene. Single-scene trajectory capacity was searched in 512-track increments under the same 90% peak-VRAM acceptance rule.
+
+Only the two profiler GPUs ran concurrently. The unrelated `adapt-vqa` container was left untouched. All Modal applications carried `owner=jeet`, `project=mvtracker`, and `purpose=profiling` tags.
+
+Artifacts and W&B:
+
+- H200: `jeet-mvtracker-runs-v2/frontier56-h200-20260816-r2/`; https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/3hiu3492
+- B200: `jeet-mvtracker-runs-v2/frontier56-b200-20260816-r2/`; https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/4pj76qxi
+
+### Confirmed batch frontier
+
+| GPU | Views | Tracks/scene | Max safe batch | Peak VRAM | Median update | Scenes/s | Tracks/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| H200 | 5 | 1,024 | 3 | 76.91% | 1,786.6 ms | 1.679 | 1,719 |
+| H200 | 5 | 2,048 | 2 | 77.10% | 1,704.0 ms | 1.174 | 2,404 |
+| H200 | 6 | 1,024 | 3 | 84.96% | 2,029.1 ms | 1.479 | 1,514 |
+| H200 | 6 | 2,048 | 2 | 82.21% | 1,874.0 ms | 1.067 | 2,186 |
+| B200 | 5 | 1,024 | 4 | 80.25% | 2,127.2 ms | 1.880 | 1,926 |
+| B200 | 5 | 2,048 | 2 | 60.53% | 1,622.7 ms | 1.233 | 2,524 |
+| B200 | 6 | 1,024 | 4 | 88.57% | 2,365.6 ms | 1.691 | 1,731 |
+| B200 | 6 | 2,048 | 2 | 64.47% | 1,717.9 ms | 1.164 | 2,384 |
+
+### Single-scene trajectory frontier
+
+| GPU | Views | Confirmed tracks | Peak VRAM | Median update | Tracks/s | Boundary status |
+|---|---:|---:|---:|---:|---:|---|
+| H200 | 5 | 6,144 | 88.83% | 1,814.5 ms | 3,386 | Practical tested ceiling; the next 512-track point was unavailable in the prepared real-scene cache. |
+| H200 | 6 | 5,632 | 84.72% | 1,802.5 ms | 3,125 | Exact tested maximum: 6,144 used 91.58% and was rejected. |
+| B200 | 5 | at least 6,144 | 69.75% | 1,707.5 ms | 3,598 | Data-limited lower bound, not a GPU maximum. |
+| B200 | 6 | at least 6,144 | 71.74% | 1,835.2 ms | 3,348 | Data-limited lower bound, not a GPU maximum. |
+
+Attempts to prepare unique 8,192–12,288-track samples were stopped after the real MV-Kubric microset could not produce the requested motion-balanced sample promptly. No duplicated or synthetic trajectories were substituted. Consequently the B200 single-scene numbers are explicitly lower bounds.
+
+### Takeaway
+
+B200 buys one extra scene at 1,024 tracks for both five and six views, but it does not increase the selected batch at 2,048 tracks. Its throughput gain over H200 is about 5–14% for these confirmed shapes while its hourly price is about 38% higher. H200 remains the better cost default; B200 is useful when the extra 1,024-track scene per update or higher per-device trajectory ceiling matters.
