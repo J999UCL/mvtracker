@@ -515,3 +515,53 @@ Local JSON and contact sheets are under
 both datasets. DIEGESIS still has large absolute-error outliers at very distant
 window/background pixels, but its median depth and relative error remain
 well-scaled; those pixels were not clipped or replaced with ground truth.
+
+## 2026-08-16 — VGGT-Omega H100 throughput profile
+
+### Setup
+
+The profile ran in one tagged Modal H100 container. DIEGESIS was downloaded
+directly from Hugging Face to the container SSD using Xet; only MV-Kubric scenes
+900–903 were copied from the network Volume. All inference and temporary depth
+writes used local SSD. Inputs were 24-timestamp temporal chunks at 512-pixel
+model resolution: 96 images for each four-view DIEGESIS chunk and 240 images for
+each ten-view MV-Kubric chunk. Each measured point used one warm-up and three
+timed repetitions.
+
+Artifacts:
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/5dx19ozn
+- Modal Volume: `jeet-mvtracker-runs-v2/vggt-omega-h100-throughput-20260816-xet2/report.json`
+
+Staging took 184.60 seconds in total. The 29.30 GB DIEGESIS snapshot downloaded
+in 95.25 seconds; the four staged MV-Kubric scenes occupied 587.81 MB. The whole
+profile took 1,315.84 seconds (21.93 minutes), approximately $1.44 at $3.95 per
+H100-hour.
+
+### Results
+
+Eight loader workers were fastest for both datasets. Scene batching did not
+increase throughput: model cost scaled approximately linearly with batch size,
+while reserved VRAM rose sharply.
+
+| Dataset | Batch | Total/chunk | Scenes/s | Peak reserved | Status |
+|---|---:|---:|---:|---:|---|
+| DIEGESIS, 4 views | 1 | 4.675 s | 0.2139 | 20.62% | safe |
+| DIEGESIS, 4 views | 2 | 9.516 s | 0.2102 | 36.02% | safe |
+| DIEGESIS, 4 views | 4 | 18.901 s | 0.2116 | 66.37% | safe |
+| DIEGESIS, 4 views | 6 | 28.462 s | 0.2108 | 96.73% | rejected by 90% rule |
+| MV-Kubric, 10 views | 1 | 22.351 s | 0.04474 | 42.41% | safe |
+| MV-Kubric, 10 views | 2 | 44.963 s | 0.04448 | 79.13% | safe |
+| MV-Kubric, 10 views | 3 | 67.868 s | 0.04420 | 98.44% | rejected by 90% rule |
+
+The production recommendation is batch size 1 with eight loader workers. It is
+the fastest measured setting per scene, leaves substantial VRAM headroom, and
+avoids gaining no throughput from larger batches. The ten-view MV-Kubric
+sequence is slower per image than four-view DIEGESIS because the joint sequence
+is 240 rather than 96 images and the model's cross-image processing is not
+linear in sequence length.
+
+For 17 DIEGESIS scenes of 240 frames (ten chunks each) plus 100 MV-Kubric scenes
+of 24 frames (one chunk each), the measured batch-1 rates project to 50.5 minutes
+of H100 inference, or about $3.32. This excludes one-time input staging and the
+final upload of complete sidecars to persistent storage.
