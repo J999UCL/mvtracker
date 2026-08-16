@@ -119,7 +119,7 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertIn('RUN_ROOT = Path("/mnt/mvtracker-runs")', profile_source)
         self.assertIn("str(RUN_ROOT): run_volume,", continual_source)
         self.assertNotIn("str(RUN_ROOT): run_volume.with_mount_options", continual_source)
-        self.assertEqual(continual_source.count("ephemeral_disk=EPHEMERAL_DISK_MIB"), 2)
+        self.assertGreaterEqual(continual_source.count("ephemeral_disk=EPHEMERAL_DISK_MIB"), 2)
 
     def test_main_launch_requires_explicit_confirmation(self):
         contract.require_main_confirmation("smoke", False)

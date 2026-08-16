@@ -4,19 +4,20 @@ experiment_path: ${oc.env:MVTRACKER_TRAINING_RUN_DIR}
 restore_ckpt_path: ${oc.env:MVTRACKER_TRAINING_CHECKPOINT}
 
 datasets:
-  root: /mnt/mvtracker-data/datasets
+  root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
   train:
     name: mixed-diegesis-mvkubric-training
     batch_size: 1
     sequence_len: 24
     traj_per_sample: 2048
+    kubric_metadata_index_root: ${oc.env:MVTRACKER_MVKUBRIC_INDEX_ROOT,${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/kubric-multiview/train/MVTracker_index}
     kubric_max_depth: 24
     num_workers: 8
     source_schedule: [diegesis, mvkubric, diegesis, mvkubric]
     sources:
       diegesis:
         name: tapvid3d-multiview-training
-        root: /mnt/mvtracker-data/datasets/diegesis-mvtracker
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/diegesis-mvtracker
         include_scene_ids:
           - bathroom01
           - bathroom02
@@ -38,7 +39,7 @@ datasets:
         view_count_probabilities: [0.25, 0.25, 0.25, 0.25]
       mvkubric:
         name: kubric-multiview-v3-training
-        root: /mnt/mvtracker-data/datasets
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
         include_scene_ids:
           - "900"
           - "901"
@@ -147,11 +148,11 @@ datasets:
     num_workers: 4
     sources:
       diegesis:
-        root: /mnt/mvtracker-data/datasets/diegesis-mvtracker
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/diegesis-mvtracker
         include_scene_ids: [bedroom01, diningroom02]
         views: [0, 1, 2, 3]
       mvkubric:
-        root: /mnt/mvtracker-data/datasets
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
         include_scene_ids: ["998", "999"]
         views: [0, 1, 2, 3]
 

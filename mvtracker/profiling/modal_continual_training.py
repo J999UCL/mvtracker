@@ -13,6 +13,7 @@ GPU_REQUEST = "H100!:2"
 GPU_COUNT = 2
 MAX_CONTAINERS = 1
 EPHEMERAL_DISK_MIB = 512 * 1024
+LOCAL_DATA_ROOT = "/tmp/mvtracker-continual-data"
 CONTINUAL_RUN_SUBDIR = "continual-training"
 WORKSPACE_CONTAINER_LIMIT = 3
 REQUIRED_FREE_SLOTS = 2
@@ -20,6 +21,11 @@ MODAL_TAGS = {
     "owner": "jeet",
     "project": "mvtracker",
     "purpose": "training",
+}
+PROFILE_TAGS = {
+    "owner": "jeet",
+    "project": "mvtracker",
+    "purpose": "profiling",
 }
 WANDB_ENTITY = "jeetucl-ucl"
 WANDB_PROJECT = "mvtracker-continual-training"

@@ -62,3 +62,24 @@ Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
 `owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
 directory.
+
+The continual-training bundle is prepared from the existing DIEGESIS raw/cache
+tree and MV-Kubric pool. Preparation writes the tar to local CPU scratch before
+copying it once to the data Volume. GPU jobs validate the archive size, extract
+it to the container-local `/tmp/mvtracker-continual-data` SSD, and train against
+that root; the immutable staging metrics are saved beside the run manifest and
+logged to W&B.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
+
+modal run --timestamps tools/modal_continual_training.py::prepare-bundle
+modal run --timestamps tools/modal_continual_training.py::profile-cpu-loader
+modal run --timestamps tools/modal_continual_training.py::profile-h100-loader
+```
+
+The loader profiles use four warm-ups and 32 measured samples. The CPU profile
+reports DIEGESIS and MV-Kubric separately; the H100 profile uses the production
+CUDA prefetch/nvJPEG path for DIEGESIS. Both profile entrypoints carry
+`owner=jeet`, `project=mvtracker`, `purpose=profiling` tags.

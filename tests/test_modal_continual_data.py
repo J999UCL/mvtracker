@@ -11,6 +11,8 @@ from mvtracker.profiling.modal_continual_data import (
     EXPECTED_MVKUBRIC_SCENES,
     MVKUBRIC_INDEX_RELATIVE,
     _require_existing_profile_data,
+    extract_continual_training_bundle,
+    prepare_continual_training_bundle,
 )
 
 
@@ -63,6 +65,51 @@ class ModalContinualDataTests(unittest.TestCase):
             (mvkubric / "999").rename(mvkubric / "1000")
             with self.assertRaisesRegex(RuntimeError, "exactly scenes 900..999"):
                 _require_existing_profile_data(root)
+
+    def test_bundle_round_trip_preserves_validated_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            extracted = Path(directory) / "extracted"
+            root.mkdir()
+            manifest = {
+                "mvkubric_revision": "pinned",
+                "diegesis": {"splits": EXPECTED_DIEGESIS_SPLITS},
+                "mvkubric": {"scene_count": 100},
+            }
+            (root / "profile-data-manifest.json").write_text(json.dumps(manifest))
+            (root / "continual-training-data-manifest.json").write_text(json.dumps({}))
+            (root / "source/diegesis").mkdir(parents=True)
+            (root / "checkpoints").mkdir()
+            (root / "checkpoints/mvtracker_200000_june2025.pth").write_bytes(b"checkpoint")
+            for split, count in EXPECTED_DIEGESIS_SPLITS.items():
+                for index in range(count):
+                    (root / "datasets/diegesis-mvtracker/TAPVid3D_raw" / split / str(index)).mkdir(parents=True)
+                    (root / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache" / split / str(index)).mkdir(parents=True)
+            for scene in EXPECTED_MVKUBRIC_SCENES:
+                (root / "datasets/kubric-multiview/train" / scene).mkdir(parents=True)
+            index_root = root / MVKUBRIC_INDEX_RELATIVE
+            (index_root / "scenes").mkdir(parents=True)
+            entries = {}
+            for scene in EXPECTED_MVKUBRIC_SCENES:
+                (index_root / "scenes" / f"{scene}.npz").write_bytes(b"index")
+                entries[scene] = {"arrays": f"scenes/{scene}.npz"}
+            (index_root / "manifest.json").write_text(
+                json.dumps({"version": 1, "scenes": entries})
+            )
+
+            bundle = prepare_continual_training_bundle(root)
+            staging = extract_continual_training_bundle(
+                root, local_data_root=extracted, bundle_manifest=bundle
+            )
+            self.assertEqual(staging["local_data_root"], str(extracted))
+            self.assertEqual(
+                {
+                    path.name
+                    for path in (extracted / "datasets/kubric-multiview/train").iterdir()
+                    if path.name.isdigit()
+                },
+                EXPECTED_MVKUBRIC_SCENES,
+            )
 
 
 if __name__ == "__main__":
