@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - diegesis_mvkubric_gt_ddp_smoke
+  - _self_
+
+trainer:
+  num_steps: 3
+  save_ckpt_freq: 3

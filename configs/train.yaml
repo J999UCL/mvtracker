@@ -30,6 +30,7 @@ datasets:
 # === Trainer Settings ===
 trainer:
   num_steps: 200000
+  lr_schedule_steps: 200100
   eval_freq: 10000
   viz_freq: 10000
   save_ckpt_freq: 500

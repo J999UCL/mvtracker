@@ -1,0 +1,213 @@
+# @package _global_
+
+experiment_path: ${oc.env:MVTRACKER_TRAINING_RUN_DIR}
+restore_ckpt_path: ${oc.env:MVTRACKER_TRAINING_CHECKPOINT}
+
+datasets:
+  root: /mnt/mvtracker-data/datasets
+  train:
+    name: mixed-diegesis-mvkubric-training
+    batch_size: 1
+    sequence_len: 24
+    traj_per_sample: 2048
+    kubric_max_depth: 24
+    num_workers: 8
+    source_schedule: [diegesis, mvkubric, diegesis, mvkubric]
+    sources:
+      diegesis:
+        name: tapvid3d-multiview-training
+        root: /mnt/mvtracker-data/datasets/diegesis-mvtracker
+        include_scene_ids:
+          - bathroom01
+          - bathroom02
+          - bathroom03
+          - bedroom02
+          - bedroom03
+          - bedroom04
+          - diningroom01
+          - diningroom03
+          - diningroom04
+          - kitchen01
+          - kitchen02
+          - kitchen03
+          - kitchen04
+          - livingroom01
+          - livingroom03
+          - livingroom04
+          - livingroom05
+        view_count_probabilities: [0.25, 0.25, 0.25, 0.25]
+      mvkubric:
+        name: kubric-multiview-v3-training
+        root: /mnt/mvtracker-data/datasets
+        include_scene_ids:
+          - "900"
+          - "901"
+          - "902"
+          - "903"
+          - "904"
+          - "905"
+          - "906"
+          - "907"
+          - "908"
+          - "909"
+          - "910"
+          - "911"
+          - "912"
+          - "913"
+          - "914"
+          - "915"
+          - "916"
+          - "917"
+          - "918"
+          - "919"
+          - "920"
+          - "921"
+          - "922"
+          - "923"
+          - "924"
+          - "925"
+          - "926"
+          - "927"
+          - "928"
+          - "929"
+          - "930"
+          - "931"
+          - "932"
+          - "933"
+          - "934"
+          - "935"
+          - "936"
+          - "937"
+          - "938"
+          - "939"
+          - "940"
+          - "941"
+          - "942"
+          - "943"
+          - "944"
+          - "945"
+          - "946"
+          - "947"
+          - "948"
+          - "949"
+          - "950"
+          - "951"
+          - "952"
+          - "953"
+          - "954"
+          - "955"
+          - "956"
+          - "957"
+          - "958"
+          - "959"
+          - "960"
+          - "961"
+          - "962"
+          - "963"
+          - "964"
+          - "965"
+          - "966"
+          - "967"
+          - "968"
+          - "969"
+          - "970"
+          - "971"
+          - "972"
+          - "973"
+          - "974"
+          - "975"
+          - "976"
+          - "977"
+          - "978"
+          - "979"
+          - "980"
+          - "981"
+          - "982"
+          - "983"
+          - "984"
+          - "985"
+          - "986"
+          - "987"
+          - "988"
+          - "989"
+          - "990"
+          - "991"
+          - "992"
+          - "993"
+          - "994"
+          - "995"
+          - "996"
+          - "997"
+        view_count_probabilities: [0.20, 0.10, 0.10, 0.25, 0.10, 0.25]
+        trajectory_caps_by_view: {5: 819, 6: 512}
+  eval:
+    names:
+      - tapvid3d-multiview-validation
+      - kubric-multiview-v3
+    num_workers: 4
+    sources:
+      diegesis:
+        root: /mnt/mvtracker-data/datasets/diegesis-mvtracker
+        include_scene_ids: [bedroom01, diningroom02]
+        views: [0, 1, 2, 3]
+      mvkubric:
+        root: /mnt/mvtracker-data/datasets
+        include_scene_ids: ["998", "999"]
+        views: [0, 1, 2, 3]
+
+trainer:
+  num_steps: 1000
+  lr_schedule_steps: 2000
+  eval_freq: 250
+  viz_freq: 10000
+  save_ckpt_freq: 250
+  lr: 0.0001
+  wdecay: 0.00001
+  anneal_strategy: linear
+  grad_clip: 1.0
+  gradient_accumulation_steps: 4
+  expensive_diagnostics_interval: 50
+  precision: bf16-mixed
+  visibility_loss_weight: 0.1
+
+modes:
+  validate_at_start: true
+
+reproducibility:
+  seed: ${oc.env:MVTRACKER_TRAINING_SEED}
+  deterministic: false
+
+augmentations:
+  probability: 0.8
+  rgb: true
+  depth: true
+  variable_depth_type: false
+  variable_num_views: true
+  cropping: true
+  cropping_size: [384, 512]
+  variable_vggt_crop_size: false
+  keep_principal_point_centered: false
+  variable_trajpersample: true
+  scene_transform: true
+  camera_params_noise: true
+  normalize_scene_following_vggt: false
+
+logging:
+  log_wandb: true
+  wandb_entity: jeetucl-ucl
+  wandb_project: mvtracker-continual-training
+  wandb_group: gt-depth-replay-v1
+  wandb_run_name: ${oc.env:MVTRACKER_WANDB_RUN_NAME}
+  wandb_run_id: ${oc.env:MVTRACKER_WANDB_RUN_ID}
+  tags:
+    - diegesis-mvkubric-50-50
+    - gt-depth
+    - ddp2-h100
+    - full-model
+    - continual-training
+
+evaluation:
+  evaluator:
+    rerun_viz_indices: null
+    forward_pass_log_indices: null
+    mp4_track_viz_indices: null

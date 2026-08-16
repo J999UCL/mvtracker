@@ -33,3 +33,32 @@ logs are committed to the `jeet-mvtracker-runs-v2` Volume under the run name.
 If batch 8 is safe, report the result as at least 8 rather than as an unbounded
 maximum. Always use these local entrypoints so the app receives the exact GPU
 and experiment billing tags.
+
+## GT-depth DIEGESIS + MV-Kubric continual training
+
+The launcher refuses a two-H100 submission unless the selected source SHA is
+the pushed `origin/main` commit and at least two Prism container slots are free.
+It never stops another app. Data setup verifies the existing DIEGESIS and
+100-scene MV-Kubric micro pool, then materializes the pinned, checksummed
+published mixed-depth checkpoint into the existing data Volume.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
+
+# One-time CPU-only data verification and checkpoint materialization.
+modal run --timestamps tools/modal_continual_training.py::setup_data
+
+# Required DDP/W&B resume smoke: steps 1-3, then resume to exactly step 5.
+modal container list --json
+modal run --timestamps tools/modal_continual_training.py::smoke
+
+# Main run is deliberately gated and cannot launch without this flag.
+modal container list --json
+modal run --timestamps tools/modal_continual_training.py::train --confirm-main
+```
+
+Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
+`owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
+explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
+directory.
