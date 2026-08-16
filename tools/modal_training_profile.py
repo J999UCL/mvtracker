@@ -326,7 +326,7 @@ def prepare_high_trajectory_batches_remote() -> dict:
     from mvtracker.cli.profile_training import prepare_profile_batch
     from mvtracker.profiling.modal_training import FRONTIER_VIEWS
 
-    trajectories = 12288
+    trajectories = 9216
     run = wandb.init(
         project="mvtracker-modal-profiling",
         job_type="batch-preparation",
@@ -368,7 +368,7 @@ def prepare_high_trajectory_batches_remote() -> dict:
 def _trial_command(case, warmup, measured, output, gpu_spec):
     if case.views in (5, 6):
         if case.trajectories > 2048:
-            cache_name = f"views{case.views}-traj12288-batch1-accum1.pt"
+            cache_name = f"views{case.views}-traj9216-batch1-accum1.pt"
         else:
             cache_name = f"views{case.views}-traj2048-batch12-accum1.pt"
     else:
