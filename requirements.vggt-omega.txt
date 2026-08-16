@@ -1,0 +1,2 @@
+# Official VGGT-Omega inference package, pinned to the validated source revision.
+vggt-omega @ git+https://github.com/facebookresearch/vggt-omega.git@39a0cb8af88554f15ddcb5354cd52bde588fa014
