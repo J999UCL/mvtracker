@@ -463,6 +463,7 @@ def profile_encoded_loader(
                 pin_memory=True,
                 persistent_workers=workers > 0,
                 prefetch_factor=2 if workers > 0 else None,
+                multiprocessing_context="spawn" if workers > 0 else None,
                 collate_fn=dataset.collate_fn,
                 drop_last=True,
             )

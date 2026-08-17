@@ -524,6 +524,8 @@ def _build_source_train_loader(dataset, sampler, cfg, fabric):
     loader_kwargs = {}
     if not requires_cuda_prefetch:
         loader_kwargs["in_order"] = cfg.reproducibility.deterministic
+    elif cfg.datasets.train.num_workers > 0:
+        loader_kwargs["multiprocessing_context"] = "spawn"
     loader = loader_type(
         dataset,
         batch_size=int(cfg.datasets.train.batch_size),
@@ -1375,6 +1377,12 @@ def main(cfg: DictConfig):
             pin_memory=True,
             persistent_workers=cfg.datasets.eval.num_workers > 0,
             prefetch_factor=2 if cfg.datasets.eval.num_workers > 0 else None,
+            multiprocessing_context=(
+                "spawn"
+                if getattr(eval_dataset, "requires_cuda_prefetch", False)
+                and cfg.datasets.eval.num_workers > 0
+                else None
+            ),
         )
         if getattr(eval_dataset, "requires_cuda_prefetch", False):
             eval_dataloader = CudaPrefetchLoader(
@@ -1506,6 +1514,8 @@ def main(cfg: DictConfig):
         loader_kwargs = {}
         if not requires_cuda_prefetch:
             loader_kwargs["in_order"] = cfg.reproducibility.deterministic
+        elif cfg.datasets.train.num_workers > 0:
+            loader_kwargs["multiprocessing_context"] = "spawn"
         common_loader_kwargs = {
             "num_workers": cfg.datasets.train.num_workers,
             "pin_memory": True,

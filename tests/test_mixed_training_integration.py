@@ -34,6 +34,10 @@ class AttrDict(dict):
 
 
 class MixedTrainingIntegrationTests(unittest.TestCase):
+    def test_cuda_prefetch_workers_use_thread_safe_spawn_context(self):
+        source = ast.unparse(_node("_build_source_train_loader"))
+        self.assertIn("loader_kwargs['multiprocessing_context'] = 'spawn'", source)
+
     def test_all_worker_pools_start_before_cuda_producers(self):
         events = []
 
