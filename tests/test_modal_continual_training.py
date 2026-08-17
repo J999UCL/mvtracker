@@ -38,9 +38,9 @@ class ContinualTrainingConfigTests(unittest.TestCase):
         self.assertEqual(train["traj_per_sample"], 2048)
         self.assertTrue(train["mvkubric_gpu_decode"])
         self.assertEqual(trainer["num_steps"], 1000)
-        self.assertEqual(trainer["lr_schedule_steps"], 2000)
+        self.assertEqual(trainer["lr_schedule_steps"], 1000)
         self.assertEqual(trainer["gradient_accumulation_steps"], 4)
-        self.assertEqual(trainer["lr"], 1e-4)
+        self.assertEqual(trainer["lr"], 2e-5)
         self.assertEqual(trainer["anneal_strategy"], "linear")
 
     def test_base_config_preserves_legacy_scheduler_horizon(self):
