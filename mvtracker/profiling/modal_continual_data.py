@@ -413,15 +413,16 @@ def profile_encoded_loader(
         OmegaConf.load(repo_root / "configs/train.yaml"),
         OmegaConf.load(repo_root / "configs/experiment/diegesis_mvkubric_gt_ddp.yaml"),
     )
-    config.datasets.root = str(data_root)
+    datasets_root = data_root / "datasets"
+    config.datasets.root = str(datasets_root)
     config.datasets.train.kubric_metadata_index_root = str(
-        data_root / "kubric-multiview/train/MVTracker_index"
+        datasets_root / "kubric-multiview/train/MVTracker_index"
     )
     def build_dataset(dataset_source):
         if dataset_source == "diegesis":
             return TapVid3DMultiViewDataset.from_name(
                 config.datasets.train.sources.diegesis.name,
-                str(data_root / "diegesis-mvtracker"),
+                str(datasets_root / "diegesis-mvtracker"),
                 training_args=config,
                 fabric=SimpleNamespace(world_size=1),
                 include_scene_ids=list((
@@ -435,7 +436,7 @@ def profile_encoded_loader(
 
         return KubricMultiViewDataset.from_name(
             config.datasets.train.sources.mvkubric.name,
-            str(data_root),
+            str(datasets_root),
             training_args=config,
             fabric=SimpleNamespace(world_size=1),
             include_scene_ids=(
@@ -546,7 +547,7 @@ def profile_encoded_loader(
         "source_schedule": list(source_schedule),
         "measured_sources": measured_sources,
         "hardware_samples": hardware_samples,
-        "index_root": str(data_root / "kubric-multiview/train/MVTracker_index"),
+        "index_root": str(datasets_root / "kubric-multiview/train/MVTracker_index"),
     }
 
 
