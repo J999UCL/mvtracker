@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -1124,8 +1126,11 @@ def decode_tapvid3d_batch(
     device: torch.device,
     *,
     timing_events: tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event] | None = None,
-    nvimagecodec_decoder=None,
-    cuda_stream: int | None = None,
+    nvimagecodec_rgb_decoder=None,
+    nvimagecodec_depth_decoder=None,
+    rgb_stream: torch.cuda.Stream | None = None,
+    depth_stream: torch.cuda.Stream | None = None,
+    prepare_stream: torch.cuda.Stream | None = None,
 ) -> Datapoint:
     if device.type != "cuda":
         raise RuntimeError("TAPVid-3D training requires CUDA nvJPEG decoding")
@@ -1141,22 +1146,28 @@ def decode_tapvid3d_batch(
     flat_encoded = [encoded for sample in batch.samples for encoded in sample.jpeg_bytes]
     decoded_depths = None
     if codec == "jpeg":
-        decoded_all = decode_jpeg(flat_encoded, mode=ImageReadMode.RGB, device=device)
+        if rgb_stream is None or prepare_stream is None:
+            raise RuntimeError("GPU image decode requires explicit CUDA streams")
+        with torch.cuda.stream(rgb_stream):
+            decoded_all = decode_jpeg(flat_encoded, mode=ImageReadMode.RGB, device=device)
+        prepare_stream.wait_stream(rgb_stream)
     elif codec == "nvimagecodec":
-        if nvimagecodec_decoder is None:
-            raise RuntimeError("MV-Kubric GPU decode requires an nvImageCodec decoder")
-        if cuda_stream is None:
-            raise RuntimeError("MV-Kubric GPU decode requires an explicit CUDA stream")
-        rgb_images = nvimagecodec_decoder.decode(
+        if nvimagecodec_rgb_decoder is None or nvimagecodec_depth_decoder is None:
+            raise RuntimeError("MV-Kubric GPU decode requires RGB and depth decoders")
+        if rgb_stream is None or depth_stream is None or prepare_stream is None:
+            raise RuntimeError("MV-Kubric GPU decode requires explicit CUDA streams")
+        rgb_images = nvimagecodec_rgb_decoder.decode(
             flat_encoded,
-            cuda_stream=cuda_stream,
+            cuda_stream=rgb_stream.cuda_stream,
         )
-        depth_images = nvimagecodec_decoder.decode(
+        depth_images = nvimagecodec_depth_decoder.decode(
             [encoded for sample in batch.samples for encoded in sample.depth_bytes],
-            cuda_stream=cuda_stream,
+            cuda_stream=depth_stream.cuda_stream,
         )
         decoded_all = [torch.from_dlpack(image.to_dlpack()) for image in rgb_images]
         decoded_depths = [torch.from_dlpack(image.to_dlpack()) for image in depth_images]
+        prepare_stream.wait_stream(rgb_stream)
+        prepare_stream.wait_stream(depth_stream)
     else:
         raise ValueError(f"unsupported encoded image codec: {codec}")
     if timing_events is not None:
@@ -1303,66 +1314,169 @@ class _CudaPrefetchIterator:
         source: Iterable,
         device: torch.device,
         timing_interval: int,
+        queue_depth: int,
+        decode_batch_size: int,
     ):
         self.source = iter(source)
         self.device = device
-        self.stream = torch.cuda.Stream(device=device)
+        self.rgb_stream = torch.cuda.Stream(device=device)
+        self.depth_stream = torch.cuda.Stream(device=device)
+        self.prepare_stream = torch.cuda.Stream(device=device)
         self.timing_interval = timing_interval
+        self.queue_depth = queue_depth
+        self.decode_batch_size = decode_batch_size
         self.preload_index = 0
         self.last_timing = None
-        self.nvimagecodec_decoder = None
-        self.next_item = None
-        self._preload()
+        self.ready = queue.Queue(maxsize=queue_depth)
+        self.finished = object()
+        self.producer = threading.Thread(target=self._produce, daemon=True)
+        self.producer.start()
 
-    def _preload(self):
+    @staticmethod
+    def _batch_key(encoded: EncodedTapVid3DBatch):
+        keys = []
+        for sample in encoded.samples:
+            views = (
+                int(sample.depth.shape[0])
+                if sample.depth is not None
+                else len(sample.depth_sensor_widths)
+            )
+            if views < 1 or len(sample.jpeg_bytes) % views:
+                raise ValueError("encoded sample has an invalid view/frame layout")
+            keys.append((
+                sample.image_codec,
+                views,
+                len(sample.jpeg_bytes) // views,
+                sample.output_size,
+            ))
+        if len(set(keys)) != 1:
+            raise ValueError("each encoded source batch must have one view/frame shape")
+        return keys[0]
+
+    @staticmethod
+    def _slice_datapoint(datapoint: Datapoint, start: int, end: int) -> Datapoint:
+        values = {}
+        batch_size = len(datapoint.seq_name)
+        for field in fields(Datapoint):
+            value = getattr(datapoint, field.name)
+            if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == batch_size:
+                value = value[start:end]
+            elif isinstance(value, list) and len(value) == batch_size:
+                value = value[start:end]
+            values[field.name] = value
+        return Datapoint(**values)
+
+    def _decode_group(self, items, rgb_decoder, depth_decoder):
+        samples = [sample for _, encoded, _ in items for sample in encoded.samples]
+        events = None
+        record_timing = (
+            self.timing_interval > 0
+            and self.preload_index % self.timing_interval == 0
+        )
+        if record_timing:
+            events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
+        with torch.cuda.stream(self.prepare_stream):
+            datapoint = decode_tapvid3d_batch(
+                EncodedTapVid3DBatch(samples),
+                self.device,
+                timing_events=events,
+                nvimagecodec_rgb_decoder=rgb_decoder,
+                nvimagecodec_depth_decoder=depth_decoder,
+                rgb_stream=self.rgb_stream,
+                depth_stream=self.depth_stream,
+                prepare_stream=self.prepare_stream,
+            )
+            ready_event = torch.cuda.Event()
+            ready_event.record(self.prepare_stream)
+        offset = 0
+        outputs = []
+        for position, encoded, gotit in items:
+            end = offset + len(encoded.samples)
+            outputs.append((
+                position,
+                self._slice_datapoint(datapoint, offset, end),
+                gotit,
+                events,
+                ready_event,
+            ))
+            offset = end
+        self.preload_index += len(items)
+        return outputs
+
+    def _produce(self):
         try:
-            encoded, gotit = next(self.source)
-        except StopIteration:
-            self.next_item = None
-            return
-        if not all(gotit):
-            self.next_item = (None, gotit, None)
-        else:
-            record_timing = (
-                self.timing_interval > 0
-                and self.preload_index % self.timing_interval == 0
-            )
-            events = (
-                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
-                if record_timing else None
-            )
-            with torch.cuda.stream(self.stream):
-                if encoded.samples[0].image_codec == "nvimagecodec":
-                    if self.nvimagecodec_decoder is None:
-                        from nvidia import nvimgcodec
+            torch.cuda.set_device(self.device)
+            rgb_decoder = None
+            depth_decoder = None
+            while True:
+                window = []
+                for _ in range(self.queue_depth):
+                    try:
+                        window.append(next(self.source))
+                    except StopIteration:
+                        break
+                if not window:
+                    break
 
-                        self.nvimagecodec_decoder = nvimgcodec.Decoder(
-                            device_id=(
-                                self.device.index
-                                if self.device.index is not None
-                                else torch.cuda.current_device()
-                            )
-                        )
-                datapoint = decode_tapvid3d_batch(
-                    encoded,
-                    self.device,
-                    timing_events=events,
-                    nvimagecodec_decoder=self.nvimagecodec_decoder,
-                    cuda_stream=self.stream.cuda_stream,
-                )
-                self.next_item = (datapoint, gotit, events)
-        self.preload_index += 1
+                outputs = [None] * len(window)
+                grouped = {}
+                for position, (encoded, gotit) in enumerate(window):
+                    if not all(gotit):
+                        outputs[position] = (None, gotit, None, None)
+                        continue
+                    grouped.setdefault(self._batch_key(encoded), []).append(
+                        (position, encoded, gotit)
+                    )
+
+                if (
+                    rgb_decoder is None
+                    and any(key[0] == "nvimagecodec" for key in grouped)
+                ):
+                    from nvidia import nvimgcodec
+
+                    device_id = (
+                        self.device.index
+                        if self.device.index is not None
+                        else torch.cuda.current_device()
+                    )
+                    rgb_decoder = nvimgcodec.Decoder(device_id=device_id)
+                    depth_decoder = nvimgcodec.Decoder(device_id=device_id)
+
+                next_output = 0
+                for items in grouped.values():
+                    for start in range(0, len(items), self.decode_batch_size):
+                        for position, datapoint, gotit, events, ready_event in self._decode_group(
+                            items[start:start + self.decode_batch_size],
+                            rgb_decoder,
+                            depth_decoder,
+                        ):
+                            outputs[position] = (datapoint, gotit, events, ready_event)
+                        while next_output < len(outputs) and outputs[next_output] is not None:
+                            self.ready.put(outputs[next_output])
+                            next_output += 1
+                while next_output < len(outputs):
+                    self.ready.put(outputs[next_output])
+                    next_output += 1
+                if len(window) < self.queue_depth:
+                    break
+        except BaseException as error:
+            self.ready.put(error)
+        finally:
+            self.ready.put(self.finished)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self.next_item is None:
+        item = self.ready.get()
+        if item is self.finished:
             raise StopIteration
+        if isinstance(item, BaseException):
+            raise item
         current = torch.cuda.current_stream(self.device)
-        current.wait_stream(self.stream)
-        datapoint, gotit, events = self.next_item
+        datapoint, gotit, events, ready_event = item
         if datapoint is not None:
+            current.wait_event(ready_event)
             _record_stream(datapoint, current)
             if events is not None:
                 events[2].synchronize()
@@ -1376,7 +1490,6 @@ class _CudaPrefetchIterator:
                     metadata["gpu_image_decode_ms"] = decode_ms
                     metadata["gpu_jpeg_decode_ms"] = decode_ms
                     metadata["gpu_prepare_total_ms"] = prepare_ms
-        self._preload()
         return datapoint, gotit
 
 
@@ -1386,18 +1499,26 @@ class CudaPrefetchLoader:
         loader,
         device: torch.device | None = None,
         timing_interval: int = 0,
+        queue_depth: int = 8,
+        decode_batch_size: int = 4,
     ):
         if timing_interval < 0:
             raise ValueError("timing_interval must be non-negative")
+        if queue_depth < 1 or decode_batch_size < 1:
+            raise ValueError("CUDA queue and decode batch sizes must be positive")
         self.loader = loader
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.timing_interval = timing_interval
+        self.queue_depth = queue_depth
+        self.decode_batch_size = decode_batch_size
 
     def __iter__(self):
         return _CudaPrefetchIterator(
             self.loader,
             self.device,
             self.timing_interval,
+            self.queue_depth,
+            self.decode_batch_size,
         )
 
     def __len__(self):

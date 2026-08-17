@@ -548,6 +548,8 @@ def _build_source_train_loader(dataset, sampler, cfg, fabric):
             loader,
             device=fabric.device,
             timing_interval=int(cfg.trainer.expensive_diagnostics_interval),
+            queue_depth=int(cfg.datasets.train.cuda_prefetch_queue_depth),
+            decode_batch_size=int(cfg.datasets.train.cuda_decode_batch_size),
         )
     return loader
 
@@ -1365,7 +1367,11 @@ def main(cfg: DictConfig):
             prefetch_factor=2 if cfg.datasets.eval.num_workers > 0 else None,
         )
         if getattr(eval_dataset, "requires_cuda_prefetch", False):
-            eval_dataloader = CudaPrefetchLoader(eval_dataloader)
+            eval_dataloader = CudaPrefetchLoader(
+                eval_dataloader,
+                queue_depth=int(cfg.datasets.train.cuda_prefetch_queue_depth),
+                decode_batch_size=int(cfg.datasets.train.cuda_decode_batch_size),
+            )
         eval_dataloaders.append((dataset_name, eval_dataloader))
 
     # # Let each rank handle a subset of the evaluation dataloaders
@@ -1539,6 +1545,8 @@ def main(cfg: DictConfig):
                 train_loader,
                 device=fabric.device,
                 timing_interval=int(cfg.trainer.expensive_diagnostics_interval),
+                queue_depth=int(cfg.datasets.train.cuda_prefetch_queue_depth),
+                decode_batch_size=int(cfg.datasets.train.cuda_decode_batch_size),
             )
         logging.info(f"LEN TRAIN LOADER={len(train_loader)}")
         optimizer_steps_per_epoch = max(

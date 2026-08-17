@@ -42,8 +42,18 @@ class TapVid3DGpuDecodeTests(unittest.TestCase):
             depth_patch_operations=(),
         )
         batch = loader.EncodedTapVid3DBatch([sample, sample])
+        rgb_stream = torch.cuda.Stream()
+        depth_stream = torch.cuda.Stream()
+        prepare_stream = torch.cuda.Stream()
         with mock.patch.object(loader, "decode_jpeg", wraps=loader.decode_jpeg) as decoder:
-            decoded = loader.decode_tapvid3d_batch(batch, torch.device("cuda"))
+            with torch.cuda.stream(prepare_stream):
+                decoded = loader.decode_tapvid3d_batch(
+                    batch,
+                    torch.device("cuda"),
+                    rgb_stream=rgb_stream,
+                    depth_stream=depth_stream,
+                    prepare_stream=prepare_stream,
+                )
         self.assertEqual(decoder.call_count, 1)
         self.assertEqual(len(decoder.call_args.args[0]), 4)
         self.assertEqual(decoded.video.shape, (2, 1, 2, 3, 8, 10))

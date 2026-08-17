@@ -16,6 +16,8 @@ datasets:
     max_videos: null                # takes all training videos by default
     kubric_max_depth: 24
     num_workers: 8
+    cuda_prefetch_queue_depth: 8
+    cuda_decode_batch_size: 4
   eval:
     names:
       - panoptic-multiview-views1_7_14_20
