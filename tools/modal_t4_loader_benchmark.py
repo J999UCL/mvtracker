@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import partial
 import json
 from pathlib import Path
 
@@ -109,8 +110,12 @@ def profile_t4_loader_remote(
                 "gpu": gpu_monitor.sample(),
             }
 
-        profiles = run_case_matrix(
+        profile_loader = partial(
             profile_encoded_loader,
+            Path(DATASET_IMAGE_ROOT),
+        )
+        profiles = run_case_matrix(
+            profile_loader,
             warmup=warmup,
             measured=measured,
             workers=T4_WORKERS,
