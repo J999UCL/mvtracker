@@ -166,7 +166,11 @@ def _install_dataset_image(dataset_version: str) -> None:
 
 
 runtime_image = _runtime_image()
-dataset_image = _dependency_image().run_function(
+dataset_image = _dependency_image().add_local_file(
+    Path(__file__).with_name("modal_training_profile.py"),
+    "/root/modal_training_profile.py",
+    copy=True,
+).run_function(
     _install_dataset_image,
     volumes={str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
     cpu=32,
