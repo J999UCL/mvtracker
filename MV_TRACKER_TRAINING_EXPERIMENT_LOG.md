@@ -628,3 +628,50 @@ from about 10.29 seconds to 2.03 seconds across 16 samples, an 80.3% reduction.
 This benchmark measures loader exposure rather than model throughput; the
 alternating case demonstrates that preparation is hidden when model compute is
 available to overlap it.
+
+## 2026-08-17 — Two-H100 asynchronous-loader training smoke
+
+A fresh two-H100 DDP smoke completed exactly ten optimizer updates using the
+mixed DIEGESIS/MV-Kubric GT-depth recipe, four local microbatches per rank and
+eight scenes per global update. Evaluation was disabled. The run used the
+bounded asynchronous CUDA loader after trimming per-group trajectory padding
+back to each source sample's original track count.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/bbc4bc074954
+- Modal app: `ap-2eyPl7Oh5R3lHzhFW6Xe7q`
+- Run Volume: `jeet-mvtracker-runs-v2/continual-training/loader-h100-smoke10-cbc606a/`
+- Step-10 checkpoint: `model_000010.pth`
+- Final checkpoint: `model_final.pth`
+
+Distributed initialization began at 20:34:02 UTC, the trainer was ready at
+20:34:28, and the first prepared batch arrived at 20:35:05. The initial worker
+and import warmup therefore took about 37.2 seconds after trainer readiness.
+The first update took 145.29 seconds because it also ran first-step compilation
+and expensive diagnostics. Updates 2–10 averaged 8.95 seconds, including 1.00
+second of exposed data wait.
+
+| Step | Total | Data | Forward | Backward |
+|---:|---:|---:|---:|---:|
+| 1 | 145.29 s | 48.50 s | 18.16 s | 78.48 s |
+| 2 | 9.25 s | 1.00 s | 4.13 s | 2.57 s |
+| 3 | 4.96 s | 0.51 s | 2.37 s | 1.97 s |
+| 4 | 11.10 s | 0.65 s | 4.95 s | 4.07 s |
+| 5 | 12.98 s | 3.65 s | 5.61 s | 2.84 s |
+| 6 | 6.41 s | 0.48 s | 2.81 s | 2.60 s |
+| 7 | 8.44 s | 0.73 s | 4.71 s | 2.41 s |
+| 8 | 11.20 s | 0.22 s | 7.08 s | 3.74 s |
+| 9 | 5.65 s | 0.63 s | 2.39 s | 1.94 s |
+| 10 | 10.58 s | 1.10 s | 5.33 s | 2.70 s |
+
+At step 10 the global update contained 8 scenes and 8,233 trajectories,
+yielding 0.756 scenes/s and 778.3 trajectories/s. The point-in-time hardware
+sample reported GPU 0 at 56% utilization and 28.0/79.6 GiB, GPU 1 at 100% and
+55.0/79.6 GiB, 4.34 CPU cores used, and 69.6 GiB container RAM. These are one
+instant rather than sustained-utilization averages. The final exposed loader
+wait was 1.10 seconds; loader-worker preparation was 1.11 seconds and reported
+GPU JPEG decode time was 1.13 seconds.
+
+The detached Modal invocation retried after successful completion. Its later
+invocations found `model_final.pth` at ten completed steps and performed no
+additional optimizer updates. The app was stopped manually after confirming
+both checkpoints were durable.
