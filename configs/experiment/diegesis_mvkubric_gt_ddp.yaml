@@ -163,7 +163,7 @@ trainer:
   eval_freq: 250
   viz_freq: 10000
   save_ckpt_freq: 250
-  lr: 0.00002
+  lr: 0.00005
   wdecay: 0.00001
   anneal_strategy: linear
   grad_clip: 1.0

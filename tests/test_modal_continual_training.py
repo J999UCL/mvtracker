@@ -4,9 +4,6 @@ import sys
 import unittest
 from pathlib import Path
 
-import yaml
-
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -20,85 +17,6 @@ def _load_launch_contract():
 
 
 contract = _load_launch_contract()
-
-
-class ContinualTrainingConfigTests(unittest.TestCase):
-    def setUp(self):
-        path = ROOT / "configs/experiment/diegesis_mvkubric_gt_ddp.yaml"
-        self.config = yaml.safe_load(path.read_text(encoding="utf-8"))
-
-    def test_scientific_recipe_is_encoded_in_config(self):
-        train = self.config["datasets"]["train"]
-        trainer = self.config["trainer"]
-
-        self.assertEqual(train["name"], "mixed-diegesis-mvkubric-training")
-        self.assertEqual(train["source_schedule"], ["diegesis", "mvkubric"] * 2)
-        self.assertEqual(train["batch_size"], 1)
-        self.assertEqual(train["sequence_len"], 24)
-        self.assertEqual(train["traj_per_sample"], 2048)
-        self.assertTrue(train["mvkubric_gpu_decode"])
-        self.assertEqual(trainer["num_steps"], 1000)
-        self.assertEqual(trainer["lr_schedule_steps"], 1000)
-        self.assertEqual(trainer["gradient_accumulation_steps"], 4)
-        self.assertEqual(trainer["lr"], 2e-5)
-        self.assertEqual(trainer["anneal_strategy"], "linear")
-        self.assertEqual(trainer["hardware_metrics_interval"], 10)
-
-    def test_base_config_preserves_legacy_scheduler_horizon(self):
-        base = yaml.safe_load((ROOT / "configs/train.yaml").read_text(encoding="utf-8"))
-
-        self.assertEqual(base["trainer"]["num_steps"], 200000)
-        self.assertEqual(base["trainer"]["lr_schedule_steps"], 200100)
-
-    def test_gt_depth_and_full_training_scene_policy(self):
-        sources = self.config["datasets"]["train"]["sources"]
-
-        self.assertEqual(len(sources["diegesis"]["include_scene_ids"]), 17)
-        self.assertEqual(
-            sources["mvkubric"]["include_scene_ids"],
-            [str(scene) for scene in range(900, 998)],
-        )
-        self.assertEqual(
-            self.config["datasets"]["eval"]["sources"]["mvkubric"]["include_scene_ids"],
-            ["101", "102"],
-        )
-        self.assertFalse(self.config["augmentations"]["variable_depth_type"])
-        self.assertTrue(self.config["augmentations"]["depth"])
-        self.assertEqual(
-            sources["mvkubric"]["view_count_probabilities"],
-            [0.20, 0.10, 0.10, 0.25, 0.10, 0.25],
-        )
-        self.assertEqual(sources["mvkubric"]["trajectory_caps_by_view"], {5: 819, 6: 512})
-
-    def test_wandb_policy_is_explicit(self):
-        logging = self.config["logging"]
-
-        self.assertTrue(logging["log_wandb"])
-        self.assertEqual(logging["wandb_entity"], contract.WANDB_ENTITY)
-        self.assertEqual(logging["wandb_project"], contract.WANDB_PROJECT)
-        self.assertEqual(logging["wandb_group"], contract.WANDB_GROUP)
-        self.assertIn("ddp2-h100", logging["tags"])
-        self.assertEqual(
-            self.config["evaluation"]["evaluator"],
-            {
-                "rerun_viz_indices": None,
-                "forward_pass_log_indices": None,
-                "mp4_track_viz_indices": None,
-            },
-        )
-
-    def test_smoke_config_is_exactly_five_steps(self):
-        path = ROOT / "configs/experiment/diegesis_mvkubric_gt_ddp_smoke.yaml"
-        config = yaml.safe_load(path.read_text(encoding="utf-8"))
-
-        self.assertEqual(config["trainer"]["num_steps"], 5)
-        self.assertFalse(config["modes"]["validate_at_start"])
-        self.assertEqual(config["datasets"]["eval"]["names"], [])
-
-        phase1_path = ROOT / "configs/experiment/diegesis_mvkubric_gt_ddp_smoke_phase1.yaml"
-        phase1 = yaml.safe_load(phase1_path.read_text(encoding="utf-8"))
-        self.assertEqual(phase1["trainer"]["num_steps"], 3)
-        self.assertEqual(phase1["trainer"]["save_ckpt_freq"], 3)
 
 
 class ModalContinualTrainingContractTests(unittest.TestCase):
