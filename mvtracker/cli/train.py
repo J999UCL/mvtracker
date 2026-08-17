@@ -1634,7 +1634,7 @@ def main(cfg: DictConfig):
             fabric.load_raw(restore_ckpt_path, model)
 
     tb_writer = (
-        SummaryWriter(log_dir=os.path.join(cfg.experiment_path, "runs"))
+        SummaryWriter(log_dir=os.path.join(cfg.experiment_path, "runs"), flush_secs=10)
         if fabric.global_rank == 0
         else None
     )

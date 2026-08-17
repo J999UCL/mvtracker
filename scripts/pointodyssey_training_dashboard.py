@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Serve a live MV-Tracker training dashboard over an SSH port forward.
+"""Serve a live MV-Tracker training dashboard from local files or W&B.
 
-The dashboard is read-only.  It consumes the run's TensorBoard scalar events
-and ``train.log``, samples one explicitly selected GPU through NVML, and pushes
-fresh snapshots to the browser with server-sent events.
+The dashboard is read-only. Local mode consumes TensorBoard, ``train.log``, and
+NVML. W&B mode reads the same metrics from one explicitly selected W&B run.
+Both modes push fresh snapshots to the browser with server-sent events.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ DEFAULT_PORT = 8766
 DEFAULT_STREAM_INTERVAL_SECONDS = 1.0
 DEFAULT_GPU_SAMPLE_INTERVAL_SECONDS = 2.0
 DEFAULT_MAX_GPU_SAMPLES = 10_000
+DEFAULT_WANDB_POLL_INTERVAL_SECONDS = 10.0
 
 DATAPOINT_RE = re.compile(
     r"Datapoint:\s+\['([^']+)'\].*?waited\s+([0-9.]+)s"
@@ -119,6 +120,45 @@ class RunConfig:
     eval_datasets: tuple[str, ...]
 
 
+def run_config_from_mapping(config: dict[str, Any]) -> RunConfig:
+    def selected(path: str, default: Any = None) -> Any:
+        value: Any = config
+        for key in path.split("."):
+            if not isinstance(value, dict) or key not in value:
+                return default
+            value = value[key]
+        return value
+
+    eval_names = selected("datasets.eval.names", []) or []
+    return RunConfig(
+        total_steps=int(selected("trainer.num_steps", 0)),
+        gradient_accumulation_steps=int(
+            selected("trainer.gradient_accumulation_steps", 1)
+        ),
+        trajectory_cap=(
+            int(selected("datasets.train.traj_per_sample"))
+            if selected("datasets.train.traj_per_sample") is not None
+            else None
+        ),
+        num_workers=(
+            int(selected("datasets.train.num_workers"))
+            if selected("datasets.train.num_workers") is not None
+            else None
+        ),
+        sequence_len=(
+            int(selected("datasets.train.sequence_len"))
+            if selected("datasets.train.sequence_len") is not None
+            else None
+        ),
+        eval_frequency=(
+            int(selected("trainer.eval_freq"))
+            if selected("trainer.eval_freq") is not None
+            else None
+        ),
+        eval_datasets=tuple(str(name) for name in eval_names),
+    )
+
+
 class HydraConfigReader:
     """Reload the Hydra config only when its file changes."""
 
@@ -140,38 +180,8 @@ class HydraConfigReader:
         try:
             from omegaconf import OmegaConf
 
-            config = OmegaConf.load(self.path)
-
-            def selected(path: str, default: Any = None) -> Any:
-                return OmegaConf.select(config, path, default=default)
-
-            eval_names = selected("datasets.eval.names", []) or []
-            parsed = RunConfig(
-                total_steps=int(selected("trainer.num_steps", 0)),
-                gradient_accumulation_steps=int(
-                    selected("trainer.gradient_accumulation_steps", 1)
-                ),
-                trajectory_cap=(
-                    int(selected("datasets.train.traj_per_sample"))
-                    if selected("datasets.train.traj_per_sample") is not None
-                    else None
-                ),
-                num_workers=(
-                    int(selected("datasets.train.num_workers"))
-                    if selected("datasets.train.num_workers") is not None
-                    else None
-                ),
-                sequence_len=(
-                    int(selected("datasets.train.sequence_len"))
-                    if selected("datasets.train.sequence_len") is not None
-                    else None
-                ),
-                eval_frequency=(
-                    int(selected("trainer.eval_freq"))
-                    if selected("trainer.eval_freq") is not None
-                    else None
-                ),
-                eval_datasets=tuple(str(name) for name in eval_names),
+            parsed = run_config_from_mapping(
+                OmegaConf.to_container(OmegaConf.load(self.path), resolve=True)
             )
         except Exception as exc:
             self.error = f"cannot read Hydra config {self.path}: {exc}"
@@ -242,6 +252,133 @@ class TensorBoardScalarReader:
         self._cached = output
         self.error = None
         return output
+
+
+class WandbRunReader:
+    """Incrementally read scalar history and metadata from one W&B run."""
+
+    def __init__(
+        self,
+        run_path: str,
+        poll_interval_seconds: float,
+        api: Any = None,
+    ):
+        if api is None:
+            import wandb
+
+            api = wandb.Api()
+        self.run_path = run_path
+        self.run = api.run(run_path)
+        self.poll_interval_seconds = poll_interval_seconds
+        self._last_poll_monotonic: float | None = None
+        self._next_history_step = 0
+        self._scalars: dict[str, dict[int, dict[str, float | int]]] = {}
+        self.error: str | None = None
+
+    def read(self) -> dict[str, list[dict[str, float | int]]]:
+        now = time.monotonic()
+        if (
+            self._last_poll_monotonic is not None
+            and now - self._last_poll_monotonic < self.poll_interval_seconds
+        ):
+            return self._ordered_scalars()
+        self._last_poll_monotonic = now
+        try:
+            self.run.load(force=True)
+            rows = self.run.scan_history(
+                page_size=1000,
+                min_step=self._next_history_step,
+                use_cache=False,
+            )
+            for row in rows:
+                history_step = int(row["_step"])
+                self._next_history_step = max(
+                    self._next_history_step, history_step + 1
+                )
+                optimizer_step = int(row.get("global_step", history_step))
+                wall_time = finite_float(row.get("_timestamp"))
+                for tag, raw_value in row.items():
+                    if tag.startswith("_") or tag == "global_step":
+                        continue
+                    value = finite_float(raw_value)
+                    if value is None:
+                        continue
+                    point: dict[str, float | int] = {
+                        "step": optimizer_step,
+                        "value": value,
+                    }
+                    if wall_time is not None:
+                        point["wall_time"] = wall_time
+                    self._scalars.setdefault(tag, {})[optimizer_step] = point
+            self.error = None
+        except Exception as exc:
+            self.error = f"cannot read W&B run {self.run_path}: {exc}"
+        return self._ordered_scalars()
+
+    def _ordered_scalars(self) -> dict[str, list[dict[str, float | int]]]:
+        return {
+            tag: [by_step[step] for step in sorted(by_step)]
+            for tag, by_step in self._scalars.items()
+        }
+
+    def config(self) -> RunConfig:
+        return run_config_from_mapping(dict(self.run.config))
+
+    def status(self) -> str:
+        return {
+            "finished": "completed",
+            "crashed": "failed",
+            "killed": "failed",
+        }.get(str(self.run.state), str(self.run.state))
+
+
+class WandbConfigReader:
+    def __init__(self, run_reader: WandbRunReader):
+        self.run_reader = run_reader
+        self.error: str | None = None
+
+    def read(self) -> RunConfig | None:
+        try:
+            config = self.run_reader.config()
+        except Exception as exc:
+            self.error = f"cannot read W&B config: {exc}"
+            return None
+        self.error = None
+        return config
+
+
+def gpu_series_from_scalars(
+    scalars: dict[str, list[dict[str, float | int]]],
+) -> list[dict[str, Any]]:
+    fields = {
+        "utilization_percent": "utilization_percent",
+        "memory_used_gib": "vram_used_gib",
+        "memory_total_gib": "vram_total_gib",
+        "memory_utilization_percent": "vram_percent",
+    }
+    samples: dict[tuple[int, int], dict[str, Any]] = {}
+    for tag, points in scalars.items():
+        match = re.fullmatch(r"hardware/gpu_(\d+)/(.+)", tag)
+        if match is None or match.group(2) not in fields:
+            continue
+        gpu_index = int(match.group(1))
+        field = fields[match.group(2)]
+        for point in points:
+            step = int(point["step"])
+            sample = samples.setdefault(
+                (gpu_index, step), {"gpu_index": gpu_index, "step": step}
+            )
+            sample[field] = float(point["value"])
+            if "wall_time" in point:
+                sample["wall_time"] = float(point["wall_time"])
+    if not samples:
+        return []
+    start = min(float(sample.get("wall_time", 0)) for sample in samples.values())
+    return [
+        sample
+        | {"elapsed_seconds": float(sample.get("wall_time", start)) - start}
+        for _, sample in sorted(samples.items())
+    ]
 
 
 class TrainingLogReader:
@@ -495,16 +632,28 @@ class TrainingDashboardState:
         event_dir: Path,
         gpu_history: GPUHistory,
         stale_after_seconds: float = 60.0,
+        scalar_reader: Any = None,
+        config_reader: Any = None,
+        status_reader: Callable[[], str] | None = None,
+        run_label: str | None = None,
+        telemetry_from_scalars: bool = False,
     ):
         self.run_dir = run_dir
         self.log_reader = TrainingLogReader(log_path)
-        self.scalar_reader = TensorBoardScalarReader(event_dir)
-        self.config_reader = HydraConfigReader(run_dir / ".hydra" / "config.yaml")
+        self.scalar_reader = scalar_reader or TensorBoardScalarReader(event_dir)
+        self.config_reader = config_reader or HydraConfigReader(
+            run_dir / ".hydra" / "config.yaml"
+        )
         self.gpu_history = gpu_history
         self.stale_after_seconds = stale_after_seconds
+        self.status_reader = status_reader
+        self.run_label = run_label or str(run_dir)
+        self.telemetry_from_scalars = telemetry_from_scalars
         self._lock = threading.Lock()
 
     def _status(self, now: float) -> str:
+        if self.status_reader is not None:
+            return self.status_reader()
         if self.log_reader.finished or (self.run_dir / "model_final.pth").is_file():
             return "completed"
         if self.log_reader.fatal_error:
@@ -556,8 +705,11 @@ class TrainingDashboardState:
             self.log_reader.refresh()
             scalars = self.scalar_reader.read()
             status = self._status(now)
-            self.gpu_history.sample_if_due(status in {"running", "stale"})
-            gpu = self.gpu_history.series()
+            if self.telemetry_from_scalars:
+                gpu = gpu_series_from_scalars(scalars)
+            else:
+                self.gpu_history.sample_if_due(status in {"running", "stale"})
+                gpu = self.gpu_history.series()
             accumulation_steps = (
                 config.gradient_accumulation_steps if config is not None else 1
             )
@@ -654,6 +806,25 @@ class TrainingDashboardState:
             validation = {
                 tag: points for tag, points in scalars.items() if tag.startswith("eval_")
             }
+            performance = {
+                name: scalars.get(f"performance/{name}", [])
+                for name in (
+                    "samples_per_second",
+                    "trajectories_per_second",
+                    "global_samples",
+                    "global_trajectories",
+                )
+            }
+            hardware = {
+                name: scalars.get(f"hardware/container/{name}", [])
+                for name in (
+                    "cpu_cores_used",
+                    "cpu_utilization_percent",
+                    "memory_used_gib",
+                    "memory_limit_gib",
+                    "memory_utilization_percent",
+                )
+            }
             completed_step = max(
                 [int(point["step"]) for point in timing["total"]]
                 + [int(row["step"]) for row in self.log_reader.timing_rows]
@@ -674,7 +845,7 @@ class TrainingDashboardState:
                 "schema_version": 1,
                 "format": "mvtracker_training_dashboard",
                 "server_time": utc_iso(now),
-                "run_dir": str(self.run_dir),
+                "run_dir": self.run_label,
                 "status": status,
                 "progress": {
                     "completed_steps": completed_step,
@@ -713,6 +884,8 @@ class TrainingDashboardState:
                     "timing": timing,
                     "motion": motion,
                     "validation": validation,
+                    "performance": performance,
+                    "hardware": hardware,
                     "pipeline": pipeline,
                     "gpu": gpu,
                 },
@@ -879,7 +1052,12 @@ INDEX_HTML = r"""<!doctype html>
       <div class="chart-panel"><h3>Allocated VRAM</h3><div class="chart-wrap compact"><canvas id="gpu-vram"></canvas></div></div>
       <div class="chart-panel"><h3>Power and temperature</h3><div class="chart-wrap compact"><canvas id="gpu-thermal"></canvas></div></div>
     </div>
-    <div class="chart-note">NVML telemetry is sampled on the training host and streamed through the SSH tunnel.</div>
+    <div class="grid-3" style="margin-top:22px">
+      <div class="chart-panel"><h3>Training throughput</h3><div class="chart-wrap compact"><canvas id="training-throughput"></canvas></div></div>
+      <div class="chart-panel"><h3>Container CPU</h3><div class="chart-wrap compact"><canvas id="container-cpu"></canvas></div></div>
+      <div class="chart-panel"><h3>Container memory</h3><div class="chart-wrap compact"><canvas id="container-memory"></canvas></div></div>
+    </div>
+    <div class="chart-note">Local mode samples NVML. W&amp;B mode displays the per-rank GPU and container metrics logged by training.</div>
   </section>
 
   <footer><span id="latest-message">Waiting for training log…</span></footer>
@@ -928,9 +1106,12 @@ const charts={
   motionPath:new Chart(document.getElementById('motion-path-length'),{type:'line',data:{datasets:[line('Full mean',palette.s1),line('Window mean',palette.s2),line('Window p90',palette.s4,{borderDash:[6,4]})]},options:options('Optimizer step','Path length (m)',{min:0})}),
   motionBuckets:new Chart(document.getElementById('motion-window-buckets'),{type:'line',data:{datasets:[line('Static',palette.s3),line('Dynamic',palette.s1),line('Very dynamic',palette.s5)]},options:options('Optimizer step','Tracks',{min:0})}),
   motionMismatch:new Chart(document.getElementById('motion-window-mismatch'),{type:'line',data:{datasets:[line('All sampled',palette.s2),line('Global dynamic → window static',palette.s5)]},options:options('Optimizer step','Tracks',{min:0})}),
-  gpuUtil:new Chart(document.getElementById('gpu-util'),{type:'line',data:{datasets:[line('Utilization',palette.s1)]},options:options('Elapsed time (min)','Utilization (%)',{min:0,max:100,legend:false})}),
-  gpuVram:new Chart(document.getElementById('gpu-vram'),{type:'line',data:{datasets:[line('Used VRAM',palette.s2)]},options:options('Elapsed time (min)','VRAM (GiB)',{min:0,legend:false})}),
-  gpuThermal:new Chart(document.getElementById('gpu-thermal'),{type:'line',data:{datasets:[line('Power',palette.s3),line('Temperature',palette.s4,{yAxisID:'temp'})]},options:options('Elapsed time (min)','Power (W)',{scales:{temp:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Temperature (°C)',color:palette.muted}}}})})
+  gpuUtil:new Chart(document.getElementById('gpu-util'),{type:'line',data:{datasets:[line('GPU 0',palette.s1),line('GPU 1',palette.s2)]},options:options('Elapsed time (min)','Utilization (%)',{min:0,max:100})}),
+  gpuVram:new Chart(document.getElementById('gpu-vram'),{type:'line',data:{datasets:[line('GPU 0',palette.s1),line('GPU 1',palette.s2)]},options:options('Elapsed time (min)','VRAM (GiB)',{min:0})}),
+  gpuThermal:new Chart(document.getElementById('gpu-thermal'),{type:'line',data:{datasets:[line('Power',palette.s3),line('Temperature',palette.s4,{yAxisID:'temp'})]},options:options('Elapsed time (min)','Power (W)',{scales:{temp:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Temperature (°C)',color:palette.muted}}}})}),
+  throughput:new Chart(document.getElementById('training-throughput'),{type:'line',data:{datasets:[line('Samples/s',palette.s1),line('Trajectories/s',palette.s3,{yAxisID:'trajectories'})]},options:options('Optimizer step','Samples/s',{scales:{trajectories:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Trajectories/s',color:palette.muted}}}})}),
+  containerCpu:new Chart(document.getElementById('container-cpu'),{type:'line',data:{datasets:[line('CPU utilization',palette.s1),line('Cores used',palette.s3,{yAxisID:'cores'})]},options:options('Optimizer step','Utilization (%)',{min:0,scales:{cores:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'CPU cores',color:palette.muted}}}})}),
+  containerMemory:new Chart(document.getElementById('container-memory'),{type:'line',data:{datasets:[line('Memory used',palette.s2),line('Memory utilization',palette.s4,{yAxisID:'percent'})]},options:options('Optimizer step','Memory (GiB)',{min:0,scales:{percent:{position:'right',min:0,max:100,grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Utilization (%)',color:palette.muted}}}})})
 };
 const rawOpacity=document.getElementById('raw-opacity');
 const rawOpacityValue=document.getElementById('raw-opacity-value');
@@ -958,7 +1139,7 @@ const movingAverageXY=(input,windowSize=50)=>{
 const movingAveragePoints=(series,windowSize=50)=>movingAverageXY(points(series),windowSize);
 const parityPoints=series=>points(series).map(point=>({x:point.x,y:1}));
 const pipePoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.step),y:Number(point[key])}));
-const gpuPoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.elapsed_seconds)/60,y:Number(point[key])}));
+const gpuPoints=(series,key,gpuIndex=null)=>(series||[]).filter(point=>point[key]!=null&&(gpuIndex==null||Number(point.gpu_index)===gpuIndex)).map(point=>({x:Number(point.elapsed_seconds)/60,y:Number(point[key])}));
 function update(chart,datasets){datasets.forEach((data,index)=>{chart.data.datasets[index].data=data;});chart.update(reduced?'none':undefined);}
 const text=(id,value)=>{document.getElementById(id).textContent=value;};
 function render(state){
@@ -998,7 +1179,13 @@ function render(state){
   update(charts.motionBuckets,[points(motion.window_static),points(motion.window_dynamic),points(motion.window_very_dynamic)]);
   update(charts.motionMismatch,[points(motion.track_count),points(motion.full_dynamic_window_static)]);
   const gpu=state.series?.gpu||[];
-  update(charts.gpuUtil,[gpuPoints(gpu,'utilization_percent')]); update(charts.gpuVram,[gpuPoints(gpu,'vram_used_gib')]); update(charts.gpuThermal,[gpuPoints(gpu,'power_watts'),gpuPoints(gpu,'temperature_c')]);
+  const gpuIndices=[...new Set(gpu.map(point=>Number(point.gpu_index??0)))].sort((a,b)=>a-b).slice(0,2);
+  [charts.gpuUtil,charts.gpuVram].forEach(chart=>chart.data.datasets.forEach((dataset,index)=>dataset.label=gpuIndices[index]==null?`GPU ${index}`:`GPU ${gpuIndices[index]}`));
+  update(charts.gpuUtil,gpuIndices.map(index=>gpuPoints(gpu,'utilization_percent',index)).concat([[],[]]).slice(0,2)); update(charts.gpuVram,gpuIndices.map(index=>gpuPoints(gpu,'vram_used_gib',index)).concat([[],[]]).slice(0,2)); update(charts.gpuThermal,[gpuPoints(gpu,'power_watts'),gpuPoints(gpu,'temperature_c')]);
+  const performance=state.series?.performance||{}, hardware=state.series?.hardware||{};
+  update(charts.throughput,[points(performance.samples_per_second),points(performance.trajectories_per_second)]);
+  update(charts.containerCpu,[points(hardware.cpu_utilization_percent),points(hardware.cpu_cores_used)]);
+  update(charts.containerMemory,[points(hardware.memory_used_gib),points(hardware.memory_utilization_percent)]);
 
   const validation=state.series?.validation||{}, tags=Object.keys(validation).sort(), select=document.getElementById('validation-select');
   const previous=select.value;
@@ -1103,10 +1290,15 @@ def make_handler(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--run-dir", type=Path)
+    source.add_argument(
+        "--wandb-run",
+        help="W&B run path as entity/project/run_id",
+    )
     parser.add_argument("--log-file", type=Path, default=None)
     parser.add_argument("--event-dir", type=Path, default=None)
-    parser.add_argument("--gpu-index", type=nonnegative_int, required=True)
+    parser.add_argument("--gpu-index", type=nonnegative_int)
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=port_number, default=DEFAULT_PORT)
     parser.add_argument(
@@ -1124,34 +1316,70 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=positive_int,
         default=DEFAULT_MAX_GPU_SAMPLES,
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--wandb-poll-interval-seconds",
+        type=positive_float,
+        default=DEFAULT_WANDB_POLL_INTERVAL_SECONDS,
+    )
+    args = parser.parse_args(argv)
+    if args.run_dir is not None and args.gpu_index is None:
+        parser.error("--gpu-index is required with --run-dir")
+    if args.wandb_run is not None:
+        if len(args.wandb_run.split("/")) != 3:
+            parser.error("--wandb-run must be entity/project/run_id")
+        if args.log_file is not None or args.event_dir is not None:
+            parser.error("--log-file and --event-dir are local-mode options")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    run_dir = args.run_dir.expanduser().resolve()
-    log_path = (
-        args.log_file.expanduser().resolve()
-        if args.log_file is not None
-        else run_dir / "train.log"
-    )
-    event_dir = (
-        args.event_dir.expanduser().resolve()
-        if args.event_dir is not None
-        else run_dir / "runs_0"
-    )
-    gpu_reader = NVMLGPUReader(args.gpu_index)
-    gpu_history = GPUHistory(
-        gpu_reader,
-        interval_seconds=args.gpu_sample_interval_seconds,
-        max_samples=args.max_gpu_samples,
-    )
-    state = TrainingDashboardState(
-        run_dir=run_dir,
-        log_path=log_path,
-        event_dir=event_dir,
-        gpu_history=gpu_history,
-    )
+    if args.wandb_run is not None:
+        run_reader = WandbRunReader(
+            args.wandb_run,
+            poll_interval_seconds=args.wandb_poll_interval_seconds,
+        )
+        gpu_reader = None
+        state = TrainingDashboardState(
+            run_dir=Path("."),
+            log_path=Path("/nonexistent/wandb-train.log"),
+            event_dir=Path("/nonexistent/wandb-events"),
+            gpu_history=GPUHistory(lambda: {}, 1, 1),
+            scalar_reader=run_reader,
+            config_reader=WandbConfigReader(run_reader),
+            status_reader=run_reader.status,
+            run_label=f"wandb://{args.wandb_run}",
+            telemetry_from_scalars=True,
+        )
+        source_description = f"wandb={args.wandb_run}"
+    else:
+        run_dir = args.run_dir.expanduser().resolve()
+        log_path = (
+            args.log_file.expanduser().resolve()
+            if args.log_file is not None
+            else run_dir / "train.log"
+        )
+        event_dir = (
+            args.event_dir.expanduser().resolve()
+            if args.event_dir is not None
+            else run_dir / "runs_0"
+        )
+        gpu_reader = NVMLGPUReader(args.gpu_index)
+        gpu_history = GPUHistory(
+            gpu_reader,
+            interval_seconds=args.gpu_sample_interval_seconds,
+            max_samples=args.max_gpu_samples,
+        )
+        state = TrainingDashboardState(
+            run_dir=run_dir,
+            log_path=log_path,
+            event_dir=event_dir,
+            gpu_history=gpu_history,
+        )
+        source_description = (
+            f"run_dir={run_dir} log={log_path} events={event_dir} "
+            f"gpu={args.gpu_index}"
+        )
     state.snapshot()
     server = ThreadingHTTPServer(
         (args.host, args.port),
@@ -1160,7 +1388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     server.daemon_threads = True
     print(
         f"MVTRACKER_TRAINING_DASHBOARD http://{args.host}:{server.server_port} "
-        f"run_dir={run_dir} log={log_path} events={event_dir} gpu={args.gpu_index}",
+        f"{source_description}",
         flush=True,
     )
     try:
@@ -1169,7 +1397,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         pass
     finally:
         server.server_close()
-        gpu_reader.close()
+        if gpu_reader is not None:
+            gpu_reader.close()
     return 0
 
 

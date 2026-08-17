@@ -144,6 +144,70 @@ class TensorBoardScalarReaderTests(unittest.TestCase):
             writer.close()
 
 
+class WandbRunReaderTests(unittest.TestCase):
+    def test_merges_sparse_wandb_rows_by_optimizer_step(self):
+        class FakeRun:
+            state = "running"
+            config = {
+                "trainer": {
+                    "num_steps": 37,
+                    "gradient_accumulation_steps": 3,
+                },
+                "datasets": {"eval": {"names": ["held-out"]}},
+            }
+
+            def load(self, force=False):
+                return {}
+
+            def scan_history(self, **kwargs):
+                self.scan_kwargs = kwargs
+                return iter(
+                    [
+                        {
+                            "_step": 4,
+                            "global_step": 2,
+                            "_timestamp": 100.0,
+                            "live_total_loss": 0.4,
+                        },
+                        {
+                            "_step": 5,
+                            "global_step": 2,
+                            "_timestamp": 100.1,
+                            "hardware/gpu_1/utilization_percent": 81,
+                        },
+                    ]
+                )
+
+        run = FakeRun()
+        api = SimpleNamespace(run=lambda path: run)
+        reader = dashboard.WandbRunReader("entity/project/run", 10, api=api)
+
+        scalars = reader.read()
+
+        self.assertEqual(scalars["live_total_loss"][0]["step"], 2)
+        self.assertEqual(
+            scalars["hardware/gpu_1/utilization_percent"][0]["value"], 81
+        )
+        self.assertEqual(reader.config().total_steps, 37)
+        self.assertEqual(reader.status(), "running")
+        self.assertEqual(run.scan_kwargs["min_step"], 0)
+
+    def test_builds_separate_gpu_series_from_logged_rank_metrics(self):
+        scalars = {
+            "hardware/gpu_0/utilization_percent": [
+                {"step": 1, "value": 72.0, "wall_time": 10.0}
+            ],
+            "hardware/gpu_1/memory_used_gib": [
+                {"step": 1, "value": 64.0, "wall_time": 10.0}
+            ],
+        }
+
+        series = dashboard.gpu_series_from_scalars(scalars)
+
+        self.assertEqual({point["gpu_index"] for point in series}, {0, 1})
+        self.assertEqual(series[1]["vram_used_gib"], 64.0)
+
+
 class GPUHistoryTests(unittest.TestCase):
     def test_samples_at_bounded_frequency_and_capacity(self):
         calls = []
@@ -291,6 +355,9 @@ class DashboardHTTPTests(unittest.TestCase):
             "gpu-util",
             "gpu-vram",
             "gpu-thermal",
+            "training-throughput",
+            "container-cpu",
+            "container-memory",
         ):
             self.assertIn(f'id="{chart_id}"', html)
         self.assertIn("new EventSource('/api/stream')", html)
@@ -332,6 +399,13 @@ class CommandLineTests(unittest.TestCase):
     def test_gpu_index_is_required(self):
         with self.assertRaises(SystemExit):
             dashboard.parse_args(["--run-dir", "/tmp/run"])
+
+    def test_wandb_mode_does_not_require_a_local_gpu(self):
+        args = dashboard.parse_args(
+            ["--wandb-run", "entity/project/run-id"]
+        )
+        self.assertEqual(args.wandb_run, "entity/project/run-id")
+        self.assertIsNone(args.gpu_index)
 
 
 if __name__ == "__main__":
