@@ -72,7 +72,7 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
     def test_preflight_refuses_to_interrupt_active_apps(self):
         active = tuple(
             contract.ActiveContainer(str(index), f"other-{index}")
-            for index in range(2)
+            for index in range(contract.WORKSPACE_CONTAINER_LIMIT - 1)
         )
         with self.assertRaisesRegex(RuntimeError, "other-0, other-1"):
             contract.require_training_capacity(active)
