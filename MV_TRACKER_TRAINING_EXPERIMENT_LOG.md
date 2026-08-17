@@ -565,3 +565,34 @@ For 17 DIEGESIS scenes of 240 frames (ten chunks each) plus 100 MV-Kubric scenes
 of 24 frames (one chunk each), the measured batch-1 rates project to 50.5 minutes
 of H100 inference, or about $3.32. This excludes one-time input staging and the
 final upload of complete sidecars to persistent storage.
+
+## 2026-08-17 — Cached Modal dataset image and CPU loader profile
+
+The continual-training data is now a cached Modal image layer at
+`/opt/mvtracker-data`, built from the archive Volume before the commit-specific
+Git checkout layer. Training no longer mounts the data Volume or copies and
+extracts archives at container startup. The dataset image is
+`im-oWfJU0ZwiRztxAnVw5Tbcz`, version
+`diegesis21-mvkubric100-val101-102-v1`. Its successful CPU build ran at
+https://modal.com/apps/ucl-prism/main/ap-pJu2cabHTuVIgSG7nZDfei. Parallel
+extraction plus filesystem capture took about ten minutes; saving the expanded
+dataset layer itself took 53.78 seconds. A later source-only commit reused this
+dataset layer without re-extraction.
+
+The CPU validation loaded valid samples from both DIEGESIS and MV-Kubric and
+recorded cold and warmed single-worker loader measurements. The run is at
+https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/6qvj3tqr and the
+Modal invocation is at
+https://modal.com/apps/ucl-prism/main/ap-LA9zfyNtqUyRXjKbDklq3V.
+
+| Dataset | Phase | Valid samples | Rejected samples | Samples/s | Median | p95 |
+|---|---|---:|---:|---:|---:|---:|
+| DIEGESIS | cold | 4 | 0 | 1.782 | 0.768 s | 0.768 s |
+| DIEGESIS | warm | 32 | 2 | 0.611 | 0.630 s | 5.219 s |
+| MV-Kubric | cold | 4 | 0 | 0.783 | 1.521 s | 1.521 s |
+| MV-Kubric | warm | 32 | 0 | 0.815 | 1.324 s | 1.903 s |
+
+The two DIEGESIS rejections are normal dataset-window rejections and were
+resampled, matching the training and CUDA loader behavior. These measurements
+are CPU-only validation of image availability and loader behavior; no H100
+throughput benchmark was run.
