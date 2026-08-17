@@ -1125,6 +1125,7 @@ def decode_tapvid3d_batch(
     *,
     timing_events: tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event] | None = None,
     nvimagecodec_decoder=None,
+    cuda_stream: int | None = None,
 ) -> Datapoint:
     if device.type != "cuda":
         raise RuntimeError("TAPVid-3D training requires CUDA nvJPEG decoding")
@@ -1144,9 +1145,15 @@ def decode_tapvid3d_batch(
     elif codec == "nvimagecodec":
         if nvimagecodec_decoder is None:
             raise RuntimeError("MV-Kubric GPU decode requires an nvImageCodec decoder")
-        rgb_images = nvimagecodec_decoder.decode(flat_encoded)
+        if cuda_stream is None:
+            raise RuntimeError("MV-Kubric GPU decode requires an explicit CUDA stream")
+        rgb_images = nvimagecodec_decoder.decode(
+            flat_encoded,
+            cuda_stream=cuda_stream,
+        )
         depth_images = nvimagecodec_decoder.decode(
-            [encoded for sample in batch.samples for encoded in sample.depth_bytes]
+            [encoded for sample in batch.samples for encoded in sample.depth_bytes],
+            cuda_stream=cuda_stream,
         )
         decoded_all = [torch.from_dlpack(image.to_dlpack()) for image in rgb_images]
         decoded_depths = [torch.from_dlpack(image.to_dlpack()) for image in depth_images]
@@ -1291,10 +1298,18 @@ def _record_stream(datapoint: Datapoint, stream: torch.cuda.Stream) -> None:
 
 
 class _CudaPrefetchIterator:
-    def __init__(self, source: Iterable, device: torch.device):
+    def __init__(
+        self,
+        source: Iterable,
+        device: torch.device,
+        timing_interval: int,
+    ):
         self.source = iter(source)
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
+        self.timing_interval = timing_interval
+        self.preload_index = 0
+        self.last_timing = None
         self.nvimagecodec_decoder = None
         self.next_item = None
         self._preload()
@@ -1308,7 +1323,14 @@ class _CudaPrefetchIterator:
         if not all(gotit):
             self.next_item = (None, gotit, None)
         else:
-            events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
+            record_timing = (
+                self.timing_interval > 0
+                and self.preload_index % self.timing_interval == 0
+            )
+            events = (
+                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
+                if record_timing else None
+            )
             with torch.cuda.stream(self.stream):
                 if encoded.samples[0].image_codec == "nvimagecodec":
                     if self.nvimagecodec_decoder is None:
@@ -1326,8 +1348,10 @@ class _CudaPrefetchIterator:
                     self.device,
                     timing_events=events,
                     nvimagecodec_decoder=self.nvimagecodec_decoder,
+                    cuda_stream=self.stream.cuda_stream,
                 )
                 self.next_item = (datapoint, gotit, events)
+        self.preload_index += 1
 
     def __iter__(self):
         return self
@@ -1340,24 +1364,41 @@ class _CudaPrefetchIterator:
         datapoint, gotit, events = self.next_item
         if datapoint is not None:
             _record_stream(datapoint, current)
-            events[2].synchronize()
-            decode_ms = events[0].elapsed_time(events[1])
-            prepare_ms = events[0].elapsed_time(events[2])
-            for metadata in datapoint.sample_metadata:
-                metadata["gpu_image_decode_ms"] = decode_ms
-                metadata["gpu_jpeg_decode_ms"] = decode_ms
-                metadata["gpu_prepare_total_ms"] = prepare_ms
+            if events is not None:
+                events[2].synchronize()
+                self.last_timing = (
+                    events[0].elapsed_time(events[1]),
+                    events[0].elapsed_time(events[2]),
+                )
+            if self.last_timing is not None:
+                decode_ms, prepare_ms = self.last_timing
+                for metadata in datapoint.sample_metadata:
+                    metadata["gpu_image_decode_ms"] = decode_ms
+                    metadata["gpu_jpeg_decode_ms"] = decode_ms
+                    metadata["gpu_prepare_total_ms"] = prepare_ms
         self._preload()
         return datapoint, gotit
 
 
 class CudaPrefetchLoader:
-    def __init__(self, loader, device: torch.device | None = None):
+    def __init__(
+        self,
+        loader,
+        device: torch.device | None = None,
+        timing_interval: int = 0,
+    ):
+        if timing_interval < 0:
+            raise ValueError("timing_interval must be non-negative")
         self.loader = loader
         self.device = device or torch.device("cuda", torch.cuda.current_device())
+        self.timing_interval = timing_interval
 
     def __iter__(self):
-        return _CudaPrefetchIterator(self.loader, self.device)
+        return _CudaPrefetchIterator(
+            self.loader,
+            self.device,
+            self.timing_interval,
+        )
 
     def __len__(self):
         return len(self.loader)

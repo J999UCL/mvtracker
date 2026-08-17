@@ -544,7 +544,11 @@ def _build_source_train_loader(dataset, sampler, cfg, fabric):
         use_distributed_sampler=False,
     )
     if requires_cuda_prefetch:
-        loader = CudaPrefetchLoader(loader, device=fabric.device)
+        loader = CudaPrefetchLoader(
+            loader,
+            device=fabric.device,
+            timing_interval=int(cfg.trainer.expensive_diagnostics_interval),
+        )
     return loader
 
 
@@ -1531,7 +1535,11 @@ def main(cfg: DictConfig):
             use_distributed_sampler=train_batch_sampler is None,
         )
         if requires_cuda_prefetch:
-            train_loader = CudaPrefetchLoader(train_loader, device=fabric.device)
+            train_loader = CudaPrefetchLoader(
+                train_loader,
+                device=fabric.device,
+                timing_interval=int(cfg.trainer.expensive_diagnostics_interval),
+            )
         logging.info(f"LEN TRAIN LOADER={len(train_loader)}")
         optimizer_steps_per_epoch = max(
             1,

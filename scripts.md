@@ -162,6 +162,6 @@ W&B. It includes cold/warm samples, p50/p95 wait and throughput, and a
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
 modal container list --json
-modal run --timestamps tools/modal_t4_loader_benchmark.py::profile \
+modal run --detach --timestamps tools/modal_t4_loader_benchmark.py::profile \
   --run-name t4-loader-baseline
 ```
