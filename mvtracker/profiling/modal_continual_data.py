@@ -481,7 +481,9 @@ def profile_encoded_loader(
             batch, gotit = next(iterator)
             if not all(gotit):
                 return dataset_source, None
-            torch.cuda.synchronize()
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream())
+            ready.synchronize()
             return dataset_source, int(batch.video.shape[0] * batch.video.shape[1])
         index = next(iterator)
         sample, gotit = datasets[dataset_source][index]
