@@ -437,7 +437,7 @@ def profile_encoded_loader(
         index = next(iterator)
         sample, gotit = dataset[index]
         if not gotit:
-            raise RuntimeError("encoded-loader profile produced an invalid sample")
+            return None
         if hasattr(sample, "jpeg_bytes"):
             return len(sample.jpeg_bytes)
         return int(sample.video.shape[0])
