@@ -67,6 +67,13 @@ EXPERIMENT_PHASES = {
             "target_completed_steps": 5,
         },
     ),
+    "smoke10": (
+        {
+            "name": "smoke10",
+            "config": "diegesis_mvkubric_gt_ddp_smoke10",
+            "target_completed_steps": 10,
+        },
+    ),
     "main": (
         {
             "name": "main",
@@ -284,7 +291,7 @@ def profile_h100_loader_remote() -> dict:
 )
 def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
     if mode not in EXPERIMENT_PHASES:
-        raise ValueError("mode must be smoke or main")
+        raise ValueError("unsupported training mode")
     require_remote_main_confirmation(mode, confirmation)
     validate_run_name(run_name)
     commit = _source_commit()
@@ -420,6 +427,12 @@ def profile_h100_loader() -> None:
 def smoke(run_name: str = "") -> None:
     selected = _prepare_launch("smoke", run_name, confirm_main=False)
     print(json.dumps(train_remote.remote("smoke", selected, ""), indent=2))
+
+
+@app.local_entrypoint(name="smoke10")
+def smoke10(run_name: str = "") -> None:
+    selected = _prepare_launch("smoke10", run_name, confirm_main=False)
+    print(json.dumps(train_remote.remote("smoke10", selected, ""), indent=2))
 
 
 @app.local_entrypoint(name="train")

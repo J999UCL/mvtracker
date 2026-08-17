@@ -98,6 +98,10 @@ modal run --timestamps tools/modal_continual_training.py::profile-cpu-loader
 modal container list --json
 modal run --timestamps tools/modal_continual_training.py::smoke
 
+# Production-path timing smoke: one phase of exactly 10 optimizer steps.
+modal container list --json
+modal run --timestamps tools/modal_continual_training.py::smoke10
+
 # Main run is deliberately gated and cannot launch without this flag.
 modal container list --json
 modal run --timestamps tools/modal_continual_training.py::train --confirm-main
