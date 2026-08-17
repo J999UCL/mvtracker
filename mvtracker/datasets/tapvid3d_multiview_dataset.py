@@ -1513,8 +1513,11 @@ class CudaPrefetchLoader:
         self.decode_batch_size = decode_batch_size
 
     def __iter__(self):
+        return self.iter_from(iter(self.loader))
+
+    def iter_from(self, source):
         return _CudaPrefetchIterator(
-            self.loader,
+            source,
             self.device,
             self.timing_interval,
             self.queue_depth,

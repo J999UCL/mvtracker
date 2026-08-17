@@ -554,6 +554,16 @@ def _build_source_train_loader(dataset, sampler, cfg, fabric):
     return loader
 
 
+def _start_mixed_source_iterators(train_loaders):
+    raw_iterators = {
+        source: iter(loader.loader) for source, loader in train_loaders.items()
+    }
+    return {
+        source: loader.iter_from(raw_iterators[source])
+        for source, loader in train_loaders.items()
+    }
+
+
 def _run_rank_zero_eval(fabric, cfg, evaluator, model, dataloaders, writer, step):
     """Run validation once using the unwrapped model while other ranks wait."""
     fabric.barrier()
@@ -1760,9 +1770,7 @@ def main(cfg: DictConfig):
         if mixed_training:
             for source, sampler in source_samplers.items():
                 sampler.set_start_cursor(source_cursors[source])
-            data_iters = {
-                source: iter(loader) for source, loader in train_loaders.items()
-            }
+            data_iters = _start_mixed_source_iterators(train_loaders)
             n_batches = (
                 int(cfg.trainer.num_steps) - total_steps
             ) * gradient_accumulation_steps

@@ -34,6 +34,39 @@ class AttrDict(dict):
 
 
 class MixedTrainingIntegrationTests(unittest.TestCase):
+    def test_all_worker_pools_start_before_cuda_producers(self):
+        events = []
+
+        class RawLoader:
+            def __init__(self, source):
+                self.source = source
+
+            def __iter__(self):
+                events.append(f"workers:{self.source}")
+                return iter(())
+
+        class PrefetchLoader:
+            def __init__(self, source):
+                self.source = source
+                self.loader = RawLoader(source)
+
+            def iter_from(self, iterator):
+                events.append(f"producer:{self.source}")
+                return iterator
+
+        start = _load("_start_mixed_source_iterators", {})
+        start({source: PrefetchLoader(source) for source in ("diegesis", "mvkubric")})
+
+        self.assertEqual(
+            events,
+            [
+                "workers:diegesis",
+                "workers:mvkubric",
+                "producer:diegesis",
+                "producer:mvkubric",
+            ],
+        )
+
     def test_source_shape_metrics_accept_float_padding_masks(self):
         metrics = _load(
             "_source_batch_shape_metrics",
