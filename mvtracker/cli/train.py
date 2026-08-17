@@ -1257,7 +1257,7 @@ def main(cfg: DictConfig):
                 just_return_kwargs=True,
             )
             kubric_kwargs["views_to_return"] = list(source_cfg.views)
-            kubric_kwargs["num_views"] = len(source_cfg.views)
+            kubric_kwargs["num_views"] = -1
             eval_dataset = KubricMultiViewDataset(**kubric_kwargs)
         elif dataset_name.startswith("tapvid2d-davis-"):
             eval_dataset = TapVidDataset.from_name(dataset_name, cfg.datasets.root)
