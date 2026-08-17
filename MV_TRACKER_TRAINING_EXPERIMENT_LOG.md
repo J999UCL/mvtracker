@@ -596,3 +596,35 @@ The two DIEGESIS rejections are normal dataset-window rejections and were
 resampled, matching the training and CUDA loader behavior. These measurements
 are CPU-only validation of image availability and loader behavior; no H100
 throughput benchmark was run.
+
+## 2026-08-17 — Asynchronous CUDA loader profile
+
+The production encoded loader now prepares samples in a bounded background
+queue, batches compatible view counts for decode, runs RGB and depth decode on
+separate CUDA streams, and uses per-group completion events. The training thread
+therefore waits only for the sample it consumes. The production-safe bounds are
+four queued source batches and two source batches per decode submission.
+
+The final profile used one tagged T4, 8 loader workers, 4 warm-up samples and 16
+measured samples per case. The first queue-8/decode-4 trial completed each fixed
+source but exhausted the 15 GB T4 when both source queues were active; it was
+replaced by the bounded configuration below.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/pe2dyzla
+- Modal artifact: `jeet-mvtracker-runs-v2/t4-loader-benchmark/t4-loader-async-bounded-8d7989a.json`
+- Runtime: 3 minutes 46 seconds
+
+| Case | Samples/s from exposed loader time | Wait p50 | Wait p95 |
+|---|---:|---:|---:|
+| DIEGESIS, 4 views | 1.556 | 0.795 s | 1.597 s |
+| MV-Kubric, 4 views | 1.194 | 0.661 s | 2.296 s |
+| MV-Kubric, 6 views | 0.816 | 0.971 s | 4.675 s |
+| Alternating DIEGESIS/MV-Kubric, 4 views with 1.25 s compute | 7.873 | 0.0017 s | 0.984 s |
+
+Against the valid short baseline, fixed-source throughput improved by 1.1% for
+DIEGESIS-4, 5.5% for MV-Kubric-4 and 12.0% for MV-Kubric-6. More importantly,
+the representative alternating schedule reduced aggregate exposed loader wait
+from about 10.29 seconds to 2.03 seconds across 16 samples, an 80.3% reduction.
+This benchmark measures loader exposure rather than model throughput; the
+alternating case demonstrates that preparation is hidden when model compute is
+available to overlap it.
