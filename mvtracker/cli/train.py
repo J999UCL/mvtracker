@@ -67,6 +67,75 @@ LATEST_CHECKPOINT_MANIFEST = "latest_checkpoint.json"
 WANDB_RUN_ID_FILE = "wandb_run_id.txt"
 
 
+class _ContainerHardwareMonitor:
+    """Read CPU and memory usage for the complete Linux container cgroup."""
+
+    def __init__(self, cgroup_root=Path("/sys/fs/cgroup")):
+        self.cgroup_root = Path(cgroup_root)
+        self._last_cpu_seconds = self._cpu_usage_seconds()
+        self._last_sample_time = time.monotonic()
+
+    def _cpu_usage_seconds(self):
+        fields = dict(
+            line.split(maxsplit=1)
+            for line in (self.cgroup_root / "cpu.stat").read_text().splitlines()
+        )
+        return int(fields["usage_usec"]) / 1_000_000.0
+
+    def _cpu_limit(self):
+        quota, period = (self.cgroup_root / "cpu.max").read_text().split()
+        if quota == "max":
+            return float(len(os.sched_getaffinity(0)))
+        return int(quota) / int(period)
+
+    def sample(self):
+        sample_time = time.monotonic()
+        cpu_seconds = self._cpu_usage_seconds()
+        elapsed = sample_time - self._last_sample_time
+        cpu_cores = (cpu_seconds - self._last_cpu_seconds) / elapsed
+        self._last_cpu_seconds = cpu_seconds
+        self._last_sample_time = sample_time
+
+        memory_used = int((self.cgroup_root / "memory.current").read_text())
+        memory_limit = int((self.cgroup_root / "memory.max").read_text())
+        available_cpus = self._cpu_limit()
+        return {
+            "hardware/container/cpu_cores_used": cpu_cores,
+            "hardware/container/cpu_utilization_percent": (
+                100.0 * cpu_cores / available_cpus
+            ),
+            "hardware/container/memory_used_gib": memory_used / (1024 ** 3),
+            "hardware/container/memory_limit_gib": memory_limit / (1024 ** 3),
+            "hardware/container/memory_utilization_percent": (
+                100.0 * memory_used / memory_limit
+            ),
+        }
+
+
+class _RankGpuMonitor:
+    """Sample the GPU assigned to one DDP rank through NVML."""
+
+    def __init__(self, device_index):
+        import pynvml
+
+        pynvml.nvmlInit()
+        self._pynvml = pynvml
+        self._handle = pynvml.nvmlDeviceGetHandleByIndex(int(device_index))
+
+    def sample(self):
+        utilization = self._pynvml.nvmlDeviceGetUtilizationRates(self._handle)
+        memory = self._pynvml.nvmlDeviceGetMemoryInfo(self._handle)
+        return {
+            "utilization_percent": float(utilization.gpu),
+            "memory_used_gib": memory.used / (1024 ** 3),
+            "memory_total_gib": memory.total / (1024 ** 3),
+            "memory_utilization_percent": 100.0 * memory.used / memory.total,
+        }
+
+    def close(self):
+        self._pynvml.nvmlShutdown()
+
+
 def _scale_microbatch_loss(loss, gradient_accumulation_steps):
     """Scale one microbatch loss so accumulated gradients form a batch mean."""
     if gradient_accumulation_steps < 1:
@@ -255,6 +324,33 @@ def _reduce_scalar_dict(fabric, values, reduce_op="mean"):
     return {
         name: _reduce_scalar(fabric, value, reduce_op=reduce_op)
         for name, value in values.items()
+    }
+
+
+def _gather_rank_metrics(fabric, values):
+    """Gather one scalar mapping from every rank without averaging ranks away."""
+    names = tuple(sorted(values))
+    local = torch.tensor(
+        [values[name] for name in names],
+        device=fabric.device,
+        dtype=torch.float64,
+    )
+    gathered = fabric.all_gather(local).reshape(fabric.world_size, len(names))
+    return {
+        f"hardware/gpu_{rank}/{name}": float(gathered[rank, index].item())
+        for rank in range(fabric.world_size)
+        for index, name in enumerate(names)
+    }
+
+
+def _throughput_metrics(step_seconds, global_samples, global_trajectories):
+    return {
+        "performance/global_samples": global_samples,
+        "performance/global_trajectories": global_trajectories,
+        "performance/samples_per_second": global_samples / step_seconds,
+        "performance/trajectories_per_second": (
+            global_trajectories / step_seconds
+        ),
     }
 
 
@@ -1604,6 +1700,13 @@ def main(cfg: DictConfig):
     logging.info(f"Registered signal handlers for SIGUSR1 and SIGTERM.")
 
     model.train()
+    hardware_metrics_interval = int(cfg.trainer.get("hardware_metrics_interval", 10))
+    if hardware_metrics_interval < 1:
+        raise ValueError("trainer.hardware_metrics_interval must be at least 1")
+    gpu_monitor = _RankGpuMonitor(torch.cuda.current_device())
+    container_monitor = (
+        _ContainerHardwareMonitor() if fabric.global_rank == 0 else None
+    )
     should_keep_training = total_steps < cfg.trainer.num_steps
     total_batches_loaded = 0
     total_batches_failed = 0
@@ -1683,6 +1786,8 @@ def main(cfg: DictConfig):
         accumulated_source_counts = {}
         accumulated_source_view_counts = {}
         accumulated_source_track_counts = {}
+        accumulated_sample_count = 0
+        accumulated_trajectory_count = 0.0
         microbatch_gradient_norms = []
         microbatch_gradient_cosines = []
 
@@ -1764,6 +1869,11 @@ def main(cfg: DictConfig):
                         )
             if current_source is not None:
                 source_view_count, source_track_count = _source_batch_shape_metrics(batch)
+            else:
+                _, source_track_count = _source_batch_shape_metrics(batch)
+            batch_scene_count = int(batch.video.shape[0])
+            accumulated_sample_count += batch_scene_count
+            accumulated_trajectory_count += source_track_count * batch_scene_count
 
             train_iters = cfg.trainer.train_iters
             if cfg.trainer.augment_train_iters:
@@ -2010,7 +2120,15 @@ def main(cfg: DictConfig):
                 optimizer.step()
                 scheduler.step()
             accumulated_bwd_duration += time.time() - optimizer_update_started_at
+            training_step_duration = time.time() - accumulation_started_at
             total_steps += 1
+            hardware_metrics = {}
+            if total_steps == 1 or total_steps % hardware_metrics_interval == 0:
+                hardware_metrics = _gather_rank_metrics(
+                    fabric, gpu_monitor.sample()
+                )
+                if container_monitor is not None:
+                    hardware_metrics.update(container_monitor.sample())
             if mixed_training:
                 checkpoint_source_cursors = dict(source_cursors)
 
@@ -2250,7 +2368,7 @@ def main(cfg: DictConfig):
                     seq_name=batch.seq_name,
                 )
 
-            total_duration = time.time() - accumulation_started_at
+            total_duration = training_step_duration
             reduced_timing = _reduce_scalar_dict(
                 fabric,
                 {
@@ -2275,6 +2393,20 @@ def main(cfg: DictConfig):
             fwd_duration = reduced_timing["forward"]
             sync_duration = reduced_timing["sync"]
             bwd_duration = reduced_timing["backward"]
+            step_wall_seconds = _reduce_scalar(
+                fabric, training_step_duration, reduce_op="max"
+            )
+            global_sample_count = _reduce_scalar(
+                fabric, accumulated_sample_count, reduce_op="sum"
+            )
+            global_trajectory_count = _reduce_scalar(
+                fabric, accumulated_trajectory_count, reduce_op="sum"
+            )
+            throughput_metrics = _throughput_metrics(
+                step_wall_seconds,
+                global_sample_count,
+                global_trajectory_count,
+            )
             sampling_metrics = _reduce_scalar_dict(
                 fabric,
                 {
@@ -2298,6 +2430,9 @@ def main(cfg: DictConfig):
                 total_durations.append(total_duration)
 
                 tb_writer.add_scalar(f"timing/step", total_duration, total_steps)
+                tb_writer.add_scalar(
+                    "timing/step_wall", step_wall_seconds, total_steps
+                )
                 tb_writer.add_scalar(f"timing/only_fwd", fwd_durations[-1], total_steps)
                 tb_writer.add_scalar(f"timing/only_sync", sync_durations[-1], total_steps)
                 tb_writer.add_scalar(f"timing/only_bwd", bwd_durations[-1], total_steps)
@@ -2317,6 +2452,10 @@ def main(cfg: DictConfig):
                     reduced_timing["gpu_prepare"],
                     total_steps,
                 )
+                for name, value in throughput_metrics.items():
+                    tb_writer.add_scalar(name, value, total_steps)
+                for name, value in hardware_metrics.items():
+                    tb_writer.add_scalar(name, value, total_steps)
                 if sampling_metrics:
                     for name, value in sampling_metrics.items():
                         tb_writer.add_scalar(f"sampling/{name}", value, total_steps)
@@ -2420,6 +2559,8 @@ def main(cfg: DictConfig):
             accumulated_source_counts = {}
             accumulated_source_view_counts = {}
             accumulated_source_track_counts = {}
+            accumulated_sample_count = 0
+            accumulated_trajectory_count = 0.0
             microbatch_gradient_norms = []
             microbatch_gradient_cosines = []
 
@@ -2440,6 +2581,7 @@ def main(cfg: DictConfig):
     if torch_profiler is not None:
         torch_profiler.stop()
     gradient_diagnostics.close()
+    gpu_monitor.close()
 
     save_path = f"{cfg.experiment_path}/model_final.pth"
     logging.info(f"Saving file {save_path}")

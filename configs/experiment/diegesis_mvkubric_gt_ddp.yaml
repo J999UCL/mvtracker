@@ -169,6 +169,7 @@ trainer:
   grad_clip: 1.0
   gradient_accumulation_steps: 4
   expensive_diagnostics_interval: 50
+  hardware_metrics_interval: 10
   precision: bf16-mixed
   visibility_loss_weight: 0.1
 

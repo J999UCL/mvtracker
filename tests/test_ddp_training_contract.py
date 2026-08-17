@@ -21,6 +21,14 @@ def _function_node(name):
     )
 
 
+def _class_node(name):
+    return next(
+        node
+        for node in TRAIN_TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == name
+    )
+
+
 def _load_functions(*names, namespace=None):
     nodes = [_function_node(name) for name in names]
     module = ast.Module(body=nodes, type_ignores=[])
@@ -30,6 +38,66 @@ def _load_functions(*names, namespace=None):
 
 
 class DDPTrainingContractTests(unittest.TestCase):
+    def test_container_metrics_use_cgroup_cpu_and_memory(self):
+        ticks = iter((10.0, 12.0))
+        module = ast.Module(
+            body=[_class_node("_ContainerHardwareMonitor")], type_ignores=[]
+        )
+        namespace = {
+            "Path": Path,
+            "time": SimpleNamespace(monotonic=lambda: next(ticks)),
+            "os": SimpleNamespace(sched_getaffinity=lambda _pid: range(8)),
+        }
+        exec(compile(ast.fix_missing_locations(module), str(TRAIN_PATH), "exec"), namespace)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cpu.stat").write_text("usage_usec 1000000\n")
+            (root / "cpu.max").write_text("400000 100000\n")
+            (root / "memory.current").write_text(str(8 * 1024 ** 3))
+            (root / "memory.max").write_text(str(16 * 1024 ** 3))
+            monitor = namespace["_ContainerHardwareMonitor"](root)
+            (root / "cpu.stat").write_text("usage_usec 5000000\n")
+
+            metrics = monitor.sample()
+
+        self.assertEqual(metrics["hardware/container/cpu_cores_used"], 2.0)
+        self.assertEqual(metrics["hardware/container/cpu_utilization_percent"], 50.0)
+        self.assertEqual(metrics["hardware/container/memory_used_gib"], 8.0)
+        self.assertEqual(metrics["hardware/container/memory_utilization_percent"], 50.0)
+
+    def test_throughput_uses_global_work_and_step_wall_time(self):
+        (throughput_metrics,) = _load_functions("_throughput_metrics")
+
+        metrics = throughput_metrics(4.0, 8, 4096)
+
+        self.assertEqual(metrics["performance/global_samples"], 8)
+        self.assertEqual(metrics["performance/global_trajectories"], 4096)
+        self.assertEqual(metrics["performance/samples_per_second"], 2.0)
+        self.assertEqual(metrics["performance/trajectories_per_second"], 1024.0)
+
+    def test_gpu_metrics_keep_both_ddp_ranks_separate(self):
+        (gather_rank_metrics,) = _load_functions(
+            "_gather_rank_metrics", namespace={"torch": torch}
+        )
+
+        class Fabric:
+            device = torch.device("cpu")
+            world_size = 2
+
+            @staticmethod
+            def all_gather(_local):
+                return torch.tensor([[75.0, 20.0], [62.0, 18.0]])
+
+        metrics = gather_rank_metrics(
+            Fabric(), {"utilization_percent": 0.0, "memory_used_gib": 0.0}
+        )
+
+        self.assertEqual(metrics["hardware/gpu_0/utilization_percent"], 20.0)
+        self.assertEqual(metrics["hardware/gpu_1/utilization_percent"], 18.0)
+        self.assertEqual(metrics["hardware/gpu_0/memory_used_gib"], 75.0)
+        self.assertEqual(metrics["hardware/gpu_1/memory_used_gib"], 62.0)
+
     def test_onecycle_uses_independent_schedule_horizon(self):
         (fetch_optimizer,) = _load_functions(
             "fetch_optimizer",

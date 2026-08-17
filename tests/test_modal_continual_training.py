@@ -42,6 +42,7 @@ class ContinualTrainingConfigTests(unittest.TestCase):
         self.assertEqual(trainer["gradient_accumulation_steps"], 4)
         self.assertEqual(trainer["lr"], 2e-5)
         self.assertEqual(trainer["anneal_strategy"], "linear")
+        self.assertEqual(trainer["hardware_metrics_interval"], 10)
 
     def test_base_config_preserves_legacy_scheduler_horizon(self):
         base = yaml.safe_load((ROOT / "configs/train.yaml").read_text(encoding="utf-8"))
