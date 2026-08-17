@@ -52,6 +52,7 @@ def _load_module():
         query_points: object = None
         query_points_3d: object = None
         sample_metadata: object = None
+        track_padding_mask: object = None
         track_upscaling_factor: object = 1.0
 
     @dataclass(frozen=True)
@@ -98,6 +99,33 @@ def _load_module():
 
 
 loader = _load_module()
+
+
+class CudaDecodeBatchSplitTests(unittest.TestCase):
+    def test_split_removes_padding_from_other_decode_batches(self):
+        datapoint = loader.Datapoint(
+            video=torch.zeros(2, 1, 1, 3, 2, 2),
+            segmentation=None,
+            trajectory=torch.zeros(2, 1, 1, 5, 3),
+            trajectory_3d=torch.zeros(2, 1, 5, 3),
+            visibility=torch.ones(2, 1, 1, 5, dtype=torch.bool),
+            valid=torch.ones(2, 1, 5),
+            seq_name=["short", "long"],
+            query_points_3d=torch.zeros(2, 5, 4),
+            sample_metadata=[{}, {}],
+            track_padding_mask=torch.tensor(
+                [[False, False, False, True, True], [False] * 5]
+            ),
+        )
+
+        result = loader._CudaPrefetchIterator._slice_datapoint(
+            datapoint, 0, 1, track_count=3
+        )
+
+        self.assertEqual(result.trajectory.shape[-2], 3)
+        self.assertEqual(result.visibility.shape[-1], 3)
+        self.assertEqual(result.query_points_3d.shape[-2], 3)
+        self.assertEqual(result.track_padding_mask.shape[-1], 3)
 
 
 def _jpeg_bytes(height, width, value):

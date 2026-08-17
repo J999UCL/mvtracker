@@ -1354,13 +1354,30 @@ class _CudaPrefetchIterator:
         return keys[0]
 
     @staticmethod
-    def _slice_datapoint(datapoint: Datapoint, start: int, end: int) -> Datapoint:
+    def _slice_datapoint(
+        datapoint: Datapoint,
+        start: int,
+        end: int,
+        track_count: int,
+    ) -> Datapoint:
+        track_axes = {
+            "trajectory": -2,
+            "trajectory_3d": -2,
+            "visibility": -1,
+            "valid": -1,
+            "query_points_3d": -2,
+            "track_padding_mask": -1,
+        }
         values = {}
         batch_size = len(datapoint.seq_name)
         for field in fields(Datapoint):
             value = getattr(datapoint, field.name)
             if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == batch_size:
                 value = value[start:end]
+                if field.name in track_axes:
+                    slices = [slice(None)] * value.ndim
+                    slices[track_axes[field.name]] = slice(0, track_count)
+                    value = value[tuple(slices)]
             elif isinstance(value, list) and len(value) == batch_size:
                 value = value[start:end]
             values[field.name] = value
@@ -1392,9 +1409,12 @@ class _CudaPrefetchIterator:
         outputs = []
         for position, encoded, gotit in items:
             end = offset + len(encoded.samples)
+            track_count = max(
+                int(sample.trajectory.shape[-2]) for sample in encoded.samples
+            )
             outputs.append((
                 position,
-                self._slice_datapoint(datapoint, offset, end),
+                self._slice_datapoint(datapoint, offset, end, track_count),
                 gotit,
                 events,
                 ready_event,
