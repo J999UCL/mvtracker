@@ -19,7 +19,6 @@ from modal_training_profile import (
     run_volume,
     wandb_secret,
 )
-from mvtracker.profiling.modal_continual_data import profile_encoded_loader
 from mvtracker.profiling.modal_continual_training import (
     DATASET_IMAGE_ROOT,
     DATASET_IMAGE_VERSION,
@@ -81,6 +80,7 @@ def profile_t4_loader_remote(
     measured: int = 32,
 ) -> dict:
     import wandb
+    from mvtracker.profiling.modal_continual_data import profile_encoded_loader
 
     if _RUN_NAME.fullmatch(run_name) is None:
         raise ValueError("run name contains unsupported characters")
