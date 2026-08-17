@@ -76,17 +76,17 @@ class _ContainerHardwareMonitor:
         self._last_sample_time = time.monotonic()
 
     def _cpu_usage_seconds(self):
-        fields = dict(
-            line.split(maxsplit=1)
-            for line in (self.cgroup_root / "cpu.stat").read_text().splitlines()
+        usage_ns = int(
+            (self.cgroup_root / "cpuacct/cpuacct.usage").read_text()
         )
-        return int(fields["usage_usec"]) / 1_000_000.0
+        return usage_ns / 1_000_000_000.0
 
     def _cpu_limit(self):
-        quota, period = (self.cgroup_root / "cpu.max").read_text().split()
-        if quota == "max":
+        quota = int((self.cgroup_root / "cpu/cpu.cfs_quota_us").read_text())
+        period = int((self.cgroup_root / "cpu/cpu.cfs_period_us").read_text())
+        if quota < 0:
             return float(len(os.sched_getaffinity(0)))
-        return int(quota) / int(period)
+        return quota / period
 
     def sample(self):
         sample_time = time.monotonic()
@@ -96,8 +96,12 @@ class _ContainerHardwareMonitor:
         self._last_cpu_seconds = cpu_seconds
         self._last_sample_time = sample_time
 
-        memory_used = int((self.cgroup_root / "memory.current").read_text())
-        memory_limit = int((self.cgroup_root / "memory.max").read_text())
+        memory_used = int(
+            (self.cgroup_root / "memory/memory.usage_in_bytes").read_text()
+        )
+        memory_limit = int(
+            (self.cgroup_root / "memory/memory.limit_in_bytes").read_text()
+        )
         available_cpus = self._cpu_limit()
         return {
             "hardware/container/cpu_cores_used": cpu_cores,

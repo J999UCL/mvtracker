@@ -52,12 +52,16 @@ class DDPTrainingContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "cpu.stat").write_text("usage_usec 1000000\n")
-            (root / "cpu.max").write_text("400000 100000\n")
-            (root / "memory.current").write_text(str(8 * 1024 ** 3))
-            (root / "memory.max").write_text(str(16 * 1024 ** 3))
+            (root / "cpuacct").mkdir()
+            (root / "cpu").mkdir()
+            (root / "memory").mkdir()
+            (root / "cpuacct/cpuacct.usage").write_text("1000000000\n")
+            (root / "cpu/cpu.cfs_quota_us").write_text("400000\n")
+            (root / "cpu/cpu.cfs_period_us").write_text("100000\n")
+            (root / "memory/memory.usage_in_bytes").write_text(str(8 * 1024 ** 3))
+            (root / "memory/memory.limit_in_bytes").write_text(str(16 * 1024 ** 3))
             monitor = namespace["_ContainerHardwareMonitor"](root)
-            (root / "cpu.stat").write_text("usage_usec 5000000\n")
+            (root / "cpuacct/cpuacct.usage").write_text("5000000000\n")
 
             metrics = monitor.sample()
 
