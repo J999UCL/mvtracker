@@ -9,14 +9,13 @@ from pathlib import Path
 
 import modal
 
-from modal_continual_training import dataset_image
+from modal_continual_training import dataset_image, preflight_active_containers
 from modal_training_profile import (
     BASE_TAGS,
     RUN_ROOT,
     _RUN_NAME,
     _source_commit,
     _source_image,
-    preflight_active_containers,
     run_volume,
     wandb_secret,
 )
