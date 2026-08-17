@@ -152,11 +152,11 @@ modal run --timestamps tools/modal_mvkubric_shard.py::benchmark_shards
 
 ## Single-T4 production loader benchmark
 
-The reusable T4 harness uses the cached continual-training dataset image, one
-tagged T4 container, deterministic DIEGESIS/MV-Kubric view cases, and writes a
-JSON report under `jeet-mvtracker-runs-v2` while logging the same metrics to
-W&B. It includes cold/warm samples, p50/p95 wait and throughput, and a
-1.25-second simulated-compute overlap check.
+The reusable T4 harness uses the cached continual-training dataset image and
+one tagged T4 container. It runs warm-only DIEGESIS-4-view, MV-Kubric-4/6-view,
+and mixed-view-4 cases with 16 measured samples. Only the mixed case includes
+the 1.25-second simulated-compute gap. Every case logs progress immediately to
+stdout and W&B and commits a partial JSON report to `jeet-mvtracker-runs-v2`.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker

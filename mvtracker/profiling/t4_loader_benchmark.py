@@ -14,10 +14,6 @@ T4_MAX_CONTAINERS = 1
 T4_WORKERS = 8
 SIMULATED_COMPUTE_SECONDS = 1.25
 SOURCE_SCHEDULE = ("diegesis", "mvkubric", "diegesis", "mvkubric")
-VIEW_CASES = {
-    "diegesis": (1, 2, 4),
-    "mvkubric": (1, 2, 4, 6),
-}
 
 
 @dataclass(frozen=True)
@@ -30,10 +26,10 @@ class LoaderCase:
         return f"{self.source}-views{self.views}"
 
 
-CASES = tuple(
-    LoaderCase(source, views)
-    for source, view_counts in VIEW_CASES.items()
-    for views in view_counts
+CASES = (
+    LoaderCase("diegesis", 4),
+    LoaderCase("mvkubric", 4),
+    LoaderCase("mvkubric", 6),
 )
 
 
@@ -71,40 +67,35 @@ def run_case_matrix(
     workers: int = T4_WORKERS,
     simulated_compute_seconds: float = SIMULATED_COMPUTE_SECONDS,
     hardware_sampler: Callable[[], Mapping[str, object]] | None = None,
+    progress_callback: Callable[[str, str, Mapping[str, object] | None], None] | None = None,
 ) -> dict[str, object]:
-    """Run all fixed-view cases plus the production alternating source schedule."""
+    """Run the short warm-only matrix and report each case as it completes."""
     profiles: dict[str, Mapping[str, object]] = {}
     for case in CASES:
-        profiles[case.name] = {
-            "cold": _run_profile(
-                profile_loader, case, warmup=0, measured=measured,
-                workers=workers, simulated_compute_seconds=simulated_compute_seconds,
-                hardware_sampler=hardware_sampler,
-            ),
-            "warm": _run_profile(
-                profile_loader, case, warmup=warmup, measured=measured,
-                workers=workers, simulated_compute_seconds=simulated_compute_seconds,
-                hardware_sampler=hardware_sampler,
-            ),
-        }
+        if progress_callback is not None:
+            progress_callback("started", case.name, None)
+        result = _run_profile(
+            profile_loader, case, warmup=warmup, measured=measured,
+            workers=workers, simulated_compute_seconds=0.0,
+            hardware_sampler=hardware_sampler,
+        )
+        profiles[case.name] = result
+        if progress_callback is not None:
+            progress_callback("completed", case.name, result)
 
-    schedule_profile = {
-        "cold": profile_loader(
-            source="diegesis", source_schedule=SOURCE_SCHEDULE, view_count=4,
-            warmup=0, measured=measured, workers=workers, use_cuda=True,
-            simulated_compute_seconds=simulated_compute_seconds,
-            hardware_sampler=hardware_sampler,
-        ),
-        "warm": profile_loader(
-            source="diegesis", source_schedule=SOURCE_SCHEDULE, view_count=4,
-            warmup=warmup, measured=measured, workers=workers, use_cuda=True,
-            simulated_compute_seconds=simulated_compute_seconds,
-            hardware_sampler=hardware_sampler,
-        ),
-    }
-    for phase in schedule_profile.values():
-        if tuple(phase.get("source_schedule", ())) != SOURCE_SCHEDULE:
-            raise ValueError("alternating profile did not preserve the production source schedule")
+    schedule_name = "alternating-dkdk-views4"
+    if progress_callback is not None:
+        progress_callback("started", schedule_name, None)
+    schedule_profile = profile_loader(
+        source="diegesis", source_schedule=SOURCE_SCHEDULE, view_count=4,
+        warmup=warmup, measured=measured, workers=workers, use_cuda=True,
+        simulated_compute_seconds=simulated_compute_seconds,
+        hardware_sampler=hardware_sampler,
+    )
+    if tuple(schedule_profile.get("source_schedule", ())) != SOURCE_SCHEDULE:
+        raise ValueError("alternating profile did not preserve the production source schedule")
+    if progress_callback is not None:
+        progress_callback("completed", schedule_name, schedule_profile)
     return {
         "cases": profiles,
         "alternating_source_schedule": schedule_profile,
@@ -115,7 +106,8 @@ def run_case_matrix(
         "warmup": warmup,
         "measured": measured,
         "workers": workers,
-        "simulated_compute_seconds": simulated_compute_seconds,
+        "fixed_case_simulated_compute_seconds": 0.0,
+        "alternating_simulated_compute_seconds": simulated_compute_seconds,
     }
 
 

@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class T4LoaderBenchmarkTests(unittest.TestCase):
     def test_case_matrix_and_alternating_schedule_are_fixed(self):
         calls = []
+        progress = []
 
         def profile(**kwargs):
             calls.append(kwargs)
@@ -31,18 +32,27 @@ class T4LoaderBenchmarkTests(unittest.TestCase):
                 "max_exposed_wait_seconds": 0.3,
             }
 
-        result = run_case_matrix(profile, warmup=4, measured=2)
+        result = run_case_matrix(
+            profile,
+            warmup=4,
+            measured=2,
+            progress_callback=lambda event, name, payload: progress.append(
+                (event, name, payload)
+            ),
+        )
 
         self.assertEqual(
             [case.name for case in CASES],
-            ["diegesis-views1", "diegesis-views2", "diegesis-views4",
-             "mvkubric-views1", "mvkubric-views2", "mvkubric-views4", "mvkubric-views6"],
+            ["diegesis-views4", "mvkubric-views4", "mvkubric-views6"],
         )
         self.assertEqual(result["source_schedule"], list(SOURCE_SCHEDULE))
         self.assertEqual(result["alternating_schedule_label"], "representative-fixed-view4")
-        self.assertEqual(len(calls), 16)
+        self.assertEqual(len(calls), 4)
         self.assertEqual(calls[-1]["source_schedule"], SOURCE_SCHEDULE)
-        self.assertEqual(result["cases"]["mvkubric-views6"]["cold"]["view_count"], 6)
+        self.assertEqual(result["cases"]["mvkubric-views6"]["view_count"], 6)
+        self.assertEqual(len(progress), 8)
+        self.assertEqual(progress[0][:2], ("started", "diegesis-views4"))
+        self.assertEqual(progress[-1][:2], ("completed", "alternating-dkdk-views4"))
 
     def test_container_monitor_reports_cpu_and_ram(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -72,6 +82,7 @@ class T4LoaderBenchmarkTests(unittest.TestCase):
         self.assertIn("Path(DATASET_IMAGE_ROOT)", source)
         self.assertIn("run_volume.commit()", source)
         self.assertIn("wandb.init", source)
+        self.assertIn("PROFILE_PROGRESS", source)
 
     def test_profile_waits_only_for_the_current_cuda_stream(self):
         source = (

@@ -77,7 +77,7 @@ def profile_t4_loader_remote(
     run_name: str,
     *,
     warmup: int = 4,
-    measured: int = 32,
+    measured: int = 16,
 ) -> dict:
     import wandb
     from mvtracker.profiling.modal_continual_data import profile_encoded_loader
@@ -93,7 +93,7 @@ def profile_t4_loader_remote(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
         job_type="t4-loader-benchmark",
-        tags=["modal", "t4", "loader", "cold-warm", "production-path"],
+        tags=["modal", "t4", "loader", "warm-only", "production-path"],
         config={
             "source_commit": _source_commit(),
             "gpu": T4_GPU_REQUEST,
@@ -102,6 +102,24 @@ def profile_t4_loader_remote(
             **MODAL_TAGS,
         },
     )
+    output_dir = RUN_ROOT / RUN_SUBDIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = output_dir / f"{run_name}.json"
+    progress = {
+        "format": "mvtracker_t4_loader_benchmark_progress",
+        "source_commit": _source_commit(),
+        "status": "running",
+        "current_case": None,
+        "completed": {},
+    }
+
+    def write_progress():
+        artifact_path.write_text(
+            json.dumps(progress, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        run_volume.commit()
+
     try:
         def sample_hardware():
             return {
@@ -113,6 +131,25 @@ def profile_t4_loader_remote(
             profile_encoded_loader,
             Path(DATASET_IMAGE_ROOT),
         )
+
+        def report_progress(event, case_name, result):
+            progress["current_case"] = case_name if event == "started" else None
+            if result is not None:
+                progress["completed"][case_name] = result
+            print(
+                f"PROFILE_PROGRESS event={event} case={case_name} "
+                f"completed={len(progress['completed'])}/4",
+                flush=True,
+            )
+            metrics = {
+                "progress/cases_completed": len(progress["completed"]),
+                f"progress/{case_name}/completed": int(event == "completed"),
+            }
+            if result is not None:
+                metrics.update(_flatten_scalars(result, f"profiles/{case_name}"))
+            run.log(metrics)
+            write_progress()
+
         profiles = run_case_matrix(
             profile_loader,
             warmup=warmup,
@@ -120,6 +157,7 @@ def profile_t4_loader_remote(
             workers=T4_WORKERS,
             simulated_compute_seconds=SIMULATED_COMPUTE_SECONDS,
             hardware_sampler=sample_hardware,
+            progress_callback=report_progress,
         )
         hardware = {
             "cpu_ram": container_monitor.sample(),
@@ -135,9 +173,8 @@ def profile_t4_loader_remote(
             "profiles": profiles,
             "hardware": hardware,
         }
-        output_dir = RUN_ROOT / RUN_SUBDIR
-        output_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = output_dir / f"{run_name}.json"
+        progress["status"] = "completed"
+        progress["current_case"] = None
         artifact_path.write_text(
             json.dumps(artifact, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
@@ -152,7 +189,7 @@ def profile_t4_loader_remote(
 
 
 @app.local_entrypoint(name="profile")
-def profile(run_name: str = "", warmup: int = 4, measured: int = 32) -> None:
+def profile(run_name: str = "", warmup: int = 4, measured: int = 16) -> None:
     commit = _source_commit()
     preflight_active_containers(required_free_slots=1)
     selected = run_name or _default_run_name(commit)
