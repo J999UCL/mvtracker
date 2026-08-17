@@ -288,7 +288,6 @@ class WandbRunReader:
             rows = self.run.scan_history(
                 page_size=1000,
                 min_step=self._next_history_step,
-                use_cache=False,
             )
             for row in rows:
                 history_step = int(row["_step"])
