@@ -472,7 +472,7 @@ def profile_encoded_loader(
 
     source_cursor = 0
 
-    def consume() -> tuple[str, int | None]:
+    def consume() -> tuple[str, int | None, dict | None]:
         nonlocal source_cursor
         dataset_source = source_schedule[source_cursor % len(source_schedule)]
         source_cursor += 1
@@ -480,21 +480,25 @@ def profile_encoded_loader(
         if use_cuda:
             batch, gotit = next(iterator)
             if not all(gotit):
-                return dataset_source, None
+                return dataset_source, None, None
             torch.cuda.synchronize()
-            return dataset_source, int(batch.video.shape[0] * batch.video.shape[1])
+            return (
+                dataset_source,
+                int(batch.video.shape[0] * batch.video.shape[1]),
+                batch.sample_metadata[0],
+            )
         index = next(iterator)
         sample, gotit = datasets[dataset_source][index]
         if not gotit:
-            return dataset_source, None
+            return dataset_source, None, None
         if hasattr(sample, "jpeg_bytes"):
-            return dataset_source, len(sample.jpeg_bytes)
-        return dataset_source, int(sample.video.shape[0])
+            return dataset_source, len(sample.jpeg_bytes), sample.metadata
+        return dataset_source, int(sample.video.shape[0]), sample.metadata
 
     warmup_done = 0
     rejected = 0
     while warmup_done < warmup:
-        _, frame_count = consume()
+        _, frame_count, _ = consume()
         if frame_count is None:
             rejected += 1
         else:
@@ -502,18 +506,20 @@ def profile_encoded_loader(
     sample_seconds = []
     exposed_wait_seconds = []
     measured_sources = []
+    worker_prepare_seconds = []
     hardware_samples = []
     encoded_frames = 0
     started = time.perf_counter()
     while len(sample_seconds) < measured:
         sample_started = time.perf_counter()
-        measured_source, frame_count = consume()
+        measured_source, frame_count, metadata = consume()
         if frame_count is None:
             rejected += 1
             continue
         sample_seconds.append(time.perf_counter() - sample_started)
         exposed_wait_seconds.append(sample_seconds[-1])
         measured_sources.append(measured_source)
+        worker_prepare_seconds.append(float(metadata["worker_prepare_seconds"]))
         encoded_frames += frame_count
         if hardware_sampler is not None:
             hardware_samples.append(hardware_sampler())
@@ -546,6 +552,8 @@ def profile_encoded_loader(
         "view_count": view_count,
         "source_schedule": list(source_schedule),
         "measured_sources": measured_sources,
+        "worker_prepare_seconds_p50": sorted(worker_prepare_seconds)[len(worker_prepare_seconds) // 2],
+        "worker_prepare_seconds_p95": sorted(worker_prepare_seconds)[max(0, int(len(worker_prepare_seconds) * 0.95) - 1)],
         "hardware_samples": hardware_samples,
         "index_root": str(datasets_root / "kubric-multiview/train/MVTracker_index"),
     }
