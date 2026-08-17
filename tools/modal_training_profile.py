@@ -86,7 +86,7 @@ def _dependency_image() -> modal.Image:
     )
 
 
-def _runtime_image() -> modal.Image:
+def _source_image(base: modal.Image) -> modal.Image:
     commit = _source_commit()
     clone = (
         "git init /opt/mvtracker && "
@@ -96,7 +96,7 @@ def _runtime_image() -> modal.Image:
         f'test "$(git -C /opt/mvtracker rev-parse HEAD)" = "{commit}"'
     )
     return (
-        _dependency_image()
+        base
         .run_commands(clone)
         .env(
             {
@@ -110,6 +110,10 @@ def _runtime_image() -> modal.Image:
             }
         )
     )
+
+
+def _runtime_image() -> modal.Image:
+    return _source_image(_dependency_image())
 
 
 app = modal.App(

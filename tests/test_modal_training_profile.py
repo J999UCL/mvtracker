@@ -28,20 +28,20 @@ class ModalTrainingProfileTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "tools/modal_training_profile.py"
         ).read_text(encoding="utf-8")
         dependency_start = source.index("def _dependency_image()")
+        source_start = source.index("def _source_image(")
         runtime_start = source.index("def _runtime_image()")
-        dependency = source[dependency_start:runtime_start]
+        dependency = source[dependency_start:source_start]
+        source_layer = source[source_start:runtime_start]
         runtime = source[runtime_start:source.index("\n\napp = modal.App", runtime_start)]
 
         self.assertIn("pip_install_from_requirements", dependency)
         self.assertIn("flash-attn==2.8.3.post1", dependency)
         self.assertIn("pointops", dependency)
         self.assertNotIn("_source_commit()", dependency)
-        self.assertLess(
-            runtime.index("_dependency_image()"),
-            runtime.index(".run_commands(clone)"),
-        )
-        self.assertIn("checkout --detach FETCH_HEAD", runtime)
-        self.assertIn("rev-parse HEAD", runtime)
+        self.assertIn("_source_image(_dependency_image())", runtime)
+        self.assertIn(".run_commands(clone)", source_layer)
+        self.assertIn("checkout --detach FETCH_HEAD", source_layer)
+        self.assertIn("rev-parse HEAD", source_layer)
 
     def test_runtime_installs_lossless_gpu_image_codecs_and_zstd(self):
         source = (

@@ -85,8 +85,14 @@ modal run --timestamps tools/modal_mvkubric_validation.py
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
-# One-time CPU-only data verification and checkpoint materialization.
+# One-time CPU-only source-data verification and checkpoint materialization.
 modal run --timestamps tools/modal_continual_training.py::setup_data
+
+# One-time CPU build of the expanded immutable dataset image.
+modal run --timestamps tools/modal_continual_training.py::build_dataset_image
+
+# CPU-only first-touch and warm loader verification against the dataset image.
+modal run --timestamps tools/modal_continual_training.py::profile-cpu-loader
 
 # Required DDP/W&B resume smoke: steps 1-3, then resume to exactly step 5.
 modal container list --json
@@ -102,10 +108,10 @@ Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
 directory.
 
-Training containers copy the DIEGESIS archive and four MV-Kubric tar.zst shards
-from the Modal data Volume, extract them concurrently under
-`/tmp/mvtracker-continual-data`, and copy only the prepared cache/index and
-checkpoint sidecars. Staging time and copied bytes are logged to W&B.
+The dataset image expands the DIEGESIS archive and four MV-Kubric tar.zst
+shards once under `/opt/mvtracker-data`. The immutable dataset layer sits above
+dependencies and below the commit-specific source layer. Training mounts only
+the writable results Volume and reads the dataset directly from the image.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker

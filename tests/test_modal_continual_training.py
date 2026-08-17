@@ -45,6 +45,20 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertNotIn("str(RUN_ROOT): run_volume.with_mount_options", continual_source)
         self.assertGreaterEqual(continual_source.count("ephemeral_disk=EPHEMERAL_DISK_MIB"), 2)
 
+    def test_training_uses_cached_dataset_image_without_data_volume_staging(self):
+        source = (
+            ROOT / "tools/modal_continual_training.py"
+        ).read_text(encoding="utf-8")
+        train_start = source.index("def train_remote(")
+        train_end = source.index("\ndef _default_run_name", train_start)
+        training = source[train_start:train_end]
+
+        self.assertIn("image=training_image", source)
+        self.assertIn("_dependency_image().run_function", source)
+        self.assertIn('"MVTRACKER_DATA_ROOT": DATASET_IMAGE_ROOT', training)
+        self.assertNotIn("stage_continual_training_data", training)
+        self.assertNotIn("data_volume", training)
+
     def test_main_launch_requires_explicit_confirmation(self):
         contract.require_main_confirmation("smoke", False)
         contract.require_main_confirmation("main", True)
