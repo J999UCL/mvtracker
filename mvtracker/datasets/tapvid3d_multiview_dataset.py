@@ -1499,8 +1499,8 @@ class CudaPrefetchLoader:
         loader,
         device: torch.device | None = None,
         timing_interval: int = 0,
-        queue_depth: int = 8,
-        decode_batch_size: int = 4,
+        queue_depth: int = 4,
+        decode_batch_size: int = 2,
     ):
         if timing_interval < 0:
             raise ValueError("timing_interval must be non-negative")
