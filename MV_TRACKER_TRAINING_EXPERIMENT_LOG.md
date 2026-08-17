@@ -638,14 +638,16 @@ bounded asynchronous CUDA loader after trimming per-group trajectory padding
 back to each source sample's original track count.
 
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/bbc4bc074954
-- Modal app: `ap-2eyPl7Oh5R3lHzhFW6Xe7q`
+- Modal app: `ap-FGF8xz00ZUPGFKmBAENQaZ`
 - Run Volume: `jeet-mvtracker-runs-v2/continual-training/loader-h100-smoke10-cbc606a/`
 - Step-10 checkpoint: `model_000010.pth`
 - Final checkpoint: `model_final.pth`
 
-Distributed initialization began at 20:34:02 UTC, the trainer was ready at
-20:34:28, and the first prepared batch arrived at 20:35:05. The initial worker
-and import warmup therefore took about 37.2 seconds after trainer readiness.
+The Modal app started at 20:32:43 UTC. Distributed initialization began at
+20:34:02, the trainer was ready at 20:34:28, and the first prepared batch
+arrived at 20:35:05. This was 2 minutes 22 seconds from app creation to the
+first batch, including 37.2 seconds of worker and import warmup after trainer
+readiness.
 The first update took 145.29 seconds because it also ran first-step compilation
 and expensive diagnostics. Updates 2–10 averaged 8.95 seconds, including 1.00
 second of exposed data wait.
@@ -671,7 +673,7 @@ instant rather than sustained-utilization averages. The final exposed loader
 wait was 1.10 seconds; loader-worker preparation was 1.11 seconds and reported
 GPU JPEG decode time was 1.13 seconds.
 
-The detached Modal invocation retried after successful completion. Its later
-invocations found `model_final.pth` at ten completed steps and performed no
-additional optimizer updates. The app was stopped manually after confirming
-both checkpoints were durable.
+Three duplicate launcher invocations occurred after successful completion.
+They found `model_final.pth` at ten completed steps and performed no additional
+optimizer updates. The final duplicate app was stopped manually after
+confirming both checkpoints were durable.
