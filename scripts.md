@@ -149,3 +149,19 @@ To benchmark parallel local copy and extraction of the four MV-Kubric shards:
 modal container list --json
 modal run --timestamps tools/modal_mvkubric_shard.py::benchmark_shards
 ```
+
+## Single-T4 production loader benchmark
+
+The reusable T4 harness uses the cached continual-training dataset image, one
+tagged T4 container, deterministic DIEGESIS/MV-Kubric view cases, and writes a
+JSON report under `jeet-mvtracker-runs-v2` while logging the same metrics to
+W&B. It includes cold/warm samples, p50/p95 wait and throughput, and a
+1.25-second simulated-compute overlap check.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
+modal container list --json
+modal run --timestamps tools/modal_t4_loader_benchmark.py::profile \
+  --run-name t4-loader-baseline
+```

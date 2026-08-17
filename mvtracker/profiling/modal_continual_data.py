@@ -50,6 +50,28 @@ LOCAL_STAGING_SIDECARS = (
 )
 
 
+class _DeterministicRequestSampler:
+    """Finite production-style requests with an explicit view count."""
+
+    def __init__(self, dataset, total: int, view_count: int | None):
+        self.dataset = dataset
+        self.total = int(total)
+        self.view_count = view_count
+
+    def __iter__(self):
+        from mvtracker.datasets.utils import SampleRequest
+
+        for virtual_index in range(self.total):
+            yield SampleRequest(
+                virtual_index=virtual_index,
+                view_count=self.view_count,
+                scene_index=virtual_index % self.dataset.real_len,
+            )
+
+    def __len__(self):
+        return self.total
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -346,6 +368,10 @@ def profile_encoded_loader(
     workers: int = 0,
     use_cuda: bool = False,
     mvkubric_scene_ids=None,
+    view_count: int | None = None,
+    source_schedule=None,
+    simulated_compute_seconds: float = 0.0,
+    hardware_sampler=None,
 ) -> dict:
     """Measure encoded TAPVid-3D samples after local extraction.
 
@@ -360,13 +386,23 @@ def profile_encoded_loader(
         raise ValueError("warmup must be non-negative, measured and workers must be positive")
     if use_cuda and workers < 1:
         raise ValueError("the CUDA encoded-loader profile requires at least one worker")
+    if view_count is not None and not 1 <= int(view_count) <= 6:
+        raise ValueError("view_count must be between one and six")
+    if simulated_compute_seconds < 0:
+        raise ValueError("simulated_compute_seconds must be non-negative")
+    if source_schedule is None:
+        source_schedule = (source,)
+    else:
+        source_schedule = tuple(source_schedule)
+        if not source_schedule or any(item not in {"diegesis", "mvkubric"} for item in source_schedule):
+            raise ValueError("source_schedule must contain diegesis or mvkubric")
+    if source_schedule != (source,) and not use_cuda:
+        raise ValueError("source_schedule requires the CUDA production loader")
     import itertools
     from omegaconf import OmegaConf
     from types import SimpleNamespace
 
     import torch
-    from torchdata.stateful_dataloader import StatefulDataLoader
-
     from mvtracker.datasets.tapvid3d_multiview_dataset import (
         CudaPrefetchLoader,
         TapVid3DMultiViewDataset,
@@ -381,23 +417,23 @@ def profile_encoded_loader(
     config.datasets.train.kubric_metadata_index_root = str(
         data_root / "kubric-multiview/train/MVTracker_index"
     )
-    if source == "diegesis":
-        dataset = TapVid3DMultiViewDataset.from_name(
-            config.datasets.train.sources.diegesis.name,
-            str(data_root / "diegesis-mvtracker"),
-            training_args=config,
-            fabric=SimpleNamespace(world_size=1),
-            include_scene_ids=list((
-                "bathroom01", "bathroom02", "bathroom03", "bedroom02", "bedroom03",
-                "bedroom04", "diningroom01", "diningroom03", "diningroom04", "kitchen01",
-                "kitchen02", "kitchen03", "kitchen04", "livingroom01", "livingroom03",
-                "livingroom04", "livingroom05",
-            )),
-        )
-    else:
+    def build_dataset(dataset_source):
+        if dataset_source == "diegesis":
+            return TapVid3DMultiViewDataset.from_name(
+                config.datasets.train.sources.diegesis.name,
+                str(data_root / "diegesis-mvtracker"),
+                training_args=config,
+                fabric=SimpleNamespace(world_size=1),
+                include_scene_ids=list((
+                    "bathroom01", "bathroom02", "bathroom03", "bedroom02", "bedroom03",
+                    "bedroom04", "diningroom01", "diningroom03", "diningroom04", "kitchen01",
+                    "kitchen02", "kitchen03", "kitchen04", "livingroom01", "livingroom03",
+                    "livingroom04", "livingroom05",
+                )),
+            )
         from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
 
-        dataset = KubricMultiViewDataset.from_name(
+        return KubricMultiViewDataset.from_name(
             config.datasets.train.sources.mvkubric.name,
             str(data_root),
             training_args=config,
@@ -408,61 +444,86 @@ def profile_encoded_loader(
                 else [str(scene) for scene in range(900, 998)]
             ),
         )
-    if use_cuda:
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA encoded-loader profile requires a visible GPU")
-        loader = StatefulDataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=workers,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
-            collate_fn=dataset.collate_fn,
-            drop_last=True,
-            in_order=False,
-        )
-        iterator = iter(CudaPrefetchLoader(loader))
-    else:
-        iterator = itertools.cycle(range(dataset.real_len))
 
-    def consume() -> int | None:
+    datasets = {dataset_source: build_dataset(dataset_source) for dataset_source in set(source_schedule)}
+    if use_cuda and not torch.cuda.is_available():
+        raise RuntimeError("CUDA encoded-loader profile requires a visible GPU")
+
+    iterators = {}
+    for dataset_source, dataset in datasets.items():
+        if use_cuda:
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=1,
+                sampler=_DeterministicRequestSampler(
+                    dataset, warmup + measured + 8, view_count
+                ),
+                num_workers=workers,
+                pin_memory=True,
+                persistent_workers=workers > 0,
+                prefetch_factor=2 if workers > 0 else None,
+                collate_fn=dataset.collate_fn,
+                drop_last=True,
+            )
+            iterators[dataset_source] = iter(CudaPrefetchLoader(loader))
+        else:
+            iterators[dataset_source] = itertools.cycle(range(dataset.real_len))
+
+    source_cursor = 0
+
+    def consume() -> tuple[str, int | None]:
+        nonlocal source_cursor
+        dataset_source = source_schedule[source_cursor % len(source_schedule)]
+        source_cursor += 1
+        iterator = iterators[dataset_source]
         if use_cuda:
             batch, gotit = next(iterator)
             if not all(gotit):
-                return None
+                return dataset_source, None
             torch.cuda.synchronize()
-            return int(batch.video.shape[0] * batch.video.shape[1])
+            return dataset_source, int(batch.video.shape[0] * batch.video.shape[1])
         index = next(iterator)
-        sample, gotit = dataset[index]
+        sample, gotit = datasets[dataset_source][index]
         if not gotit:
-            return None
+            return dataset_source, None
         if hasattr(sample, "jpeg_bytes"):
-            return len(sample.jpeg_bytes)
-        return int(sample.video.shape[0])
+            return dataset_source, len(sample.jpeg_bytes)
+        return dataset_source, int(sample.video.shape[0])
 
     warmup_done = 0
     rejected = 0
     while warmup_done < warmup:
-        if consume() is None:
+        _, frame_count = consume()
+        if frame_count is None:
             rejected += 1
         else:
             warmup_done += 1
     sample_seconds = []
+    exposed_wait_seconds = []
+    measured_sources = []
+    hardware_samples = []
     encoded_frames = 0
     started = time.perf_counter()
     while len(sample_seconds) < measured:
         sample_started = time.perf_counter()
-        frame_count = consume()
+        measured_source, frame_count = consume()
         if frame_count is None:
             rejected += 1
             continue
-        encoded_frames += frame_count
         sample_seconds.append(time.perf_counter() - sample_started)
+        exposed_wait_seconds.append(sample_seconds[-1])
+        measured_sources.append(measured_source)
+        encoded_frames += frame_count
+        if hardware_sampler is not None:
+            hardware_samples.append(hardware_sampler())
+        if simulated_compute_seconds:
+            time.sleep(simulated_compute_seconds)
+            if hardware_sampler is not None:
+                hardware_samples.append(hardware_sampler())
     if use_cuda:
         torch.cuda.synchronize()
-    elapsed = time.perf_counter() - started
+    wall_elapsed = time.perf_counter() - started
+    elapsed = sum(sample_seconds)
     return {
         "warmup": warmup,
         "measured": measured,
@@ -470,10 +531,21 @@ def profile_encoded_loader(
         "use_cuda": use_cuda,
         "rejected": rejected,
         "elapsed_seconds": elapsed,
+        "wall_elapsed_seconds": wall_elapsed,
         "samples_per_second": measured / elapsed,
         "sample_seconds_median": sorted(sample_seconds)[len(sample_seconds) // 2],
+        "sample_seconds_p50": sorted(sample_seconds)[len(sample_seconds) // 2],
         "sample_seconds_p95": sorted(sample_seconds)[max(0, int(len(sample_seconds) * 0.95) - 1)],
+        "first_sample_seconds": sample_seconds[0],
+        "exposed_wait_seconds_p50": sorted(exposed_wait_seconds)[len(exposed_wait_seconds) // 2],
+        "exposed_wait_seconds_p95": sorted(exposed_wait_seconds)[max(0, int(len(exposed_wait_seconds) * 0.95) - 1)],
+        "max_exposed_wait_seconds": max(exposed_wait_seconds),
+        "simulated_compute_seconds": simulated_compute_seconds,
         "encoded_frames": encoded_frames,
+        "view_count": view_count,
+        "source_schedule": list(source_schedule),
+        "measured_sources": measured_sources,
+        "hardware_samples": hardware_samples,
         "index_root": str(data_root / "kubric-multiview/train/MVTracker_index"),
     }
 
