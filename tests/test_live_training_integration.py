@@ -46,6 +46,10 @@ class LivePhysicalTrainingTests(unittest.TestCase):
         self.assertIn("MixedStepLookahead", source)
         self.assertIn("PhysicalGroupPrefetchIterator", source)
         self.assertIn("source_cursors = dict(physical_step.end_cursors)", source)
+        self.assertIn(
+            "gradient_accumulation_steps=gradient_accumulation_steps / batch_scene_count",
+            source,
+        )
         self.assertNotIn("torch.cuda.synchronize", source)
 
     def test_cpu_preparation_has_no_cuda_wait(self):
