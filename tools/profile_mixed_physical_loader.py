@@ -381,17 +381,28 @@ def _resource_sample(gpu_handles):
     return sample
 
 
-def _run_lane(device_index: int, fixed, datasets, workers: int, passes: int):
+def _run_lane(
+    local_device_index: int,
+    physical_device_id: int,
+    fixed,
+    datasets,
+    workers: int,
+    passes: int,
+):
     import torch
     import pynvml
 
-    torch.cuda.set_device(device_index)
+    torch.cuda.set_device(local_device_index)
     pynvml.nvmlInit()
     nvml_handles = [
         (pynvml, pynvml.nvmlDeviceGetHandleByIndex(1)),
         (pynvml, pynvml.nvmlDeviceGetHandleByIndex(2)),
     ]
-    results = {"device": device_index, "passes": []}
+    results = {
+        "local_device": local_device_index,
+        "physical_device": physical_device_id,
+        "passes": [],
+    }
     for pass_index in range(passes):
         pass_name = "cold" if pass_index == 0 else "warm"
         samples = 0
@@ -404,7 +415,7 @@ def _run_lane(device_index: int, fixed, datasets, workers: int, passes: int):
         pass_started = time.perf_counter()
         for step in fixed:
             groups, materialization_time, encoded = _materialize_groups(
-                step, datasets, device_index, workers
+                step, datasets, local_device_index, workers
             )
             materialization_seconds += materialization_time
             encoded_bytes += encoded
@@ -416,7 +427,7 @@ def _run_lane(device_index: int, fixed, datasets, workers: int, passes: int):
             )
             resources.append(_resource_sample(nvml_handles))
             step_decode = _decode_groups(
-                groups, torch.device(f"cuda:{device_index}"), nvml_handles
+                groups, torch.device(f"cuda:{local_device_index}"), nvml_handles
             )
             decode_records.extend(step_decode)
             step_records.append({
@@ -554,7 +565,14 @@ def main(argv=None):
     for local_device in range(2):
         print(f"[loader-profile] starting physical Titan {physical_ids[local_device]}", flush=True)
         result["lanes"].append(
-            _run_lane(local_device, fixed, datasets, args.workers, args.passes)
+            _run_lane(
+                local_device,
+                physical_ids[local_device],
+                fixed,
+                datasets,
+                args.workers,
+                args.passes,
+            )
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = args.output_dir / "report.json"
