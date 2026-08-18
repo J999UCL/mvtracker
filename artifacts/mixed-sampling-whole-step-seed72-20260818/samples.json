@@ -1,0 +1,948 @@
+[
+  {
+    "step": 0,
+    "microbatch": 0,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 0,
+    "scene_index": 15,
+    "scene": "livingroom04",
+    "seed": 72,
+    "window": [
+      58,
+      82
+    ],
+    "views": [
+      0
+    ],
+    "view_count": 1,
+    "trajectories": 256,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 0,
+    "microbatch": 0,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 1,
+    "scene_index": 7,
+    "scene": "diningroom03",
+    "seed": 73,
+    "window": [
+      168,
+      192
+    ],
+    "views": [
+      0,
+      1,
+      3
+    ],
+    "view_count": 3,
+    "trajectories": 1391,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 0,
+    "microbatch": 1,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 0,
+    "scene_index": 49,
+    "scene": "949",
+    "seed": 72,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      1
+    ],
+    "view_count": 1,
+    "trajectories": 256,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 0,
+    "microbatch": 1,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 1,
+    "scene_index": 15,
+    "scene": "915",
+    "seed": 73,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      4,
+      5,
+      7,
+      9
+    ],
+    "view_count": 4,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 0,
+    "microbatch": 2,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 2,
+    "scene_index": 2,
+    "scene": "bathroom03",
+    "seed": 74,
+    "window": [
+      208,
+      232
+    ],
+    "views": [
+      2
+    ],
+    "view_count": 1,
+    "trajectories": 553,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 0,
+    "microbatch": 2,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 3,
+    "scene_index": 12,
+    "scene": "kitchen04",
+    "seed": 75,
+    "window": [
+      97,
+      121
+    ],
+    "views": [
+      0,
+      1,
+      2
+    ],
+    "view_count": 3,
+    "trajectories": 722,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 0,
+    "microbatch": 3,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 2,
+    "scene_index": 8,
+    "scene": "908",
+    "seed": 74,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      0,
+      5
+    ],
+    "view_count": 2,
+    "trajectories": 1297,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 0,
+    "microbatch": 3,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 3,
+    "scene_index": 14,
+    "scene": "914",
+    "seed": 75,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      4,
+      6,
+      8,
+      9
+    ],
+    "view_count": 4,
+    "trajectories": 1930,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 0,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 4,
+    "scene_index": 14,
+    "scene": "livingroom03",
+    "seed": 76,
+    "window": [
+      28,
+      52
+    ],
+    "views": [
+      1,
+      2
+    ],
+    "view_count": 2,
+    "trajectories": 1632,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 0,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 5,
+    "scene_index": 1,
+    "scene": "bathroom02",
+    "seed": 77,
+    "window": [
+      58,
+      82
+    ],
+    "views": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "view_count": 4,
+    "trajectories": 1479,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 1,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 4,
+    "scene_index": 94,
+    "scene": "994",
+    "seed": 76,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      3,
+      4,
+      8
+    ],
+    "view_count": 3,
+    "trajectories": 701,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 1,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 5,
+    "scene_index": 22,
+    "scene": "922",
+    "seed": 77,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      0,
+      1,
+      2,
+      6,
+      7,
+      8
+    ],
+    "view_count": 6,
+    "trajectories": 179,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 2,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 1,
+    "virtual_index": 8,
+    "scene_index": 11,
+    "scene": "kitchen03",
+    "seed": 80,
+    "window": [
+      64,
+      88
+    ],
+    "views": [
+      0,
+      1,
+      3
+    ],
+    "view_count": 3,
+    "trajectories": 912,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 2,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 1,
+    "virtual_index": 9,
+    "scene_index": 5,
+    "scene": "bedroom04",
+    "seed": 81,
+    "window": [
+      180,
+      204
+    ],
+    "views": [
+      1,
+      3
+    ],
+    "view_count": 2,
+    "trajectories": 635,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 3,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 6,
+    "scene_index": 64,
+    "scene": "964",
+    "seed": 78,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      3
+    ],
+    "view_count": 1,
+    "trajectories": 1026,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 1,
+    "microbatch": 3,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 7,
+    "scene_index": 12,
+    "scene": "912",
+    "seed": 79,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      5,
+      6,
+      8,
+      9
+    ],
+    "view_count": 4,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 2,
+    "microbatch": 0,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 10,
+    "scene_index": 8,
+    "scene": "diningroom04",
+    "seed": 82,
+    "window": [
+      184,
+      208
+    ],
+    "views": [
+      0,
+      2
+    ],
+    "view_count": 2,
+    "trajectories": 1786,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 2,
+    "microbatch": 0,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 11,
+    "scene_index": 0,
+    "scene": "bathroom01",
+    "seed": 83,
+    "window": [
+      202,
+      226
+    ],
+    "views": [
+      1,
+      2
+    ],
+    "view_count": 2,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 2,
+    "microbatch": 1,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 8,
+    "scene_index": 86,
+    "scene": "986",
+    "seed": 80,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      0,
+      1,
+      4,
+      9
+    ],
+    "view_count": 4,
+    "trajectories": 1568,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 2,
+    "microbatch": 1,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 9,
+    "scene_index": 74,
+    "scene": "974",
+    "seed": 81,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      0,
+      4,
+      9
+    ],
+    "view_count": 3,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 2,
+    "microbatch": 2,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 12,
+    "scene_index": 4,
+    "scene": "bedroom03",
+    "seed": 84,
+    "window": [
+      122,
+      146
+    ],
+    "views": [
+      2
+    ],
+    "view_count": 1,
+    "trajectories": 521,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 2,
+    "microbatch": 2,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 13,
+    "scene_index": 9,
+    "scene": "kitchen01",
+    "seed": 85,
+    "window": [
+      130,
+      154
+    ],
+    "views": [
+      0,
+      2,
+      3
+    ],
+    "view_count": 3,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 2,
+    "microbatch": 3,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 10,
+    "scene_index": 89,
+    "scene": "989",
+    "seed": 82,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      4,
+      5
+    ],
+    "view_count": 2,
+    "trajectories": 1092,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 2,
+    "microbatch": 3,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 11,
+    "scene_index": 46,
+    "scene": "946",
+    "seed": 83,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      1,
+      4
+    ],
+    "view_count": 2,
+    "trajectories": 1009,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 3,
+    "microbatch": 0,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 14,
+    "scene_index": 10,
+    "scene": "kitchen02",
+    "seed": 86,
+    "window": [
+      42,
+      66
+    ],
+    "views": [
+      2
+    ],
+    "view_count": 1,
+    "trajectories": 1172,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 3,
+    "microbatch": 0,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 15,
+    "scene_index": 13,
+    "scene": "livingroom01",
+    "seed": 87,
+    "window": [
+      22,
+      46
+    ],
+    "views": [
+      0,
+      1,
+      2
+    ],
+    "view_count": 3,
+    "trajectories": 1704,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 3,
+    "microbatch": 1,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 12,
+    "scene_index": 75,
+    "scene": "975",
+    "seed": 84,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      3
+    ],
+    "view_count": 1,
+    "trajectories": 1781,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 3,
+    "microbatch": 1,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 13,
+    "scene_index": 79,
+    "scene": "979",
+    "seed": 85,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      0,
+      1,
+      6,
+      7
+    ],
+    "view_count": 4,
+    "trajectories": 1243,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 3,
+    "microbatch": 2,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 16,
+    "scene_index": 16,
+    "scene": "livingroom05",
+    "seed": 88,
+    "window": [
+      70,
+      94
+    ],
+    "views": [
+      0,
+      1,
+      2
+    ],
+    "view_count": 3,
+    "trajectories": 1912,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 3,
+    "microbatch": 2,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 17,
+    "scene_index": 6,
+    "scene": "diningroom01",
+    "seed": 89,
+    "window": [
+      216,
+      240
+    ],
+    "views": [
+      2,
+      3
+    ],
+    "view_count": 2,
+    "trajectories": 1403,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 3,
+    "microbatch": 3,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 14,
+    "scene_index": 33,
+    "scene": "933",
+    "seed": 86,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      0,
+      6
+    ],
+    "view_count": 2,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 3,
+    "microbatch": 3,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 15,
+    "scene_index": 65,
+    "scene": "965",
+    "seed": 87,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      2,
+      4,
+      5,
+      7,
+      8
+    ],
+    "view_count": 5,
+    "trajectories": 819,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 4,
+    "microbatch": 0,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 1,
+    "virtual_index": 20,
+    "scene_index": 1,
+    "scene": "bathroom02",
+    "seed": 92,
+    "window": [
+      53,
+      77
+    ],
+    "views": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "view_count": 4,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 4,
+    "microbatch": 0,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 1,
+    "virtual_index": 21,
+    "scene_index": 10,
+    "scene": "kitchen02",
+    "seed": 93,
+    "window": [
+      121,
+      145
+    ],
+    "views": [
+      1,
+      2,
+      3
+    ],
+    "view_count": 3,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 4,
+    "microbatch": 1,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 16,
+    "scene_index": 97,
+    "scene": "997",
+    "seed": 88,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      2,
+      3,
+      7,
+      8
+    ],
+    "view_count": 4,
+    "trajectories": 1740,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 4,
+    "microbatch": 1,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 17,
+    "scene_index": 82,
+    "scene": "982",
+    "seed": 89,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      1,
+      7,
+      8,
+      9
+    ],
+    "view_count": 4,
+    "trajectories": 2048,
+    "rgb_aug": false,
+    "depth_aug": false
+  },
+  {
+    "step": 4,
+    "microbatch": 2,
+    "rank": 0,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 22,
+    "scene_index": 16,
+    "scene": "livingroom05",
+    "seed": 94,
+    "window": [
+      140,
+      164
+    ],
+    "views": [
+      1,
+      2,
+      3
+    ],
+    "view_count": 3,
+    "trajectories": 1341,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 4,
+    "microbatch": 2,
+    "rank": 1,
+    "source": "diegesis",
+    "attempt": 0,
+    "virtual_index": 23,
+    "scene_index": 5,
+    "scene": "bedroom04",
+    "seed": 95,
+    "window": [
+      196,
+      220
+    ],
+    "views": [
+      1
+    ],
+    "view_count": 1,
+    "trajectories": 1141,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 4,
+    "microbatch": 3,
+    "rank": 0,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 18,
+    "scene_index": 88,
+    "scene": "988",
+    "seed": 90,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      8
+    ],
+    "view_count": 1,
+    "trajectories": 983,
+    "rgb_aug": true,
+    "depth_aug": true
+  },
+  {
+    "step": 4,
+    "microbatch": 3,
+    "rank": 1,
+    "source": "mvkubric",
+    "attempt": 0,
+    "virtual_index": 19,
+    "scene_index": 60,
+    "scene": "960",
+    "seed": 91,
+    "window": [
+      0,
+      24
+    ],
+    "views": [
+      1,
+      3
+    ],
+    "view_count": 2,
+    "trajectories": 820,
+    "rgb_aug": true,
+    "depth_aug": true
+  }
+]
