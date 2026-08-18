@@ -323,9 +323,9 @@ def _decode_groups(groups, device, gpu_handles):
 
     timed = _TimedDecoder(device)
     records = []
-    for group in groups:
+    iterator = PhysicalGroupPrefetchIterator(groups, timed)
+    for _ in groups:
         exposed_started = time.perf_counter()
-        iterator = PhysicalGroupPrefetchIterator((group,), timed)
         _, datapoint = next(iterator)
         exposed_wait = time.perf_counter() - exposed_started
         started_event, finished_event = timed.timings[-1]
@@ -413,7 +413,12 @@ def _run_lane(
         resources = []
         step_records = []
         pass_started = time.perf_counter()
-        for step in fixed:
+        for step_index, step in enumerate(fixed):
+            print(
+                f"[loader-profile][gpu={physical_device_id}] "
+                f"{pass_name} step {step_index + 1}/{len(fixed)} materializing",
+                flush=True,
+            )
             groups, materialization_time, encoded = _materialize_groups(
                 step, datasets, local_device_index, workers
             )
@@ -426,6 +431,14 @@ def _run_lane(
                 for sample in group.samples
             )
             resources.append(_resource_sample(nvml_handles))
+            print(
+                f"[loader-profile][gpu={physical_device_id}] "
+                f"{pass_name} step {step_index + 1}/{len(fixed)} "
+                f"materialized {sum(len(group.samples) for group in groups)} scenes "
+                f"in {materialization_time:.3f}s; decoding "
+                f"{len(groups)} physical groups",
+                flush=True,
+            )
             step_decode = _decode_groups(
                 groups, torch.device(f"cuda:{local_device_index}"), nvml_handles
             )
@@ -441,6 +454,13 @@ def _run_lane(
                 ),
                 "decode": step_decode,
             })
+            print(
+                f"[loader-profile][gpu={physical_device_id}] "
+                f"{pass_name} step {step_index + 1}/{len(fixed)} complete; "
+                f"decode={sum(item['decode_ms'] for item in step_decode):.1f}ms "
+                f"wait={sum(item['exposed_wait_seconds'] for item in step_decode):.3f}s",
+                flush=True,
+            )
         wall = time.perf_counter() - pass_started
         decode_seconds = sum(item["decode_ms"] for item in decode_records) / 1000.0
         exposed_wait = sum(item["exposed_wait_seconds"] for item in decode_records)
@@ -562,18 +582,26 @@ def main(argv=None):
         "steps_retry_count": [step.retry_count for step in fixed],
         "lanes": [],
     }
-    for local_device in range(2):
-        print(f"[loader-profile] starting physical Titan {physical_ids[local_device]}", flush=True)
-        result["lanes"].append(
-            _run_lane(
-                local_device,
-                physical_ids[local_device],
-                fixed,
-                datasets,
-                args.workers,
-                args.passes,
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        lane_futures = []
+        for local_device in range(2):
+            print(
+                f"[loader-profile] starting physical Titan "
+                f"{physical_ids[local_device]}",
+                flush=True,
             )
-        )
+            lane_futures.append(
+                executor.submit(
+                    _run_lane,
+                    local_device,
+                    physical_ids[local_device],
+                    fixed,
+                    datasets,
+                    args.workers,
+                    args.passes,
+                )
+            )
+        result["lanes"] = [future.result() for future in lane_futures]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = args.output_dir / "report.json"
     report.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
