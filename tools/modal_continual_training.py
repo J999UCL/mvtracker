@@ -12,14 +12,6 @@ import sys
 
 import modal
 
-from modal_dataset_image_build import (
-    TRAIN_ARCHIVE_STAGES,
-    TRAIN_SCENES,
-    install_dataset_base,
-    install_mvkubric_archive,
-    install_mvkubric_validation_and_index,
-)
-
 from modal_training_profile import (
     DATA_ROOT,
     RUN_ROOT,
@@ -33,9 +25,8 @@ from modal_training_profile import (
 
 from mvtracker.profiling.modal_continual_training import (
     CONTINUAL_RUN_SUBDIR,
-    DATASET_IMAGE_ROOT,
-    DATASET_IMAGE_VERSION,
-    EPHEMERAL_DISK_MIB,
+    DATA_LAYOUT_VERSION,
+    DATA_VOLUME_ROOT,
     GPU_REQUEST,
     MAIN_CONFIRMATION,
     MAX_CONTAINERS,
@@ -88,42 +79,7 @@ EXPERIMENT_PHASES = {
 app = modal.App(APP_NAME, tags={**MODAL_TAGS, "experiment": "unclassified"})
 
 
-canonical_index_path = Path(__file__).resolve().parents[1] / (
-    "mvtracker/datasets/kubric_metadata_index.py"
-)
-dataset_image = _dependency_image().add_local_file(
-    str(canonical_index_path),
-    remote_path="/opt/mvtracker/mvtracker/datasets/kubric_metadata_index.py",
-    copy=True,
-)
-_dataset_stage_options = {
-    "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
-    "cpu": 16,
-    "memory": 8192,
-    "timeout": 12 * 60 * 60,
-}
-dataset_image = dataset_image.run_function(
-    install_dataset_base,
-    **_dataset_stage_options,
-    kwargs={"dataset_version": DATASET_IMAGE_VERSION},
-)
-for _archive_name, _scene_start, _scene_end in TRAIN_ARCHIVE_STAGES:
-    dataset_image = dataset_image.run_function(
-        install_mvkubric_archive,
-        **_dataset_stage_options,
-        kwargs={
-            "dataset_version": DATASET_IMAGE_VERSION,
-            "archive_name": _archive_name,
-            "scene_start": _scene_start,
-            "scene_end": _scene_end,
-        },
-    )
-dataset_image = dataset_image.run_function(
-    install_mvkubric_validation_and_index,
-    **_dataset_stage_options,
-    kwargs={"dataset_version": DATASET_IMAGE_VERSION},
-)
-training_image = _source_image(dataset_image)
+training_image = _source_image(_dependency_image())
 
 
 def _run_identity(run_name: str, commit: str) -> tuple[int, str]:
@@ -131,14 +87,14 @@ def _run_identity(run_name: str, commit: str) -> tuple[int, str]:
     return int.from_bytes(digest[:4], "big"), digest.hex()[:12]
 
 
-def _profile_dataset_image_cpu() -> dict:
+def _profile_volume_cpu() -> dict:
     from mvtracker.profiling.modal_continual_data import profile_encoded_loader
 
     profiles = {}
     for source in ("diegesis", "mvkubric"):
         profiles[source] = {
             "cold": profile_encoded_loader(
-                Path(DATASET_IMAGE_ROOT) / "datasets",
+                Path(DATA_VOLUME_ROOT),
                 source=source,
                 warmup=0,
                 measured=4,
@@ -146,7 +102,7 @@ def _profile_dataset_image_cpu() -> dict:
                 use_cuda=False,
             ),
             "warm": profile_encoded_loader(
-                Path(DATASET_IMAGE_ROOT) / "datasets",
+                Path(DATA_VOLUME_ROOT),
                 source=source,
                 warmup=LOADER_PROFILE_WARMUP,
                 measured=LOADER_PROFILE_MEASURED,
@@ -155,8 +111,8 @@ def _profile_dataset_image_cpu() -> dict:
             ),
         }
     return {
-        "dataset_image_root": DATASET_IMAGE_ROOT,
-        "dataset_image_version": DATASET_IMAGE_VERSION,
+        "data_volume_root": DATA_VOLUME_ROOT,
+        "data_layout_version": DATA_LAYOUT_VERSION,
         "profiles": profiles,
     }
 
@@ -164,9 +120,12 @@ def _profile_dataset_image_cpu() -> dict:
 def _profile_h100_mvkubric_loader() -> dict:
     from mvtracker.profiling.modal_continual_data import profile_encoded_loader
 
-    scene_ids = list(TRAIN_SCENES[:25])
+    manifest = json.loads(
+        (Path(DATA_VOLUME_ROOT) / "direct-volume-data-manifest.json").read_text()
+    )
+    scene_ids = manifest["train_scene_ids"][:25]
     profile = profile_encoded_loader(
-        Path(DATASET_IMAGE_ROOT) / "datasets",
+        Path(DATA_VOLUME_ROOT),
         source="mvkubric",
         warmup=H100_LOADER_PROFILE_WARMUP,
         measured=H100_LOADER_PROFILE_MEASURED,
@@ -176,7 +135,7 @@ def _profile_h100_mvkubric_loader() -> dict:
     )
     return {
         "profiles": {"mvkubric": profile},
-        "staging": {"scene_ids": scene_ids, "local_data_root": DATASET_IMAGE_ROOT},
+        "staging": {"scene_ids": scene_ids, "data_root": DATA_VOLUME_ROOT},
     }
 
 
@@ -205,6 +164,7 @@ def _profile_summary(result: dict) -> dict:
 @app.function(
     image=training_image,
     secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
     cpu=32,
     memory=65536,
     timeout=4 * 60 * 60,
@@ -218,15 +178,15 @@ def profile_cpu_loader_remote() -> dict:
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
         group=WANDB_GROUP,
-        job_type="dataset-image-cpu-validation",
-        tags=["modal", "dataset-image", "cpu", "cold-warm-loader"],
+        job_type="volume-cpu-validation",
+        tags=["modal", "volume-v2", "cpu", "cold-warm-loader"],
         config={
             "source_commit": _source_commit(),
-            "dataset_image_version": DATASET_IMAGE_VERSION,
+            "data_layout_version": DATA_LAYOUT_VERSION,
             **PROFILE_TAGS,
         },
     )
-    result = _profile_dataset_image_cpu()
+    result = _profile_volume_cpu()
     run.summary.update(_profile_summary(result))
     run.finish()
     return result
@@ -235,10 +195,10 @@ def profile_cpu_loader_remote() -> dict:
 @app.function(
     image=training_image,
     secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
     gpu="H100!",
     cpu=32,
     memory=65536,
-    ephemeral_disk=EPHEMERAL_DISK_MIB,
     timeout=4 * 60 * 60,
     max_containers=MAX_CONTAINERS,
     include_source=False,
@@ -264,12 +224,12 @@ def profile_h100_loader_remote() -> dict:
     image=training_image,
     secrets=[wandb_secret],
     volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
     gpu=GPU_REQUEST,
     cpu=32,
     memory=65536,
-    ephemeral_disk=EPHEMERAL_DISK_MIB,
     timeout=6 * 60 * 60,
     max_containers=MAX_CONTAINERS,
     include_source=False,
@@ -295,7 +255,8 @@ def train_remote(
         "mode": mode,
         "run_name": run_name,
         "source_commit": commit,
-        "dataset_image_version": DATASET_IMAGE_VERSION,
+        "data_volume": "jeet-mvtracker-data-v2",
+        "data_layout_version": DATA_LAYOUT_VERSION,
         "phases": [dict(phase) for phase in EXPERIMENT_PHASES[mode]],
         "gpu": GPU_REQUEST,
         "max_containers": MAX_CONTAINERS,
@@ -320,11 +281,11 @@ def train_remote(
         {
             "MVTRACKER_TRAINING_RUN_DIR": str(run_dir),
             "MVTRACKER_TRAINING_CHECKPOINT": str(
-                Path(DATASET_IMAGE_ROOT) / "checkpoints/mvtracker_200000_june2025.pth"
+                Path(DATA_VOLUME_ROOT) / "checkpoints/mvtracker_200000_june2025.pth"
             ),
-            "MVTRACKER_DATA_ROOT": DATASET_IMAGE_ROOT,
+            "MVTRACKER_DATA_ROOT": DATA_VOLUME_ROOT,
             "MVTRACKER_MVKUBRIC_INDEX_ROOT": str(
-                Path(DATASET_IMAGE_ROOT)
+                Path(DATA_VOLUME_ROOT)
                 / "datasets/kubric-multiview/train/MVTracker_index"
             ),
             "MVTRACKER_TRAINING_SEED": str(seed),
@@ -382,21 +343,11 @@ def _prepare_launch(mode: str, run_name: str, confirm_main: bool) -> str:
     return selected
 
 
-@app.local_entrypoint(name="build-dataset-image")
-def build_dataset_image() -> None:
-    commit = _source_commit()
-    require_pushed_main_commit(commit)
-    app.set_tags({**PROFILE_TAGS, "experiment": "dataset-image-v2", "gpu": "cpu"})
-    with modal.enable_output():
-        dataset_image.build(app)
-    print(f"DATASET_IMAGE {dataset_image.object_id}")
-
-
 @app.local_entrypoint(name="profile-cpu-loader")
 def profile_cpu_loader() -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
-    app.set_tags({**PROFILE_TAGS, "experiment": "dataset-image-cpu", "gpu": "cpu"})
+    app.set_tags({**PROFILE_TAGS, "experiment": "volume-v2-cpu", "gpu": "cpu"})
     print(json.dumps(profile_cpu_loader_remote.remote(), indent=2))
 
 

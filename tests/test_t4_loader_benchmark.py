@@ -79,7 +79,7 @@ class T4LoaderBenchmarkTests(unittest.TestCase):
         self.assertIn('T4_GPU_REQUEST = "T4"', (ROOT / "mvtracker/profiling/t4_loader_benchmark.py").read_text())
         self.assertIn("BASE_TAGS", source)
         self.assertIn("partial(\n            profile_encoded_loader,", source)
-        self.assertIn("Path(DATASET_IMAGE_ROOT)", source)
+        self.assertIn("Path(DATA_VOLUME_ROOT)", source)
         self.assertIn("run_volume.commit()", source)
         self.assertIn("wandb.init", source)
         self.assertIn("PROFILE_PROGRESS", source)

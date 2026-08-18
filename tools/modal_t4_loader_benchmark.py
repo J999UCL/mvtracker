@@ -1,4 +1,4 @@
-"""Single-T4 production loader benchmark using the cached dataset image."""
+"""Single-T4 production loader benchmark reading Modal Volume v2."""
 
 from __future__ import annotations
 
@@ -9,19 +9,20 @@ from pathlib import Path
 
 import modal
 
-from modal_continual_training import dataset_image, preflight_active_containers
+from modal_continual_training import preflight_active_containers, training_image
 from modal_training_profile import (
     BASE_TAGS,
+    DATA_ROOT,
     RUN_ROOT,
     _RUN_NAME,
     _source_commit,
-    _source_image,
+    data_volume,
     run_volume,
     wandb_secret,
 )
 from mvtracker.profiling.modal_continual_training import (
-    DATASET_IMAGE_ROOT,
-    DATASET_IMAGE_VERSION,
+    DATA_LAYOUT_VERSION,
+    DATA_VOLUME_ROOT,
 )
 from mvtracker.profiling.t4_loader_benchmark import (
     ContainerHardwareMonitor,
@@ -41,7 +42,7 @@ WANDB_ENTITY = "jeetucl-ucl"
 MODAL_TAGS = {**BASE_TAGS, "experiment": "t4-loader-benchmark", "gpu": "t4"}
 
 app = modal.App(APP_NAME, tags=MODAL_TAGS)
-image = _source_image(dataset_image)
+image = training_image
 
 
 def _flatten_scalars(value, prefix=""):
@@ -65,7 +66,10 @@ def _default_run_name(commit: str) -> str:
 @app.function(
     image=image,
     secrets=[wandb_secret],
-    volumes={str(RUN_ROOT): run_volume},
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
     gpu=T4_GPU_REQUEST,
     cpu=16,
     memory=32768,
@@ -129,7 +133,7 @@ def profile_t4_loader_remote(
 
         profile_loader = partial(
             profile_encoded_loader,
-            Path(DATASET_IMAGE_ROOT),
+            Path(DATA_VOLUME_ROOT),
         )
 
         def report_progress(event, case_name, result):
@@ -168,8 +172,8 @@ def profile_t4_loader_remote(
             "source_commit": _source_commit(),
             "gpu": T4_GPU_REQUEST,
             "modal_tags": MODAL_TAGS,
-            "dataset_image_root": DATASET_IMAGE_ROOT,
-            "dataset_image_version": DATASET_IMAGE_VERSION,
+            "data_volume_root": DATA_VOLUME_ROOT,
+            "data_layout_version": DATA_LAYOUT_VERSION,
             "profiles": profiles,
             "hardware": hardware,
         }

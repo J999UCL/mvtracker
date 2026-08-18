@@ -1,4 +1,4 @@
-"""CPU-only Modal setup for the continual-training dataset image."""
+"""CPU-only Modal setup for the direct-Volume continual-training data."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from modal_training_profile import (
     _runtime_image,
     _source_commit,
     data_volume,
-    hf_secret,
     wandb_secret,
 )
 from mvtracker.profiling.modal_continual_training import (
@@ -30,10 +29,10 @@ app = modal.App(
 
 @app.function(
     image=_runtime_image(),
-    secrets=[hf_secret, wandb_secret],
+    secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume},
     cpu=16,
-    memory=32768,
+    memory=16384,
     ephemeral_disk=EPHEMERAL_DISK_MIB,
     timeout=24 * 60 * 60,
     max_containers=MAX_CONTAINERS,
@@ -42,9 +41,7 @@ app = modal.App(
 def setup_training_data_remote() -> dict:
     import wandb
 
-    from mvtracker.profiling.modal_continual_data import (
-        materialize_expanded_continual_training_data,
-    )
+    from modal_volume_ingestion import materialize_direct_volume_data
 
     run = wandb.init(
         entity=WANDB_ENTITY,
@@ -54,15 +51,15 @@ def setup_training_data_remote() -> dict:
         tags=["modal", "data-setup", "gt-depth-replay-v1"],
         config={"source_commit": _source_commit(), **PROFILE_TAGS},
     )
-    manifest = materialize_expanded_continual_training_data(DATA_ROOT)
-    data_volume.commit()
+    manifest = materialize_direct_volume_data(data_volume.commit)
     run.summary.update(
         {
-            "mvkubric_train_scenes": manifest["mvkubric"]["train_scene_count"],
-            "mvkubric_validation_scenes": manifest["mvkubric"][
-                "validation_scene_count"
-            ],
-            "checkpoint_sha256": manifest["checkpoint"]["sha256"],
+            "mvkubric_train_scenes": manifest["train_scene_count"],
+            "mvkubric_validation_scenes": manifest["validation_scene_count"],
+            **{
+                f"ingestion/{name}/seconds": seconds
+                for name, seconds in manifest["archive_seconds"].items()
+            },
         }
     )
     run.finish()

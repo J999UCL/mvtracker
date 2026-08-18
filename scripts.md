@@ -80,14 +80,12 @@ source archive is retained.
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
-# One-time CPU-only archive verification, validation extraction, and checkpoint
-# materialization. This submits a detached Function call and prints its ID.
+# One-time CPU-only direct-Volume ingestion. It expands DIEGESIS and both
+# MV-Kubric archives into jeet-mvtracker-data-v2, copies validation 101--127,
+# rebuilds the metadata index, and prints the detached Function call ID.
 modal run --detach --timestamps tools/modal_continual_data_setup.py::setup_data
 
-# One-time CPU build of the expanded immutable dataset image.
-modal run --detach --timestamps tools/modal_continual_training.py::build_dataset_image
-
-# CPU-only first-touch and warm loader verification against the dataset image.
+# CPU-only first-touch and warm loader verification against Volume v2.
 modal run --timestamps tools/modal_continual_training.py::profile_cpu_loader
 
 # Required DDP/W&B resume smoke: steps 1-3, then resume to exactly step 5.
@@ -112,12 +110,11 @@ Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
 directory.
 
-The dataset image expands the DIEGESIS archive and each official 1,000-scene
-MV-Kubric archive once under `/opt/mvtracker-data`. Its final CPU layer copies
-validation scenes `101`--`127`, builds the 2,027-scene `MVTracker_index`, and
-writes `dataset-image.json`. The immutable dataset layer sits above
-dependencies and below the commit-specific source layer. Training mounts only
-the writable results Volume and reads the dataset directly from the image.
+The CPU setup expands the DIEGESIS archive and each official 1,000-scene
+MV-Kubric archive once under `/mnt/mvtracker-data`. It copies validation scenes
+`101`--`127`, builds `MVTracker_index` from the observed scene inventory, and
+writes `direct-volume-data-manifest.json`. Profiling and training mount
+`jeet-mvtracker-data-v2` read-only and mount only the results Volume writable.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
@@ -136,8 +133,8 @@ Both profile entrypoints carry
 
 ## Single-T4 production loader benchmark
 
-The reusable T4 harness uses the cached continual-training dataset image and
-one tagged T4 container. It runs warm-only DIEGESIS-4-view, MV-Kubric-4/6-view,
+The reusable T4 harness reads the continual-training data directly from Volume
+v2 using one tagged T4 container. It runs warm-only DIEGESIS-4-view, MV-Kubric-4/6-view,
 and mixed-view-4 cases with 16 measured samples. Only the mixed case includes
 the 1.25-second simulated-compute gap. Every case logs progress immediately to
 stdout and W&B and commits a partial JSON report to `jeet-mvtracker-runs-v2`.

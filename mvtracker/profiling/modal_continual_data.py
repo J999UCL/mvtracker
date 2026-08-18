@@ -290,7 +290,9 @@ def profile_encoded_loader(
             include_scene_ids=(
                 list(mvkubric_scene_ids)
                 if mvkubric_scene_ids is not None
-                else [str(scene) for scene in range(1001, 3001)]
+                else json.loads(
+                    (data_root / "direct-volume-data-manifest.json").read_text()
+                )["train_scene_ids"]
             ),
         )
 

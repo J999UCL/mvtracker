@@ -43,9 +43,9 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertIn('RUN_ROOT = Path("/mnt/mvtracker-runs")', profile_source)
         self.assertIn("str(RUN_ROOT): run_volume,", continual_source)
         self.assertNotIn("str(RUN_ROOT): run_volume.with_mount_options", continual_source)
-        self.assertGreaterEqual(continual_source.count("ephemeral_disk=EPHEMERAL_DISK_MIB"), 2)
+        self.assertNotIn("ephemeral_disk=", continual_source)
 
-    def test_training_uses_cached_dataset_image_without_data_volume_staging(self):
+    def test_training_reads_data_volume_v2_directly(self):
         source = (
             ROOT / "tools/modal_continual_training.py"
         ).read_text(encoding="utf-8")
@@ -54,19 +54,22 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         training = source[train_start:train_end]
 
         self.assertIn("image=training_image", source)
-        self.assertIn("dataset_image = _dependency_image()", source)
-        self.assertIn(".run_function(", source)
-        self.assertIn('"MVTRACKER_DATA_ROOT": DATASET_IMAGE_ROOT', training)
+        self.assertIn("training_image = _source_image(_dependency_image())", source)
+        self.assertNotIn(".run_function(", source)
+        self.assertIn('"MVTRACKER_DATA_ROOT": DATA_VOLUME_ROOT', training)
         self.assertNotIn("stage_continual_training_data", training)
-        self.assertNotIn("data_volume", training)
+        self.assertIn(
+            "str(DATA_ROOT): data_volume.with_mount_options(read_only=True)",
+            source,
+        )
 
-    def test_full_archives_are_extracted_in_bounded_scene_layers(self):
-        source = (ROOT / "tools/modal_dataset_image_build.py").read_text(
+    def test_volume_ingestion_extracts_each_archive_once(self):
+        source = (ROOT / "tools/modal_volume_ingestion.py").read_text(
             encoding="utf-8"
         )
         self.assertIn('"--strip-components=2"', source)
-        self.assertIn("(TRAIN_ARCHIVES[0], 1001, 1500)", source)
-        self.assertIn("(TRAIN_ARCHIVES[1], 2501, 3000)", source)
+        self.assertIn('"rapidgzip", "-d", "-c", "-P", "16"', source)
+        self.assertNotIn("--exclude-from", source)
 
     def test_main_launch_requires_explicit_confirmation(self):
         contract.require_main_confirmation("smoke", False)
