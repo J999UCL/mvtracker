@@ -252,6 +252,8 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
                 "selected_views": views,
                 "depth_source": "gt",
                 "gotit": True,
+                "apply_rgb_aug": bool(apply_rgb_aug),
+                "apply_depth_aug": bool(apply_depth_aug),
                 "worker_prepare_seconds": time.perf_counter() - load_started,
                 "motion_track_count": int(len(selected_global)),
                 "motion_full_mean_m": float(full_movement.mean()),

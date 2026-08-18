@@ -1105,6 +1105,8 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "depth_source": depth_type,
                 "requested_view_count": request.view_count if request is not None else None,
                 "gotit": True,
+                "apply_rgb_aug": bool(apply_rgb_aug),
+                "apply_depth_aug": bool(apply_depth_aug),
                 "worker_prepare_seconds": time.perf_counter() - load_started,
                 **motion_statistics,
             },
