@@ -677,3 +677,22 @@ Three duplicate launcher invocations occurred after successful completion.
 They found `model_final.pth` at ten completed steps and performed no additional
 optimizer updates. The final duplicate app was stopped manually after
 confirming both checkpoints were durable.
+
+## 2026-08-18 — Sequential mixed-sampler baseline
+
+Before changing mixed sampling or introducing physical scene batching, the
+current one-sample-at-a-time path was recorded on Dopey for five optimizer-step
+groups. The run used seed 72, the real 17-scene DIEGESIS training split and
+MV-Kubric scenes 900–997. It produced 40 accepted samples in about 20 seconds
+on CPU and did not decode them on a GPU.
+
+- Remote JSON: `/media/data3/jthakwani/mvtracker-runs/mixed-sampling-baseline-seed72-20260818/samples.json`
+- Remote table: `/media/data3/jthakwani/mvtracker-runs/mixed-sampling-baseline-seed72-20260818/samples.md`
+- Local copies: `artifacts/mixed-sampling-baseline-seed72-20260818/`
+
+The current paired-rank retry behavior fired twice. DIEGESIS virtual samples
+6/7 were discarded and replaced by 8/9 at step 1, microbatch 2; virtual samples
+18/19 were discarded and replaced by 20/21 at step 4, microbatch 0. The other
+three groups had no retries. W&B logging was requested but unavailable because
+Dopey had no configured W&B API key; the JSON and Markdown artifacts completed
+before that logging step.
