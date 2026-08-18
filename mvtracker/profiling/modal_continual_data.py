@@ -14,33 +14,29 @@ from concurrent.futures import ThreadPoolExecutor
 
 from huggingface_hub import hf_hub_download
 
+from mvtracker.profiling.modal_mvkubric2000 import (
+    ARCHIVE_ROOT_RELATIVE,
+    TRAIN_ARCHIVES,
+    TRAIN_SCENES,
+    VALIDATION_SCENES,
+)
+
 CHECKPOINT_REPO = "ethz-vlg/mvtracker"
 CHECKPOINT_REVISION = "010d5d114e860aae6b2568104927b636cdca01bc"
 CHECKPOINT_FILE = "mvtracker_200000_june2025.pth"
 CHECKPOINT_SHA256 = "a7fa86f2a7223e3e0aa4c1d3eff0dec5fe8a9227a48572ce943b8e49d8a4f8e6"
 MANIFEST_VERSION = 1
 EXPECTED_DIEGESIS_SPLITS = {"train": 17, "validation": 2, "test": 2}
-EXPECTED_MVKUBRIC_TRAIN_SCENES = {str(scene) for scene in range(900, 998)}
-EXPECTED_MVKUBRIC_POOL_SCENES = {
-    *EXPECTED_MVKUBRIC_TRAIN_SCENES,
-    "998",
-    "999",
-    "101",
-    "102",
-}
-# Keep the old name as the archive/manifest's 100-scene pool contract.
-EXPECTED_MVKUBRIC_SCENES = {str(scene) for scene in range(900, 1000)}
-MVKUBRIC_VALIDATION_SCENES = {"101", "102"}
+EXPECTED_MVKUBRIC_TRAIN_SCENES = set(TRAIN_SCENES)
+EXPECTED_MVKUBRIC_POOL_SCENES = set(TRAIN_SCENES) | set(VALIDATION_SCENES)
+EXPECTED_MVKUBRIC_SCENES = set(TRAIN_SCENES)
+MVKUBRIC_VALIDATION_SCENES = set(VALIDATION_SCENES)
 MVKUBRIC_INDEX_RELATIVE = Path("datasets/kubric-multiview/train/MVTracker_index")
 DIEGESIS_ARCHIVE_RELATIVE = Path(
     "archives/diegesis/"
     "diegesis-81389015a6d713a848a120e34850f360621bcdce.tar.zst"
 )
-MVKUBRIC_SHARD_ROOT_RELATIVE = Path("archives/mvkubric/zstd")
-MVKUBRIC_SHARDS = tuple(
-    MVKUBRIC_SHARD_ROOT_RELATIVE / f"mvkubric-train-{index:02d}.tar.zst"
-    for index in range(4)
-)
+MVKUBRIC_SHARDS = tuple(ARCHIVE_ROOT_RELATIVE / item["filename"] for item in TRAIN_ARCHIVES)
 LOCAL_STAGING_SIDECARS = (
     Path("profile-data-manifest.json"),
     Path("continual-training-data-manifest.json"),
@@ -131,7 +127,7 @@ def _require_existing_profile_data(data_root: Path) -> dict:
     }
     if mvkubric != EXPECTED_MVKUBRIC_POOL_SCENES:
         raise RuntimeError(
-            "existing MV-Kubric pool must contain scenes 900..999 plus validation 101/102"
+            "existing MV-Kubric pool must contain scenes 1001..3000 plus validation 101..127"
         )
     _validate_mvkubric_index(data_root, EXPECTED_MVKUBRIC_POOL_SCENES)
     return manifest
@@ -212,7 +208,11 @@ def stage_continual_training_data(
     *,
     local_data_root: Path,
 ) -> dict:
-    """Stage compressed source data and compact sidecars onto local SSD."""
+    """Legacy staging is disabled; use the immutable dataset image."""
+    raise RuntimeError(
+        "legacy archive staging is disabled for the 2,000-scene pool; "
+        "use the cached dataset image"
+    )
     data_root = Path(data_root)
     local_data_root = Path(local_data_root)
     inputs = (DIEGESIS_ARCHIVE_RELATIVE, *MVKUBRIC_SHARDS, *LOCAL_STAGING_SIDECARS)
@@ -301,7 +301,7 @@ def stage_continual_training_data(
     }
     if observed_mvkubric != EXPECTED_MVKUBRIC_POOL_SCENES:
         raise RuntimeError(
-            "staged MV-Kubric pool must contain scenes 900..999 plus validation 101/102"
+            "staged MV-Kubric pool must contain scenes 1001..3000 plus validation 101..127"
         )
     return {
         "local_data_root": str(local_data_root),
@@ -317,7 +317,10 @@ def stage_mvkubric_profile_shard(
     local_data_root: Path,
     shard_index: int = 0,
 ) -> dict:
-    """Stage one 25-scene MV-Kubric shard for a short loader benchmark."""
+    """Legacy shard staging is disabled; profile the cached dataset image."""
+    raise RuntimeError(
+        "legacy MV-Kubric shard staging is disabled; use the cached dataset image"
+    )
     if not 0 <= shard_index < len(MVKUBRIC_SHARDS):
         raise ValueError("shard_index must be in [0, 4)")
     data_root = Path(data_root)
@@ -442,7 +445,7 @@ def profile_encoded_loader(
             include_scene_ids=(
                 list(mvkubric_scene_ids)
                 if mvkubric_scene_ids is not None
-                else [str(scene) for scene in range(900, 998)]
+                else [str(scene) for scene in range(1001, 3001)]
             ),
         )
 
@@ -592,4 +595,41 @@ def materialize_continual_training_data(data_root: Path) -> dict:
         "checkpoint": _materialize_checkpoint(data_root, token),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return manifest
+
+
+def materialize_expanded_continual_training_data(data_root: Path) -> dict:
+    """Prepare the versioned 2,000-scene pool for the cached dataset image."""
+
+    token = os.environ["HF_TOKEN"]
+    from mvtracker.profiling.modal_mvkubric2000 import materialize_mvkubric2000
+
+    data_root = Path(data_root)
+    profile_manifest_path = data_root / "profile-data-manifest.json"
+    if not profile_manifest_path.is_file():
+        raise FileNotFoundError(profile_manifest_path)
+    profile_manifest = json.loads(profile_manifest_path.read_text(encoding="utf-8"))
+    if profile_manifest.get("diegesis", {}).get("splits") != EXPECTED_DIEGESIS_SPLITS:
+        raise RuntimeError("existing DIEGESIS split manifest is incompatible")
+    for split, expected_count in EXPECTED_DIEGESIS_SPLITS.items():
+        raw_root = data_root / "datasets/diegesis-mvtracker/TAPVid3D_raw" / split
+        cache_root = data_root / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache" / split
+        raw = {path.name for path in raw_root.iterdir() if path.is_dir()}
+        cached = {path.name for path in cache_root.iterdir() if path.is_dir()}
+        if len(raw) != expected_count or raw != cached:
+            raise RuntimeError(f"existing DIEGESIS {split} data is incomplete")
+
+    mvkubric_manifest = materialize_mvkubric2000(data_root, token)
+    checkpoint = _materialize_checkpoint(data_root, token)
+    manifest = {
+        "schema_version": MANIFEST_VERSION,
+        "mvkubric_revision": mvkubric_manifest["revision"],
+        "diegesis": profile_manifest["diegesis"],
+        "mvkubric": mvkubric_manifest,
+        "checkpoint": checkpoint,
+    }
+    manifest_path = data_root / "continual-training-data-manifest.json"
+    temporary = manifest_path.with_suffix(".json.partial")
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(manifest_path)
     return manifest

@@ -5,7 +5,7 @@
 This profile requests exactly one H100 (`max_containers=1`) and carries the
 billing tags `owner=jeet`, `project=mvtracker`, `purpose=profiling`.  It stages
 the pinned DIEGESIS snapshot directly from Hugging Face/Xet onto container-local
-SSD (about 90 seconds), and copies only MV-Kubric scenes `900`--`903` with
+SSD (about 90 seconds), and copies only MV-Kubric scenes `1001`--`1004` with
 `rgba_*.png` plus `metadata.json` from the read-only Modal Volume.  Inference
 and temporary profile outputs stay on local SSD; only the small report is
 committed to `jeet-mvtracker-runs-v2` and metrics go to W&B.  Each dataset
@@ -58,35 +58,31 @@ If batch 8 is safe, report the result as at least 8 rather than as an unbounded
 maximum. Always use these local entrypoints so the app receives the exact GPU
 and experiment billing tags.
 
-## GT-depth DIEGESIS + MV-Kubric continual training
+## GT-depth DIEGESIS + 2,000-scene MV-Kubric continual training
 
 The launcher refuses a two-H100 submission unless the selected source SHA is
 the pushed `origin/main` commit and at least two Prism container slots are free.
 It never stops another app. Data setup verifies the existing DIEGESIS and
-100-scene MV-Kubric micro pool, then materializes the pinned, checksummed
+2,000-scene MV-Kubric pool, then materializes the pinned, checksummed
 published mixed-depth checkpoint into the existing data Volume.
 
-Validation scenes `101` and `102` use the pinned upstream
-`kubric-multiview--train.full.0031-1000.tar.gz` archive. The tagged setup
-entrypoint streams only the ordered prefix needed to extract those two scenes,
-copies them into `datasets/kubric-multiview/train`, and rebuilds one combined
-102-scene `MVTracker_index`. It is a CPU/data setup job, not training; inspect
-`modal container list --json` before launching because the source archive is
-very large even when streamed selectively.
-
-```bash
-cd /Users/jeetthakwani/dev/PointTracking/mvtracker
-export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
-modal container list --json
-modal run --timestamps tools/modal_mvkubric_validation.py
-```
+The tagged CPU setup downloads and checksum-verifies the unchanged official
+archives `kubric-multiview--train.full.1001-2000.tar.gz` and
+`kubric-multiview--train.full.2001-3000.tar.gz` at revision
+`cccb9128fb95d302c662151e65a09377175c2a3a` into the versioned Volume path
+`archives/mvkubric/2000-scenes-v1/`. It streams only the ordered range needed
+for validation scenes `101`--`127` from
+`kubric-multiview--train.full.0031-1000.tar.gz` into
+`datasets/kubric-multiview/2000-scenes-v1/validation/`. No 395-GB validation
+source archive is retained.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
-# One-time CPU-only source-data verification and checkpoint materialization.
-modal run --timestamps tools/modal_continual_training.py::setup_data
+# One-time CPU-only archive verification, validation extraction, and checkpoint
+# materialization.
+modal run --timestamps tools/modal_continual_training.py::setup-data
 
 # One-time CPU build of the expanded immutable dataset image.
 modal run --timestamps tools/modal_continual_training.py::build_dataset_image
@@ -116,8 +112,10 @@ Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
 directory.
 
-The dataset image expands the DIEGESIS archive and four MV-Kubric tar.zst
-shards once under `/opt/mvtracker-data`. The immutable dataset layer sits above
+The dataset image expands the DIEGESIS archive and each official 1,000-scene
+MV-Kubric archive once under `/opt/mvtracker-data`. Its final CPU layer copies
+validation scenes `101`--`127`, builds the 2,027-scene `MVTracker_index`, and
+writes `dataset-image.json`. The immutable dataset layer sits above
 dependencies and below the commit-specific source layer. Training mounts only
 the writable results Volume and reads the dataset directly from the image.
 
@@ -130,33 +128,11 @@ modal run --timestamps tools/modal_continual_training.py::profile-h100-loader
 ```
 
 The CPU loader profile uses four warm-ups and 32 measured samples. The H100
-profile stages only the first 25-scene MV-Kubric shard, then measures 20 warm-up
-and 100 production-path samples using batched nvImageCodec PNG/TIFF decoding.
+profile stages the first 500-scene MV-Kubric archive range, then measures 20
+warm-up and 100 production-path samples using batched nvImageCodec PNG/TIFF
+decoding.
 Both profile entrypoints carry
 `owner=jeet`, `project=mvtracker`, `purpose=profiling` tags.
-
-To measure archive transfer, extraction, and one CPU sample per dataset without
-launching training or a GPU:
-
-```bash
-MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) \
-modal run --timestamps tools/modal_data_loading_smoke.py
-```
-
-To split the pinned MV-Kubric archive into four independently extractable
-`tar.zst` shards (CPU-only, one Modal container):
-
-```bash
-modal container list --json
-modal run --timestamps tools/modal_mvkubric_shard.py
-```
-
-To benchmark parallel local copy and extraction of the four MV-Kubric shards:
-
-```bash
-modal container list --json
-modal run --timestamps tools/modal_mvkubric_shard.py::benchmark_shards
-```
 
 ## Single-T4 production loader benchmark
 

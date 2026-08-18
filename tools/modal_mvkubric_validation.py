@@ -1,233 +1,56 @@
-"""Materialize the two MV-Kubric validation scenes into the shared Modal volume."""
+"""Materialize the pinned 2,000-scene MV-Kubric inputs on the data Volume."""
 
 from __future__ import annotations
 
-import hashlib
-import io
 import json
 from pathlib import Path
-import shutil
-import tarfile
-import time
 
 import modal
 
-from modal_training_profile import (
-    _runtime_image,
-    data_volume,
-    hf_secret,
-    wandb_secret,
-)
+from modal_training_profile import DATA_ROOT, _runtime_image, data_volume, hf_secret, wandb_secret
 
-
-DATA_ROOT = Path("/mnt/mvtracker-data")
-MVKUBRIC_REPO = "ethz-vlg/mv3dpt-datasets"
-MVKUBRIC_REVISION = "cccb9128fb95d302c662151e65a09377175c2a3a"
-SOURCE_ARCHIVE = "kubric-multiview--train.full.0031-1000.tar.gz"
-SOURCE_ARCHIVE_SIZE_BYTES = 394_716_348_566
-RANGE_BYTES = 1 << 30
-VALIDATION_SCENES = ("101", "102")
-TRAIN_ROOT = DATA_ROOT / "datasets/kubric-multiview/train"
-INDEX_ROOT = TRAIN_ROOT / "MVTracker_index"
 
 app = modal.App(
     "jeet-mvkubric-validation",
     tags={"owner": "jeet", "project": "mvtracker", "purpose": "profiling"},
 )
 image = _runtime_image()
-volume = data_volume
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(16 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _scene_inventory(root: Path) -> list[str]:
-    return sorted(
-        (path.name for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
-        key=int,
-    )
-
-
-def _validate_scene(root: Path, scene_id: str) -> dict[str, object]:
-    scene = root / scene_id
-    if not scene.is_dir():
-        raise FileNotFoundError(scene)
-    if not (scene / "tracks_3d.npz").is_file():
-        raise RuntimeError(f"scene {scene_id} is missing tracks_3d.npz")
-    views = sorted(path.parent.name for path in scene.glob("view_*/metadata.json"))
-    for view in views:
-        view_root = scene / view
-        if not list(view_root.glob("rgba_*.png")) or not list(view_root.glob("depth_*.tiff")):
-            raise RuntimeError(f"scene {scene_id}/{view} has no readable RGB/depth frames")
-    return {
-        "scene_id": scene_id,
-        "views": views,
-        "files": sum(1 for path in scene.rglob("*") if path.is_file()),
-        "bytes": sum(path.stat().st_size for path in scene.rglob("*") if path.is_file()),
-    }
-
-
-class _RangeStream(io.RawIOBase):
-    """Read a large signed Xet object through bounded HTTP ranges."""
-
-    def __init__(self, url: str, size: int):
-        self.url = url
-        self.size = size
-        self.offset = 0
-        self.response = None
-
-    def readable(self) -> bool:
-        return True
-
-    def readinto(self, target) -> int:
-        if self.offset >= self.size:
-            return 0
-        if self.response is None:
-            end = min(self.size, self.offset + RANGE_BYTES) - 1
-            import requests
-
-            response = requests.get(
-                self.url,
-                headers={"Range": f"bytes={self.offset}-{end}"},
-                stream=True,
-                timeout=120,
-            )
-            response.raise_for_status()
-            expected = f"bytes {self.offset}-{end}/{self.size}"
-            if response.headers.get("Content-Range") != expected:
-                response.close()
-                raise RuntimeError(
-                    f"unexpected Xet range: {response.headers.get('Content-Range')!r}; "
-                    f"expected {expected!r}"
-                )
-            self.response = response
-        block = self.response.raw.read(len(target))
-        if not block:
-            self.response.close()
-            self.response = None
-            return self.readinto(target)
-        target[: len(block)] = block
-        self.offset += len(block)
-        if self.offset % RANGE_BYTES == 0:
-            self.response.close()
-            self.response = None
-        return len(block)
-
-    def close(self):
-        if self.response is not None:
-            self.response.close()
-            self.response = None
-        super().close()
 
 
 @app.function(
     image=image,
     secrets=[hf_secret, wandb_secret],
-    volumes={str(DATA_ROOT): volume},
+    volumes={str(DATA_ROOT): data_volume},
     cpu=16,
     memory=65536,
     ephemeral_disk=512 * 1024,
-    timeout=6 * 60 * 60,
+    timeout=12 * 60 * 60,
     max_containers=1,
 )
 def materialize_validation() -> dict[str, object]:
+    import os
     import wandb
 
-    from mvtracker.datasets.kubric_metadata_index import build_kubric_metadata_index, KubricMetadataIndex
+    from mvtracker.profiling.modal_mvkubric2000 import materialize_mvkubric2000
 
-    started = time.perf_counter()
     run = wandb.init(
         entity="jeetucl-ucl",
         project="mvtracker-modal-profiling",
-        job_type="mvkubric-validation-setup",
+        job_type="mvkubric-2000-scene-setup",
         tags=["modal", "mv-kubric", "validation", "archive"],
-        config={
-            "repo_id": MVKUBRIC_REPO,
-            "revision": MVKUBRIC_REVISION,
-            "archive": SOURCE_ARCHIVE,
-            "validation_scenes": list(VALIDATION_SCENES),
-            "owner": "jeet",
-            "project": "mvtracker",
-            "purpose": "profiling",
-        },
+        config={"owner": "jeet", "project": "mvtracker", "purpose": "profiling"},
     )
     try:
-        staging = Path("/tmp/mvkubric-validation")
-        if staging.exists():
-            shutil.rmtree(staging)
-        staging.mkdir()
-        from huggingface_hub import hf_hub_url
-
-        url = hf_hub_url(
-            repo_id=MVKUBRIC_REPO,
-            filename=SOURCE_ARCHIVE,
-            repo_type="dataset",
-            revision=MVKUBRIC_REVISION,
+        manifest = materialize_mvkubric2000(DATA_ROOT, os.environ["HF_TOKEN"])
+        data_volume.commit()
+        run.summary.update(
+            {
+                "train_scene_count": manifest["train_scene_count"],
+                "validation_scene_count": manifest["validation_scene_count"],
+                "archive_root": str(Path(DATA_ROOT) / "archives/mvkubric/2000-scenes-v1"),
+            }
         )
-        source_root = staging / "kubric-multiview/train"
-        source_root.mkdir(parents=True)
-        seen = set()
-        stream = io.BufferedReader(
-            _RangeStream(url, SOURCE_ARCHIVE_SIZE_BYTES), buffer_size=8 * 1024 * 1024
-        )
-        with tarfile.open(fileobj=stream, mode="r|gz") as archive:
-            for member in archive:
-                parts = Path(member.name).parts
-                if len(parts) < 3 or parts[:2] != ("kubric-multiview", "train"):
-                    continue
-                scene_id = parts[2]
-                if scene_id not in VALIDATION_SCENES:
-                    if seen == set(VALIDATION_SCENES):
-                        break
-                    continue
-                archive.extract(member, staging)
-                seen.add(scene_id)
-        stream.close()
-        if seen != set(VALIDATION_SCENES):
-            raise RuntimeError(
-                f"{SOURCE_ARCHIVE} at {MVKUBRIC_REVISION} lacks validation scenes "
-                f"{sorted(set(VALIDATION_SCENES) - seen)}"
-            )
-        reports = [_validate_scene(source_root, scene) for scene in VALIDATION_SCENES]
-        existing = set(_scene_inventory(TRAIN_ROOT))
-        expected_train = {str(scene) for scene in range(900, 1000)}
-        if existing != expected_train:
-            raise RuntimeError(
-                f"refusing to modify volume: expected train scenes 900..999, observed "
-                f"{len(existing)} scenes"
-            )
-        for scene in VALIDATION_SCENES:
-            destination = TRAIN_ROOT / scene
-            if destination.exists():
-                shutil.rmtree(destination)
-            shutil.copytree(source_root / scene, destination)
-        all_scenes = expected_train | set(VALIDATION_SCENES)
-        manifest_path = build_kubric_metadata_index(
-            TRAIN_ROOT, index_root=INDEX_ROOT, overwrite=True
-        )
-        index = KubricMetadataIndex(INDEX_ROOT)
-        if set(index.scenes) != all_scenes:
-            raise RuntimeError("combined MV-Kubric index scene allowlist is incomplete")
-        index.validate_source(TRAIN_ROOT)
-        volume.commit()
-        result = {
-            "repo_id": MVKUBRIC_REPO,
-            "revision": MVKUBRIC_REVISION,
-            "archive": SOURCE_ARCHIVE,
-            "validation_scenes": reports,
-            "train_scene_count": len(expected_train),
-            "combined_index_scene_count": len(index.scenes),
-            "index_manifest": str(manifest_path),
-            "index_manifest_sha256": _sha256(manifest_path),
-            "elapsed_seconds": time.perf_counter() - started,
-        }
-        run.summary.update(result)
-        return result
+        return manifest
     finally:
         run.finish()
 

@@ -12,7 +12,13 @@ import sys
 
 import modal
 
-from modal_dataset_image_build import install_dataset_image
+from modal_dataset_image_build import (
+    TRAIN_ARCHIVE_STAGES,
+    TRAIN_SCENES,
+    install_dataset_base,
+    install_mvkubric_archive,
+    install_mvkubric_validation_and_index,
+)
 
 from modal_training_profile import (
     DATA_ROOT,
@@ -46,6 +52,7 @@ from mvtracker.profiling.modal_continual_training import (
     require_remote_main_confirmation,
     validate_run_name,
 )
+from mvtracker.profiling.modal_mvkubric2000 import TRAIN_ARCHIVES as PINNED_MVKUBRIC_ARCHIVES
 
 
 APP_NAME = "jeet-mvtracker-continual-training"
@@ -87,12 +94,45 @@ app = modal.App(APP_NAME, tags={**MODAL_TAGS, "experiment": "unclassified"})
 
 
 runtime_image = _runtime_image()
-dataset_image = _dependency_image().run_function(
-    install_dataset_image,
-    volumes={str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
-    cpu=32,
-    memory=65536,
-    timeout=4 * 60 * 60,
+canonical_index_path = Path(__file__).resolve().parents[1] / (
+    "mvtracker/datasets/kubric_metadata_index.py"
+)
+dataset_image = _dependency_image()
+dataset_image = dataset_image.add_local_file(
+    str(canonical_index_path),
+    remote_path="/opt/mvtracker/mvtracker/datasets/kubric_metadata_index.py",
+    copy=True,
+)
+_dataset_stage_options = {
+    "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
+    "cpu": 32,
+    "memory": 65536,
+    "timeout": 4 * 60 * 60,
+}
+dataset_image = dataset_image.run_function(
+    install_dataset_base,
+    **_dataset_stage_options,
+    kwargs={"dataset_version": DATASET_IMAGE_VERSION},
+)
+for _archive_name, _scene_start, _scene_end in TRAIN_ARCHIVE_STAGES:
+    _archive_record = next(
+        item for item in PINNED_MVKUBRIC_ARCHIVES if item["filename"] == _archive_name
+    )
+    dataset_image = dataset_image.run_function(
+        install_mvkubric_archive,
+        **_dataset_stage_options,
+        kwargs={
+            "dataset_version": DATASET_IMAGE_VERSION,
+            "archive_name": _archive_name,
+            "scene_start": _scene_start,
+            "scene_end": _scene_end,
+            "archive_size_bytes": _archive_record["size_bytes"],
+            "archive_sha256": _archive_record["sha256"],
+        },
+    )
+dataset_image = dataset_image.run_function(
+    install_mvkubric_validation_and_index,
+    **_dataset_stage_options,
     kwargs={"dataset_version": DATASET_IMAGE_VERSION},
 )
 training_image = _source_image(dataset_image)
@@ -118,7 +158,7 @@ def setup_training_data_remote() -> dict:
     import wandb
 
     from mvtracker.profiling.modal_continual_data import (
-        materialize_continual_training_data,
+        materialize_expanded_continual_training_data,
     )
 
     run = wandb.init(
@@ -129,11 +169,12 @@ def setup_training_data_remote() -> dict:
         tags=["modal", "data-setup", "gt-depth-replay-v1"],
         config={"source_commit": _source_commit(), **MODAL_TAGS},
     )
-    manifest = materialize_continual_training_data(DATA_ROOT)
+    manifest = materialize_expanded_continual_training_data(DATA_ROOT)
     data_volume.commit()
     run.summary.update(
         {
-            "mvkubric_scenes": manifest["mvkubric"]["scene_count"],
+            "mvkubric_train_scenes": manifest["mvkubric"]["train_scene_count"],
+            "mvkubric_validation_scenes": manifest["mvkubric"]["validation_scene_count"],
             "checkpoint_sha256": manifest["checkpoint"]["sha256"],
         }
     )
@@ -172,36 +213,32 @@ def _profile_dataset_image_cpu() -> dict:
 
 
 def _profile_h100_mvkubric_loader() -> dict:
-    from mvtracker.profiling.modal_continual_data import (
-        profile_encoded_loader,
-        stage_mvkubric_profile_shard,
-    )
+    from mvtracker.profiling.modal_continual_data import profile_encoded_loader
 
-    staging = stage_mvkubric_profile_shard(
-        DATA_ROOT,
-        local_data_root=Path("/tmp/mvtracker-profile-data"),
-    )
+    scene_ids = list(TRAIN_SCENES[:25])
     profile = profile_encoded_loader(
-        Path("/tmp/mvtracker-profile-data") / "datasets",
+        Path(DATASET_IMAGE_ROOT) / "datasets",
         source="mvkubric",
         warmup=H100_LOADER_PROFILE_WARMUP,
         measured=H100_LOADER_PROFILE_MEASURED,
         workers=8,
         use_cuda=True,
-        mvkubric_scene_ids=staging["scene_ids"],
+        mvkubric_scene_ids=scene_ids,
     )
-    return {"profiles": {"mvkubric": profile}, "staging": staging}
+    return {
+        "profiles": {"mvkubric": profile},
+        "staging": {"scene_ids": scene_ids, "local_data_root": DATASET_IMAGE_ROOT},
+    }
 
 
 def _profile_summary(result: dict) -> dict:
     summary = {}
     if "staging" in result:
-        summary.update(
-            {
-                "staging/elapsed_seconds": result["staging"]["elapsed_seconds"],
-                "staging/copied_bytes": result["staging"]["copied_size_bytes"],
-            }
-        )
+        staging = result["staging"]
+        if "elapsed_seconds" in staging:
+            summary["staging/elapsed_seconds"] = staging["elapsed_seconds"]
+        if "copied_size_bytes" in staging:
+            summary["staging/copied_bytes"] = staging["copied_size_bytes"]
     for source, profile in result["profiles"].items():
         phases = profile if "cold" in profile else {"measured": profile}
         for phase, measurements in phases.items():
@@ -247,9 +284,8 @@ def profile_cpu_loader_remote() -> dict:
 
 
 @app.function(
-    image=runtime_image,
+    image=training_image,
     secrets=[wandb_secret],
-    volumes={str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
     gpu="H100!",
     cpu=32,
     memory=65536,
