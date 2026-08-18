@@ -178,7 +178,7 @@ capture five groups of eight current sampler outputs without running training:
 source /media/data3/jthakwani/mvtracker-venv/bin/activate
 cd /media/data3/jthakwani/mvtracker
 python tools/inspect_mixed_sampling.py \
-  --diegesis-root /media/data3/jthakwani/mvtracker-data \
+  --diegesis-root /media/data3/jthakwani/datasets/diegesis-mvtracker \
   --mvkubric-root /media/data3/jthakwani/datasets/mv3dpt-train-micro \
   --mvkubric-index-root /media/data3/jthakwani/datasets/mv3dpt-train-micro/kubric-multiview/train/MVTracker_index \
   --output-dir /media/data3/jthakwani/mvtracker-runs/mixed-sampling-baseline \
