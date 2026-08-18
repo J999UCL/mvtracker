@@ -305,6 +305,26 @@ class CacheTests(unittest.TestCase):
 
 
 class SelectiveLoaderTests(unittest.TestCase):
+    def test_plan_is_metadata_only_and_materialization_reads_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = _dataset(root)
+            with mock.patch.object(loader, "_read_encoded_frames", side_effect=AssertionError):
+                plan = None
+                for index in range(32):
+                    plan = dataset.plan_sample(index)
+                    if plan is not None:
+                        break
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan.track_count, len(plan.selected_track_indices))
+            self.assertEqual(plan.frame_indices.shape, (dataset.seq_len,))
+            self.assertEqual(len(plan.views), len(plan.rgb_sources))
+            self.assertEqual(plan.image_codec, "jpeg")
+            sample, gotit = dataset.materialize_sample(plan)
+            self.assertTrue(gotit)
+            self.assertEqual(sample.metadata["selected_views"], list(plan.views))
+            self.assertEqual(sample.trajectory_3d.shape[1], plan.track_count)
+
     def test_samples_gt_raw_and_cleaned_estimated_depth(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 
 from mvtracker.datasets.kubric_multiview_dataset import (
     KubricMultiViewDataset,
@@ -24,6 +24,7 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
     _spatial_transform,
     _visible_path_lengths,
     collate_encoded_tapvid3d,
+    SamplePlan,
 )
 
 
@@ -44,8 +45,7 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
         if self.novel_views is not None or self.normalize_scene_following_vggt:
             raise ValueError("MV-Kubric GPU decode does not support novel-view/VGGT modes")
 
-    def __getitem__(self, index):
-        load_started = time.perf_counter()
+    def plan_sample(self, index) -> SamplePlan | None:
         request = index if hasattr(index, "virtual_index") else None
         virtual_index = request.virtual_index if request is not None else int(index)
         scene_index = (
@@ -106,7 +106,7 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
             maximum=self.max_tracks_to_preload,
         )
         if not len(preselected):
-            return None, False
+            return None
 
         tracks = tracks_all[frame_indices][:, preselected]
         visibility = visibility_all[:, frame_indices][:, :, preselected]
@@ -126,19 +126,20 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
             & (camera_z > 0)
         )
 
-        first_rgb = scene_path / scene["view_names"][views[0]] / scene["rgba_files"][views[0]][start]
-        with Image.open(first_rgb) as image:
-            source_size = (int(image.height), int(image.width))
-        rgb_bytes = []
-        depth_bytes = []
+        metadata_path = scene_path / scene["view_names"][views[0]] / "metadata.json"
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            width, height = json.load(handle)["metadata"]["resolution"]
+        source_size = (int(height), int(width))
+        rgb_sources = []
+        depth_sources = []
         for view in views:
             view_path = scene_path / scene["view_names"][view]
-            rgb_bytes.extend(
-                (view_path / scene["rgba_files"][view][frame]).read_bytes()
+            rgb_sources.extend(
+                view_path / scene["rgba_files"][view][frame]
                 for frame in frame_indices
             )
-            depth_bytes.extend(
-                (view_path / scene["depth_files"][view][frame]).read_bytes()
+            depth_sources.extend(
+                view_path / scene["depth_files"][view][frame]
                 for frame in frame_indices
             )
 
@@ -208,7 +209,7 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
             sample_index=virtual_index,
         )
         if not len(selected):
-            return None, False
+            return None
 
         selected_tracks = tracks[:, selected]
         xy_z = transformed_trajectory[:, :, selected]
@@ -230,18 +231,40 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
             intrinsics += rng.normal(0, 0.001, size=intrinsics.shape)
             extrinsics += rng.normal(0, 0.001, size=extrinsics.shape)
 
-        sample = EncodedTapVid3DSample(
-            jpeg_bytes=tuple(rgb_bytes),
-            depth=None,
-            theta=torch.from_numpy(theta),
-            intrs=torch.from_numpy(intrinsics),
-            extrs=torch.from_numpy(extrinsics),
-            trajectory=torch.from_numpy(xy_z),
-            trajectory_3d=torch.from_numpy(selected_tracks),
-            visibility=torch.from_numpy(selected_visibility),
-            valid=torch.ones((self.seq_len, len(selected)), dtype=torch.float32),
-            query_points_3d=torch.from_numpy(query_points),
-            seq_name=sequence,
+        return SamplePlan(
+            dataset="kubric",
+            virtual_index=virtual_index,
+            scene_index=scene_index,
+            sequence=sequence,
+            seed=seed,
+            frame_indices=frame_indices.copy(),
+            views=tuple(views),
+            preselected_track_indices=preselected.copy(),
+            selected_track_indices=selected.copy(),
+            selected_global_track_indices=selected_global.copy(),
+            track_count=int(len(selected)),
+            query_points_3d=query_points,
+            trajectory=xy_z,
+            trajectory_3d=selected_tracks,
+            visibility=selected_visibility,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            theta=theta,
+            source_size=source_size,
+            output_size=output_size,
+            image_codec="nvimagecodec",
+            depth_source="gt",
+            rgb_sources=tuple(rgb_sources),
+            depth_sources=tuple(depth_sources),
+            apply_rgb_aug=apply_rgb_aug,
+            rgb_augmentation=rgb_augmentation,
+            apply_depth_aug=apply_depth_aug,
+            depth_patch_operations=depth_operations,
+            augmentation_seed=seed,
+            depth_scale=depth_scale,
+            max_depth=float(self.max_depth),
+            depth_sensor_widths=tuple(float(arrays["sensor_widths"][view]) for view in views),
+            depth_focal_lengths=tuple(float(arrays["focal_lengths"][view]) for view in views),
             metadata={
                 "virtual_index": virtual_index,
                 "scene_index": scene_index,
@@ -254,7 +277,6 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
                 "gotit": True,
                 "apply_rgb_aug": bool(apply_rgb_aug),
                 "apply_depth_aug": bool(apply_depth_aug),
-                "worker_prepare_seconds": time.perf_counter() - load_started,
                 "motion_track_count": int(len(selected_global)),
                 "motion_full_mean_m": float(full_movement.mean()),
                 "motion_full_median_m": float(np.median(full_movement)),
@@ -272,18 +294,46 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
                     ((full_movement > 0.1) & (window_movement < 0.01)).sum()
                 ),
             },
-            output_size=output_size,
-            apply_rgb_aug=apply_rgb_aug,
-            rgb_augmentation=rgb_augmentation,
-            apply_depth_aug=apply_depth_aug,
-            augmentation_seed=seed,
-            depth_scale=depth_scale,
-            track_upscaling_factor=1.0 / depth_scale,
-            max_depth=float(self.max_depth),
-            depth_patch_operations=depth_operations,
-            image_codec="nvimagecodec",
-            depth_bytes=tuple(depth_bytes),
-            depth_sensor_widths=tuple(float(arrays["sensor_widths"][view]) for view in views),
-            depth_focal_lengths=tuple(float(arrays["focal_lengths"][view]) for view in views),
+        )
+
+    def materialize_sample(self, plan: SamplePlan):
+        load_started = time.perf_counter()
+        rgb_bytes = tuple(path.read_bytes() for path in plan.rgb_sources)
+        depth_bytes = tuple(path.read_bytes() for path in plan.depth_sources)
+        metadata = dict(plan.metadata)
+        metadata["gotit"] = True
+        metadata["worker_prepare_seconds"] = time.perf_counter() - load_started
+        sample = EncodedTapVid3DSample(
+            jpeg_bytes=rgb_bytes,
+            depth=None,
+            theta=torch.from_numpy(plan.theta),
+            intrs=torch.from_numpy(plan.intrinsics),
+            extrs=torch.from_numpy(plan.extrinsics),
+            trajectory=torch.from_numpy(plan.trajectory),
+            trajectory_3d=torch.from_numpy(plan.trajectory_3d),
+            visibility=torch.from_numpy(plan.visibility),
+            valid=torch.ones((self.seq_len, plan.track_count), dtype=torch.float32),
+            query_points_3d=torch.from_numpy(plan.query_points_3d),
+            seq_name=plan.sequence,
+            metadata=metadata,
+            output_size=plan.output_size,
+            apply_rgb_aug=plan.apply_rgb_aug,
+            rgb_augmentation=plan.rgb_augmentation,
+            apply_depth_aug=plan.apply_depth_aug,
+            augmentation_seed=plan.augmentation_seed,
+            depth_scale=plan.depth_scale,
+            track_upscaling_factor=1.0 / plan.depth_scale,
+            max_depth=plan.max_depth,
+            depth_patch_operations=plan.depth_patch_operations,
+            image_codec=plan.image_codec,
+            depth_bytes=depth_bytes,
+            depth_sensor_widths=plan.depth_sensor_widths,
+            depth_focal_lengths=plan.depth_focal_lengths,
         )
         return sample, True
+
+    def __getitem__(self, index):
+        plan = self.plan_sample(index)
+        if plan is None:
+            return None, False
+        return self.materialize_sample(plan)

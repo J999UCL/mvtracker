@@ -246,6 +246,46 @@ class EncodedTapVid3DSample:
 
 
 @dataclass
+class SamplePlan:
+    """Metadata-only sampling ticket consumed by an encoded materializer."""
+
+    dataset: str
+    virtual_index: int
+    scene_index: int
+    sequence: str
+    seed: int
+    frame_indices: np.ndarray
+    views: tuple[int, ...]
+    preselected_track_indices: np.ndarray
+    selected_track_indices: np.ndarray
+    selected_global_track_indices: np.ndarray
+    track_count: int
+    query_points_3d: np.ndarray
+    trajectory: np.ndarray
+    trajectory_3d: np.ndarray
+    visibility: np.ndarray
+    intrinsics: np.ndarray
+    extrinsics: np.ndarray
+    theta: np.ndarray
+    source_size: tuple[int, int]
+    output_size: tuple[int, int]
+    image_codec: str
+    depth_source: str
+    rgb_sources: tuple[Any, ...]
+    depth_sources: tuple[Any, ...]
+    apply_rgb_aug: bool
+    rgb_augmentation: dict[str, Any] | None
+    apply_depth_aug: bool
+    depth_patch_operations: tuple[tuple[int, ...], ...]
+    augmentation_seed: int
+    depth_scale: float
+    max_depth: float
+    depth_sensor_widths: tuple[float, ...]
+    depth_focal_lengths: tuple[float, ...]
+    metadata: dict[str, Any]
+
+
+@dataclass
 class EncodedTapVid3DBatch:
     samples: list[EncodedTapVid3DSample]
 
@@ -863,8 +903,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             return kwargs
         return TapVid3DMultiViewDataset(**kwargs)
 
-    def __getitem__(self, index):
-        load_started = time.perf_counter()
+    def plan_sample(self, index) -> SamplePlan | None:
         request = index if hasattr(index, "virtual_index") else None
         virtual_index = request.virtual_index if request is not None else int(index)
         scene_index = (
@@ -934,7 +973,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             maximum=getattr(self, "max_tracks_to_preload", 18000),
         )
         if not len(preselected):
-            return None, False
+            return None
 
         legal = _legal_contiguous_window_starts(frame_count, self.seq_len)
         if not len(legal):
@@ -948,37 +987,16 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         depths = []
         encoded = []
         source_size = tuple(int(value) for value in manifest["resolution_hw"])
-        estimated_depths = cleaned_mask = None
-        if depth_type != "gt":
-            estimated_depths, cleaned_mask = self.estimated_depth_store.load(
-                sequence, views, frame_indices
-            )
-            if estimated_depths.shape != (view_count, self.seq_len, *source_size):
-                raise ValueError(
-                    f"estimated depth shape {estimated_depths.shape} does not match "
-                    f"sample shape {(view_count, self.seq_len, *source_size)}"
-                )
-            if depth_type == "estimated_cleaned":
-                estimated_depths = estimated_depths * cleaned_mask
         for view_position, view in enumerate(views):
             raw_view = source_root / str(view)
             extrinsics.append(np.asarray(self._mmap(raw_view / "extrinsics_w2c.npy")[frame_indices, :3, :4], dtype=np.float32))
             k = _intrinsics_matrix(self._mmap(raw_view / "intrinsics.npy"))
             intrinsics.append(np.repeat(k[None], self.seq_len, axis=0))
             visibility.append(visibility_all[views.index(view), frame_indices][:, preselected])
-            depth = (
-                self._mmap(raw_view / "depth.npy")[frame_indices]
-                if estimated_depths is None
-                else estimated_depths[view_position]
-            )
-            depths.append(torch.from_numpy(np.asarray(depth, dtype=np.float32).copy()))
             cache_view = cache_root / f"view_{view}"
-            encoded.extend(_read_encoded_frames(
-                self._jpeg_descriptor(cache_view / "jpeg_bytes.bin"),
-                self._mmap(cache_view / "jpeg_offsets.npy"),
-                frame_indices,
-                label=cache_view,
-            ))
+            encoded_source = (cache_view / "jpeg_bytes.bin", cache_view / "jpeg_offsets.npy")
+            encoded.append(encoded_source)
+            depths.append(raw_view / "depth.npy")
         extrinsics_np = np.stack(extrinsics)
         intrinsics_np = np.stack(intrinsics)
         visibility_np = np.stack(visibility)
@@ -1043,7 +1061,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             sample_index=virtual_index,
         )
         if not len(selected):
-            return None, False
+            return None
         xy_z = transformed_trajectory[:, :, selected]
         selected_tracks = tracks[:, selected]
         selected_visibility = visibility_np[:, :, selected]
@@ -1082,18 +1100,40 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         if getattr(self, "enable_camera_params_noise_augs", False):
             intrinsics_np = intrinsics_np + rng.normal(0, 0.001, size=intrinsics_np.shape)
             extrinsics_np = extrinsics_np + rng.normal(0, 0.001, size=extrinsics_np.shape)
-        sample = EncodedTapVid3DSample(
-            jpeg_bytes=tuple(encoded),
-            depth=torch.stack(depths)[:, :, None],
-            theta=torch.from_numpy(theta),
-            intrs=torch.from_numpy(intrinsics_np),
-            extrs=torch.from_numpy(extrinsics_np),
-            trajectory=torch.from_numpy(xy_z),
-            trajectory_3d=torch.from_numpy(np.asarray(selected_tracks, dtype=np.float32)),
-            visibility=torch.from_numpy(selected_visibility),
-            valid=torch.ones((self.seq_len, len(selected)), dtype=torch.float32),
-            query_points_3d=torch.from_numpy(query_points),
-            seq_name=sequence,
+        return SamplePlan(
+            dataset="tapvid3d",
+            virtual_index=virtual_index,
+            scene_index=scene_index,
+            sequence=sequence,
+            seed=seed,
+            frame_indices=frame_indices.copy(),
+            views=tuple(views),
+            preselected_track_indices=preselected.copy(),
+            selected_track_indices=selected.copy(),
+            selected_global_track_indices=selected_global.copy(),
+            track_count=int(len(selected)),
+            query_points_3d=query_points,
+            trajectory=xy_z,
+            trajectory_3d=np.asarray(selected_tracks, dtype=np.float32),
+            visibility=selected_visibility,
+            intrinsics=intrinsics_np,
+            extrinsics=extrinsics_np,
+            theta=theta,
+            source_size=source_size,
+            output_size=output_size,
+            image_codec="jpeg",
+            depth_source=depth_type,
+            rgb_sources=tuple(encoded),
+            depth_sources=tuple(depths),
+            apply_rgb_aug=apply_rgb_aug,
+            rgb_augmentation=rgb_augmentation,
+            apply_depth_aug=apply_depth_aug,
+            depth_patch_operations=depth_patch_operations,
+            augmentation_seed=seed,
+            depth_scale=depth_scale,
+            max_depth=float(getattr(self, "max_depth", 1000.0)),
+            depth_sensor_widths=(),
+            depth_focal_lengths=(),
             metadata={
                 "virtual_index": virtual_index,
                 "scene_index": scene_index,
@@ -1107,20 +1147,75 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "gotit": True,
                 "apply_rgb_aug": bool(apply_rgb_aug),
                 "apply_depth_aug": bool(apply_depth_aug),
-                "worker_prepare_seconds": time.perf_counter() - load_started,
                 **motion_statistics,
             },
-            output_size=output_size,
-            apply_rgb_aug=apply_rgb_aug,
-            rgb_augmentation=rgb_augmentation,
-            apply_depth_aug=apply_depth_aug,
-            augmentation_seed=seed,
-            depth_scale=depth_scale,
-            track_upscaling_factor=1.0 / depth_scale,
-            max_depth=float(getattr(self, "max_depth", 1000.0)),
-            depth_patch_operations=depth_patch_operations,
+        )
+
+    def materialize_sample(self, plan: SamplePlan):
+        load_started = time.perf_counter()
+        encoded = []
+        depths = []
+        for (byte_path, offset_path), depth_path in zip(plan.rgb_sources, plan.depth_sources):
+            encoded.extend(_read_encoded_frames(
+                self._jpeg_descriptor(byte_path),
+                self._mmap(offset_path),
+                plan.frame_indices,
+                label=byte_path.parent,
+            ))
+            if plan.depth_source == "gt":
+                depth = self._mmap(depth_path)[plan.frame_indices]
+                depths.append(torch.from_numpy(np.asarray(depth, dtype=np.float32).copy()))
+        if plan.depth_source != "gt":
+            estimated_depths, cleaned_mask = self.estimated_depth_store.load(
+                plan.sequence, plan.views, plan.frame_indices
+            )
+            expected = (len(plan.views), self.seq_len, *plan.source_size)
+            if estimated_depths.shape != expected:
+                raise ValueError(
+                    f"estimated depth shape {estimated_depths.shape} does not match sample shape {expected}"
+                )
+            depths = [
+                torch.from_numpy(np.asarray(
+                    estimated_depths[position] * cleaned_mask[position]
+                    if plan.depth_source == "estimated_cleaned"
+                    else estimated_depths[position],
+                    dtype=np.float32,
+                ).copy())
+                for position in range(len(plan.views))
+            ]
+        metadata = dict(plan.metadata)
+        metadata["gotit"] = True
+        metadata["worker_prepare_seconds"] = time.perf_counter() - load_started
+        sample = EncodedTapVid3DSample(
+            jpeg_bytes=tuple(encoded),
+            depth=torch.stack(depths)[:, :, None],
+            theta=torch.from_numpy(plan.theta),
+            intrs=torch.from_numpy(plan.intrinsics),
+            extrs=torch.from_numpy(plan.extrinsics),
+            trajectory=torch.from_numpy(plan.trajectory),
+            trajectory_3d=torch.from_numpy(plan.trajectory_3d),
+            visibility=torch.from_numpy(plan.visibility),
+            valid=torch.ones((self.seq_len, plan.track_count), dtype=torch.float32),
+            query_points_3d=torch.from_numpy(plan.query_points_3d),
+            seq_name=plan.sequence,
+            metadata=metadata,
+            output_size=plan.output_size,
+            apply_rgb_aug=plan.apply_rgb_aug,
+            rgb_augmentation=plan.rgb_augmentation,
+            apply_depth_aug=plan.apply_depth_aug,
+            augmentation_seed=plan.augmentation_seed,
+            depth_scale=plan.depth_scale,
+            track_upscaling_factor=1.0 / plan.depth_scale,
+            max_depth=plan.max_depth,
+            depth_patch_operations=plan.depth_patch_operations,
         )
         return sample, True
+
+    def __getitem__(self, index):
+        plan = self.plan_sample(index)
+        if plan is None:
+            return None, False
+        return self.materialize_sample(plan)
 
 
 def decode_tapvid3d_batch(
