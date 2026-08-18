@@ -100,35 +100,24 @@ dataset_image = dataset_image.add_local_file(
     remote_path="/opt/mvtracker/mvtracker/datasets/kubric_metadata_index.py",
     copy=True,
 )
-_cached_dataset_stage_options = {
-    "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
-    "cpu": 32,
-    "memory": 65536,
-    "timeout": 12 * 60 * 60,
-}
 _dataset_stage_options = {
-    **_cached_dataset_stage_options,
+    "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
     "cpu": 4,
     "memory": 8192,
+    "timeout": 12 * 60 * 60,
 }
 dataset_image = dataset_image.run_function(
     install_dataset_base,
-    **_cached_dataset_stage_options,
+    **_dataset_stage_options,
     kwargs={"dataset_version": DATASET_IMAGE_VERSION},
 )
-for _stage_index, (_archive_name, _scene_start, _scene_end) in enumerate(
-    TRAIN_ARCHIVE_STAGES
-):
+for _archive_name, _scene_start, _scene_end in TRAIN_ARCHIVE_STAGES:
     _archive_record = next(
         item for item in PINNED_MVKUBRIC_ARCHIVES if item["filename"] == _archive_name
     )
     dataset_image = dataset_image.run_function(
         install_mvkubric_archive,
-        **(
-            _cached_dataset_stage_options
-            if _stage_index == 0
-            else _dataset_stage_options
-        ),
+        **_dataset_stage_options,
         kwargs={
             "dataset_version": DATASET_IMAGE_VERSION,
             "archive_name": _archive_name,
