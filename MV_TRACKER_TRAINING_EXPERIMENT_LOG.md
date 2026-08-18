@@ -697,7 +697,7 @@ three groups had no retries. W&B logging was requested but unavailable because
 Dopey had no configured W&B API key; the JSON and Markdown artifacts completed
 before that logging step.
 
-## 2026-08-18 — Whole-step mixed sample selection parity
+## 2026-08-18 — Direct-dataset whole-step sampling parity
 
 The sampler was extended with one whole-step call that selects all eight
 ordinary requests for an optimizer update: four DIEGESIS and four MV-Kubric
@@ -716,3 +716,31 @@ occurred: 6/7 to 8/9 and 18/19 to 20/21.
 - Local copy: `artifacts/mixed-sampling-whole-step-seed72-20260818-direct/`
 - Comparison: `identical=true`, expected 40, actual 40
 - W&B was not used because no W&B credential is configured on Dopey.
+
+This was a dataset-direct parity check. It did not pass through the production
+DataLoaders, CUDA prefetch wrapper, or GPU decoders, so its 18.40-second runtime
+must not be used as a training-loader throughput measurement.
+
+## 2026-08-18 — Live training-loader whole-step sampling parity
+
+Stage 2 was repeated through the actual mixed-training input path on Dopey:
+two Fabric ranks, the production scheduled source samplers, eight workers per
+source per rank, CUDA prefetch, nvImageCodec RGB/depth decoding, and the same
+cross-rank failure reduction used by training. The exact pinned
+`nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20` package first had to be installed in
+the Dopey venv; the previous CPU-direct check had hidden that missing runtime
+dependency.
+
+The live run produced 40/40 records identical to the saved sequential baseline,
+including the same four retry rows. Cold startup plus the first step took
+46.682 seconds. Subsequent loader-only steps took 4.149, 2.332, 1.747, and
+5.331 seconds (3.390-second mean). These timings expose loader work without
+model compute overlap; they are authoritative for loader-path behavior but not
+for final end-to-end step throughput.
+
+- Remote output: `/media/data3/jthakwani/mvtracker-runs/mixed-sampling-live-stage2-seed72-20260818-r3/`
+- Local copy: `artifacts/mixed-sampling-live-stage2-seed72-20260818/`
+- Comparison: `identical=true`, expected 40, actual 40
+- Step timings: `46.682, 4.149, 2.332, 1.747, 5.331` seconds
+- W&B was not used because this was a bounded loader verifier and Dopey has no
+  configured W&B credential.
