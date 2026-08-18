@@ -24,11 +24,9 @@ from modal_training_profile import (
     DATA_ROOT,
     RUN_ROOT,
     _dependency_image,
-    _runtime_image,
     _source_image,
     _source_commit,
     data_volume,
-    hf_secret,
     run_volume,
     wandb_secret,
 )
@@ -93,7 +91,6 @@ EXPERIMENT_PHASES = {
 app = modal.App(APP_NAME, tags={**MODAL_TAGS, "experiment": "unclassified"})
 
 
-runtime_image = _runtime_image()
 canonical_index_path = Path(__file__).resolve().parents[1] / (
     "mvtracker/datasets/kubric_metadata_index.py"
 )
@@ -141,45 +138,6 @@ training_image = _source_image(dataset_image)
 def _run_identity(run_name: str, commit: str) -> tuple[int, str]:
     digest = hashlib.sha256(f"{commit}:{run_name}".encode()).digest()
     return int.from_bytes(digest[:4], "big"), digest.hex()[:12]
-
-
-@app.function(
-    image=runtime_image,
-    secrets=[hf_secret, wandb_secret],
-    volumes={str(DATA_ROOT): data_volume},
-    cpu=16,
-    memory=32768,
-    ephemeral_disk=EPHEMERAL_DISK_MIB,
-    timeout=24 * 60 * 60,
-    max_containers=MAX_CONTAINERS,
-    include_source=False,
-)
-def setup_training_data_remote() -> dict:
-    import wandb
-
-    from mvtracker.profiling.modal_continual_data import (
-        materialize_expanded_continual_training_data,
-    )
-
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        group=WANDB_GROUP,
-        job_type="data-setup",
-        tags=["modal", "data-setup", "gt-depth-replay-v1"],
-        config={"source_commit": _source_commit(), **PROFILE_TAGS},
-    )
-    manifest = materialize_expanded_continual_training_data(DATA_ROOT)
-    data_volume.commit()
-    run.summary.update(
-        {
-            "mvkubric_train_scenes": manifest["mvkubric"]["train_scene_count"],
-            "mvkubric_validation_scenes": manifest["mvkubric"]["validation_scene_count"],
-            "checkpoint_sha256": manifest["checkpoint"]["sha256"],
-        }
-    )
-    run.finish()
-    return manifest
 
 
 def _profile_dataset_image_cpu() -> dict:
@@ -431,14 +389,6 @@ def _prepare_launch(mode: str, run_name: str, confirm_main: bool) -> str:
     validate_run_name(selected)
     app.set_tags({**MODAL_TAGS, "experiment": selected, "gpu": "h100x2"})
     return selected
-
-
-@app.local_entrypoint(name="setup-data")
-def setup_data() -> None:
-    commit = _source_commit()
-    require_pushed_main_commit(commit)
-    app.set_tags({**PROFILE_TAGS, "experiment": "data-setup", "gpu": "cpu"})
-    print(json.dumps(setup_training_data_remote.remote(), indent=2))
 
 
 @app.local_entrypoint(name="build-dataset-image")

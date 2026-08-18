@@ -82,10 +82,10 @@ export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
 # One-time CPU-only archive verification, validation extraction, and checkpoint
 # materialization.
-modal run --timestamps tools/modal_continual_training.py::setup-data
+modal run --timestamps tools/modal_continual_data_setup.py::setup-data
 
 # One-time CPU build of the expanded immutable dataset image.
-modal run --timestamps tools/modal_continual_training.py::build_dataset_image
+modal run --timestamps tools/modal_continual_training.py::build-dataset-image
 
 # CPU-only first-touch and warm loader verification against the dataset image.
 modal run --timestamps tools/modal_continual_training.py::profile-cpu-loader
