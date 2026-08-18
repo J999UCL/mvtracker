@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.util
 import json
@@ -303,11 +304,15 @@ def profile_encoded_loader(
     iterators = {}
     for dataset_source, dataset in datasets.items():
         if use_cuda:
+            request_count = sum(
+                source_schedule[index % len(source_schedule)] == dataset_source
+                for index in range(warmup + measured)
+            )
             loader = torch.utils.data.DataLoader(
                 dataset,
                 batch_size=1,
                 sampler=_DeterministicRequestSampler(
-                    dataset, warmup + measured + 8, view_count
+                    dataset, request_count, view_count
                 ),
                 num_workers=workers,
                 pin_memory=True,
@@ -384,7 +389,7 @@ def profile_encoded_loader(
         torch.cuda.synchronize()
     wall_elapsed = time.perf_counter() - started
     elapsed = sum(sample_seconds)
-    return {
+    result = {
         "warmup": warmup,
         "measured": measured,
         "workers": workers,
@@ -410,6 +415,13 @@ def profile_encoded_loader(
         "hardware_samples": hardware_samples,
         "index_root": str(datasets_root / "kubric-multiview/train/MVTracker_index"),
     }
+    if use_cuda:
+        for iterator in iterators.values():
+            iterator.producer.join()
+        del iterators, datasets
+        gc.collect()
+        torch.cuda.empty_cache()
+    return result
 
 
 def materialize_continual_training_data(data_root: Path) -> dict:
