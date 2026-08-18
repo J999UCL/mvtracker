@@ -74,6 +74,7 @@ def _row(step, microbatch, rank, source, attempt, batch):
 
 def run(args):
     config = _load_config(args)
+    print("starting two-rank Fabric live-loader inspection", flush=True)
     fabric = Fabric(
         accelerator="cuda",
         devices=2,
@@ -81,6 +82,10 @@ def run(args):
     )
     fabric.launch()
     fabric.seed_everything(args.seed, workers=True)
+    print(
+        f"rank {fabric.global_rank}: Fabric ready on {fabric.device}",
+        flush=True,
+    )
 
     datasets = {
         source: _build_training_dataset(
@@ -92,6 +97,7 @@ def run(args):
         )
         for source, source_config in config.datasets.train.sources.items()
     }
+    print(f"rank {fabric.global_rank}: datasets ready", flush=True)
     schedule = BalancedMixedSourceSchedule(
         {source: dataset.real_len for source, dataset in datasets.items()},
         SOURCE_PATTERN,
@@ -115,6 +121,7 @@ def run(args):
         for source, dataset in datasets.items()
     }
     data_iters = _start_mixed_source_iterators(loaders)
+    print(f"rank {fabric.global_rank}: live iterators ready", flush=True)
 
     local_rows = []
     step_seconds = []
@@ -141,11 +148,17 @@ def run(args):
             )
         fabric.barrier()
         step_seconds.append(time.perf_counter() - started)
+        print(
+            f"rank {fabric.global_rank}: step {step + 1}/{args.steps} "
+            f"loaded in {step_seconds[-1]:.3f}s",
+            flush=True,
+        )
 
     gathered_rows = [None] * fabric.world_size if fabric.global_rank == 0 else None
     gathered_seconds = [None] * fabric.world_size if fabric.global_rank == 0 else None
     dist.gather_object(local_rows, gathered_rows, dst=0)
     dist.gather_object(step_seconds, gathered_seconds, dst=0)
+    print(f"rank {fabric.global_rank}: gather complete", flush=True)
     if fabric.global_rank != 0:
         return
 
