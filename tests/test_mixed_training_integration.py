@@ -33,6 +33,69 @@ class AttrDict(dict):
     __getattr__ = dict.__getitem__
 
 
+class _DeferredFuture:
+    def __init__(self, executor, function, args, kwargs):
+        self.executor = executor
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs
+
+    def result(self):
+        self.executor.events.append(("run", self.executor.source_for(self.args)))
+        return self.function(*self.args, **self.kwargs)
+
+
+class _RecordingExecutor:
+    """Deterministic executor that exposes submission before execution."""
+
+    instances = []
+
+    def __init__(self, max_workers=None):
+        self.events = []
+        self.max_workers = max_workers
+        self.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    @staticmethod
+    def source_for(args):
+        return next(
+            (
+                argument.source if hasattr(argument, "source") else argument
+                for argument in args
+                if hasattr(argument, "source")
+                or argument in ("diegesis", "mvkubric")
+            ),
+            None,
+        )
+
+    def submit(self, function, *args, **kwargs):
+        self.events.append(("submit", self.source_for(args)))
+        return _DeferredFuture(self, function, args, kwargs)
+
+
+class _SourceIterator:
+    def __init__(self, source, candidates):
+        self.source = source
+        self._candidates = iter(candidates)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._candidates)
+
+
+class _FabricSuccesses:
+    def __init__(self, successes):
+        self.successes = iter(successes)
+        self.local_successes = []
+
+
 class MixedTrainingIntegrationTests(unittest.TestCase):
     def test_cuda_prefetch_workers_use_thread_safe_spawn_context(self):
         source = ast.unparse(_node("_build_source_train_loader"))
@@ -169,12 +232,14 @@ class MixedTrainingIntegrationTests(unittest.TestCase):
 
     def test_main_encodes_mixed_retry_resume_metrics_and_single_eval_contract(self):
         source = ast.unparse(_node("main"))
+        loader_source = ast.unparse(_node("_load_mixed_step"))
         self.assertIn("('diegesis', 'mvkubric', 'diegesis', 'mvkubric')", source)
-        self.assertIn("source_cursors[current_source] += 1", source)
-        self.assertIn("if not _all_ranks_succeeded", source)
+        self.assertIn("_load_mixed_step", source)
+        self.assertIn("source_cursors[source] += 1", loader_source)
+        self.assertIn("_all_ranks_succeeded", loader_source)
         self.assertLess(
-            source.index("source_cursors[current_source] += 1"),
-            source.index("if not _all_ranks_succeeded"),
+            loader_source.index("source_cursors[source] += 1"),
+            loader_source.index("_all_ranks_succeeded"),
         )
         self.assertIn("state.mixed_schedule_state", source)
         self.assertIn("state.source_cursors", source)
@@ -190,6 +255,136 @@ class MixedTrainingIntegrationTests(unittest.TestCase):
         source = ast.unparse(_node("_save_training_checkpoint"))
         self.assertIn("state.mixed_schedule_state = mixed_schedule_state", source)
         self.assertIn("state.source_cursors = dict(source_cursors)", source)
+
+
+class MixedWholeStepLoaderTests(unittest.TestCase):
+    pattern = ("diegesis", "mvkubric", "diegesis", "mvkubric")
+
+    @staticmethod
+    def _all_ranks_succeeded(fabric, local_success):
+        fabric.local_successes.append(local_success)
+        return next(fabric.successes)
+
+    def setUp(self):
+        self.load_step = _load(
+            "_load_mixed_step",
+            {
+                "ThreadPoolExecutor": _RecordingExecutor,
+                "_all_ranks_succeeded": self._all_ranks_succeeded,
+            },
+        )
+
+    @staticmethod
+    def _iterators(rank, start=0, count=8):
+        starts = (
+            start
+            if isinstance(start, dict)
+            else {source: start for source in ("diegesis", "mvkubric")}
+        )
+        return {
+            source: _SourceIterator(
+                source,
+                [
+                    (
+                        SimpleNamespace(
+                            label=f"{source[0]}{cursor}-r{rank}",
+                            sample_metadata=[{}],
+                        ),
+                        [True],
+                    )
+                    for cursor in range(starts[source], starts[source] + count)
+                ],
+            )
+            for source in ("diegesis", "mvkubric")
+        }
+
+    def _invoke(self, data_iters, cursors, successes):
+        result = self.load_step(
+            fabric=_FabricSuccesses(successes),
+            source_pattern=self.pattern,
+            data_iters=data_iters,
+            source_samplers={},
+            train_loaders={},
+            source_cursors=cursors,
+        )
+        return (*result, _RecordingExecutor.instances[-1])
+
+    def _load(self, rank, cursors, successes, *, start=0):
+        return self._invoke(
+            self._iterators(rank, start=start), cursors, successes
+        )
+
+    def test_two_ranks_load_exactly_eight_requests_in_local_dkdk_order(self):
+        global_microbatches = []
+        for rank in range(2):
+            cursors = {"diegesis": 0, "mvkubric": 0}
+            microbatches, loaded, failed, _ = self._load(
+                rank, cursors, [True] * 4
+            )
+            self.assertEqual(len(microbatches), 4)
+            self.assertEqual(
+                [source for source, _ in microbatches], list(self.pattern)
+            )
+            self.assertEqual(loaded, 4)
+            self.assertEqual(failed, 0)
+            self.assertEqual(cursors, {"diegesis": 2, "mvkubric": 2})
+            global_microbatches.extend((rank, *item) for item in microbatches)
+
+        self.assertEqual(len(global_microbatches), 8)
+        self.assertEqual(
+            [batch.label for _, _, batch in global_microbatches],
+            [
+                "d0-r0", "m0-r0", "d1-r0", "m1-r0",
+                "d0-r1", "m0-r1", "d1-r1", "m1-r1",
+            ],
+        )
+
+    def test_submits_both_sources_before_waiting_for_either(self):
+        _, _, _, executor = self._load(
+            rank=0,
+            cursors={"diegesis": 0, "mvkubric": 0},
+            successes=[True] * 4,
+        )
+        first_run = next(
+            index for index, event in enumerate(executor.events) if event[0] == "run"
+        )
+        submitted_sources = {
+            source for event, source in executor.events[:first_run]
+            if event == "submit"
+        }
+        self.assertEqual(submitted_sources, {"diegesis", "mvkubric"})
+
+    def test_global_pair_retry_advances_cursor_and_resume_is_exact(self):
+        cursors = {"diegesis": 0, "mvkubric": 0}
+        uninterrupted_iters = self._iterators(rank=0)
+        microbatches, loaded, failed, _ = self._invoke(
+            uninterrupted_iters,
+            cursors,
+            # Every local sample succeeds, but the peer rank rejects the first slot.
+            [False, True, True, True, True],
+        )
+        self.assertEqual(
+            [(source, batch.label) for source, batch in microbatches],
+            [
+                ("diegesis", "d1-r0"),
+                ("mvkubric", "m0-r0"),
+                ("diegesis", "d2-r0"),
+                ("mvkubric", "m1-r0"),
+            ],
+        )
+        self.assertEqual((loaded, failed), (5, 1))
+        self.assertEqual(cursors, {"diegesis": 3, "mvkubric": 2})
+
+        saved_cursors = dict(cursors)
+        uninterrupted, _, _, _ = self._invoke(
+            uninterrupted_iters, cursors, [True] * 4
+        )
+        resumed, _, _, _ = self._invoke(
+            self._iterators(rank=0, start=saved_cursors),
+            saved_cursors,
+            [True] * 4,
+        )
+        self.assertEqual(resumed, uninterrupted)
 
 
 if __name__ == "__main__":
