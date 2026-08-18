@@ -18,6 +18,14 @@ class MixedSourceSample:
     request: ScheduledSampleRequest
 
 
+@dataclass(frozen=True)
+class MixedStepSample:
+    microbatch: int
+    rank: int
+    source: str
+    request: ScheduledSampleRequest
+
+
 class BalancedMixedSourceSchedule:
     """Stateless rank-local schedule over balanced shuffled scene cycles."""
 
@@ -108,6 +116,33 @@ class BalancedMixedSourceSchedule:
                 scene_index=int(permutation[offset]),
             ),
         )
+
+    def sample_step(
+        self,
+        source_cursors: Mapping[str, int],
+    ) -> tuple[MixedStepSample, ...]:
+        """Select every rank's ordinary sample request for one optimizer step."""
+        missing = set(self.scene_counts) - set(source_cursors)
+        if missing:
+            raise ValueError(f"source cursors missing: {sorted(missing)}")
+
+        occurrences = {source: 0 for source in self.scene_counts}
+        selected = []
+        for microbatch, source in enumerate(self.source_pattern):
+            local_cursor = int(source_cursors[source]) + occurrences[source]
+            occurrences[source] += 1
+            for rank in range(self.world_size):
+                selected.append(
+                    MixedStepSample(
+                        microbatch=microbatch,
+                        rank=rank,
+                        source=source,
+                        request=self.sample_source(
+                            source, local_cursor, rank
+                        ).request,
+                    )
+                )
+        return tuple(selected)
 
     def state_dict(self) -> dict[str, object]:
         return {

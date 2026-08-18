@@ -87,6 +87,23 @@ class BalancedMixedSourceScheduleTests(unittest.TestCase):
         for microbatch in range(4):
             self.assertIsNone(self.schedule.sample(0, microbatch, 0).request.view_count)
 
+    def test_sample_step_selects_the_same_eight_requests_together(self):
+        selected = self.schedule.sample_step({"diegesis": 6, "mvkubric": 10})
+        self.assertEqual(len(selected), 8)
+        self.assertEqual(
+            [(item.microbatch, item.rank, item.source) for item in selected],
+            [
+                (0, 0, "diegesis"), (0, 1, "diegesis"),
+                (1, 0, "mvkubric"), (1, 1, "mvkubric"),
+                (2, 0, "diegesis"), (2, 1, "diegesis"),
+                (3, 0, "mvkubric"), (3, 1, "mvkubric"),
+            ],
+        )
+        self.assertEqual(
+            [item.request.virtual_index for item in selected],
+            [12, 13, 20, 21, 14, 15, 22, 23],
+        )
+
 
 class SceneSelectionTests(unittest.TestCase):
     def test_mvkubric_training_and_validation_allowlists_are_disjoint(self):

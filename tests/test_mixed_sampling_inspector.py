@@ -24,6 +24,23 @@ class FakeSchedule:
             ),
         )
 
+    def sample_step(self, cursors):
+        selected = []
+        occurrences = {source: 0 for source in cursors}
+        for microbatch, source in enumerate(MODULE.SOURCE_PATTERN):
+            cursor = cursors[source] + occurrences[source]
+            occurrences[source] += 1
+            for rank in range(self.world_size):
+                selected.append(
+                    SimpleNamespace(
+                        microbatch=microbatch,
+                        rank=rank,
+                        source=source,
+                        request=self.sample_source(source, cursor, rank).request,
+                    )
+                )
+        return selected
+
 
 class FakeDataset:
     def __init__(self, source, fail_virtual=None):
@@ -81,6 +98,19 @@ class MixedSamplingInspectorTests(unittest.TestCase):
         first_pair = rows[:2]
         self.assertEqual([row["virtual_index"] for row in first_pair], [2, 3])
         self.assertEqual([row["attempt"] for row in first_pair], [1, 1])
+
+    def test_whole_step_selection_is_identical_including_retry(self):
+        datasets = {
+            "diegesis": FakeDataset("diegesis", fail_virtual=1),
+            "mvkubric": FakeDataset("mvkubric", fail_virtual=5),
+        }
+        sequential = MODULE.collect_sequential_samples(
+            FakeSchedule(), datasets, steps=2
+        )
+        whole_step = MODULE.collect_whole_step_samples(
+            FakeSchedule(), datasets, steps=2
+        )
+        self.assertEqual(whole_step, sequential)
 
 
 if __name__ == "__main__":
