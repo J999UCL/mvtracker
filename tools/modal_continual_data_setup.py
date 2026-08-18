@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import modal
 
 from modal_training_profile import (
@@ -76,4 +74,5 @@ def setup_training_data_remote() -> dict:
 def setup_data() -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
-    print(json.dumps(setup_training_data_remote.remote(), indent=2))
+    call = setup_training_data_remote.spawn()
+    print(f"FUNCTION_CALL {call.object_id}")

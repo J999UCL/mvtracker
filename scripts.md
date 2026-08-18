@@ -81,7 +81,7 @@ cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
 # One-time CPU-only archive verification, validation extraction, and checkpoint
-# materialization.
+# materialization. This submits a detached Function call and prints its ID.
 modal run --detach --timestamps tools/modal_continual_data_setup.py::setup_data
 
 # One-time CPU build of the expanded immutable dataset image.
