@@ -190,3 +190,32 @@ python tools/inspect_mixed_sampling.py \
   --run-name mixed-sampling-baseline-seed72 \
   --wandb-entity jeetucl-ucl --wandb-project mvtracker-modal-profiling
 ```
+
+### Profile the planned mixed physical loader on Dopey
+
+This is a bounded loader/decode profiler, not training.  It is pinned to the
+physical Titan devices `1,2` and refuses any other device pair.  The first run
+creates a deterministic four-step plan stream; later runs may pass the same
+`plan.json` to replay exactly the same requests.  It reports cold/warm CPU
+planning and materialisation, encoded-byte cache volume, CUDA decode time,
+exposed wait, samples/sec, trajectories/sec, process RSS, and NVML GPU memory
+and utilisation.  CUDA outputs are checked for device placement and finite
+values after each physical group.
+
+```bash
+source /media/data3/jthakwani/mvtracker-venv/bin/activate
+cd /media/data3/jthakwani/mvtracker
+python tools/profile_mixed_physical_loader.py \
+  --device-ids 1,2 \
+  --steps 4 --passes 2 --workers 4 \
+  --output-dir /media/data3/jthakwani/mvtracker-runs/mixed-physical-loader
+```
+
+The output directory contains `plan.json` and `report.json`.  The optional
+bounded numerical parity check uses no model or optimizer and can be run on a
+3090 separately:
+
+```bash
+python tools/profile_mixed_physical_loader.py \
+  --mode parity --parity-device cuda:0
+```
