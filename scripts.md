@@ -102,6 +102,10 @@ modal run --timestamps tools/modal_continual_training.py::smoke
 modal container list --json
 modal run --timestamps tools/modal_continual_training.py::smoke10
 
+# Reproduce a loader A/B with an identical seed; eager materialization is an
+# explicit benchmark mode and is not the production default.
+modal run --timestamps tools/modal_continual_training.py::smoke10 --run-name <unique-name> --seed <fixed-seed> --materialize-whole-step true
+
 # Main run is deliberately gated and cannot launch without this flag.
 modal container list --json
 modal run --timestamps tools/modal_continual_training.py::train --confirm-main
