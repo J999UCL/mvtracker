@@ -54,7 +54,7 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         training = source[train_start:train_end]
 
         self.assertIn("image=training_image", source)
-        self.assertIn("dataset_image = modal.Image.from_id(", source)
+        self.assertIn("dataset_image = _dependency_image()", source)
         self.assertIn(".run_function(", source)
         self.assertIn('"MVTRACKER_DATA_ROOT": DATASET_IMAGE_ROOT', training)
         self.assertNotIn("stage_continual_training_data", training)

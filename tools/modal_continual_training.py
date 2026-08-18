@@ -15,6 +15,7 @@ import modal
 from modal_dataset_image_build import (
     TRAIN_ARCHIVE_STAGES,
     TRAIN_SCENES,
+    install_dataset_base,
     install_mvkubric_archive,
     install_mvkubric_validation_and_index,
 )
@@ -22,6 +23,7 @@ from modal_dataset_image_build import (
 from modal_training_profile import (
     DATA_ROOT,
     RUN_ROOT,
+    _dependency_image,
     _source_image,
     _source_commit,
     data_volume,
@@ -89,15 +91,26 @@ EXPERIMENT_PHASES = {
 app = modal.App(APP_NAME, tags={**MODAL_TAGS, "experiment": "unclassified"})
 
 
-MVKUBRIC_1001_1500_IMAGE_ID = "im-SAhj7qgBbNxXId6CxLb5WG"
-dataset_image = modal.Image.from_id(MVKUBRIC_1001_1500_IMAGE_ID)
+canonical_index_path = Path(__file__).resolve().parents[1] / (
+    "mvtracker/datasets/kubric_metadata_index.py"
+)
+dataset_image = _dependency_image().add_local_file(
+    str(canonical_index_path),
+    remote_path="/opt/mvtracker/mvtracker/datasets/kubric_metadata_index.py",
+    copy=True,
+)
 _dataset_stage_options = {
     "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
     "cpu": 4,
     "memory": 8192,
     "timeout": 12 * 60 * 60,
 }
-for _archive_name, _scene_start, _scene_end in TRAIN_ARCHIVE_STAGES[1:]:
+dataset_image = dataset_image.run_function(
+    install_dataset_base,
+    **_dataset_stage_options,
+    kwargs={"dataset_version": DATASET_IMAGE_VERSION},
+)
+for _archive_name, _scene_start, _scene_end in TRAIN_ARCHIVE_STAGES:
     _archive_record = next(
         item for item in PINNED_MVKUBRIC_ARCHIVES if item["filename"] == _archive_name
     )

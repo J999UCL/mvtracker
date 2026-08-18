@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import modal
 
 from modal_training_profile import (
@@ -29,9 +27,6 @@ app = modal.App(
     "jeet-mvtracker-continual-data-setup",
     tags={**PROFILE_TAGS, "experiment": "data-setup", "gpu": "cpu"},
 )
-
-MVKUBRIC_1001_1500_IMAGE_ID = "im-SAhj7qgBbNxXId6CxLb5WG"
-
 
 @app.function(
     image=_runtime_image(),
@@ -74,58 +69,9 @@ def setup_training_data_remote() -> dict:
     return manifest
 
 
-@app.function(
-    image=modal.Image.from_id(MVKUBRIC_1001_1500_IMAGE_ID),
-    secrets=[wandb_secret],
-    cpu=1,
-    memory=2048,
-    timeout=10 * 60,
-    max_containers=1,
-    include_source=False,
-)
-def verify_mvkubric_checkpoint_image_remote() -> dict:
-    from pathlib import Path
-
-    import wandb
-
-    train_root = Path("/opt/mvtracker-data/datasets/kubric-multiview/train")
-    observed = sorted(
-        (path.name for path in train_root.iterdir() if path.is_dir()), key=int
-    )
-    expected = [str(scene) for scene in range(1001, 1501)]
-    if observed != expected:
-        raise RuntimeError(
-            f"checkpoint image has {len(observed)} scenes; expected 1001-1500"
-        )
-    result = {
-        "image_id": MVKUBRIC_1001_1500_IMAGE_ID,
-        "scene_count": len(observed),
-        "scene_start": observed[0],
-        "scene_end": observed[-1],
-    }
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        group=WANDB_GROUP,
-        job_type="dataset-image-checkpoint-verification",
-        tags=["modal", "dataset-image", "cpu", "checkpoint-verification"],
-        config={"source_commit": _source_commit(), **PROFILE_TAGS},
-    )
-    run.summary.update(result)
-    run.finish()
-    return result
-
-
 @app.local_entrypoint(name="setup-data")
 def setup_data() -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
     call = setup_training_data_remote.spawn()
     print(f"FUNCTION_CALL {call.object_id}")
-
-
-@app.local_entrypoint(name="verify-checkpoint-image")
-def verify_checkpoint_image() -> None:
-    commit = _source_commit()
-    require_pushed_main_commit(commit)
-    print(json.dumps(verify_mvkubric_checkpoint_image_remote.remote(), indent=2))

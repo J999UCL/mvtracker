@@ -87,9 +87,6 @@ modal run --detach --timestamps tools/modal_continual_data_setup.py::setup_data
 # One-time CPU build of the expanded immutable dataset image.
 modal run --detach --timestamps tools/modal_continual_training.py::build_dataset_image
 
-# Recover a completed orphaned 1001-1500 image layer as a clean snapshot.
-modal run --timestamps tools/modal_recover_dataset_image.py::main
-
 # CPU-only first-touch and warm loader verification against the dataset image.
 modal run --timestamps tools/modal_continual_training.py::profile_cpu_loader
 
