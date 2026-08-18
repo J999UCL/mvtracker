@@ -207,7 +207,7 @@ source /media/data3/jthakwani/mvtracker-venv/bin/activate
 cd /media/data3/jthakwani/mvtracker
 python tools/profile_mixed_physical_loader.py \
   --device-ids 1,2 \
-  --steps 4 --passes 2 --workers 4 \
+  --steps 4 --passes 1 --workers 4 \
   --decode-image-chunk-size 8 \
   --output-dir /media/data3/jthakwani/mvtracker-runs/mixed-physical-loader
 ```

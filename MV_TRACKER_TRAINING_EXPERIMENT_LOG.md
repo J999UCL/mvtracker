@@ -800,3 +800,62 @@ materialization remains available only as an explicit benchmark switch.
 - Lazy W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/f1aac438efd2
 - Eager output: `jeet-mvtracker-runs-v2/continual-training/whole-step-loader-smoke10-20260818T091500Z/`
 - Lazy output: `jeet-mvtracker-runs-v2/continual-training/lazy-loader-matched-smoke10-20260818/`
+
+## 2026-08-18 — Planned physical loader on Dopey Titans
+
+The mixed training input path was split into deterministic metadata planning
+and payload materialization. Four complete optimizer updates are kept ahead in
+CPU RAM. Within each eight-scene update, same-view scenes may form physical
+batches of two regardless of their individual trajectory counts; trajectory
+axes are padded to the larger scene and the padding mask excludes those slots
+from the model and metrics. Pairing is admitted only by the measured H100
+batch-two limits: 1/2/4 views at at most 1,024 tracks and 3 views at at most
+1,280 tracks. Five- and six-view samples remain singletons.
+
+The final bounded loader/decode profile ran concurrently on Dopey's physical
+Titan X devices 1 and 2. It used four optimizer updates, 32 total scenes, four
+CPU materialization workers per lane, CUDA RGB/depth streams, eight-image
+decode chunks, and one pass. It did not run the model, optimizer, training, or
+GPU 0. W&B was unavailable on Dopey, so the durable JSON and log are the run
+record.
+
+Artifacts:
+
+```text
+/media/data3/jthakwani/mvtracker-runs/mixed-physical-loader-final-20260818/
+  plan.json
+  profile.log
+  report.json
+```
+
+| Metric | Titan 1 | Titan 2 |
+|---|---:|---:|
+| Scenes | 16 | 16 |
+| Trajectories | 20,215 | 21,052 |
+| Encoded payload | 1.455 GB | 1.350 GB |
+| Wall time | 13.495 s | 13.967 s |
+| CPU materialization | 0.936 s | 0.843 s |
+| CUDA decode events | 12.163 s | 12.819 s |
+| Exposed loader wait | 12.073 s | 12.742 s |
+| Scenes/s | 1.186 | 1.146 |
+| Trajectories/s | 1,498 | 1,507 |
+| Peak sampled process RSS | 6.260 GiB | 6.744 GiB |
+| Peak sampled GPU memory | 8.427 GiB | 8.441 GiB |
+
+Metadata planning took 2.167, 3.481, 1.961 and 2.106 seconds for the four
+updates; the four-step lookahead is intended to hide this behind training.
+There was one deterministic invalid-plan retry. The scheduler used two safe
+pairs: rank 0 executed 3/4/4/4 physical groups and rank 1 executed 4/3/4/4,
+reducing 32 logical scene forwards to 30 physical forwards. The first pair had
+256/256 tracks and no padding; the second had 701/912 tracks and 211 padded
+slots. Allowing unequal
+rank-local group counts was necessary: DDP only requires both ranks to meet at
+the final synchronized backward, not to execute the same number of no-sync
+forwards.
+
+An earlier two-pass Titan check completed the cold pass but exhausted the
+12 GiB Titan during repeated nvTIFF decoding in the warm pass. Bounded decode
+chunks made allocation failures explicit and prevented null decoder outputs
+from reaching DLPack. The successful one-pass profile peaked at 8.441 GiB.
+This is a Titan loader validation, not an H100 end-to-end speed claim; the
+physical batching limits remain those measured with full H100 training steps.
