@@ -82,13 +82,13 @@ export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
 # One-time CPU-only archive verification, validation extraction, and checkpoint
 # materialization.
-modal run --timestamps tools/modal_continual_data_setup.py::setup-data
+modal run --timestamps tools/modal_continual_data_setup.py::setup_data
 
 # One-time CPU build of the expanded immutable dataset image.
-modal run --timestamps tools/modal_continual_training.py::build-dataset-image
+modal run --timestamps tools/modal_continual_training.py::build_dataset_image
 
 # CPU-only first-touch and warm loader verification against the dataset image.
-modal run --timestamps tools/modal_continual_training.py::profile-cpu-loader
+modal run --timestamps tools/modal_continual_training.py::profile_cpu_loader
 
 # Required DDP/W&B resume smoke: steps 1-3, then resume to exactly step 5.
 modal container list --json
@@ -123,8 +123,8 @@ the writable results Volume and reads the dataset directly from the image.
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
-modal run --timestamps tools/modal_continual_training.py::profile-cpu-loader
-modal run --timestamps tools/modal_continual_training.py::profile-h100-loader
+modal run --timestamps tools/modal_continual_training.py::profile_cpu_loader
+modal run --timestamps tools/modal_continual_training.py::profile_h100_loader
 ```
 
 The CPU loader profile uses four warm-ups and 32 measured samples. The H100
