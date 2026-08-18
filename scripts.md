@@ -169,3 +169,20 @@ modal container list --json
 modal run --detach --timestamps tools/modal_t4_loader_benchmark.py::profile \
   --run-name t4-loader-baseline
 ```
+### Inspect the current sequential mixed-source sampler on Dopey
+
+After pulling the desired commit and building the MV-Kubric metadata index,
+capture five groups of eight current sampler outputs without running training:
+
+```bash
+source /media/data3/jthakwani/mvtracker-venv/bin/activate
+cd /media/data3/jthakwani/mvtracker
+python tools/inspect_mixed_sampling.py \
+  --diegesis-root /media/data3/jthakwani/mvtracker-data \
+  --mvkubric-root /media/data3/jthakwani/datasets/mv3dpt-train-micro \
+  --mvkubric-index-root /media/data3/jthakwani/datasets/mv3dpt-train-micro/kubric-multiview/train/MVTracker_index \
+  --output-dir /media/data3/jthakwani/mvtracker-runs/mixed-sampling-baseline \
+  --steps 5 --seed 72 \
+  --run-name mixed-sampling-baseline-seed72 \
+  --wandb-entity jeetucl-ucl --wandb-project mvtracker-modal-profiling
+```
