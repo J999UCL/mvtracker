@@ -133,12 +133,13 @@ def render_markdown(rows: list[dict]) -> str:
         "|---:|---:|---:|---|---|---:|---:|---|---|---:|---|---|",
     ]
     for row in rows:
+        values = dict(row)
+        values["views"] = ",".join(str(view) for view in row["views"])
         lines.append(
             "| {step} | {microbatch} | {rank} | {source} | {scene} | "
             "{virtual_index} | {seed} | {window[0]}:{window[1]} | {views} | "
             "{trajectories} | {rgb_aug} | {depth_aug} |".format(
-                **row,
-                views=",".join(str(view) for view in row["views"]),
+                **values,
             )
         )
     return "\n".join(lines) + "\n"

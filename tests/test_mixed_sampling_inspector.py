@@ -112,6 +112,17 @@ class MixedSamplingInspectorTests(unittest.TestCase):
         )
         self.assertEqual(whole_step, sequential)
 
+    def test_markdown_renders_selected_views(self):
+        row = MODULE.collect_whole_step_samples(
+            FakeSchedule(),
+            {
+                "diegesis": FakeDataset("diegesis"),
+                "mvkubric": FakeDataset("mvkubric"),
+            },
+            steps=1,
+        )[0]
+        self.assertIn("| 0,1 |", MODULE.render_markdown([row]))
+
 
 if __name__ == "__main__":
     unittest.main()
