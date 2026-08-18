@@ -289,7 +289,12 @@ def profile_h100_loader_remote() -> dict:
     max_containers=MAX_CONTAINERS,
     include_source=False,
 )
-def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
+def train_remote(
+    mode: str,
+    run_name: str,
+    confirmation: str = "",
+    materialize_whole_step: bool = True,
+) -> dict:
     if mode not in EXPERIMENT_PHASES:
         raise ValueError("unsupported training mode")
     require_remote_main_confirmation(mode, confirmation)
@@ -312,6 +317,7 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
         "wandb_project": WANDB_PROJECT,
         "wandb_group": WANDB_GROUP,
         "wandb_run_id": wandb_run_id,
+        "materialize_whole_step": materialize_whole_step,
         "modal_tags": MODAL_TAGS,
     }
     if manifest_path.is_file():
@@ -354,6 +360,7 @@ def train_remote(mode: str, run_name: str, confirmation: str = "") -> dict:
                 "-m",
                 "mvtracker.cli.train",
                 f"+experiment={phase['config']}",
+                f"datasets.train.materialize_whole_step={str(materialize_whole_step).lower()}",
             ]
             completed = subprocess.run(
                 command,
@@ -430,9 +437,16 @@ def smoke(run_name: str = "") -> None:
 
 
 @app.local_entrypoint(name="smoke10")
-def smoke10(run_name: str = "") -> None:
+def smoke10(run_name: str = "", materialize_whole_step: bool = True) -> None:
     selected = _prepare_launch("smoke10", run_name, confirm_main=False)
-    print(json.dumps(train_remote.remote("smoke10", selected, ""), indent=2))
+    print(
+        json.dumps(
+            train_remote.remote(
+                "smoke10", selected, "", materialize_whole_step
+            ),
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint(name="train")

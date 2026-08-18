@@ -18,6 +18,7 @@ datasets:
     num_workers: 8
     cuda_prefetch_queue_depth: 4
     cuda_decode_batch_size: 2
+    materialize_whole_step: true
   eval:
     names:
       - panoptic-multiview-views1_7_14_20

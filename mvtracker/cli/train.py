@@ -1902,7 +1902,10 @@ def main(cfg: DictConfig):
             logging.info(f"Gonna load batch {i_batch + 1}/{n_batches} (rank={fabric.global_rank})")
             current_source = None
             if mixed_training:
-                if microbatches_accumulated == 0:
+                if (
+                    cfg.datasets.train.materialize_whole_step
+                    and microbatches_accumulated == 0
+                ):
                     (
                         mixed_step_batches,
                         step_batches_loaded,
@@ -1923,10 +1926,28 @@ def main(cfg: DictConfig):
                             step_batches_failed,
                             step_batches_loaded,
                         )
-                current_source, batch = mixed_step_batches[
-                    microbatches_accumulated
-                ]
-                mixed_step_batches[microbatches_accumulated] = None
+                if cfg.datasets.train.materialize_whole_step:
+                    current_source, batch = mixed_step_batches[
+                        microbatches_accumulated
+                    ]
+                    mixed_step_batches[microbatches_accumulated] = None
+                else:
+                    current_source = mixed_schedule.source_pattern[
+                        microbatches_accumulated
+                    ]
+                    try:
+                        batch = next(data_iters[current_source])
+                    except StopIteration:
+                        source_samplers[current_source].set_start_cursor(
+                            source_cursors[current_source]
+                        )
+                        data_iters[current_source] = iter(
+                            train_loaders[current_source]
+                        )
+                        batch = next(data_iters[current_source])
+                    source_cursors[current_source] += 1
+                    batch, gotit = batch
+                    total_batches_loaded += 1
             else:
                 try:
                     batch = next(data_iter)
@@ -1944,7 +1965,10 @@ def main(cfg: DictConfig):
                 logging.info(f"Debugging hotfix: loaded batch {batch.seq_name} "
                              f"with {len(batch.video)} views and {batch.video.shape[2]} frames")
 
-            if not mixed_training and not _all_ranks_succeeded(fabric, all(gotit)):
+            if (
+                (not mixed_training or not cfg.datasets.train.materialize_whole_step)
+                and not _all_ranks_succeeded(fabric, all(gotit))
+            ):
                 total_batches_failed += 1
                 accumulated_dataloader_duration += time.time() - start_time_1
                 logging.info(f"batch is None: "
