@@ -484,6 +484,17 @@ def _mixed_source_name(cfg):
     return cfg.datasets.train.name == "mixed-diegesis-mvkubric-training"
 
 
+def _eval_dataset_names_for_step(cfg, step):
+    """Return the configured evaluation datasets for one completed step."""
+    schedule = cfg.datasets.eval.get("schedule")
+    if schedule is None:
+        return tuple(cfg.datasets.eval.names)
+    for entry in schedule:
+        if int(step) in {int(value) for value in entry.steps}:
+            return tuple(entry.names)
+    raise ValueError(f"no evaluation dataset schedule entry configured for step {step}")
+
+
 def _planned_physical_batching(cfg):
     settings = cfg.datasets.train.get("physical_batching")
     return settings is not None and bool(settings.get("enabled", False))
@@ -686,6 +697,12 @@ def _run_rank_zero_eval(fabric, cfg, evaluator, model, dataloaders, writer, step
     """Run validation once using the unwrapped model while other ranks wait."""
     fabric.barrier()
     if fabric.global_rank == 0:
+        scheduled_names = set(_eval_dataset_names_for_step(cfg, step))
+        dataloaders = [
+            (name, dataloader)
+            for name, dataloader in dataloaders
+            if name in scheduled_names
+        ]
         run_test_eval(
             cfg,
             evaluator,
@@ -1245,7 +1262,7 @@ def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
             for k in metrics[0].keys()
         }
         for k, v in metrics_to_log.items():
-            writer.add_scalar(k, v, step)
+            writer.add_scalar(f"eval/{ds_name}/{k}", v, step)
 
         with pd.option_context(
                 'display.max_rows', None,
@@ -1395,14 +1412,22 @@ def main(cfg: DictConfig):
                 for manifest in eval_dataset._manifests.values()
             ):
                 raise ValueError("DIEGESIS validation scenes do not match fixed views")
-        elif _mixed_source_name(cfg) and dataset_name == "kubric-multiview-v3":
+        elif _mixed_source_name(cfg) and dataset_name in {
+            "kubric-multiview-v3-validation-subset",
+            "kubric-multiview-v3-validation-full",
+        }:
             source_cfg = cfg.datasets.eval.sources.mvkubric
+            include_scene_ids = (
+                source_cfg.subset_scene_ids
+                if dataset_name.endswith("-subset")
+                else source_cfg.full_scene_ids
+            )
             kubric_kwargs = KubricMultiViewDataset.from_name(
-                dataset_name,
+                "kubric-multiview-v3",
                 source_cfg.root,
                 cfg,
                 subset="train",
-                include_scene_ids=source_cfg.include_scene_ids,
+                include_scene_ids=include_scene_ids,
                 just_return_kwargs=True,
             )
             kubric_kwargs["views_to_return"] = list(source_cfg.views)

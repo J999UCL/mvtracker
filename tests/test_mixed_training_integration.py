@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import yaml
 
 
 TRAIN_PATH = Path(__file__).resolve().parents[1] / "mvtracker/cli/train.py"
@@ -97,6 +98,66 @@ class _FabricSuccesses:
 
 
 class MixedTrainingIntegrationTests(unittest.TestCase):
+    def test_mvkubric_recipe_uses_two_thousand_scene_training_split(self):
+        config_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiment/diegesis_mvkubric_gt_ddp.yaml"
+        )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        mvkubric = config["datasets"]["train"]["sources"]["mvkubric"]
+        self.assertNotIn("include_scene_ids", mvkubric)
+        self.assertEqual(
+            mvkubric["exclude_scene_ids"],
+            [str(scene) for scene in range(101, 128)],
+        )
+
+    def test_mvkubric_validation_schedule_keeps_datasets_separate(self):
+        config_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiment/diegesis_mvkubric_gt_ddp.yaml"
+        )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            config["datasets"]["eval"]["schedule"],
+            [
+                {
+                    "steps": [0, 1000],
+                    "names": [
+                        "tapvid3d-multiview-validation",
+                        "kubric-multiview-v3-validation-full",
+                    ],
+                },
+                {
+                    "steps": [250, 500, 750],
+                    "names": [
+                        "tapvid3d-multiview-validation",
+                        "kubric-multiview-v3-validation-subset",
+                    ],
+                },
+            ],
+        )
+
+    def test_eval_schedule_selects_configured_names(self):
+        select = _load(
+            "_eval_dataset_names_for_step",
+            {
+                "ValueError": ValueError,
+            },
+        )
+        cfg = SimpleNamespace(
+            datasets=SimpleNamespace(
+                eval=AttrDict(
+                    names=["default"],
+                    schedule=[
+                        AttrDict(steps=[0, 1000], names=["full"]),
+                        AttrDict(steps=[250, 500, 750], names=["subset"]),
+                    ],
+                )
+            )
+        )
+        self.assertEqual(select(cfg, 0), ("full",))
+        self.assertEqual(select(cfg, 500), ("subset",))
+        with self.assertRaisesRegex(ValueError, "no evaluation dataset schedule"):
+            select(cfg, 1250)
+
     def test_cuda_prefetch_workers_use_thread_safe_spawn_context(self):
         source = ast.unparse(_node("_build_source_train_loader"))
         self.assertIn("loader_kwargs['multiprocessing_context'] = 'spawn'", source)

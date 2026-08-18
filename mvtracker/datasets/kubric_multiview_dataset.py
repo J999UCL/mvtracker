@@ -130,6 +130,13 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         else:
             depth_noise_std = 0.0
 
+        # Validation split names are configuration labels. The mixed trainer
+        # supplies the actual scene IDs to the canonical Kubric factory.
+        for validation_label in ("-validation-subset", "-validation-full"):
+            if non_parsed.startswith(validation_label):
+                non_parsed = non_parsed.replace(validation_label, "", 1)
+                break
+
         if non_parsed.startswith("-duster"):
             match = re.match(r"-duster(\d+)(cleaned)?", non_parsed)
             assert match is not None
