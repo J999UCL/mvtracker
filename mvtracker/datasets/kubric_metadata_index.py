@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -98,7 +100,89 @@ def compute_source_fingerprint(data_root, scene_names):
     return digest.hexdigest()
 
 
-def build_kubric_metadata_index(data_root, index_root=None, overwrite=False):
+def _index_scene(scene_path: Path, data_root: Path, scenes_root: Path):
+    tracks_path = scene_path / "tracks_3d.npz"
+    if not tracks_path.is_file():
+        return None
+    with np.load(tracks_path) as tracks_file:
+        n_frames, n_tracks, _ = tracks_file["tracks_3d"].shape
+
+    view_dirs = sorted(
+        (path for path in scene_path.glob("view_*") if path.is_dir()),
+        key=lambda path: int(path.name.rsplit("_", 1)[1]),
+    )
+    intrinsics = []
+    extrinsics = []
+    sensor_widths = []
+    focal_lengths = []
+    rgba_files = []
+    depth_files = []
+    view_names = []
+    inventory = [
+        scene_path / "tracks_3d.npz",
+        scene_path / "tracks_segmentation_ids.npz",
+        scene_path / "tracked_objects.json",
+        scene_path / "scene.json",
+        scene_path / "views.npz",
+        scene_path / "cameras.npz",
+    ]
+    for view_dir in view_dirs:
+        metadata_path = view_dir / "metadata.json"
+        metadata = _read_json(metadata_path)
+        intr, extr = _camera_matrices(metadata)
+        sensor_widths.append(metadata["camera"]["sensor_width"])
+        focal_lengths.append(metadata["camera"]["focal_length"])
+        rgba_paths = sorted(view_dir.glob("rgba_*"))
+        depth_paths = sorted(view_dir.glob("depth_*"))
+        if len(rgba_paths) != n_frames or len(depth_paths) != n_frames:
+            raise ValueError(
+                f"{view_dir}: expected {n_frames} RGB/depth frames, got "
+                f"{len(rgba_paths)}/{len(depth_paths)}"
+            )
+        if extr.shape != (n_frames, 3, 4):
+            raise ValueError(f"{view_dir}: invalid extrinsics shape {extr.shape}")
+        view_names.append(view_dir.name)
+        rgba_files.append([path.name for path in rgba_paths])
+        depth_files.append([path.name for path in depth_paths])
+        intrinsics.append(intr)
+        extrinsics.append(extr)
+        inventory.extend((metadata_path, view_dir / "tracks_2d.npz"))
+        inventory.extend(rgba_paths)
+        inventory.extend(depth_paths)
+
+    arrays_name = f"{scene_path.name}.npz"
+    np.savez(
+        scenes_root / arrays_name,
+        intrinsics=np.stack(intrinsics),
+        extrinsics=np.stack(extrinsics),
+        sensor_widths=np.asarray(sensor_widths),
+        focal_lengths=np.asarray(focal_lengths),
+    )
+    entry = {
+        "n_frames": n_frames,
+        "n_tracks": n_tracks,
+        "invalid_frame_indices": _invalid_frames(scene_path),
+        "view_names": view_names,
+        "rgba_files": rgba_files,
+        "depth_files": depth_files,
+        "arrays": f"scenes/{arrays_name}",
+    }
+    inventory_records = []
+    for path in inventory:
+        if path.is_file():
+            inventory_records.append(
+                (path.relative_to(data_root).as_posix(), path.stat().st_size)
+            )
+    return scene_path.name, entry, inventory_records
+
+
+def build_kubric_metadata_index(
+    data_root,
+    index_root=None,
+    overwrite=False,
+    workers=16,
+    progress_every=25,
+):
     """Build the compact, relocatable index used by the optimized loader."""
     data_root = Path(data_root)
     index_root = Path(index_root or data_root / INDEX_DIRECTORY_NAME)
@@ -108,75 +192,57 @@ def build_kubric_metadata_index(data_root, index_root=None, overwrite=False):
 
     scenes_root = index_root / "scenes"
     scenes_root.mkdir(parents=True, exist_ok=True)
-    scene_entries = {}
     scene_paths = sorted(
         (path for path in data_root.iterdir() if path.is_dir() and path.name.isdigit()),
         key=lambda path: int(path.name),
     )
-    for scene_path in scene_paths:
-        tracks_path = scene_path / "tracks_3d.npz"
-        if not tracks_path.is_file():
-            continue
-        with np.load(tracks_path) as tracks_file:
-            n_frames, n_tracks, _ = tracks_file["tracks_3d"].shape
-
-        view_dirs = sorted(
-            (path for path in scene_path.glob("view_*") if path.is_dir()),
-            key=lambda path: int(path.name.rsplit("_", 1)[1]),
-        )
-        intrinsics = []
-        extrinsics = []
-        sensor_widths = []
-        focal_lengths = []
-        rgba_files = []
-        depth_files = []
-        view_names = []
-        for view_dir in view_dirs:
-            metadata = _read_json(view_dir / "metadata.json")
-            intr, extr = _camera_matrices(metadata)
-            sensor_widths.append(metadata["camera"]["sensor_width"])
-            focal_lengths.append(metadata["camera"]["focal_length"])
-            rgba = sorted(path.name for path in view_dir.glob("rgba_*"))
-            depth = sorted(path.name for path in view_dir.glob("depth_*"))
-            if len(rgba) != n_frames or len(depth) != n_frames:
-                raise ValueError(
-                    f"{view_dir}: expected {n_frames} RGB/depth frames, got "
-                    f"{len(rgba)}/{len(depth)}"
-                )
-            if extr.shape != (n_frames, 3, 4):
-                raise ValueError(f"{view_dir}: invalid extrinsics shape {extr.shape}")
-            view_names.append(view_dir.name)
-            rgba_files.append(rgba)
-            depth_files.append(depth)
-            intrinsics.append(intr)
-            extrinsics.append(extr)
-
-        arrays_name = f"{scene_path.name}.npz"
-        np.savez(
-            scenes_root / arrays_name,
-            intrinsics=np.stack(intrinsics),
-            extrinsics=np.stack(extrinsics),
-            sensor_widths=np.asarray(sensor_widths),
-            focal_lengths=np.asarray(focal_lengths),
-        )
-        scene_entries[scene_path.name] = {
-            "n_frames": n_frames,
-            "n_tracks": n_tracks,
-            "invalid_frame_indices": _invalid_frames(scene_path),
-            "view_names": view_names,
-            "rgba_files": rgba_files,
-            "depth_files": depth_files,
-            "arrays": f"scenes/{arrays_name}",
+    scene_entries = {}
+    inventories = {}
+    started = time.perf_counter()
+    total = len(scene_paths)
+    print(f"INDEX event=start scenes={total} workers={workers}", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_index_scene, path, data_root, scenes_root): path.name
+            for path in scene_paths
         }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            if result is not None:
+                scene_name, entry, inventory = result
+                scene_entries[scene_name] = entry
+                inventories[scene_name] = inventory
+            if completed % progress_every == 0 or completed == total:
+                elapsed = time.perf_counter() - started
+                rate = completed / elapsed
+                eta = (total - completed) / rate if rate else 0.0
+                print(
+                    f"INDEX event=progress completed={completed}/{total} "
+                    f"rate={rate:.2f}_scenes_per_second eta_seconds={eta:.0f}",
+                    flush=True,
+                )
+
+    digest = hashlib.sha256()
+    for scene_name in sorted(scene_entries):
+        for relative, size in inventories[scene_name]:
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(size).encode("ascii"))
+            digest.update(b"\n")
 
     manifest = {
         "version": INDEX_VERSION,
-        "source_fingerprint": compute_source_fingerprint(data_root, scene_entries),
+        "source_fingerprint": digest.hexdigest(),
         "scenes": scene_entries,
     }
     temporary = manifest_path.with_suffix(".tmp")
     temporary.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
     temporary.replace(manifest_path)
+    print(
+        f"INDEX event=complete scenes={len(scene_entries)} "
+        f"seconds={time.perf_counter() - started:.1f}",
+        flush=True,
+    )
     return manifest_path
 
 
@@ -225,8 +291,18 @@ def main():
     parser.add_argument("data_root")
     parser.add_argument("--index-root")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--progress-every", type=int, default=25)
     args = parser.parse_args()
-    print(build_kubric_metadata_index(args.data_root, args.index_root, args.overwrite))
+    print(
+        build_kubric_metadata_index(
+            args.data_root,
+            args.index_root,
+            args.overwrite,
+            args.workers,
+            args.progress_every,
+        )
+    )
 
 
 if __name__ == "__main__":
