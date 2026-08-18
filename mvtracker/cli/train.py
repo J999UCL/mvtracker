@@ -2010,6 +2010,17 @@ def main(cfg: DictConfig):
                         _assert_matching_step_fingerprint(
                             fabric, physical_step.fingerprint
                         )
+                        materialization_succeeded = _all_ranks_succeeded(
+                            fabric,
+                            physical_step.materialization_error is None,
+                        )
+                        if not materialization_succeeded:
+                            detail = physical_step.materialization_error or (
+                                "materialization failed on another rank"
+                            )
+                            raise RuntimeError(
+                                f"physical step materialization failed: {detail}"
+                            )
                         physical_group_count = len(physical_step.groups)
                         physical_group_iterator = iter(
                             PhysicalGroupPrefetchIterator(

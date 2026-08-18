@@ -63,6 +63,40 @@ class LivePhysicalTrainingTests(unittest.TestCase):
         self.assertNotIn("cuda", source)
         self.assertNotIn("wait_event", source)
 
+    def test_track_padding_marks_added_slots_unusable(self):
+        pad_node = next(
+            node
+            for node in LOADER_TREE.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_pad_tensor"
+        )
+        namespace = {"torch": torch}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[pad_node], type_ignores=[])
+                ),
+                str(LOADER_PATH),
+                "exec",
+            ),
+            namespace,
+        )
+        padded_mask = namespace["_pad_tensor"](
+            torch.tensor([[False, False]]), -1, 4, fill_value=True
+        )
+        torch.testing.assert_close(
+            padded_mask, torch.tensor([[False, False, True, True]])
+        )
+        merge_node = next(
+            node
+            for node in LOADER_TREE.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "merge_decoded_datapoints"
+        )
+        self.assertIn(
+            "fill_value=field.name == 'track_padding_mask'",
+            ast.unparse(merge_node),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

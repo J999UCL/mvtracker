@@ -68,6 +68,7 @@ class PreparedMixedStep:
     materialization_seconds: float
     pair_count: int
     padding_tracks: int
+    materialization_error: str | None = None
 
     @property
     def logical_scene_count(self) -> int:
@@ -286,32 +287,39 @@ class MixedStepLookahead:
             for scene in local_scenes
         }
         prepared = {}
+        materialization_error = None
         for scene in local_scenes:
-            sample, gotit = futures[scene.identity].result()
+            try:
+                sample, gotit = futures[scene.identity].result()
+            except BaseException as error:
+                materialization_error = f"{scene.identity}: {error}"
+                break
             if not gotit or sample is None:
-                raise RuntimeError(
-                    f"materialization failed after a valid plan: {scene.identity}"
-                )
+                materialization_error = f"{scene.identity}: invalid materialized sample"
+                break
             sample.metadata["source"] = scene.source
             prepared[scene.identity] = _pin_sample(sample)
 
         groups = []
-        for physical_group in physical_groups:
-            group_scenes = tuple(
-                next(
-                    scene
-                    for scene in local_scenes
-                    if scene.identity
-                    == (summary.source, summary.scene, summary.cursor)
+        if materialization_error is None:
+            for physical_group in physical_groups:
+                group_scenes = tuple(
+                    next(
+                        scene
+                        for scene in local_scenes
+                        if scene.identity
+                        == (summary.source, summary.scene, summary.cursor)
+                    )
+                    for summary in physical_group.scenes
                 )
-                for summary in physical_group.scenes
-            )
-            groups.append(
-                PreparedPhysicalGroup(
-                    scenes=group_scenes,
-                    samples=tuple(prepared[scene.identity] for scene in group_scenes),
+                groups.append(
+                    PreparedPhysicalGroup(
+                        scenes=group_scenes,
+                        samples=tuple(
+                            prepared[scene.identity] for scene in group_scenes
+                        ),
+                    )
                 )
-            )
         encoded_bytes = sum(
             _sample_nbytes(sample) for group in groups for sample in group.samples
         )
@@ -336,6 +344,7 @@ class MixedStepLookahead:
             materialization_seconds=materialization_seconds,
             pair_count=physical.pair_count,
             padding_tracks=physical.total_padding_tracks,
+            materialization_error=materialization_error,
         )
 
     def _produce(self) -> None:
@@ -345,7 +354,7 @@ class MixedStepLookahead:
                     self._queue.put(self._prepare_step(executor))
         except BaseException as error:
             self._queue.put(error)
-        finally:
+        else:
             self._queue.put(self._finished)
 
     def __iter__(self):
@@ -360,12 +369,19 @@ class MixedStepLookahead:
         return item
 
 
-def _pad_tensor(value: torch.Tensor, axis: int, target: int) -> torch.Tensor:
+def _pad_tensor(
+    value: torch.Tensor,
+    axis: int,
+    target: int,
+    *,
+    fill_value: bool | float = 0,
+) -> torch.Tensor:
     if value.shape[axis] == target:
         return value
     shape = list(value.shape)
     shape[axis] = target - value.shape[axis]
-    return torch.cat((value, value.new_zeros(shape)), dim=axis)
+    padding = value.new_full(shape, fill_value)
+    return torch.cat((value, padding), dim=axis)
 
 
 def merge_decoded_datapoints(datapoints: Sequence[Datapoint]) -> Datapoint:
@@ -389,7 +405,15 @@ def merge_decoded_datapoints(datapoints: Sequence[Datapoint]) -> Datapoint:
         elif all(isinstance(item, torch.Tensor) for item in items):
             axis = track_axes.get(field.name)
             if axis is not None:
-                items = [_pad_tensor(item, axis, target_tracks) for item in items]
+                items = [
+                    _pad_tensor(
+                        item,
+                        axis,
+                        target_tracks,
+                        fill_value=field.name == "track_padding_mask",
+                    )
+                    for item in items
+                ]
             values[field.name] = torch.cat(items, dim=0)
         elif all(isinstance(item, list) for item in items):
             values[field.name] = [value for item in items for value in item]
@@ -493,7 +517,7 @@ class PhysicalGroupPrefetchIterator:
                 self.ready.put((group, datapoint, event))
         except BaseException as error:
             self.ready.put(error)
-        finally:
+        else:
             self.ready.put(self.finished)
 
     def __iter__(self):
