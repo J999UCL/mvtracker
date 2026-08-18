@@ -294,13 +294,15 @@ def train_remote(
     run_name: str,
     confirmation: str = "",
     materialize_whole_step: bool = True,
+    seed_override: int = 0,
 ) -> dict:
     if mode not in EXPERIMENT_PHASES:
         raise ValueError("unsupported training mode")
     require_remote_main_confirmation(mode, confirmation)
     validate_run_name(run_name)
     commit = _source_commit()
-    seed, wandb_run_id = _run_identity(run_name, commit)
+    derived_seed, wandb_run_id = _run_identity(run_name, commit)
+    seed = seed_override or derived_seed
     run_dir = RUN_ROOT / CONTINUAL_RUN_SUBDIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "modal-run-manifest.json"
@@ -437,12 +439,16 @@ def smoke(run_name: str = "") -> None:
 
 
 @app.local_entrypoint(name="smoke10")
-def smoke10(run_name: str = "", materialize_whole_step: bool = True) -> None:
+def smoke10(
+    run_name: str = "",
+    materialize_whole_step: bool = True,
+    seed: int = 0,
+) -> None:
     selected = _prepare_launch("smoke10", run_name, confirm_main=False)
     print(
         json.dumps(
             train_remote.remote(
-                "smoke10", selected, "", materialize_whole_step
+                "smoke10", selected, "", materialize_whole_step, seed
             ),
             indent=2,
         )
