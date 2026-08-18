@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import shutil
 import subprocess
@@ -64,7 +65,9 @@ def _extract_mvkubric_archive(archive_name: str, destination: Path) -> float:
 def _materialize_diegesis() -> None:
     marker = DATA_ROOT / "direct-volume-diegesis.json"
     if marker.is_file():
+        print("INGEST phase=diegesis event=skip-complete", flush=True)
         return
+    print("INGEST phase=diegesis event=extract-start", flush=True)
     staging = DATA_ROOT / "source/.diegesis-staging"
     if staging.exists():
         shutil.rmtree(staging)
@@ -107,6 +110,7 @@ def _materialize_diegesis() -> None:
                 os.path.relpath(sequence, split_root), target_is_directory=True
             )
     marker.write_text('{"status":"complete"}\n')
+    print("INGEST phase=diegesis event=complete", flush=True)
 
 
 def materialize_direct_volume_data(commit) -> dict:
@@ -127,6 +131,7 @@ def materialize_direct_volume_data(commit) -> dict:
         marker = staging / f".complete-{scene_start}-{scene_end}"
         if marker.is_file():
             archive_seconds[archive_name] = 0.0
+            print(f"INGEST archive={archive_name} event=skip-complete", flush=True)
             continue
         for path in staging.iterdir():
             if path.is_dir() and path.name.isdigit() and scene_start <= int(path.name) <= scene_end:
@@ -143,12 +148,30 @@ def materialize_direct_volume_data(commit) -> dict:
         )
         commit()
 
-    for scene_id in VALIDATION_SCENES:
-        shutil.copytree(
-            VALIDATION_ROOT / scene_id, staging / scene_id, dirs_exist_ok=True
-        )
+    print(
+        f"INGEST phase=validation-copy event=start scenes={len(VALIDATION_SCENES)}",
+        flush=True,
+    )
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = {
+            executor.submit(
+                shutil.copytree,
+                VALIDATION_ROOT / scene_id,
+                staging / scene_id,
+                dirs_exist_ok=True,
+            ): scene_id
+            for scene_id in VALIDATION_SCENES
+        }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            future.result()
+            print(
+                f"INGEST phase=validation-copy event=progress "
+                f"completed={completed}/{len(VALIDATION_SCENES)}",
+                flush=True,
+            )
 
     index_root = staging / "MVTracker_index"
+    print("INGEST phase=index event=start", flush=True)
     build_kubric_metadata_index(staging, index_root=index_root, overwrite=True)
     observed = sorted(
         (
@@ -161,7 +184,9 @@ def materialize_direct_volume_data(commit) -> dict:
     train_scenes = [scene for scene in observed if scene not in VALIDATION_SCENES]
 
     if TRAIN_ROOT.exists():
+        print("INGEST phase=publish event=remove-old-train", flush=True)
         shutil.rmtree(TRAIN_ROOT)
+    print("INGEST phase=publish event=rename-staging", flush=True)
     staging.rename(TRAIN_ROOT)
     manifest = {
         "schema_version": 1,
@@ -177,4 +202,9 @@ def materialize_direct_volume_data(commit) -> dict:
     temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     temporary.replace(MANIFEST_PATH)
     commit()
+    print(
+        f"INGEST phase=publish event=complete train_scenes={len(train_scenes)} "
+        f"validation_scenes={len(VALIDATION_SCENES)}",
+        flush=True,
+    )
     return manifest
