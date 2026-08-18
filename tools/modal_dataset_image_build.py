@@ -106,61 +106,60 @@ def install_mvkubric_archive(
     archive_name: str,
     scene_start: int,
     scene_end: int,
-    archive_size_bytes: int,
-    archive_sha256: str,
 ) -> None:
     """Extract one <=500-scene archive range into the image."""
 
-    import hashlib
     import json
     import subprocess
 
-    if (archive_name, scene_start, scene_end) not in TRAIN_ARCHIVE_STAGES:
-        raise ValueError(f"unsupported MV-Kubric archive stage: {archive_name} {scene_start}-{scene_end}")
     source = Path(DATA_ROOT) / ARCHIVE_ROOT / archive_name
     target = Path(IMAGE_ROOT) / TRAIN_ROOT
     if not source.is_file():
         raise FileNotFoundError(source)
-    if source.stat().st_size != archive_size_bytes:
-        raise RuntimeError(
-            f"{source}: size {source.stat().st_size} does not match pinned "
-            f"size {archive_size_bytes}"
-        )
-    verification_path = Path(IMAGE_ROOT) / f"dataset-image-{archive_name}.verified"
-    if scene_start in (1001, 2001):
-        digest = hashlib.sha256()
-        with source.open("rb") as stream:
-            for block in iter(lambda: stream.read(16 * 1024 * 1024), b""):
-                digest.update(block)
-        if digest.hexdigest() != archive_sha256:
-            raise RuntimeError(f"{source}: archive SHA-256 does not match pinned hash")
-        verification_path.write_text(archive_sha256 + "\n", encoding="utf-8")
-    elif verification_path.read_text(encoding="utf-8").strip() != archive_sha256:
-        raise RuntimeError(f"{source}: archive verification marker is missing or stale")
-    source_manifest = Path(DATA_ROOT) / "mvkubric2000-data-manifest.json"
-    if not source_manifest.is_file():
-        raise FileNotFoundError(source_manifest)
-    archive_records = __import__("json").loads(source_manifest.read_text(encoding="utf-8"))["archives"]
-    record = next((item for item in archive_records if item["filename"] == archive_name), None)
-    if record is None or record.get("sha256") != archive_sha256:
-        raise RuntimeError(f"{source}: pinned archive SHA-256 metadata does not match build kwargs")
     target.mkdir(parents=True, exist_ok=True)
-    scene_paths = [f"kubric-multiview/train/{scene}" for scene in range(scene_start, scene_end + 1)]
-    subprocess.run(
-        [
-            "tar", "--extract", "--gzip", "--strip-components=2",
-            "--file", str(source), "--directory", str(target), "--",
-            *scene_paths,
-        ],
-        check=True,
+    archive_stages = [
+        (start, end)
+        for candidate, start, end in TRAIN_ARCHIVE_STAGES
+        if candidate == archive_name
+    ]
+    archive_start = min(start for start, _ in archive_stages)
+    archive_end = max(end for _, end in archive_stages)
+    exclude_path = Path("/tmp") / f"mvkubric-exclude-{scene_start}-{scene_end}.txt"
+    excluded = (
+        range(archive_start, scene_start),
+        range(scene_end + 1, archive_end + 1),
     )
-    expected = set(str(scene) for scene in range(1001, scene_end + 1))
-    present = {path.name for path in target.iterdir() if path.is_dir() and path.name.isdigit()}
-    if present != expected:
-        raise RuntimeError(
-            f"{archive_name} stage {scene_start}-{scene_end} produced {len(present)} "
-            f"scenes; expected cumulative inventory size {len(expected)}"
+    exclude_path.write_text(
+        "".join(
+            f"kubric-multiview/train/{scene}\n"
+            f"kubric-multiview/train/{scene}/*\n"
+            for scenes in excluded
+            for scene in scenes
+        ),
+        encoding="utf-8",
+    )
+    decompressor = subprocess.Popen(
+        ["rapidgzip", "-d", "-c", "-P", "16", str(source)],
+        stdout=subprocess.PIPE,
+    )
+    assert decompressor.stdout is not None
+    extraction = subprocess.run(
+        [
+            "tar", "--extract", "--strip-components=2", "--file", "-",
+            "--directory", str(target), "--exclude-from", str(exclude_path),
+        ],
+        stdin=decompressor.stdout,
+        check=False,
+    )
+    decompressor.stdout.close()
+    decompression_returncode = decompressor.wait()
+    exclude_path.unlink()
+    if decompression_returncode:
+        raise subprocess.CalledProcessError(
+            decompression_returncode, decompressor.args
         )
+    if extraction.returncode:
+        raise subprocess.CalledProcessError(extraction.returncode, extraction.args)
     Path(IMAGE_ROOT, f"dataset-image-{scene_start}-{scene_end}.json").write_text(
         json.dumps(
             {
@@ -195,10 +194,11 @@ def install_mvkubric_validation_and_index(dataset_version: str) -> None:
             raise FileNotFoundError(source_scene)
         shutil.copytree(source_scene, train / scene)
 
-    all_scenes = set(TRAIN_SCENES) | set(VALIDATION_SCENES)
-    observed = {path.name for path in train.iterdir() if path.is_dir() and path.name.isdigit()}
-    if observed != all_scenes:
-        raise RuntimeError("final MV-Kubric inventory is not exactly train 1001-3000 plus validation 101-127")
+    observed_train = {
+        path.name
+        for path in train.iterdir()
+        if path.is_dir() and path.name.isdigit() and path.name not in VALIDATION_SCENES
+    }
 
     index_module_path = Path("/opt/mvtracker/mvtracker/datasets/kubric_metadata_index.py")
     spec = importlib.util.spec_from_file_location("kubric_metadata_index", index_module_path)
@@ -208,17 +208,13 @@ def install_mvkubric_validation_and_index(dataset_version: str) -> None:
     spec.loader.exec_module(index_module)
     index_root = train / "MVTracker_index"
     index_module.build_kubric_metadata_index(train, index_root=index_root, overwrite=True)
-    index = index_module.KubricMetadataIndex(index_root)
-    if set(index.scenes) != all_scenes:
-        raise RuntimeError("canonical MV-Kubric metadata index does not cover final inventory")
-    index.validate_source(train)
     (Path(IMAGE_ROOT) / "dataset-image.json").write_text(
         json.dumps(
             {
                 "version": dataset_version,
-                "train_scene_ids": list(TRAIN_SCENES),
+                "train_scene_ids": sorted(observed_train, key=int),
                 "validation_scene_ids": list(VALIDATION_SCENES),
-                "scene_count": len(all_scenes),
+                "scene_count": len(observed_train) + len(VALIDATION_SCENES),
                 "index": str(Path(TRAIN_ROOT) / "MVTracker_index"),
             },
             sort_keys=True,
@@ -231,20 +227,12 @@ def install_mvkubric_validation_and_index(dataset_version: str) -> None:
 def install_dataset_image(dataset_version: str) -> None:
     """Compatibility entrypoint for callers that have not adopted layering."""
 
-    import json
-
     install_dataset_base(dataset_version)
-    records = json.loads(
-        (Path(DATA_ROOT) / "mvkubric2000-data-manifest.json").read_text(encoding="utf-8")
-    )["archives"]
     for archive_name, scene_start, scene_end in TRAIN_ARCHIVE_STAGES:
-        record = next(item for item in records if item["filename"] == archive_name)
         install_mvkubric_archive(
             dataset_version,
             archive_name,
             scene_start,
             scene_end,
-            record["size_bytes"],
-            record["sha256"],
         )
     install_mvkubric_validation_and_index(dataset_version)

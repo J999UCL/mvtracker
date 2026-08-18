@@ -68,6 +68,7 @@ def _dependency_image() -> modal.Image:
             "nvidia-ml-py",
             "nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20",
             "nvidia-libnvcomp-cu12==5.3.0.16",
+            "rapidgzip==0.16.0",
             # Modal's mirror currently publishes cu120 through 2.3.6.
             "spconv-cu120==2.3.6",
         )

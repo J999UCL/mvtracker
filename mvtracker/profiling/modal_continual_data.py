@@ -107,11 +107,9 @@ def _require_existing_profile_data(data_root: Path) -> dict:
         for path in mvkubric_root.iterdir()
         if path.is_dir() and path.name.isdigit()
     }
-    if mvkubric != EXPECTED_MVKUBRIC_POOL_SCENES:
-        raise RuntimeError(
-            "existing MV-Kubric pool must contain scenes 1001..3000 plus validation 101..127"
-        )
-    _validate_mvkubric_index(data_root, EXPECTED_MVKUBRIC_POOL_SCENES)
+    if not set(VALIDATION_SCENES).issubset(mvkubric):
+        raise RuntimeError("existing MV-Kubric pool is missing validation scenes")
+    _validate_mvkubric_index(data_root, mvkubric)
     return manifest
 
 

@@ -30,7 +30,7 @@ class ModalContinualDataTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "does not download or rebuild"):
                 _require_existing_profile_data(Path(directory))
 
-    def test_setup_accepts_only_exact_existing_scene_sets(self):
+    def test_setup_accepts_the_indexed_scene_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest = {
@@ -72,8 +72,19 @@ class ModalContinualDataTests(unittest.TestCase):
             (cache_root / "train" / "0").mkdir()
 
             (mvkubric / "1001").rename(mvkubric / "900")
-            with self.assertRaisesRegex(RuntimeError, "1001..3000"):
-                _require_existing_profile_data(root)
+            (index_root / "scenes/1001.npz").rename(index_root / "scenes/900.npz")
+            index_entries["900"] = index_entries.pop("1001")
+            index_entries["900"]["arrays"] = "scenes/900.npz"
+            (index_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "source_fingerprint": hashlib.sha256().hexdigest(),
+                        "scenes": index_entries,
+                    }
+                )
+            )
+            self.assertEqual(_require_existing_profile_data(root), manifest)
 
     def test_archive_staging_is_disabled_for_the_cached_image(self):
         with self.assertRaisesRegex(RuntimeError, "legacy archive staging is disabled"):

@@ -50,9 +50,6 @@ from mvtracker.profiling.modal_continual_training import (
     require_remote_main_confirmation,
     validate_run_name,
 )
-from mvtracker.profiling.modal_mvkubric2000 import TRAIN_ARCHIVES as PINNED_MVKUBRIC_ARCHIVES
-
-
 APP_NAME = "jeet-mvtracker-continual-training"
 SOURCE_ROOT = Path("/opt/mvtracker")
 LOADER_PROFILE_WARMUP = 4
@@ -101,7 +98,7 @@ dataset_image = _dependency_image().add_local_file(
 )
 _dataset_stage_options = {
     "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
-    "cpu": 4,
+    "cpu": 16,
     "memory": 8192,
     "timeout": 12 * 60 * 60,
 }
@@ -111,9 +108,6 @@ dataset_image = dataset_image.run_function(
     kwargs={"dataset_version": DATASET_IMAGE_VERSION},
 )
 for _archive_name, _scene_start, _scene_end in TRAIN_ARCHIVE_STAGES:
-    _archive_record = next(
-        item for item in PINNED_MVKUBRIC_ARCHIVES if item["filename"] == _archive_name
-    )
     dataset_image = dataset_image.run_function(
         install_mvkubric_archive,
         **_dataset_stage_options,
@@ -122,8 +116,6 @@ for _archive_name, _scene_start, _scene_end in TRAIN_ARCHIVE_STAGES:
             "archive_name": _archive_name,
             "scene_start": _scene_start,
             "scene_end": _scene_end,
-            "archive_size_bytes": _archive_record["size_bytes"],
-            "archive_sha256": _archive_record["sha256"],
         },
     )
 dataset_image = dataset_image.run_function(
