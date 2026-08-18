@@ -859,3 +859,40 @@ chunks made allocation failures explicit and prevented null decoder outputs
 from reaching DLPack. The successful one-pass profile peaked at 8.441 GiB.
 This is a Titan loader validation, not an H100 end-to-end speed claim; the
 physical batching limits remain those measured with full H100 training steps.
+
+## 2026-08-18 — Physical batching two-H100 smoke
+
+The production training path completed a bounded ten-update DDP smoke on two
+H100s with seed 72. The run used the deterministic 4-DIEGESIS/4-MV-Kubric
+logical optimizer step, four-step CPU planning lookahead, lazy RGB/depth
+materialization, physical same-view batches of at most two scenes, gradient
+accumulation and W&B logging. Evaluation was disabled. It completed without an
+OOM, deadlock, sample-ratio drift or rank failure and released both GPUs.
+
+The first update took 100.11 seconds because it included kernel compilation and
+cold initialization. Across warm updates 2–10, mean optimizer-step time was
+5.83 seconds and median was 5.64 seconds. Exposed data wait averaged 0.46
+seconds. Meanwhile, CPU planning averaged 4.11 seconds and payload
+materialization averaged 1.26 seconds, demonstrating that the four-step
+lookahead hid most input work behind model computation rather than putting it
+on the critical path. Warm throughput averaged 1,958 trajectories/s with a
+median of 2,093 trajectories/s.
+
+Five same-view pairs were formed across the 80 logical scene samples. This
+reduced 80 logical forwards to 75 physical forwards, a 6.25% reduction, with
+631 total padded trajectory slots. Exact global source counts remained four
+DIEGESIS and four MV-Kubric scenes per optimizer update. At update 10, the
+point-in-time hardware metrics were 79% utilization and 19.8/79.6 GiB on rank
+0, and 100% utilization and 30.1/79.6 GiB on rank 1. Container RAM was 39.7
+GiB.
+
+This proves the physical-batching path is operational on the intended H100 DDP
+setup and that planning is successfully overlapped. It is not a controlled
+speedup measurement against the old loader because the earlier smoke used a
+different workload seed and code state. A matched A/B would be required for an
+exact speedup claim.
+
+- Modal app: https://modal.com/apps/ucl-prism/main/ap-BdiMNdYYpEleiVtYHC64Zb
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/b4d7a46acca2
+- Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
