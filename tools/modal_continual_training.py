@@ -102,8 +102,8 @@ dataset_image = dataset_image.add_local_file(
 )
 _dataset_stage_options = {
     "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
-    "cpu": 32,
-    "memory": 65536,
+    "cpu": 4,
+    "memory": 8192,
     "timeout": 12 * 60 * 60,
 }
 dataset_image = dataset_image.run_function(
