@@ -38,6 +38,12 @@ from mvtracker.datasets import (
 )
 from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
 from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
+from mvtracker.datasets.mixed_physical_loader import (
+    MixedStepLookahead,
+    PhysicalBatchDecoder,
+    PhysicalGroupPrefetchIterator,
+)
+from mvtracker.datasets.physical_batch_scheduler import BatchCapacity
 from mvtracker.datasets import TapVidDataset
 from mvtracker.datasets import kubric_multiview_dataset
 from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
@@ -146,6 +152,15 @@ def _scale_microbatch_loss(loss, gradient_accumulation_steps):
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
     return loss / gradient_accumulation_steps
+
+
+def _scale_physical_batch_loss(loss, physical_batch_size, accumulation_steps):
+    """Weight a physical scene batch as its share of one rank's logical batch."""
+    if physical_batch_size < 1 or accumulation_steps < 1:
+        raise ValueError("physical and logical batch sizes must be positive")
+    if physical_batch_size > accumulation_steps:
+        raise ValueError("physical batch cannot exceed the logical rank batch")
+    return loss * (physical_batch_size / accumulation_steps)
 
 
 def _global_gradient_l2_norm(parameters):
@@ -467,6 +482,43 @@ class _ScheduledSourceSampler(torch.utils.data.Sampler):
 
 def _mixed_source_name(cfg):
     return cfg.datasets.train.name == "mixed-diegesis-mvkubric-training"
+
+
+def _planned_physical_batching(cfg):
+    settings = cfg.datasets.train.get("physical_batching")
+    return settings is not None and bool(settings.get("enabled", False))
+
+
+def _physical_batch_capacity(cfg):
+    settings = cfg.datasets.train.physical_batching
+    return BatchCapacity(
+        name=str(settings.capacity_name),
+        rank_count=2,
+        logical_scenes_per_rank=int(cfg.trainer.gradient_accumulation_steps),
+        max_group_size=int(settings.max_scenes),
+        pair_track_capacity_by_views=tuple(
+            sorted(
+                (int(view), int(tracks))
+                for view, tracks in settings.pair_track_capacity_by_views.items()
+            )
+        ),
+        singleton_only_views=frozenset(
+            int(view) for view in settings.singleton_only_views
+        ),
+    )
+
+
+def _assert_matching_step_fingerprint(fabric, fingerprint):
+    digest = torch.tensor(
+        list(bytes.fromhex(fingerprint)),
+        dtype=torch.uint8,
+        device=fabric.device,
+    )
+    gathered = fabric.all_gather(digest)
+    if gathered.ndim == 1:
+        gathered = gathered[None]
+    if not torch.equal(gathered, gathered[0:1].expand_as(gathered)):
+        raise RuntimeError("planned physical step differs between DDP ranks")
 
 
 def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=None):
@@ -1043,6 +1095,13 @@ def forward_batch_multi_view(
             "predictions": pred_visibilities.detach(),
         },
         "metrics": diagnostic_metrics,
+        "scene_losses": {
+            "flow": torch.stack(scene_losses).detach(),
+            "visibility": (
+                torch.stack(scene_vis_losses).detach()
+                * cfg.trainer.visibility_loss_weight
+            ),
+        },
         # "metrics": {
         #     k: v
         #     for k, v in eval_3dpt_results_dict.items()
@@ -1095,9 +1154,12 @@ def _forward_backward_microbatch(
         loss = torch.zeros((), device=fabric.device)
         component_losses = {}
         metrics = {}
+        scene_losses = None
         for name, value in output.items():
             if name == "metrics":
                 metrics.update({key: float(item) for key, item in value.items()})
+            elif name == "scene_losses":
+                scene_losses = value
             elif "loss" in value:
                 loss = loss + value["loss"]
                 component_losses[name] = value["loss"].detach()
@@ -1126,6 +1188,7 @@ def _forward_backward_microbatch(
         loss.detach(),
         component_losses,
         metrics,
+        scene_losses,
         microbatch_gradient,
         forward_duration,
         backward_duration,
@@ -1514,9 +1577,11 @@ def main(cfg: DictConfig):
 
     mixed_training = not cfg.modes.eval_only and _mixed_source_name(cfg)
     mixed_schedule = None
+    planned_physical_batching = False
     source_cursors = None
     source_samplers = None
     train_loaders = None
+    train_datasets = None
     if cfg.modes.eval_only:
         train_dataset = None
     elif mixed_training:
@@ -1544,21 +1609,30 @@ def main(cfg: DictConfig):
             master_seed=int(cfg.reproducibility.seed),
         )
         source_cursors = {source: 0 for source in train_datasets}
-        source_samplers = {
-            source: _ScheduledSourceSampler(
-                mixed_schedule,
-                source,
-                fabric.global_rank,
-                len(dataset),
-            )
-            for source, dataset in train_datasets.items()
-        }
-        train_loaders = {
-            source: _build_source_train_loader(
-                dataset, source_samplers[source], cfg, fabric
-            )
-            for source, dataset in train_datasets.items()
-        }
+        planned_physical_batching = _planned_physical_batching(cfg)
+        if planned_physical_batching:
+            capacity = _physical_batch_capacity(cfg)
+            if fabric.world_size != capacity.rank_count:
+                raise ValueError(
+                    "physical batching requires exactly "
+                    f"{capacity.rank_count} DDP ranks"
+                )
+        else:
+            source_samplers = {
+                source: _ScheduledSourceSampler(
+                    mixed_schedule,
+                    source,
+                    fabric.global_rank,
+                    len(dataset),
+                )
+                for source, dataset in train_datasets.items()
+            }
+            train_loaders = {
+                source: _build_source_train_loader(
+                    dataset, source_samplers[source], cfg, fabric
+                )
+                for source, dataset in train_datasets.items()
+            }
         train_dataset = None
     else:
         train_dataset = _build_training_dataset(
@@ -1694,8 +1768,9 @@ def main(cfg: DictConfig):
                 source: int(cursor)
                 for source, cursor in state.source_cursors.items()
             }
-            for source, sampler in source_samplers.items():
-                sampler.set_start_cursor(source_cursors[source])
+            if source_samplers is not None:
+                for source, sampler in source_samplers.items():
+                    sampler.set_start_cursor(source_cursors[source])
         elif train_loader is not None:
             epoch = total_steps // optimizer_steps_per_epoch - 1
         logging.info(
@@ -1727,8 +1802,9 @@ def main(cfg: DictConfig):
                     source: int(cursor)
                     for source, cursor in state.source_cursors.items()
                 }
-                for source, sampler in source_samplers.items():
-                    sampler.set_start_cursor(source_cursors[source])
+                if source_samplers is not None:
+                    for source, sampler in source_samplers.items():
+                        sampler.set_start_cursor(source_cursors[source])
             logging.info(
                 "Resumed explicit training checkpoint %s at %d completed steps",
                 restore_ckpt_path,
@@ -1759,6 +1835,23 @@ def main(cfg: DictConfig):
             if tb_writer is not None:
                 tb_writer.close()
             return
+
+    physical_lookahead = None
+    physical_decoder = None
+    if planned_physical_batching:
+        settings = cfg.datasets.train.physical_batching
+        physical_lookahead = MixedStepLookahead(
+            datasets=train_datasets,
+            schedule=mixed_schedule,
+            source_cursors=source_cursors,
+            rank=fabric.global_rank,
+            remaining_steps=int(cfg.trainer.num_steps) - total_steps,
+            worker_count=int(cfg.datasets.train.num_workers),
+            lookahead_steps=int(settings.lookahead_steps),
+            max_cache_bytes=int(float(settings.cpu_cache_gib_per_rank) * 1024**3),
+            capacity=_physical_batch_capacity(cfg),
+        )
+        physical_decoder = PhysicalBatchDecoder(fabric.device)
 
     torch_profiler = _create_torch_profiler(
         cfg,
@@ -1842,9 +1935,10 @@ def main(cfg: DictConfig):
             train_batch_sampler.set_epoch(epoch)
 
         if mixed_training:
-            for source, sampler in source_samplers.items():
-                sampler.set_start_cursor(source_cursors[source])
-            data_iters = _start_mixed_source_iterators(train_loaders)
+            if not planned_physical_batching:
+                for source, sampler in source_samplers.items():
+                    sampler.set_start_cursor(source_cursors[source])
+                data_iters = _start_mixed_source_iterators(train_loaders)
             n_batches = (
                 int(cfg.trainer.num_steps) - total_steps
             ) * gradient_accumulation_steps
@@ -1893,6 +1987,9 @@ def main(cfg: DictConfig):
         microbatch_gradient_norms = []
         microbatch_gradient_cosines = []
         mixed_step_batches = None
+        physical_step = None
+        physical_group_iterator = None
+        physical_group_count = None
 
         while i_batch < n_batches and total_steps < cfg.trainer.num_steps:
             if accumulation_started_at is None:
@@ -1900,9 +1997,30 @@ def main(cfg: DictConfig):
                 optimizer.zero_grad()
             start_time_1 = time.time()
             logging.info(f"Gonna load batch {i_batch + 1}/{n_batches} (rank={fabric.global_rank})")
-            current_source = None
+            current_sources = None
             if mixed_training:
-                if (
+                if planned_physical_batching:
+                    if microbatches_accumulated == 0:
+                        physical_step = next(physical_lookahead)
+                        if physical_step.start_cursors != source_cursors:
+                            raise RuntimeError(
+                                "physical lookahead cursor does not match committed state"
+                            )
+                        _assert_matching_step_fingerprint(
+                            fabric, physical_step.fingerprint
+                        )
+                        physical_group_count = len(physical_step.groups)
+                        physical_group_iterator = iter(
+                            PhysicalGroupPrefetchIterator(
+                                physical_step.groups, physical_decoder
+                            )
+                        )
+                        total_batches_loaded += physical_step.logical_scene_count
+                        total_batches_failed += physical_step.retry_count
+                    physical_group, batch = next(physical_group_iterator)
+                    current_sources = physical_group.sources
+                    gotit = [True] * len(current_sources)
+                elif (
                     cfg.datasets.train.materialize_whole_step
                     and microbatches_accumulated == 0
                 ):
@@ -1926,15 +2044,20 @@ def main(cfg: DictConfig):
                             step_batches_failed,
                             step_batches_loaded,
                         )
-                if cfg.datasets.train.materialize_whole_step:
+                if (
+                    not planned_physical_batching
+                    and cfg.datasets.train.materialize_whole_step
+                ):
                     current_source, batch = mixed_step_batches[
                         microbatches_accumulated
                     ]
+                    current_sources = (current_source,)
                     mixed_step_batches[microbatches_accumulated] = None
-                else:
+                elif not planned_physical_batching:
                     current_source = mixed_schedule.source_pattern[
                         microbatches_accumulated
                     ]
+                    current_sources = (current_source,)
                     try:
                         batch = next(data_iters[current_source])
                     except StopIteration:
@@ -1966,7 +2089,13 @@ def main(cfg: DictConfig):
                              f"with {len(batch.video)} views and {batch.video.shape[2]} frames")
 
             if (
-                (not mixed_training or not cfg.datasets.train.materialize_whole_step)
+                (
+                    not mixed_training
+                    or (
+                        not planned_physical_batching
+                        and not cfg.datasets.train.materialize_whole_step
+                    )
+                )
                 and not _all_ranks_succeeded(fabric, all(gotit))
             ):
                 total_batches_failed += 1
@@ -1976,7 +2105,8 @@ def main(cfg: DictConfig):
                              f"({total_batches_failed / total_batches_loaded * 100:.2f}%) batches")
                 continue
 
-            i_batch += 1
+            batch_scene_count = int(batch.video.shape[0])
+            i_batch += batch_scene_count if planned_physical_batching else 1
             with torch.profiler.record_function("train/host_to_device"):
                 dataclass_to_cuda_(batch)
             assert model.training
@@ -1986,7 +2116,8 @@ def main(cfg: DictConfig):
             accumulated_dataloader_duration += microbatch_dataloader_duration
             logging.info(
                 f"Datapoint: {batch.seq_name} "
-                f"(microbatch {microbatches_accumulated + 1}/{gradient_accumulation_steps}, "
+                f"(microbatch {microbatches_accumulated + 1}/"
+                f"{physical_group_count or gradient_accumulation_steps}, "
                 f"waited {microbatch_dataloader_duration:>5.2f}s)"
             )
             if batch.sample_metadata:
@@ -2006,20 +2137,25 @@ def main(cfg: DictConfig):
                             accumulated_sampling_metrics.get(name, 0.0)
                             + float(np.mean([item[name] for item in metadata]))
                         )
-            if current_source is not None:
-                source_view_count, source_track_count = _source_batch_shape_metrics(batch)
+            source_view_count = int(batch.video.shape[1])
+            if batch.track_padding_mask is not None:
+                scene_track_counts = (
+                    (~batch.track_padding_mask.bool()).sum(dim=1).tolist()
+                )
             else:
-                _, source_track_count = _source_batch_shape_metrics(batch)
-            batch_scene_count = int(batch.video.shape[0])
+                scene_track_counts = [
+                    int(batch.trajectory.shape[-2])
+                ] * batch_scene_count
             accumulated_sample_count += batch_scene_count
-            accumulated_trajectory_count += source_track_count * batch_scene_count
+            accumulated_trajectory_count += sum(scene_track_counts)
 
             train_iters = cfg.trainer.train_iters
             if cfg.trainer.augment_train_iters:
                 train_iters = augment_train_iters(train_iters, total_steps, cfg.trainer.augment_train_iters_warmup)
 
             is_final_microbatch = (
-                microbatches_accumulated + 1 == gradient_accumulation_steps
+                microbatches_accumulated + 1
+                == (physical_group_count or gradient_accumulation_steps)
             )
             run_expensive_diagnostics = (
                 total_steps % expensive_diagnostics_interval == 0
@@ -2031,6 +2167,7 @@ def main(cfg: DictConfig):
                     microbatch_loss,
                     component_losses,
                     microbatch_metrics,
+                    scene_losses,
                     microbatch_gradient,
                     forward_duration,
                     backward_duration,
@@ -2041,7 +2178,9 @@ def main(cfg: DictConfig):
                     cfg=cfg,
                     completed_steps=total_steps,
                     train_iters=train_iters,
-                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    gradient_accumulation_steps=(
+                        gradient_accumulation_steps / batch_scene_count
+                    ),
                     is_final_microbatch=is_final_microbatch,
                     run_expensive_diagnostics=run_expensive_diagnostics,
                     gradient_diagnostics=gradient_diagnostics,
@@ -2078,46 +2217,53 @@ def main(cfg: DictConfig):
 
             for metric_name, metric_value in microbatch_metrics.items():
                 accumulated_metrics[metric_name] = (
-                    accumulated_metrics.get(metric_name, 0.0) + metric_value
+                    accumulated_metrics.get(metric_name, 0.0)
+                    + metric_value * batch_scene_count
                 )
             for component_name, component_loss in component_losses.items():
                 accumulated_component_losses[component_name] = (
                     accumulated_component_losses.get(component_name, 0.0)
-                    + component_loss
+                    + component_loss * batch_scene_count
                 )
             accumulated_loss_value = (
-                microbatch_loss
+                microbatch_loss * batch_scene_count
                 if accumulated_loss_value is None
-                else accumulated_loss_value + microbatch_loss
+                else accumulated_loss_value + microbatch_loss * batch_scene_count
             )
-            if current_source is not None:
-                accumulated_source_counts[current_source] = (
-                    accumulated_source_counts.get(current_source, 0) + 1
+            if current_sources is not None:
+                scene_total_losses = (
+                    scene_losses["flow"] + scene_losses["visibility"]
                 )
-                accumulated_source_losses[current_source] = (
-                    accumulated_source_losses.get(current_source, 0.0)
-                    + microbatch_loss
-                )
-                accumulated_source_view_counts[current_source] = (
-                    accumulated_source_view_counts.get(current_source, 0.0)
-                    + source_view_count
-                )
-                accumulated_source_track_counts[current_source] = (
-                    accumulated_source_track_counts.get(current_source, 0.0)
-                    + source_track_count
-                )
-                for component_name, component_loss in component_losses.items():
-                    key = (current_source, component_name)
-                    accumulated_source_components[key] = (
-                        accumulated_source_components.get(key, 0.0)
-                        + component_loss
+                for scene_index, current_source in enumerate(current_sources):
+                    accumulated_source_counts[current_source] = (
+                        accumulated_source_counts.get(current_source, 0) + 1
                     )
-                for metric_name, metric_value in microbatch_metrics.items():
-                    key = (current_source, metric_name)
-                    accumulated_source_metrics[key] = (
-                        accumulated_source_metrics.get(key, 0.0)
-                        + metric_value
+                    accumulated_source_losses[current_source] = (
+                        accumulated_source_losses.get(current_source, 0.0)
+                        + scene_total_losses[scene_index]
                     )
+                    accumulated_source_view_counts[current_source] = (
+                        accumulated_source_view_counts.get(current_source, 0.0)
+                        + source_view_count
+                    )
+                    accumulated_source_track_counts[current_source] = (
+                        accumulated_source_track_counts.get(current_source, 0.0)
+                        + scene_track_counts[scene_index]
+                    )
+                    for component_name, per_scene_losses in scene_losses.items():
+                        key = (current_source, component_name)
+                        accumulated_source_components[key] = (
+                            accumulated_source_components.get(key, 0.0)
+                            + per_scene_losses[scene_index]
+                        )
+                if len(set(current_sources)) == 1:
+                    current_source = current_sources[0]
+                    for metric_name, metric_value in microbatch_metrics.items():
+                        key = (current_source, metric_name)
+                        accumulated_source_metrics[key] = (
+                            accumulated_source_metrics.get(key, 0.0)
+                            + metric_value * batch_scene_count
+                        )
             accumulated_fwd_duration += forward_duration
             accumulated_bwd_duration += backward_duration
             if microbatch_gradient is not None:
@@ -2126,7 +2272,15 @@ def main(cfg: DictConfig):
                 if cosine is not None:
                     microbatch_gradient_cosines.append(cosine)
             microbatches_accumulated += 1
-            if microbatches_accumulated < gradient_accumulation_steps:
+            if not planned_physical_batching:
+                if microbatches_accumulated < gradient_accumulation_steps:
+                    if torch_profiler is not None:
+                        torch_profiler.step()
+                    continue
+            if (
+                planned_physical_batching
+                and microbatches_accumulated < physical_group_count
+            ):
                 if torch_profiler is not None:
                     torch_profiler.step()
                 continue
@@ -2151,44 +2305,43 @@ def main(cfg: DictConfig):
             )
             reduced_source_values = {}
             if mixed_training:
-                for source, local_count in accumulated_source_counts.items():
-                    source_values = {
-                        f"source/{source}/loss": (
-                            accumulated_source_losses[source] / local_count
-                        ),
-                        f"source/{source}/view_count": (
-                            accumulated_source_view_counts[source] / local_count
-                        ),
-                        f"source/{source}/track_count": (
-                            accumulated_source_track_counts[source] / local_count
-                        ),
-                    }
-                    source_values.update({
-                        f"source/{source}/component/{component}": total / local_count
-                        for (candidate, component), total
-                        in accumulated_source_components.items()
-                        if candidate == source
-                    })
-                    source_values.update({
-                        f"source/{source}/metric/{metric}": total / local_count
-                        for (candidate, metric), total
-                        in accumulated_source_metrics.items()
-                        if candidate == source
-                    })
-                    reduced_source_values.update(
-                        _reduce_scalar_dict(fabric, source_values)
+                for source in mixed_schedule.scene_counts:
+                    local_count = accumulated_source_counts.get(source, 0)
+                    sums = _reduce_scalar_dict(
+                        fabric,
+                        {
+                            "loss": accumulated_source_losses.get(source, 0.0),
+                            "view_count": accumulated_source_view_counts.get(source, 0.0),
+                            "track_count": accumulated_source_track_counts.get(source, 0.0),
+                            "component/flow": accumulated_source_components.get(
+                                (source, "flow"), 0.0
+                            ),
+                            "component/visibility": accumulated_source_components.get(
+                                (source, "visibility"), 0.0
+                            ),
+                        },
+                        reduce_op="sum",
                     )
-                    reduced_source_values[f"source/{source}/sample_count"] = (
-                        _reduce_scalar(fabric, local_count, reduce_op="sum")
+                    global_count = _reduce_scalar(
+                        fabric, local_count, reduce_op="sum"
                     )
+                    reduced_source_values[f"source/{source}/sample_count"] = global_count
                     expected_count = (
                         mixed_schedule.source_pattern.count(source)
                         * fabric.world_size
                     )
-                    if reduced_source_values[f"source/{source}/sample_count"] != expected_count:
+                    if global_count != expected_count:
                         raise RuntimeError(
                             f"source {source} contributed an unexpected global sample count"
                         )
+                    for name in ("loss", "view_count", "track_count"):
+                        reduced_source_values[f"source/{source}/{name}"] = (
+                            sums[name] / global_count
+                        )
+                    for component in ("flow", "visibility"):
+                        reduced_source_values[
+                            f"source/{source}/component/{component}"
+                        ] = sums[f"component/{component}"] / global_count
             if tb_writer is not None:
                 for metric_name, metric_value in reduced_metrics.items():
                     tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
@@ -2261,6 +2414,8 @@ def main(cfg: DictConfig):
             accumulated_bwd_duration += time.time() - optimizer_update_started_at
             training_step_duration = time.time() - accumulation_started_at
             total_steps += 1
+            if planned_physical_batching:
+                source_cursors = dict(physical_step.end_cursors)
             hardware_metrics = {}
             if total_steps == 1 or total_steps % hardware_metrics_interval == 0:
                 hardware_metrics = _gather_rank_metrics(
@@ -2702,6 +2857,9 @@ def main(cfg: DictConfig):
             accumulated_trajectory_count = 0.0
             microbatch_gradient_norms = []
             microbatch_gradient_cosines = []
+            physical_step = None
+            physical_group_iterator = None
+            physical_group_count = None
 
             if torch_profiler is not None:
                 torch_profiler.step()
