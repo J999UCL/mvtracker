@@ -696,3 +696,23 @@ The current paired-rank retry behavior fired twice. DIEGESIS virtual samples
 three groups had no retries. W&B logging was requested but unavailable because
 Dopey had no configured W&B API key; the JSON and Markdown artifacts completed
 before that logging step.
+
+## 2026-08-18 — Whole-step mixed sample selection parity
+
+The sampler was extended with one whole-step call that selects all eight
+ordinary requests for an optimizer update: four DIEGESIS and four MV-Kubric
+across the two ranks. It does not batch tensors or alter either dataset's
+sampling. Paired failures still advance both ranks together and refill only the
+failed source.
+
+The normal committed CLI was run CPU-only on Dopey for five steps with seed 72
+and compared directly with the sequential baseline above. It completed in
+18.40 seconds and produced 40/40 identical accepted sample records, including
+scene, virtual index, seed, frame window, views, trajectory count, RGB/depth
+augmentation flags, and retry attempts. The same two paired DIEGESIS retries
+occurred: 6/7 to 8/9 and 18/19 to 20/21.
+
+- Remote output: `/media/data3/jthakwani/mvtracker-runs/mixed-sampling-whole-step-seed72-20260818-direct/`
+- Local copy: `artifacts/mixed-sampling-whole-step-seed72-20260818-direct/`
+- Comparison: `identical=true`, expected 40, actual 40
+- W&B was not used because no W&B credential is configured on Dopey.
