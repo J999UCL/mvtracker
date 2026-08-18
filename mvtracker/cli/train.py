@@ -60,6 +60,7 @@ import os
 import torch
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 
@@ -564,6 +565,69 @@ def _start_mixed_source_iterators(train_loaders):
         source: loader.iter_from(raw_iterators[source])
         for source, loader in train_loaders.items()
     }
+
+
+def _load_mixed_step(
+    fabric,
+    source_pattern,
+    data_iters,
+    source_samplers,
+    train_loaders,
+    source_cursors,
+):
+    """Materialize one rank's complete mixed optimizer step concurrently."""
+    sources = tuple(dict.fromkeys(source_pattern))
+    counts = {source: source_pattern.count(source) for source in sources}
+
+    def load_source(source, count):
+        batches = []
+        for _ in range(count):
+            try:
+                batches.append(next(data_iters[source]))
+            except StopIteration:
+                source_samplers[source].set_start_cursor(
+                    source_cursors[source] + len(batches)
+                )
+                data_iters[source] = iter(train_loaders[source])
+                batches.append(next(data_iters[source]))
+        return batches
+
+    with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+        futures = {
+            source: executor.submit(load_source, source, counts[source])
+            for source in sources
+        }
+        pending = {source: list(futures[source].result()) for source in sources}
+
+    accepted = {}
+    loaded_count = 0
+    failed_count = 0
+    for source in sources:
+        accepted[source] = []
+        attempt = 0
+        while len(accepted[source]) < counts[source]:
+            if pending[source]:
+                batch, gotit = pending[source].pop(0)
+            else:
+                batch, gotit = load_source(source, 1)[0]
+            source_cursors[source] += 1
+            loaded_count += 1
+            if _all_ranks_succeeded(fabric, all(gotit)):
+                if batch.sample_metadata:
+                    for metadata in batch.sample_metadata:
+                        metadata["paired_retry_attempt"] = attempt
+                accepted[source].append(batch)
+                attempt = 0
+            else:
+                failed_count += 1
+                attempt += 1
+
+    positions = {source: 0 for source in sources}
+    ordered = []
+    for source in source_pattern:
+        ordered.append((source, accepted[source][positions[source]]))
+        positions[source] += 1
+    return ordered, loaded_count, failed_count
 
 
 def _run_rank_zero_eval(fabric, cfg, evaluator, model, dataloaders, writer, step):
@@ -1828,6 +1892,7 @@ def main(cfg: DictConfig):
         accumulated_trajectory_count = 0.0
         microbatch_gradient_norms = []
         microbatch_gradient_cosines = []
+        mixed_step_batches = None
 
         while i_batch < n_batches and total_steps < cfg.trainer.num_steps:
             if accumulation_started_at is None:
@@ -1837,18 +1902,31 @@ def main(cfg: DictConfig):
             logging.info(f"Gonna load batch {i_batch + 1}/{n_batches} (rank={fabric.global_rank})")
             current_source = None
             if mixed_training:
-                current_source = mixed_schedule.source_pattern[
+                if microbatches_accumulated == 0:
+                    (
+                        mixed_step_batches,
+                        step_batches_loaded,
+                        step_batches_failed,
+                    ) = _load_mixed_step(
+                        fabric,
+                        mixed_schedule.source_pattern,
+                        data_iters,
+                        source_samplers,
+                        train_loaders,
+                        source_cursors,
+                    )
+                    total_batches_loaded += step_batches_loaded
+                    total_batches_failed += step_batches_failed
+                    if step_batches_failed:
+                        logging.info(
+                            "whole mixed step discarded %d/%d paired candidates",
+                            step_batches_failed,
+                            step_batches_loaded,
+                        )
+                current_source, batch = mixed_step_batches[
                     microbatches_accumulated
                 ]
-                try:
-                    batch = next(data_iters[current_source])
-                except StopIteration:
-                    source_samplers[current_source].set_start_cursor(
-                        source_cursors[current_source]
-                    )
-                    data_iters[current_source] = iter(train_loaders[current_source])
-                    batch = next(data_iters[current_source])
-                source_cursors[current_source] += 1
+                mixed_step_batches[microbatches_accumulated] = None
             else:
                 try:
                     batch = next(data_iter)
@@ -1857,9 +1935,8 @@ def main(cfg: DictConfig):
                     n_batches = len(train_loader)
                     n_batches -= n_batches % gradient_accumulation_steps
                     batch = next(data_iter)
-
-            batch, gotit = batch
-            total_batches_loaded += 1
+                batch, gotit = batch
+                total_batches_loaded += 1
 
             if cfg.modes.debugging_hotfix_datapoint_path is not None:
                 logging.info(f"Debugging hotfix: loading batch from {cfg.modes.debugging_hotfix_datapoint_path}")
@@ -1867,7 +1944,7 @@ def main(cfg: DictConfig):
                 logging.info(f"Debugging hotfix: loaded batch {batch.seq_name} "
                              f"with {len(batch.video)} views and {batch.video.shape[2]} frames")
 
-            if not _all_ranks_succeeded(fabric, all(gotit)):
+            if not mixed_training and not _all_ranks_succeeded(fabric, all(gotit)):
                 total_batches_failed += 1
                 accumulated_dataloader_duration += time.time() - start_time_1
                 logging.info(f"batch is None: "

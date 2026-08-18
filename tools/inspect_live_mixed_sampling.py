@@ -15,9 +15,9 @@ from omegaconf import OmegaConf
 
 from mvtracker.cli.train import (
     _ScheduledSourceSampler,
-    _all_ranks_succeeded,
     _build_source_train_loader,
     _build_training_dataset,
+    _load_mixed_step,
     _start_mixed_source_iterators,
 )
 from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
@@ -128,21 +128,22 @@ def run(args):
     for step in range(args.steps):
         fabric.barrier()
         started = time.perf_counter()
-        for microbatch, source in enumerate(SOURCE_PATTERN):
-            attempt = 0
-            while True:
-                batch, gotit = next(data_iters[source])
-                cursors[source] += 1
-                if _all_ranks_succeeded(fabric, all(gotit)):
-                    break
-                attempt += 1
+        batches, _, _ = _load_mixed_step(
+            fabric,
+            SOURCE_PATTERN,
+            data_iters,
+            samplers,
+            loaders,
+            cursors,
+        )
+        for microbatch, (source, batch) in enumerate(batches):
             local_rows.append(
                 _row(
                     step,
                     microbatch,
                     fabric.global_rank,
                     source,
-                    attempt,
+                    int(batch.sample_metadata[0]["paired_retry_attempt"]),
                     batch,
                 )
             )
