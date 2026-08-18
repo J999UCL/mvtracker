@@ -7,16 +7,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
-import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from huggingface_hub import hf_hub_download
 
 from mvtracker.profiling.modal_mvkubric2000 import (
-    ARCHIVE_ROOT_RELATIVE,
-    TRAIN_ARCHIVES,
     TRAIN_SCENES,
     VALIDATION_SCENES,
 )
@@ -30,20 +25,7 @@ EXPECTED_DIEGESIS_SPLITS = {"train": 17, "validation": 2, "test": 2}
 EXPECTED_MVKUBRIC_TRAIN_SCENES = set(TRAIN_SCENES)
 EXPECTED_MVKUBRIC_POOL_SCENES = set(TRAIN_SCENES) | set(VALIDATION_SCENES)
 EXPECTED_MVKUBRIC_SCENES = set(TRAIN_SCENES)
-MVKUBRIC_VALIDATION_SCENES = set(VALIDATION_SCENES)
 MVKUBRIC_INDEX_RELATIVE = Path("datasets/kubric-multiview/train/MVTracker_index")
-DIEGESIS_ARCHIVE_RELATIVE = Path(
-    "archives/diegesis/"
-    "diegesis-81389015a6d713a848a120e34850f360621bcdce.tar.zst"
-)
-MVKUBRIC_SHARDS = tuple(ARCHIVE_ROOT_RELATIVE / item["filename"] for item in TRAIN_ARCHIVES)
-LOCAL_STAGING_SIDECARS = (
-    Path("profile-data-manifest.json"),
-    Path("continual-training-data-manifest.json"),
-    Path("checkpoints"),
-    Path("datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache"),
-    MVKUBRIC_INDEX_RELATIVE,
-)
 
 
 class _DeterministicRequestSampler:
@@ -213,102 +195,6 @@ def stage_continual_training_data(
         "legacy archive staging is disabled for the 2,000-scene pool; "
         "use the cached dataset image"
     )
-    data_root = Path(data_root)
-    local_data_root = Path(local_data_root)
-    inputs = (DIEGESIS_ARCHIVE_RELATIVE, *MVKUBRIC_SHARDS, *LOCAL_STAGING_SIDECARS)
-    missing = [relative for relative in inputs if not (data_root / relative).exists()]
-    if missing:
-        raise FileNotFoundError(f"local staging inputs are missing: {', '.join(map(str, missing))}")
-    if local_data_root.exists():
-        shutil.rmtree(local_data_root)
-    local_data_root.mkdir(parents=True, exist_ok=False)
-
-    started = time.perf_counter()
-    archive_root = local_data_root / "archives"
-    archive_root.mkdir()
-    archive_sources = [data_root / DIEGESIS_ARCHIVE_RELATIVE, *(
-        data_root / relative for relative in MVKUBRIC_SHARDS
-    )]
-    archive_paths = [archive_root / source.name for source in archive_sources]
-    with ThreadPoolExecutor(max_workers=len(archive_sources)) as executor:
-        list(executor.map(shutil.copyfile, archive_sources, archive_paths))
-
-    diegesis_root = local_data_root / "source/diegesis"
-    mvkubric_root = local_data_root / "datasets/kubric-multiview/train"
-    diegesis_root.mkdir(parents=True)
-    mvkubric_root.mkdir(parents=True)
-
-    def extract_mvkubric(path: Path) -> None:
-        subprocess.run(
-            [
-                "tar", "--extract", "--zstd", "--strip-components=3",
-                "--file", str(path), "--directory", str(mvkubric_root),
-            ],
-            check=True,
-        )
-
-    def extract_diegesis() -> None:
-        subprocess.run(
-            [
-                "tar", "--extract", "--zstd", "--file", str(archive_paths[0]),
-                "--directory", str(diegesis_root),
-            ],
-            check=True,
-        )
-
-    with ThreadPoolExecutor(max_workers=len(archive_paths)) as executor:
-        tasks = [executor.submit(extract_diegesis)]
-        tasks.extend(executor.submit(extract_mvkubric, path) for path in archive_paths[1:])
-        for task in tasks:
-            task.result()
-
-    for scene_id in sorted(MVKUBRIC_VALIDATION_SCENES):
-        source = data_root / "datasets/kubric-multiview/train" / scene_id
-        destination = mvkubric_root / scene_id
-        if not source.is_dir():
-            raise FileNotFoundError(source)
-        shutil.copytree(source, destination)
-
-    for relative in LOCAL_STAGING_SIDECARS:
-        source = data_root / relative
-        destination = local_data_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, destination, symlinks=True)
-        else:
-            shutil.copy2(source, destination)
-
-    split_document = json.loads(
-        (Path(__file__).resolve().parents[2] / "configs/diegesis_split_v1.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    raw_root = local_data_root / "datasets/diegesis-mvtracker/TAPVid3D_raw"
-    for split, scenes in split_document["splits"].items():
-        split_root = raw_root / split
-        split_root.mkdir(parents=True)
-        for scene in scenes:
-            sequence = diegesis_root / "scenes" / scene / "tracking/sequence"
-            if not sequence.is_dir():
-                raise FileNotFoundError(sequence)
-            (split_root / scene).symlink_to(
-                os.path.relpath(sequence, split_root), target_is_directory=True
-            )
-
-    observed_mvkubric = {
-        path.name for path in mvkubric_root.iterdir()
-        if path.is_dir() and path.name.isdigit()
-    }
-    if observed_mvkubric != EXPECTED_MVKUBRIC_POOL_SCENES:
-        raise RuntimeError(
-            "staged MV-Kubric pool must contain scenes 1001..3000 plus validation 101..127"
-        )
-    return {
-        "local_data_root": str(local_data_root),
-        "copied_size_bytes": _tree_stats(local_data_root)["size_bytes"],
-        "elapsed_seconds": time.perf_counter() - started,
-        "mvkubric_index": str(local_data_root / MVKUBRIC_INDEX_RELATIVE),
-    }
 
 
 def stage_mvkubric_profile_shard(
@@ -321,45 +207,6 @@ def stage_mvkubric_profile_shard(
     raise RuntimeError(
         "legacy MV-Kubric shard staging is disabled; use the cached dataset image"
     )
-    if not 0 <= shard_index < len(MVKUBRIC_SHARDS):
-        raise ValueError("shard_index must be in [0, 4)")
-    data_root = Path(data_root)
-    local_data_root = Path(local_data_root)
-    shard = data_root / MVKUBRIC_SHARDS[shard_index]
-    index = data_root / MVKUBRIC_INDEX_RELATIVE
-    if not shard.is_file() or not index.is_dir():
-        raise FileNotFoundError("MV-Kubric shard or metadata index is missing")
-    if local_data_root.exists():
-        shutil.rmtree(local_data_root)
-    archive = local_data_root / "archives" / shard.name
-    archive.parent.mkdir(parents=True)
-    started = time.perf_counter()
-    shutil.copyfile(shard, archive)
-    train_root = local_data_root / "datasets/kubric-multiview/train"
-    train_root.mkdir(parents=True)
-    subprocess.run(
-        [
-            "tar", "--extract", "--zstd", "--strip-components=3",
-            "--file", str(archive), "--directory", str(train_root),
-        ],
-        check=True,
-    )
-    shutil.copytree(index, train_root / "MVTracker_index")
-    first_scene = 900 + shard_index * 25
-    scenes = tuple(str(scene) for scene in range(first_scene, first_scene + 25))
-    observed = tuple(sorted(
-        (path.name for path in train_root.iterdir() if path.is_dir() and path.name.isdigit()),
-        key=int,
-    ))
-    if observed != scenes:
-        raise RuntimeError(f"MV-Kubric shard inventory mismatch: {observed}")
-    return {
-        "local_data_root": str(local_data_root),
-        "copied_size_bytes": archive.stat().st_size,
-        "elapsed_seconds": time.perf_counter() - started,
-        "mvkubric_index": str(train_root / "MVTracker_index"),
-        "scene_ids": list(scenes),
-    }
 
 
 def profile_encoded_loader(

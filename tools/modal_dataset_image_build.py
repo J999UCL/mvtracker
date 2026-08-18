@@ -111,6 +111,7 @@ def install_mvkubric_archive(
 ) -> None:
     """Extract one <=500-scene archive range into the image."""
 
+    import hashlib
     import json
     import subprocess
 
@@ -125,6 +126,17 @@ def install_mvkubric_archive(
             f"{source}: size {source.stat().st_size} does not match pinned "
             f"size {archive_size_bytes}"
         )
+    verification_path = Path(IMAGE_ROOT) / f"dataset-image-{archive_name}.verified"
+    if scene_start in (1001, 2001):
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            for block in iter(lambda: stream.read(16 * 1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != archive_sha256:
+            raise RuntimeError(f"{source}: archive SHA-256 does not match pinned hash")
+        verification_path.write_text(archive_sha256 + "\n", encoding="utf-8")
+    elif verification_path.read_text(encoding="utf-8").strip() != archive_sha256:
+        raise RuntimeError(f"{source}: archive verification marker is missing or stale")
     source_manifest = Path(DATA_ROOT) / "mvkubric2000-data-manifest.json"
     if not source_manifest.is_file():
         raise FileNotFoundError(source_manifest)
@@ -136,7 +148,7 @@ def install_mvkubric_archive(
     scene_paths = [f"kubric-multiview/train/{scene}" for scene in range(scene_start, scene_end + 1)]
     subprocess.run(
         [
-            "tar", "--extract", "--gzip", "--strip-components=3",
+            "tar", "--extract", "--gzip", "--strip-components=2",
             "--file", str(source), "--directory", str(target), "--",
             *scene_paths,
         ],

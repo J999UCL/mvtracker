@@ -60,6 +60,14 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertNotIn("stage_continual_training_data", training)
         self.assertNotIn("data_volume", training)
 
+    def test_full_archives_are_extracted_in_bounded_scene_layers(self):
+        source = (ROOT / "tools/modal_dataset_image_build.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"--strip-components=2"', source)
+        self.assertIn("(TRAIN_ARCHIVES[0], 1001, 1500)", source)
+        self.assertIn("(TRAIN_ARCHIVES[1], 2501, 3000)", source)
+
     def test_main_launch_requires_explicit_confirmation(self):
         contract.require_main_confirmation("smoke", False)
         contract.require_main_confirmation("main", True)

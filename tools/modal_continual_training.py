@@ -107,7 +107,7 @@ _dataset_stage_options = {
     "volumes": {str(DATA_ROOT): data_volume.with_mount_options(read_only=True)},
     "cpu": 32,
     "memory": 65536,
-    "timeout": 4 * 60 * 60,
+    "timeout": 12 * 60 * 60,
 }
 dataset_image = dataset_image.run_function(
     install_dataset_base,
@@ -167,7 +167,7 @@ def setup_training_data_remote() -> dict:
         group=WANDB_GROUP,
         job_type="data-setup",
         tags=["modal", "data-setup", "gt-depth-replay-v1"],
-        config={"source_commit": _source_commit(), **MODAL_TAGS},
+        config={"source_commit": _source_commit(), **PROFILE_TAGS},
     )
     manifest = materialize_expanded_continual_training_data(DATA_ROOT)
     data_volume.commit()
@@ -437,7 +437,7 @@ def _prepare_launch(mode: str, run_name: str, confirm_main: bool) -> str:
 def setup_data() -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
-    app.set_tags({**MODAL_TAGS, "experiment": "data-setup", "gpu": "cpu"})
+    app.set_tags({**PROFILE_TAGS, "experiment": "data-setup", "gpu": "cpu"})
     print(json.dumps(setup_training_data_remote.remote(), indent=2))
 
 
@@ -445,7 +445,7 @@ def setup_data() -> None:
 def build_dataset_image() -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
-    app.set_tags({**MODAL_TAGS, "experiment": "dataset-image-v1", "gpu": "cpu"})
+    app.set_tags({**PROFILE_TAGS, "experiment": "dataset-image-v2", "gpu": "cpu"})
     with modal.enable_output():
         dataset_image.build(app)
     print(f"DATASET_IMAGE {dataset_image.object_id}")
