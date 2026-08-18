@@ -1228,12 +1228,15 @@ def decode_tapvid3d_batch(
     rgb_stream: torch.cuda.Stream | None = None,
     depth_stream: torch.cuda.Stream | None = None,
     prepare_stream: torch.cuda.Stream | None = None,
+    decode_image_chunk_size: int = 64,
 ) -> Datapoint:
     if device.type != "cuda":
         raise RuntimeError("TAPVid-3D training requires CUDA nvJPEG decoding")
     version = tuple(int(value) for value in torchvision.__version__.split("+")[0].split(".")[:2])
     if version < (0, 20):
         raise RuntimeError("batched CUDA JPEG decoding requires torchvision 0.20 or newer")
+    if decode_image_chunk_size < 1:
+        raise ValueError("decode_image_chunk_size must be positive")
     if timing_events is not None:
         timing_events[0].record()
     codecs = {sample.image_codec for sample in batch.samples}
@@ -1246,20 +1249,42 @@ def decode_tapvid3d_batch(
         if rgb_stream is None or prepare_stream is None:
             raise RuntimeError("GPU image decode requires explicit CUDA streams")
         with torch.cuda.stream(rgb_stream):
-            decoded_all = decode_jpeg(flat_encoded, mode=ImageReadMode.RGB, device=device)
+            decoded_all = [
+                image
+                for start in range(0, len(flat_encoded), decode_image_chunk_size)
+                for image in decode_jpeg(
+                    flat_encoded[start : start + decode_image_chunk_size],
+                    mode=ImageReadMode.RGB,
+                    device=device,
+                )
+            ]
         prepare_stream.wait_stream(rgb_stream)
     elif codec == "nvimagecodec":
         if nvimagecodec_rgb_decoder is None or nvimagecodec_depth_decoder is None:
             raise RuntimeError("MV-Kubric GPU decode requires RGB and depth decoders")
         if rgb_stream is None or depth_stream is None or prepare_stream is None:
             raise RuntimeError("MV-Kubric GPU decode requires explicit CUDA streams")
-        rgb_images = nvimagecodec_rgb_decoder.decode(
-            flat_encoded,
-            cuda_stream=rgb_stream.cuda_stream,
+        def decode_chunks(decoder, encoded, stream):
+            images = []
+            for start in range(0, len(encoded), decode_image_chunk_size):
+                chunk = decoder.decode(
+                    encoded[start : start + decode_image_chunk_size],
+                    cuda_stream=stream.cuda_stream,
+                )
+                if any(image is None for image in chunk):
+                    raise RuntimeError(
+                        "nvImageCodec failed to decode an image in a bounded chunk"
+                    )
+                images.extend(chunk)
+            return images
+
+        rgb_images = decode_chunks(
+            nvimagecodec_rgb_decoder, flat_encoded, rgb_stream
         )
-        depth_images = nvimagecodec_depth_decoder.decode(
+        depth_images = decode_chunks(
+            nvimagecodec_depth_decoder,
             [encoded for sample in batch.samples for encoded in sample.depth_bytes],
-            cuda_stream=depth_stream.cuda_stream,
+            depth_stream,
         )
         decoded_all = [torch.from_dlpack(image.to_dlpack()) for image in rgb_images]
         decoded_depths = [torch.from_dlpack(image.to_dlpack()) for image in depth_images]

@@ -298,11 +298,13 @@ def _materialize_groups(step: FixedStep, datasets, rank: int, workers: int):
 
 
 class _TimedDecoder:
-    def __init__(self, device):
+    def __init__(self, device, decode_image_chunk_size):
         from mvtracker.datasets.mixed_physical_loader import PhysicalBatchDecoder
 
         self.device = device
-        self.decoder = PhysicalBatchDecoder(device)
+        self.decoder = PhysicalBatchDecoder(
+            device, decode_image_chunk_size=decode_image_chunk_size
+        )
         self.timings = []
 
     def decode_async(self, group):
@@ -317,11 +319,11 @@ class _TimedDecoder:
         return result
 
 
-def _decode_groups(groups, device, gpu_handles):
+def _decode_groups(groups, device, gpu_handles, decode_image_chunk_size):
     import torch
     from mvtracker.datasets.mixed_physical_loader import PhysicalGroupPrefetchIterator
 
-    timed = _TimedDecoder(device)
+    timed = _TimedDecoder(device, decode_image_chunk_size)
     records = []
     iterator = PhysicalGroupPrefetchIterator(groups, timed)
     for _ in groups:
@@ -388,6 +390,7 @@ def _run_lane(
     datasets,
     workers: int,
     passes: int,
+    decode_image_chunk_size: int,
 ):
     import torch
     import pynvml
@@ -440,7 +443,10 @@ def _run_lane(
                 flush=True,
             )
             step_decode = _decode_groups(
-                groups, torch.device(f"cuda:{local_device_index}"), nvml_handles
+                groups,
+                torch.device(f"cuda:{local_device_index}"),
+                nvml_handles,
+                decode_image_chunk_size,
             )
             decode_records.extend(step_decode)
             step_records.append({
@@ -535,6 +541,7 @@ def main(argv=None):
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--passes", type=int, default=2)
+    parser.add_argument("--decode-image-chunk-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=72)
     args = parser.parse_args(argv)
     if args.mode == "parity":
@@ -542,8 +549,8 @@ def main(argv=None):
         result = _run_parity(args.parity_device)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
-    if args.steps < 1 or args.workers < 1 or args.passes < 1:
-        raise ValueError("steps, workers, and passes must be positive")
+    if min(args.steps, args.workers, args.passes, args.decode_image_chunk_size) < 1:
+        raise ValueError("steps, workers, passes, and decode chunk size must be positive")
     physical_ids = parse_device_ids(args.device_ids)
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(value) for value in physical_ids)
 
@@ -599,6 +606,7 @@ def main(argv=None):
                     datasets,
                     args.workers,
                     args.passes,
+                    args.decode_image_chunk_size,
                 )
             )
         result["lanes"] = [future.result() for future in lane_futures]

@@ -434,8 +434,11 @@ def _record_stream(datapoint: Datapoint, stream: torch.cuda.Stream) -> None:
 class PhysicalBatchDecoder:
     """Decode one scheduled physical group on persistent CUDA streams."""
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, *, decode_image_chunk_size: int = 64):
         self.device = device
+        self.decode_image_chunk_size = int(decode_image_chunk_size)
+        if self.decode_image_chunk_size < 1:
+            raise ValueError("decode_image_chunk_size must be positive")
         self.rgb_stream = torch.cuda.Stream(device=device)
         self.depth_stream = torch.cuda.Stream(device=device)
         self.prepare_stream = torch.cuda.Stream(device=device)
@@ -472,6 +475,7 @@ class PhysicalBatchDecoder:
                     rgb_stream=self.rgb_stream,
                     depth_stream=self.depth_stream,
                     prepare_stream=self.prepare_stream,
+                    decode_image_chunk_size=self.decode_image_chunk_size,
                 )
                 if len(codec_items) == len(group.samples):
                     for offset, (position, _) in enumerate(codec_items):

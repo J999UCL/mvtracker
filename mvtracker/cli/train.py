@@ -1851,7 +1851,10 @@ def main(cfg: DictConfig):
             max_cache_bytes=int(float(settings.cpu_cache_gib_per_rank) * 1024**3),
             capacity=_physical_batch_capacity(cfg),
         )
-        physical_decoder = PhysicalBatchDecoder(fabric.device)
+        physical_decoder = PhysicalBatchDecoder(
+            fabric.device,
+            decode_image_chunk_size=int(settings.decode_image_chunk_size),
+        )
 
     torch_profiler = _create_torch_profiler(
         cfg,
