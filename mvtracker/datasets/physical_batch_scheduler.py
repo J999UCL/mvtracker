@@ -10,7 +10,7 @@ identical and the selected hardware capacity permits the pair.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations, permutations
+from itertools import combinations
 from typing import Sequence
 
 
@@ -146,7 +146,7 @@ class SynchronizedBatchWave:
 
     @property
     def physical_group_count(self) -> int:
-        return len(self.ranks[0].groups)
+        return max(len(rank.groups) for rank in self.ranks)
 
     @property
     def pair_count(self) -> int:
@@ -170,19 +170,11 @@ class SynchronizedBatchWave:
 
     @property
     def wave_imbalance(self) -> int:
-        """Largest work difference between corresponding synchronized groups."""
-
-        return max(
-            abs(left.work - right.work)
-            for left, right in zip(self.ranks[0].groups, self.ranks[1].groups)
-        )
+        return abs(self.ranks[0].work - self.ranks[1].work)
 
     @property
     def total_wave_imbalance(self) -> int:
-        return sum(
-            abs(left.work - right.work)
-            for left, right in zip(self.ranks[0].groups, self.ranks[1].groups)
-        )
+        return self.wave_imbalance
 
 
 def _validate_summaries(
@@ -260,28 +252,21 @@ def _scene_index_signature(
     )
 
 
-def _synchronize_group_order(
-    rank_zero: tuple[PhysicalBatchGroup, ...],
-    rank_one: tuple[PhysicalBatchGroup, ...],
+def _order_groups(
+    groups: tuple[PhysicalBatchGroup, ...],
     summaries: Sequence[SceneSummary],
 ) -> tuple[PhysicalBatchGroup, ...]:
-    """Order rank one so corresponding physical waves are load-balanced."""
+    """Run larger groups first so their next decode can overlap model work."""
 
-    candidates = []
-    for order in permutations(rank_one):
-        differences = tuple(
-            abs(left.work - right.work)
-            for left, right in zip(rank_zero, order)
+    return tuple(
+        sorted(
+            groups,
+            key=lambda group: (
+                -group.work,
+                _scene_index_signature((group,), summaries),
+            ),
         )
-        candidates.append(
-            (
-                max(differences),
-                sum(differences),
-                _scene_index_signature(order, summaries),
-                order,
-            )
-        )
-    return min(candidates, key=lambda item: item[:3])[3]
+    )
 
 
 def schedule_physical_batch(
@@ -311,19 +296,14 @@ def schedule_physical_batch(
         rank_one_groupings = _groupings(rank_one, summaries, capacity)
         for raw_groups_zero in rank_zero_groupings:
             for raw_groups_one in rank_one_groupings:
-                if len(raw_groups_zero) != len(raw_groups_one):
-                    continue
-                groups_zero = tuple(
+                groups_zero = _order_groups(tuple(
                     PhysicalBatchGroup(tuple(summaries[index] for index in group))
                     for group in raw_groups_zero
-                )
-                groups_one = tuple(
+                ), summaries)
+                groups_one = _order_groups(tuple(
                     PhysicalBatchGroup(tuple(summaries[index] for index in group))
                     for group in raw_groups_one
-                )
-                groups_one = _synchronize_group_order(
-                    groups_zero, groups_one, summaries
-                )
+                ), summaries)
                 rank_groups = tuple(
                     RankWave(
                         rank=rank,
@@ -352,8 +332,8 @@ def schedule_physical_batch(
             -wave.pair_count,
             wave.total_padding_tracks,
             max(rank_work),
-            wave.wave_imbalance,
-            wave.total_wave_imbalance,
+            abs(rank_work[0] - rank_work[1]),
+            abs(len(wave.ranks[0].groups) - len(wave.ranks[1].groups)),
             rank_zero_signature,
             rank_one_signature,
         )

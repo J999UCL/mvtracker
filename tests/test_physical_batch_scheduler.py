@@ -1,7 +1,7 @@
 """Focused CPU contracts for the pure physical-batch scheduler."""
 
 from importlib.util import module_from_spec, spec_from_file_location
-from itertools import permutations, product
+from itertools import product
 from pathlib import Path
 import sys
 import unittest
@@ -49,7 +49,6 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
         self.assertEqual(
             [rank.logical_scene_count for rank in wave.ranks], [4, 4]
         )
-        self.assertEqual(len(wave.ranks[0].groups), len(wave.ranks[1].groups))
         self.assertEqual(sorted(_identities(wave)), sorted(_identities_from(summaries)))
         for rank in wave.ranks:
             for group in rank.groups:
@@ -119,7 +118,7 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
         )
         wave = schedule_physical_batch(summaries)
         self.assert_valid_wave(wave, summaries)
-        self.assertEqual(wave.pair_count, 2)
+        self.assertEqual(wave.pair_count, 3)
         over_capacity = {summaries[0], summaries[1]}
         self.assertFalse(
             any(
@@ -158,24 +157,17 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
         for _ in range(100):
             self.assertEqual(schedule_physical_batch(summaries), expected)
 
-    def test_corresponding_waves_are_work_balanced(self):
-        summaries = tuple(
-            _scene(i, tracks=100 + i * 100) for i in range(8)
+    def test_one_safe_pair_is_not_discarded_for_equal_group_counts(self):
+        summaries = (
+            _scene(0, views=1, tracks=256),
+            _scene(1, views=1, tracks=512),
+            *tuple(_scene(i, views=5, tracks=256) for i in range(2, 8)),
         )
         wave = schedule_physical_batch(summaries)
-        possible = [
-            (
-                max(abs(left.work - right.work) for left, right in zip(
-                    wave.ranks[0].groups, order
-                )),
-                sum(abs(left.work - right.work) for left, right in zip(
-                    wave.ranks[0].groups, order
-                )),
-            )
-            for order in permutations(wave.ranks[1].groups)
-        ]
+        self.assert_valid_wave(wave, summaries)
+        self.assertEqual(wave.pair_count, 1)
         self.assertEqual(
-            (wave.wave_imbalance, wave.total_wave_imbalance), min(possible)
+            sorted(len(rank.groups) for rank in wave.ranks), [3, 4]
         )
 
     def test_exhaustive_two_shape_assignments_preserve_invariants(self):
