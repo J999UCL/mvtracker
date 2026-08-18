@@ -6,6 +6,7 @@ import hashlib
 import json
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from typing import Mapping, Sequence
@@ -63,6 +64,10 @@ class PreparedMixedStep:
     fingerprint: str
     retry_count: int
     encoded_bytes: int
+    planning_seconds: float
+    materialization_seconds: float
+    pair_count: int
+    padding_tracks: int
 
     @property
     def logical_scene_count(self) -> int:
@@ -262,6 +267,7 @@ class MixedStepLookahead:
         )
 
     def _prepare_step(self, executor: ThreadPoolExecutor) -> PreparedMixedStep:
+        planning_started = time.perf_counter()
         (
             start_cursors,
             end_cursors,
@@ -271,6 +277,8 @@ class MixedStepLookahead:
             local_scenes,
             retries,
         ) = self._plan_step()
+        planning_seconds = time.perf_counter() - planning_started
+        materialization_started = time.perf_counter()
         futures = {
             scene.identity: executor.submit(
                 self.datasets[scene.source].materialize_sample, scene.plan
@@ -307,6 +315,7 @@ class MixedStepLookahead:
         encoded_bytes = sum(
             _sample_nbytes(sample) for group in groups for sample in group.samples
         )
+        materialization_seconds = time.perf_counter() - materialization_started
         return PreparedMixedStep(
             start_cursors=start_cursors,
             end_cursors=end_cursors,
@@ -323,6 +332,10 @@ class MixedStepLookahead:
             ),
             retry_count=retries,
             encoded_bytes=encoded_bytes,
+            planning_seconds=planning_seconds,
+            materialization_seconds=materialization_seconds,
+            pair_count=physical.pair_count,
+            padding_tracks=physical.total_padding_tracks,
         )
 
     def _produce(self) -> None:

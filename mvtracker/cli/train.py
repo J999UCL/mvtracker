@@ -1984,6 +1984,7 @@ def main(cfg: DictConfig):
         accumulated_source_track_counts = {}
         accumulated_sample_count = 0
         accumulated_trajectory_count = 0.0
+        physical_batching_metrics = None
         microbatch_gradient_norms = []
         microbatch_gradient_cosines = []
         mixed_step_batches = None
@@ -2017,6 +2018,14 @@ def main(cfg: DictConfig):
                         )
                         total_batches_loaded += physical_step.logical_scene_count
                         total_batches_failed += physical_step.retry_count
+                        physical_batching_metrics = {
+                            "planning_seconds": physical_step.planning_seconds,
+                            "materialization_seconds": physical_step.materialization_seconds,
+                            "encoded_cache_gib": physical_step.encoded_bytes / 1024**3,
+                            "pair_count": float(physical_step.pair_count),
+                            "padding_tracks": float(physical_step.padding_tracks),
+                            "physical_group_count": float(physical_group_count),
+                        }
                     physical_group, batch = next(physical_group_iterator)
                     current_sources = physical_group.sources
                     gotit = [True] * len(current_sources)
@@ -2708,6 +2717,36 @@ def main(cfg: DictConfig):
                     for name, value in accumulated_sampling_metrics.items()
                 },
             )
+            reduced_physical_batching_metrics = None
+            if physical_batching_metrics is not None:
+                reduced_physical_batching_metrics = {
+                    "planning_seconds": _reduce_scalar(
+                        fabric,
+                        physical_batching_metrics["planning_seconds"],
+                        reduce_op="max",
+                    ),
+                    "materialization_seconds": _reduce_scalar(
+                        fabric,
+                        physical_batching_metrics["materialization_seconds"],
+                        reduce_op="max",
+                    ),
+                    "encoded_cache_gib": _reduce_scalar(
+                        fabric,
+                        physical_batching_metrics["encoded_cache_gib"],
+                        reduce_op="sum",
+                    ),
+                    "pair_count": _reduce_scalar(
+                        fabric, physical_batching_metrics["pair_count"]
+                    ),
+                    "padding_tracks": _reduce_scalar(
+                        fabric, physical_batching_metrics["padding_tracks"]
+                    ),
+                    "physical_group_count": _reduce_scalar(
+                        fabric,
+                        physical_batching_metrics["physical_group_count"],
+                        reduce_op="sum",
+                    ),
+                }
             logging.info(
                 f"[timing:{total_steps:06d}] "
                 f"Total: {total_duration:>6.2f}s | "
@@ -2750,6 +2789,11 @@ def main(cfg: DictConfig):
                     tb_writer.add_scalar(name, value, total_steps)
                 for name, value in hardware_metrics.items():
                     tb_writer.add_scalar(name, value, total_steps)
+                if reduced_physical_batching_metrics is not None:
+                    for name, value in reduced_physical_batching_metrics.items():
+                        tb_writer.add_scalar(
+                            f"batching/{name}", value, total_steps
+                        )
                 if sampling_metrics:
                     for name, value in sampling_metrics.items():
                         tb_writer.add_scalar(f"sampling/{name}", value, total_steps)
