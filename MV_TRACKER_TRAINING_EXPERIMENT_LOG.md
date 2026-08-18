@@ -744,3 +744,59 @@ for final end-to-end step throughput.
 - Step timings: `46.682, 4.149, 2.332, 1.747, 5.331` seconds
 - W&B was not used because this was a bounded loader verifier and Dopey has no
   configured W&B credential.
+
+## 2026-08-18 — Concurrent whole-step live-loader benchmark
+
+The mixed trainer was changed to materialize both source streams for a complete
+optimizer step concurrently. Each rank prepares its four local samples in the
+existing DIEGESIS/MV-Kubric/DIEGESIS/MV-Kubric order; with two DDP ranks this is
+the same eight-scene global update as before. Forward, backward, gradient
+accumulation, loss scaling and optimizer behavior remain serial and unchanged.
+
+The exact live-loader verifier was repeated on Dopey at commit `9b03850` using
+an RTX 3090 and Titan X. All 40 accepted sample records matched the sequential
+baseline exactly. The resulting `samples.json` SHA256 was
+`47cab67a0ef4efd6c9f052134a672acdbc33358585c161048ed79dadc91ae0de`.
+
+Cold startup plus the first step took 45.218 seconds. Warm loader-only steps
+took 3.729, 1.048, 2.845 and 4.104 seconds, a 2.932-second mean. The prior live
+path measured 3.390 seconds on the same five-step sequence, so concurrent
+whole-step materialization reduced this bounded loader-only mean by 13.5%.
+Because this check deliberately has no model compute, a two-H100 training smoke
+is still required to determine whether the change improves end-to-end update
+time or merely moves the exposed wait to the beginning of each update.
+
+- Remote output: `/media/data3/jthakwani/mvtracker-runs/mixed-sampling-live-wholestep-seed72-20260818-r4/`
+- Comparison: `identical=true`, expected 40, actual 40
+- Step timings: `45.218, 3.729, 1.048, 2.845, 4.104` seconds
+- W&B was not used because this was a bounded loader verifier on Dopey.
+
+## 2026-08-18 — Matched eager-versus-lazy H100 loader A/B
+
+The eager whole-step implementation and the prior asynchronous consumption
+path were compared on two H100s using the same master seed (`2019407807`). The
+two runs matched exactly at every optimizer step for global sample count,
+DIEGESIS/MV-Kubric source counts, source view counts, source trajectory counts
+and total global trajectories. This removed the workload mismatch in the
+earlier smoke comparison.
+
+Across warm optimizer steps 2–10, eager materialization reduced measured data
+wait from 8.68 to 1.42 seconds in aggregate, but increased forward time from
+40.88 to 64.60 seconds and backward time from 23.91 to 35.45 seconds. Total
+warm-step time increased from 79.33 to 109.34 seconds. Lazy asynchronous
+consumption was therefore 27.4% faster end-to-end. The first update was also
+128.69 seconds with lazy consumption versus 241.94 seconds with eager
+materialization.
+
+The result rejects eager GPU materialization of all eight global samples as a
+training optimization. It drains the ready queues before compute, creates a
+large startup barrier, holds more decoded data resident and causes background
+refill/decode work to overlap adversely with model compute. Production keeps
+the deterministic eight-sample optimizer-step schedule but consumes prepared
+batches lazily, allowing loader work to remain naturally overlapped. Eager
+materialization remains available only as an explicit benchmark switch.
+
+- Eager W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/785db7bf6150
+- Lazy W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/f1aac438efd2
+- Eager output: `jeet-mvtracker-runs-v2/continual-training/whole-step-loader-smoke10-20260818T091500Z/`
+- Lazy output: `jeet-mvtracker-runs-v2/continual-training/lazy-loader-matched-smoke10-20260818/`

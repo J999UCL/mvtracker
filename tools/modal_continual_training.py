@@ -293,7 +293,7 @@ def train_remote(
     mode: str,
     run_name: str,
     confirmation: str = "",
-    materialize_whole_step: bool = True,
+    materialize_whole_step: bool = False,
     seed_override: int = 0,
 ) -> dict:
     if mode not in EXPERIMENT_PHASES:
@@ -441,7 +441,7 @@ def smoke(run_name: str = "") -> None:
 @app.local_entrypoint(name="smoke10")
 def smoke10(
     run_name: str = "",
-    materialize_whole_step: bool = True,
+    materialize_whole_step: bool = False,
     seed: int = 0,
 ) -> None:
     selected = _prepare_launch("smoke10", run_name, confirm_main=False)
