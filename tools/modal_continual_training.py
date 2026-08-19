@@ -251,12 +251,20 @@ def train_remote(
     run_dir = RUN_ROOT / CONTINUAL_RUN_SUBDIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "modal-run-manifest.json"
+    data_inventory = json.loads(
+        (Path(DATA_VOLUME_ROOT) / "direct-volume-data-manifest.json").read_text()
+    )
     manifest = {
         "mode": mode,
         "run_name": run_name,
         "source_commit": commit,
         "data_volume": "jeet-mvtracker-data-v2",
         "data_layout_version": DATA_LAYOUT_VERSION,
+        "data_inventory": {
+            "train_scene_count": data_inventory["train_scene_count"],
+            "validation_scene_count": data_inventory["validation_scene_count"],
+            "validation_scene_ids": data_inventory["validation_scene_ids"],
+        },
         "phases": [dict(phase) for phase in EXPERIMENT_PHASES[mode]],
         "gpu": GPU_REQUEST,
         "max_containers": MAX_CONTAINERS,
