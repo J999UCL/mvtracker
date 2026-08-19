@@ -1058,3 +1058,52 @@ training result itself is complete and was not rerun.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/36bd7c2a9283
 - Run: `continual-training/gt-depth-replay-smoke10-ddp2-h100-76b9abe8-20260819T210601Z`
 - Modal app: https://modal.com/apps/ucl-prism/main/ap-uL3MQBiFHg29YqtylNy4uj
+
+## 2026-08-20 — Single-H100 UpdateFormer optimization contract
+
+A locked single-H100 contract now checks UpdateFormer outputs, real-track input
+gradients, every parameter gradient, one AdamW update, optimizer state, and the
+3-D/visibility losses. BF16 results may differ by at most one ULP; FP32 values
+use fixed `rtol=1e-4`, `atol=1e-5`. Five B1/B2/B4 workloads include irregular
+track counts and exclude padded tracks exactly as the production loss does. The
+full reference tensors, baseline state, hashes, and manifest are immutable under
+`performance-contracts/updateformer-v3` on `jeet-mvtracker-runs-v2`.
+
+The memory profile was confirmed: parameters and optimizer state are small;
+retained UpdateFormer activations dominate. Non-reentrant checkpointing of each
+complete UpdateFormer call passed the contract. Across twelve chained calls it
+reduced peak allocation from 28.19 to 3.71 GiB for B1/1,536 tracks and from
+41.69 to 5.15 GiB for B4/512 tracks (7.6--8.1x), while increasing isolated step
+time by 35--43%. Block-by-block checkpointing saved less memory per unit of
+compute and was discarded. RNG preservation is disabled because UpdateFormer
+contains no stochastic operation; this also makes checkpointing CUDA-graph
+capturable.
+
+Checkpointed capacity saturated at B8 for 512 tracks (1.45 to 6.51 scenes/s,
+4.5x over B1) and B2 for 1,536 tracks (1.53 to 1.99 scenes/s). Whole-step CUDA
+Graph replay demonstrated the remaining launch-overhead ceiling: B1/512 improved
+1.80 to 5.58 scenes/s and B1/1,536 improved 1.84 to 2.51. PyTorch's supported
+autograd-aware partial graphs also passed the contract and achieved 3.7x for
+B1/512, 1.48x for B4/512, and 2.0x for B1/1,536. They are not enabled in
+production because variable trajectory counts would require either many
+one-use graph captures or numerical-changing track buckets.
+
+Two candidates were rejected before timing/promotion. Regional
+`torch.compile` changed millions of low-precision values and produced up to
+`9.2e-5` difference after one Adam update. Track-count bucketing likewise
+produced up to `8.98e-5` update drift. A reusable custom forward-only graph
+also failed the one-ULP gate. None remains in the production model.
+
+The accepted whole-call checkpoint completed a three-update live mixed-data
+smoke on one H100 with rank-local WebDataset physical batching. Warm updates
+took 6.05 and 7.76 seconds for four logical scenes; final sampled GPU memory was
+27.18/79.65 GiB. The rank-local scheduler's stale two-rank gate was removed;
+global scheduling still requires two ranks.
+
+- Contract capture: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/665sa9sz
+- Checkpoint study: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/lj0vzrl8
+- Capacity study: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/61tsnzx5
+- CUDA Graph study: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/rsbgoojb
+- Partial-graph study: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/ywz00xip
+- Live single-H100 smoke: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/137699893d38
+- Live run directory: `single-gpu-performance/updateformer-single-h100-adebc37d`
