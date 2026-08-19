@@ -374,17 +374,15 @@ class DaliEncodedImageDecoder:
                 depth_input = fn.external_source(
                     name="mvtracker_depth_encoded", device="cpu", batch=True
                 )
-                rgb = fn.experimental.decoders.image(
+                rgb = fn.decoders.image(
                     rgb_input,
                     device="mixed",
                     output_type=types.RGB,
-                    dtype=types.UINT8,
                 )
-                depth = fn.experimental.decoders.image(
+                depth = fn.decoders.image(
                     depth_input,
                     device="cpu",
-                    output_type=types.GRAY,
-                    dtype=types.UINT16,
+                    output_type=types.ANY_DATA,
                 ).gpu()
                 return rgb, depth
 
