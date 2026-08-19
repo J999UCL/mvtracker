@@ -552,7 +552,7 @@ def convert_full(
                 )
                 commit_volume()
 
-        from mvtracker.preprocessing.mvkubric_webdataset import finalize_shards
+        from mvtracker.preprocessing.mvkubric_webdataset import convert_shards, finalize_shards
 
         if not output_root.is_dir():
             progress.phase("finalize_train", scene_count=len(train_scene_ids), shard_count=shard_offset)
