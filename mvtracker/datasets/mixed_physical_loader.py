@@ -383,7 +383,7 @@ class MixedStepLookahead:
                 if physical is not None
                 else _step_fingerprint(
                     scenes,
-                    tuple(local_physical_groups),
+                    tuple(physical_groups),
                     start_cursors,
                     end_cursors,
                 )
