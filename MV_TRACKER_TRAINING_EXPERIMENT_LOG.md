@@ -1032,3 +1032,29 @@ Published dataset:
 - Data Volume: `jeet-mvtracker-data-v2`
 - Successful finalization W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/7sxzztsh
 - Successful Modal app: https://modal.com/apps/ucl-prism/main/ap-BM6BQdVVBFhOkNEEZaB0xD
+
+## 2026-08-19 — Full WebDataset two-H100 DDP smoke
+
+The GT-depth DIEGESIS/MV-Kubric 50/50 recipe completed ten optimizer updates on
+two H100s against the full 1,992-scene MV-Kubric WebDataset. The global batch
+remained eight scenes per update (four per source), with four rank-local logical
+scenes and physical pairing only for compatible view counts.
+
+The first optimizer update took 60.13 seconds, including 18.73 seconds of cold
+data loading and 28.02 seconds of first-pass model compilation. Updates 2--10
+averaged 9.35 seconds (9.17-second median). The final update took 9.57 seconds:
+2.82 seconds loading, 3.26 seconds forward and 2.25 seconds backward. Its global
+batch contained 9,712 trajectories, corresponding to 0.835 samples/s and 1,014
+trajectories/s. The sampled final hardware state was 47.0/79.6 GiB at 100% on
+GPU 0 and 52.3/79.6 GiB at 72% on GPU 1. Container memory was 42.2 GiB.
+
+Training saved both `model_000010.pth` and `model_final.pth`. The training loop
+then attempted a terminal evaluation even though the smoke configuration has no
+evaluation datasets; one rank exited and the other waited in NCCL. The stuck
+post-training app was stopped after confirming both checkpoints were durable.
+The terminal-evaluation guard is fixed for future smoke runs; the ten-update
+training result itself is complete and was not rerun.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/36bd7c2a9283
+- Run: `continual-training/gt-depth-replay-smoke10-ddp2-h100-76b9abe8-20260819T210601Z`
+- Modal app: https://modal.com/apps/ucl-prism/main/ap-uL3MQBiFHg29YqtylNy4uj
