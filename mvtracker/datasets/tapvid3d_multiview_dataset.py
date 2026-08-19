@@ -329,10 +329,11 @@ class DaliEncodedImageDecoder:
         *,
         num_threads: int = 4,
         prefetch_queue_depth: int = 2,
+        max_encoded_images: int = 288,
     ) -> None:
         if device.type != "cuda":
             raise RuntimeError("DALI MV-Kubric decoding requires CUDA")
-        if num_threads < 1 or prefetch_queue_depth < 1:
+        if num_threads < 1 or prefetch_queue_depth < 1 or max_encoded_images < 1:
             raise ValueError("DALI decoder settings must be positive")
         try:
             import nvidia.dali.fn as fn
@@ -347,11 +348,14 @@ class DaliEncodedImageDecoder:
         if device_id is None:
             device_id = torch.cuda.current_device()
         self._device = device
+        self._max_encoded_images = int(max_encoded_images)
 
         class _Pipeline(Pipeline):
             def __init__(self):
                 super().__init__(
-                    batch_size=-1,
+                    # DALI requires a positive maximum batch size. Smaller
+                    # batches can be fed on each iteration.
+                    batch_size=max_encoded_images,
                     num_threads=num_threads,
                     device_id=device_id,
                     seed=0,
@@ -409,6 +413,11 @@ class DaliEncodedImageDecoder:
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         if not rgb_encoded or len(rgb_encoded) != len(depth_encoded):
             raise ValueError("DALI RGB/depth batches must be non-empty and aligned")
+        if len(rgb_encoded) > self._max_encoded_images:
+            raise ValueError(
+                f"DALI encoded batch has {len(rgb_encoded)} images, exceeding "
+                f"the configured maximum {self._max_encoded_images}"
+            )
         # Keep the NumPy views alive until ``run`` has consumed external input.
         rgb_inputs = [np.frombuffer(bytes(value), dtype=np.uint8) for value in rgb_encoded]
         depth_inputs = [np.frombuffer(bytes(value), dtype=np.uint8) for value in depth_encoded]
@@ -1406,8 +1415,6 @@ def decode_tapvid3d_batch(
             flat_encoded,
             [encoded for sample in batch.samples for encoded in sample.depth_bytes],
         )
-        prepare_stream.wait_stream(rgb_stream)
-        prepare_stream.wait_stream(depth_stream)
     else:
         raise ValueError(f"unsupported encoded image codec: {codec}")
     if timing_events is not None:

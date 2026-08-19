@@ -32,11 +32,13 @@ class DaliDecoderContractTests(unittest.TestCase):
         self.assertIn('output_type=types.GRAY', source)
         self.assertIn('dtype=types.UINT16', source)
         self.assertIn('exec_dynamic=False', source)
+        self.assertIn('max_encoded_images: int = 288', source)
+        self.assertIn('batch_size=max_encoded_images', source)
 
     def test_modal_dependency_image_uses_one_dali_codec_abi(self):
         source = (Path(__file__).parents[1] / "tools/modal_training_profile.py").read_text()
         self.assertIn('"nvidia-dali-cuda120==1.53.0"', source)
-        self.assertIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.0"', source)
+        self.assertIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.11"', source)
         self.assertIn('"nvidia-libnvcomp-cu12==5.1.0.21"', source)
         self.assertNotIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20"', source)
         self.assertNotIn('"nvidia-libnvcomp-cu12==5.3.0.16"', source)

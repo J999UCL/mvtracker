@@ -77,7 +77,7 @@ def _dependency_image() -> modal.Image:
             # libnvcomp 5.1. Keep this set coherent; nvImageCodec 0.9 and
             # libnvcomp 5.3 are incompatible with the DALI wheel.
             "nvidia-dali-cuda120==1.53.0",
-            "nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.0",
+            "nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.11",
             "nvidia-libnvcomp-cu12==5.1.0.21",
             "rapidgzip==0.16.0",
             # Modal's mirror currently publishes cu120 through 2.3.6.

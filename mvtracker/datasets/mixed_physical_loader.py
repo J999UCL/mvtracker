@@ -491,6 +491,7 @@ class PhysicalBatchDecoder:
         decode_image_chunk_size: int = 64,
         dali_num_threads: int = 4,
         dali_prefetch_queue_depth: int = 2,
+        dali_max_encoded_images: int = 288,
     ):
         self.device = device
         self.decode_image_chunk_size = int(decode_image_chunk_size)
@@ -504,7 +505,12 @@ class PhysicalBatchDecoder:
         self.dali_decoder = None
         self.dali_num_threads = int(dali_num_threads)
         self.dali_prefetch_queue_depth = int(dali_prefetch_queue_depth)
-        if self.dali_num_threads < 1 or self.dali_prefetch_queue_depth < 1:
+        self.dali_max_encoded_images = int(dali_max_encoded_images)
+        if (
+            self.dali_num_threads < 1
+            or self.dali_prefetch_queue_depth < 1
+            or self.dali_max_encoded_images < 1
+        ):
             raise ValueError("DALI decoder settings must be positive")
 
     def _ensure_nvimagecodec(self) -> None:
@@ -526,6 +532,7 @@ class PhysicalBatchDecoder:
                 self.device,
                 num_threads=self.dali_num_threads,
                 prefetch_queue_depth=self.dali_prefetch_queue_depth,
+                max_encoded_images=self.dali_max_encoded_images,
             )
 
     def decode_async(self, group: PreparedPhysicalGroup):

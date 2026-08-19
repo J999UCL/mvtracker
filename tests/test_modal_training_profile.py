@@ -52,7 +52,7 @@ class ModalTrainingProfileTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('"zstd"', source)
         self.assertIn('"nvidia-dali-cuda120==1.53.0"', source)
-        self.assertIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.0"', source)
+        self.assertIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.11"', source)
         self.assertIn('"nvidia-libnvcomp-cu12==5.1.0.21"', source)
         self.assertNotIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20"', source)
         self.assertNotIn('"nvidia-libnvcomp-cu12==5.3.0.16"', source)
