@@ -4,6 +4,9 @@ defaults:
   - _self_
 
 datasets:
+  train:
+    physical_batching:
+      enabled: false
   eval:
     names: []
 
