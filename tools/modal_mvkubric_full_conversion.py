@@ -155,7 +155,7 @@ class _Progress:
                         for key, value in payload.items()
                         if key != "event" and isinstance(value, (int, float))
                     },
-                    commit=False,
+                        commit=True,
                 )
             except Exception:
                 # Progress reporting must not hide the conversion failure.
@@ -209,6 +209,7 @@ def _copy_archive(source: Path, destination: Path, progress: _Progress) -> dict[
     started = time.perf_counter()
     copied = 0
     next_report = COPY_PROGRESS_BYTES
+    total_bytes = source.stat().st_size
     destination.parent.mkdir(parents=True, exist_ok=True)
     with source.open("rb") as source_stream, destination.open("wb") as target_stream:
         while True:
@@ -219,8 +220,8 @@ def _copy_archive(source: Path, destination: Path, progress: _Progress) -> dict[
             copied += len(block)
             progress.update(
                 archive_bytes=copied,
-                archive_total_bytes=source.stat().st_size,
-                archive_percent=100 * copied / source.stat().st_size,
+                archive_total_bytes=total_bytes,
+                archive_percent=100 * copied / total_bytes,
             )
             if copied >= next_report:
                 elapsed = time.perf_counter() - started
@@ -228,7 +229,7 @@ def _copy_archive(source: Path, destination: Path, progress: _Progress) -> dict[
                     "copy_progress",
                     copied_gib=round(copied / (1 << 30), 2),
                     copy_gib_per_second=round(copied / (1 << 30) / max(elapsed, 1e-6), 3),
-                    copy_eta_seconds=round((source.stat().st_size - copied) / max(copied / max(elapsed, 1e-6), 1), 1),
+                    copy_eta_seconds=round((total_bytes - copied) / max(copied / max(elapsed, 1e-6), 1), 1),
                 )
                 next_report += COPY_PROGRESS_BYTES
         target_stream.flush()
@@ -287,17 +288,20 @@ def _extract_archive(archive: Path, destination: Path, progress: _Progress) -> d
     return {"seconds": elapsed, "files": files, "bytes": bytes_}
 
 
-def _scene_allowlist() -> tuple[str, ...] | None:
+def _scene_allowlist() -> tuple[str, ...]:
     if not MANIFEST_PATH.is_file():
-        return None
+        raise FileNotFoundError(f"required scene manifest is missing: {MANIFEST_PATH}")
     try:
         payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-        scenes = payload.get("train_scene_ids")
-        if isinstance(scenes, list):
-            return tuple(sorted((str(scene) for scene in scenes), key=int))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        pass
-    return None
+        scenes = payload["train_scene_ids"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"invalid scene manifest: {MANIFEST_PATH}") from error
+    if not isinstance(scenes, list) or len(scenes) != 1992:
+        raise RuntimeError(f"expected 1,992 train scene IDs in {MANIFEST_PATH}")
+    ordered = tuple(sorted((str(scene) for scene in scenes), key=int))
+    if len(set(ordered)) != len(ordered):
+        raise RuntimeError(f"scene manifest contains duplicate IDs: {MANIFEST_PATH}")
+    return ordered
 
 
 def _scenes_in_range(root: Path, start: int, end: int, allowlist: Iterable[str] | None) -> tuple[str, ...]:
@@ -308,10 +312,22 @@ def _scenes_in_range(root: Path, start: int, end: int, allowlist: Iterable[str] 
     return tuple(scene for scene in selected if start <= int(scene) <= end)
 
 
-def _conversion_progress(progress: _Progress, archive_name: str, total_scenes: int, total_shards: int):
+def _conversion_progress(
+    progress: _Progress,
+    archive_name: str,
+    total_scenes: int,
+    total_shards: int,
+    commit_volume,
+):
+    state_lock = threading.Lock()
+    started = time.perf_counter()
+    completed_scenes = 0
+
     def callback(event: object, *values: object) -> None:
+        nonlocal completed_scenes
         if event == "shard":
             result, completed, total = values
+            commit_volume()
             progress.emit(
                 "shard_complete",
                 archive=archive_name,
@@ -323,6 +339,10 @@ def _conversion_progress(progress: _Progress, archive_name: str, total_scenes: i
             )
             return
         shard, scene_id, completed, seconds = (event, *values)
+        with state_lock:
+            completed_scenes += 1
+            done = completed_scenes
+        rate = done / max(time.perf_counter() - started, 1e-6)
         progress.emit(
             "scene_complete",
             archive=archive_name,
@@ -332,6 +352,9 @@ def _conversion_progress(progress: _Progress, archive_name: str, total_scenes: i
             scene_total=len(shard.scene_ids),
             archive_scene_total=total_scenes,
             conversion_shards_total=total_shards,
+            conversion_scene_completed=done,
+            conversion_scene_total=total_scenes,
+            conversion_eta_seconds=round((total_scenes - done) / max(rate, 1e-6), 1),
             scene_seconds=float(seconds),
         )
 
@@ -348,14 +371,28 @@ def _clear_partials(root: Path) -> int:
     return removed
 
 
+def _read_published_manifest(root: Path) -> dict[str, object]:
+    manifest_path = Path(root) / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"canonical output is incomplete: {manifest_path}")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read canonical manifest: {manifest_path}") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("scene_ids"), list):
+        raise RuntimeError(f"canonical manifest is invalid: {manifest_path}")
+    return payload
+
+
 def _convert_archive(
     archive_name: str,
     start: int,
     end: int,
     output_root: Path,
     progress: _Progress,
-    allowlist: tuple[str, ...] | None,
+    allowlist: tuple[str, ...],
     shard_offset: int,
+    commit_volume,
 ) -> tuple[tuple[str, ...], dict[str, object]]:
     from mvtracker.preprocessing.mvkubric_webdataset import convert_shards
 
@@ -373,9 +410,14 @@ def _convert_archive(
     _extract_archive(local_archive, local_extract, progress)
     local_archive.unlink()
     progress.emit("local_archive_deleted", archive=archive_name)
-    scene_ids = _scenes_in_range(local_extract, start, end, allowlist)
-    if not scene_ids:
-        raise RuntimeError(f"no scenes found for {archive_name} in {local_extract}")
+    expected_ids = tuple(scene for scene in allowlist if start <= int(scene) <= end)
+    observed_ids = _scenes_in_range(local_extract, start, end, None)
+    if observed_ids != expected_ids:
+        raise RuntimeError(
+            f"{archive_name}: extracted scene IDs do not match the pinned manifest "
+            f"(expected {len(expected_ids)}, observed {len(observed_ids)})"
+        )
+    scene_ids = expected_ids
     shard_count = (len(scene_ids) + SCENES_PER_SHARD - 1) // SCENES_PER_SHARD
     progress.phase(
         "convert",
@@ -393,7 +435,9 @@ def _convert_archive(
         read_workers=READ_WORKERS,
         shard_offset=shard_offset,
         finalize=False,
-        progress_callback=_conversion_progress(progress, archive_name, len(scene_ids), shard_count),
+        progress_callback=_conversion_progress(
+            progress, archive_name, len(scene_ids), shard_count, commit_volume
+        ),
     )
     shutil.rmtree(local_extract)
     progress.emit("local_extraction_deleted", archive=archive_name)
@@ -433,7 +477,6 @@ def convert_full(
     validation_root = Path(validation_output)
     staging_root = output_root.with_name(output_root.name + ".staging")
     validation_staging = validation_root.with_name(validation_root.name + ".staging")
-    allowlist = _scene_allowlist()
     try:
         print(
             json.dumps(
@@ -452,59 +495,94 @@ def convert_full(
             flush=True,
         )
         progress.emit("startup")
+        allowlist = _scene_allowlist()
         _clear_partials(staging_root)
         _clear_partials(validation_staging)
-        staging_root.mkdir(parents=True, exist_ok=True)
-        train_scene_ids: list[str] = []
+        train_scene_ids: list[str] = list(allowlist)
         shard_offset = 0
         archive_results: list[dict[str, object]] = []
-        for archive_name, start, end in TRAIN_ARCHIVES:
-            scene_ids, result = _convert_archive(
-                archive_name,
-                start,
-                end,
-                staging_root,
-                progress,
-                allowlist,
-                shard_offset,
-            )
-            train_scene_ids.extend(scene_ids)
-            shard_offset += (len(scene_ids) + SCENES_PER_SHARD - 1) // SCENES_PER_SHARD
-            archive_results.append(
-                {"archive": archive_name, "scene_count": len(scene_ids), "shard_count": len(result["shards"])}
-            )
-            data_volume.commit()
+        commit_lock = threading.Lock()
+
+        def commit_volume() -> None:
+            with commit_lock:
+                data_volume.commit()
+
+        if output_root.is_dir():
+            train_manifest = _read_published_manifest(output_root)
+            shard_offset = len(train_manifest.get("shards", []))
+            progress.emit("train_already_published", scene_count=len(train_scene_ids), shard_count=shard_offset)
+        else:
+            staging_root.mkdir(parents=True, exist_ok=True)
+
+            for archive_name, start, end in TRAIN_ARCHIVES:
+                scene_ids, result = _convert_archive(
+                    archive_name,
+                    start,
+                    end,
+                    staging_root,
+                    progress,
+                    allowlist,
+                    shard_offset,
+                    commit_volume,
+                )
+                shard_offset += (len(scene_ids) + SCENES_PER_SHARD - 1) // SCENES_PER_SHARD
+                archive_results.append(
+                    {"archive": archive_name, "scene_count": len(scene_ids), "shard_count": len(result["shards"])}
+                )
+                commit_volume()
 
         from mvtracker.preprocessing.mvkubric_webdataset import finalize_shards
 
-        progress.phase("finalize_train", scene_count=len(train_scene_ids), shard_count=shard_offset)
-        train_manifest = finalize_shards(staging_root, train_scene_ids, scenes_per_shard=SCENES_PER_SHARD)
+        if not output_root.is_dir():
+            progress.phase("finalize_train", scene_count=len(train_scene_ids), shard_count=shard_offset)
+            train_manifest = finalize_shards(
+                staging_root, allowlist, scenes_per_shard=SCENES_PER_SHARD
+            )
         progress.phase("convert_validation", scene_count=len(VALIDATION_SCENES))
-        validation_source_root = Path(validation_source)
-        if not validation_source_root.is_dir():
-            raise FileNotFoundError(validation_source_root)
-        validation_staging.mkdir(parents=True, exist_ok=True)
-        validation_ids = _scenes_in_range(validation_source_root, 0, 10**9, VALIDATION_SCENES)
-        if not validation_ids:
-            raise RuntimeError(f"no validation scenes found under {validation_source_root}")
-        validation_result = convert_shards(
-            validation_source_root,
-            validation_staging,
-            validation_ids,
-            scenes_per_shard=SCENES_PER_SHARD,
-            shard_workers=SHARD_WORKERS,
-            read_workers=READ_WORKERS,
-            finalize=False,
-            progress_callback=_conversion_progress(progress, "validation", len(validation_ids), (len(validation_ids) + SCENES_PER_SHARD - 1) // SCENES_PER_SHARD),
-        )
-        progress.phase("finalize_validation", scene_count=len(validation_ids))
-        validation_manifest = finalize_shards(validation_staging, validation_ids, scenes_per_shard=SCENES_PER_SHARD)
-        if output_root.exists():
-            raise FileExistsError(f"refusing to replace existing canonical output: {output_root}")
-        if validation_root.exists():
-            raise FileExistsError(f"refusing to replace existing canonical output: {validation_root}")
-        staging_root.replace(output_root)
-        validation_staging.replace(validation_root)
+        if validation_root.is_dir():
+            validation_manifest = _read_published_manifest(validation_root)
+            validation_ids = tuple(str(scene) for scene in validation_manifest["scene_ids"])
+            if validation_ids != VALIDATION_SCENES:
+                raise RuntimeError("published validation scene IDs are not 101-127")
+            validation_result = {"shards": validation_manifest.get("shards", [])}
+            progress.emit("validation_already_published", scene_count=len(validation_ids))
+        else:
+            validation_source_root = Path(validation_source)
+            if not validation_source_root.is_dir():
+                raise FileNotFoundError(validation_source_root)
+            observed_validation = _scenes_in_range(validation_source_root, 0, 10**9, None)
+            if observed_validation != VALIDATION_SCENES:
+                raise RuntimeError("validation source does not contain exactly scenes 101-127")
+            validation_staging.mkdir(parents=True, exist_ok=True)
+            validation_ids = VALIDATION_SCENES
+            validation_result = convert_shards(
+                validation_source_root,
+                validation_staging,
+                validation_ids,
+                scenes_per_shard=SCENES_PER_SHARD,
+                shard_workers=SHARD_WORKERS,
+                read_workers=READ_WORKERS,
+                finalize=False,
+                progress_callback=_conversion_progress(
+                    progress,
+                    "validation",
+                    len(validation_ids),
+                    (len(validation_ids) + SCENES_PER_SHARD - 1) // SCENES_PER_SHARD,
+                    commit_volume,
+                ),
+            )
+            progress.phase("finalize_validation", scene_count=len(validation_ids))
+            validation_manifest = finalize_shards(
+                validation_staging, VALIDATION_SCENES, scenes_per_shard=SCENES_PER_SHARD
+            )
+        if not output_root.is_dir():
+            if not staging_root.is_dir():
+                raise RuntimeError(f"train staging output is missing: {staging_root}")
+            staging_root.replace(output_root)
+        if not validation_root.is_dir():
+            if not validation_staging.is_dir():
+                raise RuntimeError(f"validation staging output is missing: {validation_staging}")
+            validation_staging.replace(validation_root)
         data_volume.commit()
         progress.emit("published", train_scene_count=len(train_scene_ids), validation_scene_count=len(validation_ids), train_shard_count=shard_offset, validation_shard_count=len(validation_result["shards"]))
         result = {
