@@ -957,3 +957,50 @@ startup/first-update fill cost. The full 1,000-step run was not launched.
 - Failed smoke W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/eda46c990e5a
 - Modal app: `ap-UK0R5GUxCWYvn8Mud7IlkB`
 - Run: `direct-volume-v2-smoke10-ddp2-h100-20260819T0110Z`
+
+Correction: subsequent inspection of the saved crash batch found a real code
+exception after loading. The physical-batch visibility assertion treated
+padded trajectory slots as real tracks. Every real trajectory in the batch was
+visible somewhere; only the deliberately padded slots were invisible. The
+assertion is now padding-aware. This was separate from, and occurred after, the
+large native MV-Kubric loader stall.
+
+## 2026-08-19 — MV-Kubric WebDataset/DALI pilot
+
+A 32-scene MV-Kubric pilot was converted into eight uncompressed, indexed TAR
+shards with four scenes per shard. Each scene record contains its metadata and
+the encoded RGB/depth payloads for all ten source cameras. Conversion completed
+in roughly 3.5 minutes and produced about 12 GB of derived data under
+`datasets/kubric-multiview-webdataset/v1/train` on the data Volume. The
+conversion is parallel, reports shard/scene progress, and generates standard
+NVIDIA `wds2idx` sidecars.
+
+The production-side prototype uses DALI's indexed WebDataset reader, preserves
+the existing view-count and track/augmentation distributions, and continues to
+decode RGB/depth on CUDA. Rank-local physical batching, padding-aware
+visibility checks, and ahead-of-time correlation-extension compilation were
+also completed. No H100 training run was launched.
+
+The one-T4 native-versus-DALI pilot completed 4 warm-up and 16 measured samples
+per path at 1, 2, 4 and 6 selected views. Results were:
+
+| Selected views | Native samples/s | DALI samples/s |
+|---:|---:|---:|
+| 1 | 7.869 | 0.137 |
+| 2 | 1.131 | 0.137 |
+| 4 | 0.559 | 0.141 |
+| 6 | 0.513 | 0.139 |
+
+The pilot rejects the current **record layout**, not DALI itself. The DALI
+reader materializes all ten view components in a scene record before Python
+selects the requested 1--6 views. Its read/unpack median therefore stayed at
+6.83--7.16 seconds regardless of selected view count, while CUDA decode took
+only 0.044--0.211 seconds. The loader moves a full scene even for a one-view
+sample and is 3.7--57 times slower than the warmed native path in this test.
+This layout must not be used for the full training run. The next storage design
+must permit indexed reads of only the selected camera payloads while retaining
+scene-level metadata and statistical sampling behavior.
+
+- Successful T4 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/kiwexyf3
+- Report: `jeet-mvtracker-runs-v2/t4-mvkubric-webdataset/mvkubric-webdataset-t4-pilot-v3.json`
+- Modal app: https://modal.com/apps/ucl-prism/main/ap-Wj4MIHq6n1kfBG3GwNgN7p
