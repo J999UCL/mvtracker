@@ -28,6 +28,7 @@ class DaliDecoderContractTests(unittest.TestCase):
     def test_decoder_uses_mixed_dali_for_rgb_and_uint16_gray_depth(self):
         source = inspect.getsource(DaliEncodedImageDecoder)
         self.assertIn('fn.external_source', source)
+        self.assertIn('fn.experimental.decoders.image', source)
         self.assertIn('device="mixed"', source)
         self.assertIn('output_type=types.GRAY', source)
         self.assertIn('dtype=types.UINT16', source)
