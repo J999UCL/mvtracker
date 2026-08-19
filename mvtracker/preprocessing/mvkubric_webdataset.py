@@ -25,9 +25,21 @@ WEB_DATASET_FORMAT = "mvtracker-kubric-webdataset"
 FORMAT_VERSION = 1
 SCENES_PER_SHARD = 4
 META_COMPONENT = "meta.npz"
-RGB_COMPONENTS = tuple(f"rgb{view}.npz" for view in range(6))
-DEPTH_COMPONENTS = tuple(f"depth{view}.npz" for view in range(6))
-COMPONENTS = (META_COMPONENT, *RGB_COMPONENTS, *DEPTH_COMPONENTS)
+
+
+def component_names(view_count: int) -> tuple[str, ...]:
+    if view_count < 1:
+        raise ValueError("view_count must be positive")
+    return (
+        META_COMPONENT,
+        *(f"rgb{view}.npz" for view in range(view_count)),
+        *(f"depth{view}.npz" for view in range(view_count)),
+    )
+
+
+# Kept as a convenient schema constant for the real MV-Kubric layout.  Shard
+# manifests always use component_names(observed_view_count), not this value.
+COMPONENTS = component_names(10)
 
 
 @dataclass(frozen=True)
@@ -163,13 +175,14 @@ def _scene_components(scene_root: Path, scene_id: str, read_workers: int) -> dic
         (path for path in scene_root.iterdir() if path.is_dir() and path.name.startswith("view_")),
         key=lambda path: int(path.name.rsplit("_", 1)[1]),
     )
-    if len(view_paths) != 6:
-        raise ValueError(f"{scene_root}: expected six views, found {len(view_paths)}")
+    if not view_paths:
+        raise ValueError(f"{scene_root}: no view directories found")
     view_names = tuple(path.name for path in view_paths)
     tracks = _load_tracks(scene_root, view_names)
     camera = _load_camera(scene_root, view_names)
     n_frames = int(tracks["tracks_3d"].shape[0])
-    if tracks["visibility"].shape[1:] != tracks["tracks_3d"].shape[:2]:
+    view_count = len(view_paths)
+    if tracks["visibility"].shape[:1] != (view_count,) or tracks["visibility"].shape[1:] != tracks["tracks_3d"].shape[:2]:
         raise ValueError(f"{scene_root}: visibility shape does not match tracks_3d")
 
     meta = {
@@ -191,6 +204,23 @@ def _scene_components(scene_root: Path, scene_id: str, read_workers: int) -> dic
         futures = {name: executor.submit(_packed_encoded_frames, paths) for name, paths in jobs}
         encoded = {name: future.result() for name, future in futures.items()}
     return {META_COMPONENT: _npz_bytes(**meta), **encoded}
+
+
+def _scene_view_count(scene_root: Path, scene_id: str) -> int:
+    view_count = sum(
+        1 for path in (Path(scene_root) / str(scene_id)).iterdir()
+        if path.is_dir() and path.name.startswith("view_")
+    )
+    if view_count < 1:
+        raise ValueError(f"{scene_root}/{scene_id}: no view directories found")
+    return view_count
+
+
+def _require_consistent_view_count(scene_root: Path, scene_ids: Sequence[str]) -> int:
+    counts = {_scene_view_count(scene_root, scene_id) for scene_id in scene_ids}
+    if len(counts) != 1:
+        raise ValueError(f"scene view counts must be consistent within a split: {sorted(counts)}")
+    return counts.pop()
 
 
 def _scene_manifest(scene_root: Path, results: Sequence[dict[str, object]]) -> dict[str, dict[str, object]]:
@@ -241,10 +271,14 @@ def write_shard(
     partial = output_tar.with_suffix(output_tar.suffix + ".partial")
     partial.unlink(missing_ok=True)
     started = time.perf_counter()
+    expected_view_count = _scene_view_count(scene_root, shard.scene_ids[0])
+    expected_components = set(component_names(expected_view_count))
     with tarfile.open(partial, mode="w", format=tarfile.USTAR_FORMAT) as archive:
         for completed, scene_id in enumerate(shard.scene_ids, start=1):
             components = _scene_components(Path(scene_root) / scene_id, scene_id, read_workers)
-            for component in COMPONENTS:
+            if set(components) != expected_components:
+                raise ValueError(f"{shard.name}: scene {scene_id} has an inconsistent view count")
+            for component in component_names(expected_view_count):
                 _tar_add_bytes(archive, f"{scene_id}.{component}", components[component])
             if progress_callback is not None:
                 progress_callback(shard, scene_id, completed, time.perf_counter() - started)
@@ -255,7 +289,8 @@ def write_shard(
         "tar": str(output_tar),
         "bytes": output_tar.stat().st_size,
         "seconds": time.perf_counter() - started,
-        "components_per_scene": len(COMPONENTS),
+        "components_per_scene": len(expected_components),
+        "view_count": expected_view_count,
     }
 
 
@@ -281,6 +316,7 @@ def convert_split(
     """Convert a split, publishing only completed TAR/index pairs."""
     split_root = Path(output_root)
     split_root.mkdir(parents=True, exist_ok=True)
+    view_count = _require_consistent_view_count(scene_root, scene_ids)
     shards = split_scene_ids(scene_ids, scenes_per_shard)
     results: list[dict[str, object]] = []
     for shard in shards:
@@ -310,7 +346,8 @@ def convert_split(
         "version": FORMAT_VERSION,
         "split": split_root.name,
         "scenes_per_shard": scenes_per_shard,
-        "components": list(COMPONENTS),
+        "view_count": view_count,
+        "components": list(component_names(view_count)),
         "scene_ids": [scene for result in results for scene in result["scene_ids"]],
         "scenes": _scene_manifest(scene_root, results),
         "shards": results,
@@ -337,6 +374,7 @@ def convert_shards(
         raise ValueError("shard_workers must be positive")
     split_root = Path(output_root)
     split_root.mkdir(parents=True, exist_ok=True)
+    view_count = _require_consistent_view_count(scene_root, scene_ids)
     shards = split_scene_ids(scene_ids, scenes_per_shard)
 
     def convert_one(shard: SceneShard) -> dict[str, object]:
@@ -377,7 +415,8 @@ def convert_shards(
         "version": FORMAT_VERSION,
         "split": split_root.name,
         "scenes_per_shard": scenes_per_shard,
-        "components": list(COMPONENTS),
+        "view_count": view_count,
+        "components": list(component_names(view_count)),
         "scene_ids": [scene for result in results for scene in result["scene_ids"]],
         "scenes": _scene_manifest(scene_root, results),
         "shards": results,

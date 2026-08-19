@@ -19,7 +19,7 @@ def _native_encoded_bytes(data_root: Path, scene_ids: Sequence[str], view_count:
 
     The native profile chooses views inside worker processes, so its exact
     selected paths are not exposed by the existing profiling helper.  The
-    uniform view sampler makes the ``view_count / six`` estimate unbiased.
+    uniform view sampler makes the ``view_count / source_view_count`` estimate unbiased.
     """
     totals = []
     for scene_id in scene_ids:
@@ -29,9 +29,9 @@ def _native_encoded_bytes(data_root: Path, scene_ids: Sequence[str], view_count:
             view_bytes.append(
                 sum(path.stat().st_size for pattern in ("rgba_*", "depth_*") for path in view.glob(pattern))
             )
-        if len(view_bytes) != 6:
-            raise ValueError(f"{scene}: expected six native views")
-        totals.append(sum(view_bytes) * float(view_count) / 6.0)
+        if len(view_bytes) < view_count:
+            raise ValueError(f"{scene}: only {len(view_bytes)} native views for request {view_count}")
+        totals.append(sum(view_bytes) * float(view_count) / len(view_bytes))
     return sum(totals) / len(totals) if totals else 0.0
 
 

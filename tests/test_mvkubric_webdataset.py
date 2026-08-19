@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 
 from mvtracker.preprocessing.mvkubric_webdataset import (
-    COMPONENTS,
     SceneShard,
     _scene_components,
+    component_names,
     read_component,
     split_scene_ids,
     write_shard,
@@ -30,7 +30,7 @@ class MvKubricWebDatasetTests(unittest.TestCase):
         (scene / "scene.json").write_text(
             json.dumps({"output": {"rgb": {"invalid_frame_indices": [1]}}})
         )
-        for view in range(6):
+        for view in range(10):
             view_root = scene / f"view_{view}"
             view_root.mkdir()
             metadata = {
@@ -59,7 +59,8 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             root = Path(temporary)
             self._make_scene(root)
             components = _scene_components(root / "900", "900", read_workers=4)
-            self.assertEqual(set(components), set(COMPONENTS))
+            expected_components = component_names(10)
+            self.assertEqual(set(components), set(expected_components))
             metadata = read_component(components["meta.npz"])
             np.testing.assert_array_equal(metadata["tracks_3d"], np.ones((3, 4, 3), dtype=np.float32))
             np.testing.assert_array_equal(metadata["invalid_frame_indices"], [1])
@@ -74,19 +75,20 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             self._make_scene(root)
             output = root / "shard.tar"
             result = write_shard(root, SceneShard("mvkubric-00000", ("900",)), output, read_workers=2)
-            self.assertEqual(result["components_per_scene"], len(COMPONENTS))
+            expected_components = component_names(10)
+            self.assertEqual(result["components_per_scene"], len(expected_components))
             with tarfile.open(output, "r") as archive:
                 names = archive.getnames()
-                self.assertEqual(names, [f"900.{component}" for component in COMPONENTS])
+                self.assertEqual(names, [f"900.{component}" for component in expected_components])
                 metadata = read_component(archive.extractfile("900.meta.npz").read())
                 np.testing.assert_array_equal(metadata["resolution_hw"], [2, 3])
 
                 if _record_from_outputs is not None:
-                    outputs = [archive.extractfile(f"900.{component}").read() for component in COMPONENTS]
+                    outputs = [archive.extractfile(f"900.{component}").read() for component in expected_components]
                     record = _record_from_outputs(outputs)
                     self.assertEqual(record.name, "900")
                     self.assertEqual(record.frame_count, 3)
-                    self.assertEqual(record.view_count, 6)
+                    self.assertEqual(record.view_count, 10)
                     self.assertEqual(record.rgb_frames[2][1], bytes([2, 1, 1]))
 
     def test_split_scene_ids_is_four_scene_shards(self):
