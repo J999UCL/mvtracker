@@ -61,6 +61,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
         "diagnose",
         "checkpoint-study",
         "capacity-study",
+        "cuda-graph-study",
     }:
         raise ValueError(f"unsupported action: {action}")
     torch.set_float32_matmul_precision("high")
@@ -123,7 +124,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
             summary[f"checkpoint/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
-    else:
+    elif action == "capacity-study":
         from mvtracker.profiling.updateformer_diagnostics import (
             benchmark_checkpoint_capacity,
         )
@@ -136,6 +137,21 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
                 "scenes_per_second"
             ]
             summary[f"capacity/{name}/peak_allocated_gib"] = (
+                measurements["peak_allocated_bytes"] / 2**30
+            )
+    else:
+        from mvtracker.profiling.updateformer_diagnostics import (
+            benchmark_cuda_graphs,
+        )
+
+        verify_golden(CONTRACT_ROOT)
+        result = benchmark_cuda_graphs(CONTRACT_ROOT)
+        summary = {"contract/exact": 1}
+        for name, measurements in result["results"].items():
+            summary[f"cuda_graph/{name}/scenes_per_second"] = measurements[
+                "scenes_per_second"
+            ]
+            summary[f"cuda_graph/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
     output_root = RUN_ROOT / "performance-results" / _source_commit()
@@ -190,3 +206,8 @@ def checkpoint_study() -> None:
 @app.local_entrypoint(name="capacity-study")
 def capacity_study() -> None:
     _launch("capacity-study")
+
+
+@app.local_entrypoint(name="cuda-graph-study")
+def cuda_graph_study() -> None:
+    _launch("cuda-graph-study")

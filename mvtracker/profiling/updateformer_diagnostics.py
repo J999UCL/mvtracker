@@ -235,3 +235,78 @@ def benchmark_checkpoint_capacity(root: Path, calls=12, warmup=1, measured=3):
         "measured": measured,
         "results": results,
     }
+
+
+def benchmark_cuda_graphs(root: Path, calls=12, warmup=3, measured=20):
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    state = torch.load(
+        root / manifest["baseline_state"], map_location="cpu", weights_only=True
+    )
+    device = torch.device("cuda:0")
+    cases = (
+        Workload("batch_1_tracks_512", 1, 512, (512,), 5101),
+        Workload("batch_4_tracks_512", 4, 512, (512,) * 4, 5104),
+        Workload("batch_1_tracks_1536", 1, 1536, (1536,), 5201),
+        Workload("batch_2_tracks_1536", 2, 1536, (1536,) * 2, 5202),
+    )
+    results = {}
+    for workload in cases:
+        for mode in ("eager", "cuda_graph"):
+            model = _build_model(device)
+            model.load_state_dict(state, strict=True)
+            model.checkpoint_updateformer = True
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=5e-5,
+                weight_decay=1e-5,
+                capturable=True,
+            )
+            value, target, weights, mask = _workload_tensors(workload, device)
+
+            def step():
+                optimizer.zero_grad(set_to_none=False)
+                if value.grad is not None:
+                    value.grad.zero_()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    losses = []
+                    for _ in range(calls):
+                        output = model(value, point_mask=mask)
+                        losses.append(
+                            ((output.float() - target) * weights).square().mean()
+                        )
+                    loss = torch.stack(losses).mean()
+                loss.backward()
+                optimizer.step()
+
+            for _ in range(warmup):
+                step()
+            torch.cuda.synchronize()
+            replay = step
+            if mode == "cuda_graph":
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    step()
+                replay = graph.replay
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            durations = []
+            for _ in range(measured):
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                replay()
+                torch.cuda.synchronize()
+                durations.append(time.perf_counter() - started)
+            median = statistics.median(durations)
+            results[f"{workload.name}/{mode}"] = {
+                "median_seconds": median,
+                "scenes_per_second": workload.batch_size / median,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            }
+    return {
+        "calls": calls,
+        "warmup": warmup,
+        "measured": measured,
+        "results": results,
+    }
