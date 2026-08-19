@@ -12,6 +12,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import threading
+import time
 from typing import Any, Callable, Mapping
 
 import numpy as np
@@ -217,12 +218,19 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
     def plan_sample(self, index) -> SamplePlan | None:
         request = index if hasattr(index, "virtual_index") else None
         virtual_index = request.virtual_index if request is not None else int(index)
-        requested_scene = getattr(request, "scene_name", None) if request is not None else None
-        scene_index = self.seq_names.index(requested_scene) if requested_scene in self.seq_names else virtual_index % self.real_len
+        scene_index = (
+            request.scene_index
+            if request is not None and request.scene_index is not None
+            else virtual_index % self.real_len
+        )
+        if not 0 <= scene_index < self.real_len:
+            raise IndexError(f"scene index {scene_index} is outside [0, {self.real_len})")
         scene_name = self.seq_names[scene_index]
         scene = self._scene(scene_name)
         if scene.frame_count != 24 or self.seq_len != 24:
             raise ValueError("MV-Kubric indexed loader requires exactly 24 frames (0..23)")
+        if scene.invalid_frame_indices:
+            return None
         seed = int(self.seed + virtual_index) if self.seed is not None else None
         rng = np.random.RandomState(seed)
         available_views = list(range(scene.view_count))
@@ -283,6 +291,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         return SamplePlan(dataset="kubric-dali", virtual_index=virtual_index, scene_index=scene_index, sequence=scene_name, seed=int(seed or 0), frame_indices=frame_indices, views=views, preselected_track_indices=preselected.copy(), selected_track_indices=selected.copy(), selected_global_track_indices=selected_global.copy(), track_count=int(len(selected)), query_points_3d=query_points, trajectory=xy_z, trajectory_3d=selected_tracks, visibility=selected_visibility, intrinsics=intrinsics, extrinsics=extrinsics, theta=theta, source_size=source_size, output_size=output_size, image_codec="nvimagecodec", depth_source="gt", rgb_sources=(), depth_sources=(), apply_rgb_aug=apply_rgb_aug, rgb_augmentation=rgb_augmentation, apply_depth_aug=apply_depth_aug, depth_patch_operations=depth_operations, augmentation_seed=int(seed or 0), depth_scale=depth_scale, max_depth=float(self.max_depth), depth_sensor_widths=tuple(float(scene.sensor_widths[view]) for view in views), depth_focal_lengths=tuple(float(scene.focal_lengths[view]) for view in views), metadata=metadata, media_record_indices=media_indices)
 
     def materialize_sample(self, plan: SamplePlan):
+        started = time.perf_counter()
         if len(plan.media_record_indices) != len(plan.views):
             raise ValueError("SamplePlan media record count does not match selected views")
         rgb_sources: list[bytes] = []
@@ -295,7 +304,11 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
                 raise ValueError(f"media record {record_index}: expected 24 RGB/depth frames")
             rgb_sources.extend(rgb)
             depth_sources.extend(depth)
-        sample = EncodedTapVid3DSample(jpeg_bytes=tuple(rgb_sources), depth=None, theta=torch.from_numpy(plan.theta), intrs=torch.from_numpy(plan.intrinsics), extrs=torch.from_numpy(plan.extrinsics), trajectory=torch.from_numpy(plan.trajectory), trajectory_3d=torch.from_numpy(plan.trajectory_3d), visibility=torch.from_numpy(plan.visibility), valid=torch.ones((24, plan.track_count), dtype=torch.float32), query_points_3d=torch.from_numpy(plan.query_points_3d), seq_name=plan.sequence, metadata=dict(plan.metadata), output_size=plan.output_size, apply_rgb_aug=plan.apply_rgb_aug, rgb_augmentation=plan.rgb_augmentation, apply_depth_aug=plan.apply_depth_aug, augmentation_seed=plan.augmentation_seed, depth_scale=plan.depth_scale, track_upscaling_factor=1.0 / plan.depth_scale, max_depth=plan.max_depth, depth_patch_operations=plan.depth_patch_operations, image_codec=plan.image_codec, depth_bytes=tuple(depth_sources), depth_sensor_widths=plan.depth_sensor_widths, depth_focal_lengths=plan.depth_focal_lengths)
+        metadata = dict(plan.metadata)
+        metadata["worker_prepare_seconds"] = time.perf_counter() - started
+        metadata["media_record_count"] = len(plan.media_record_indices)
+        metadata["encoded_bytes"] = sum(map(len, rgb_sources)) + sum(map(len, depth_sources))
+        sample = EncodedTapVid3DSample(jpeg_bytes=tuple(rgb_sources), depth=None, theta=torch.from_numpy(plan.theta), intrs=torch.from_numpy(plan.intrinsics), extrs=torch.from_numpy(plan.extrinsics), trajectory=torch.from_numpy(plan.trajectory), trajectory_3d=torch.from_numpy(plan.trajectory_3d), visibility=torch.from_numpy(plan.visibility), valid=torch.ones((24, plan.track_count), dtype=torch.float32), query_points_3d=torch.from_numpy(plan.query_points_3d), seq_name=plan.sequence, metadata=metadata, output_size=plan.output_size, apply_rgb_aug=plan.apply_rgb_aug, rgb_augmentation=plan.rgb_augmentation, apply_depth_aug=plan.apply_depth_aug, augmentation_seed=plan.augmentation_seed, depth_scale=plan.depth_scale, track_upscaling_factor=1.0 / plan.depth_scale, max_depth=plan.max_depth, depth_patch_operations=plan.depth_patch_operations, image_codec=plan.image_codec, depth_bytes=tuple(depth_sources), depth_sensor_widths=plan.depth_sensor_widths, depth_focal_lengths=plan.depth_focal_lengths)
         return sample, True
 
 
