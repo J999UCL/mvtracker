@@ -73,6 +73,7 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
 
     def test_main_launch_requires_explicit_confirmation(self):
         contract.require_main_confirmation("smoke", False)
+        contract.require_main_confirmation("memory_profile", False)
         contract.require_main_confirmation("main", True)
         with self.assertRaisesRegex(RuntimeError, "--confirm-main"):
             contract.require_main_confirmation("main", False)
