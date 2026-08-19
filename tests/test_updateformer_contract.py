@@ -20,6 +20,12 @@ class UpdateFormerContractTests(unittest.TestCase):
             tensor_record(original)["sha256"], tensor_record(changed)["sha256"]
         )
 
+    def test_tensor_record_hashes_scalar_loss(self):
+        record = tensor_record(torch.tensor(1.25))
+
+        self.assertEqual(record["shape"], [])
+        self.assertEqual(len(record["sha256"]), 64)
+
     def test_exact_mismatch_reports_nested_difference(self):
         expected = {"gradient": [{"sha256": "abc"}]}
         actual = {"gradient": [{"sha256": "abd"}]}

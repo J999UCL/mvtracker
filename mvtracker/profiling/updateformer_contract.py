@@ -51,7 +51,7 @@ def verifier_sha256() -> str:
 
 def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     value = tensor.detach().contiguous().cpu()
-    return value.view(torch.uint8).numpy().tobytes()
+    return value.reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
 def tensor_record(tensor: torch.Tensor) -> dict[str, object]:
