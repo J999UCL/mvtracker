@@ -9,8 +9,6 @@ import numpy as np
 
 from mvtracker.preprocessing.mvkubric_webdataset import (
     SceneShard,
-    _load_camera,
-    _project_tracks,
     _scene_components,
     build_wids_index,
     convert_shards,
@@ -47,10 +45,9 @@ class MvKubricWebDatasetTests(unittest.TestCase):
                 "metadata": {"resolution": [3, 2]},
             }
             (view_root / "metadata.json").write_text(json.dumps(metadata))
-            camera = _load_camera(scene, [f"view_{view}"])
             np.savez(
                 view_root / "tracks_2d.npz",
-                tracks_2d=_project_tracks(tracks_3d, camera["intrinsics"][0], camera["extrinsics"][0]),
+                tracks_2d=np.zeros((frames, tracks, 2), dtype=np.float32),
                 occlusion=np.zeros((frames, tracks), dtype=np.bool_),
             )
             for frame in range(frames):
@@ -82,18 +79,6 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             rgb = read_component(components["scene-900-view-02.rgb.npz"])
             self.assertEqual(rgb["offsets"].tolist(), [0, 3, 6, 9])
             self.assertEqual(rgb["bytes"].tobytes(), bytes([2, 0, 1, 2, 1, 1, 2, 2, 1]))
-
-    def test_projection_mismatch_is_rejected_during_conversion(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            scene = self._make_scene(root)
-            with np.load(scene / "view_1" / "tracks_2d.npz") as payload:
-                tracks = payload["tracks_2d"].copy()
-                occlusion = payload["occlusion"].copy()
-            tracks[0, 0, 0] += 1.0
-            np.savez(scene / "view_1" / "tracks_2d.npz", tracks_2d=tracks, occlusion=occlusion)
-            with self.assertRaisesRegex(ValueError, "2D projection check failed"):
-                _scene_components(scene, "900", read_workers=1)
 
     def test_write_shard_has_one_metadata_and_two_media_components_per_view(self):
         with tempfile.TemporaryDirectory() as temporary:

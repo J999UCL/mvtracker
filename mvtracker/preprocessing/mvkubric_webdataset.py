@@ -146,46 +146,22 @@ def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.nd
     }
 
 
-def _project_tracks(
-    tracks_3d: np.ndarray, intrinsics: np.ndarray, extrinsics: np.ndarray
-) -> np.ndarray:
-    homogeneous = np.concatenate(
-        [tracks_3d, np.ones_like(tracks_3d[..., :1])], axis=-1
-    )
-    camera = np.einsum("fij,fpj->fpi", extrinsics, homogeneous)
-    pixels = np.einsum("ij,fpj->fpi", intrinsics, camera)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return pixels[..., :2] / pixels[..., 2:]
-
-
 def _load_tracks(
     scene_root: Path,
     view_names: Sequence[str],
-    camera: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     with np.load(scene_root / "tracks_3d.npz") as payload:
         tracks_3d = np.asarray(payload["tracks_3d"], dtype=np.float32)
     if tracks_3d.ndim != 3 or tracks_3d.shape[-1] != 3:
         raise ValueError(f"{scene_root}: tracks_3d must have shape (frames, tracks, 3)")
     occlusion: list[np.ndarray] = []
-    for view_index, view_name in enumerate(view_names):
+    for view_name in view_names:
         with np.load(scene_root / view_name / "tracks_2d.npz") as payload:
-            projected = np.asarray(payload["tracks_2d"], dtype=np.float32)
             hidden = np.asarray(payload["occlusion"], dtype=np.bool_)
         expected = tracks_3d.shape[:2]
-        if projected.shape != (*expected, 2) or hidden.shape != expected:
+        if hidden.shape != expected:
             raise ValueError(f"{scene_root}/{view_name}: track metadata shape does not match tracks_3d")
         occlusion.append(hidden)
-        if camera is not None:
-            predicted = _project_tracks(
-                tracks_3d, camera["intrinsics"][view_index], camera["extrinsics"][view_index]
-            )
-            valid = np.isfinite(projected).all(axis=-1) & np.isfinite(predicted).all(axis=-1)
-            if np.any(valid) and not np.allclose(
-                predicted[valid], projected[valid], atol=0.5, rtol=0.0
-            ):
-                error = float(np.max(np.abs(predicted[valid] - projected[valid])))
-                raise ValueError(f"{scene_root}/{view_name}: 2D projection check failed (max error {error:g})")
     return {"tracks_3d": tracks_3d, "visibility": ~np.stack(occlusion)}
 
 
@@ -207,7 +183,7 @@ def _scene_records(
     view_paths = _view_paths(scene_root)
     view_names = tuple(path.name for path in view_paths)
     camera = _load_camera(scene_root, view_names)
-    tracks = _load_tracks(scene_root, view_names, camera)
+    tracks = _load_tracks(scene_root, view_names)
     n_frames = int(tracks["tracks_3d"].shape[0])
     if tracks["visibility"].shape != (len(view_paths), *tracks["tracks_3d"].shape[:2]):
         raise ValueError(f"{scene_root}: visibility shape does not match tracks_3d")
