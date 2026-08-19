@@ -69,6 +69,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
         "capacity-study",
         "cuda-graph-study",
         "partial-graph-study",
+        "forward-graph-study",
     }:
         raise ValueError(f"unsupported action: {action}")
     torch.set_float32_matmul_precision("high")
@@ -161,7 +162,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
             summary[f"cuda_graph/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
-    else:
+    elif action == "partial-graph-study":
         from mvtracker.profiling.updateformer_diagnostics import (
             benchmark_graphed_callables,
         )
@@ -174,6 +175,21 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
                 "scenes_per_second"
             ]
             summary[f"partial_graph/{name}/peak_allocated_gib"] = (
+                measurements["peak_allocated_bytes"] / 2**30
+            )
+    else:
+        from mvtracker.profiling.updateformer_diagnostics import (
+            benchmark_forward_graph_checkpoint,
+        )
+
+        verify_golden(CONTRACT_ROOT)
+        result = benchmark_forward_graph_checkpoint(CONTRACT_ROOT)
+        summary = {"contract/exact": 1}
+        for name, measurements in result["results"].items():
+            summary[f"forward_graph/{name}/scenes_per_second"] = measurements[
+                "scenes_per_second"
+            ]
+            summary[f"forward_graph/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
     output_root = RUN_ROOT / "performance-results" / _source_commit()
@@ -305,6 +321,11 @@ def cuda_graph_study() -> None:
 @app.local_entrypoint(name="partial-graph-study")
 def partial_graph_study() -> None:
     _launch("partial-graph-study")
+
+
+@app.local_entrypoint(name="forward-graph-study")
+def forward_graph_study() -> None:
+    _launch("forward-graph-study")
 
 
 @app.local_entrypoint(name="single-gpu-smoke")

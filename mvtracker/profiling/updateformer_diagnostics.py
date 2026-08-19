@@ -423,3 +423,153 @@ def benchmark_graphed_callables(root: Path, calls=12, warmup=3, measured=20):
         "measured": measured,
         "results": results,
     }
+
+
+class _ForwardGraphCheckpoint(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, engine, input_tensor, point_mask, *parameters):
+        ctx.engine = engine
+        ctx.parameters = parameters
+        ctx.save_for_backward(input_tensor, point_mask)
+        engine.static_input.copy_(input_tensor)
+        engine.static_mask.copy_(point_mask)
+        engine.graph.replay()
+        return engine.static_output.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_tensor, point_mask = ctx.saved_tensors
+        recompute_input = input_tensor.detach().requires_grad_(True)
+        with torch.enable_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+        ):
+            output = ctx.engine.model._forward_impl(recompute_input, point_mask)
+        gradients = torch.autograd.grad(
+            output,
+            (recompute_input, *ctx.parameters),
+            grad_output,
+        )
+        return (None, gradients[0], None, *gradients[1:])
+
+
+class _ForwardGraphEngine:
+    def __init__(self, model, sample_input, sample_mask):
+        self.model = model
+        self.static_input = torch.empty_like(sample_input)
+        self.static_mask = torch.empty_like(sample_mask)
+        self.static_input.copy_(sample_input)
+        self.static_mask.copy_(sample_mask)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream), torch.no_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+        ):
+            for _ in range(3):
+                model._forward_impl(self.static_input, self.static_mask)
+        torch.cuda.current_stream().wait_stream(stream)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.no_grad(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+        ):
+            self.static_output = model._forward_impl(
+                self.static_input, self.static_mask
+            )
+
+    def __call__(self, input_tensor, point_mask):
+        return _ForwardGraphCheckpoint.apply(
+            self,
+            input_tensor,
+            point_mask,
+            *tuple(self.model.parameters()),
+        )
+
+
+def benchmark_forward_graph_checkpoint(root: Path, calls=12, warmup=3, measured=20):
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    state = torch.load(
+        root / manifest["baseline_state"], map_location="cpu", weights_only=True
+    )
+    device = torch.device("cuda:0")
+    cases = (
+        Workload("batch_1_tracks_512", 1, 512, (512,), 7101),
+        Workload("batch_4_tracks_512", 4, 512, (512,) * 4, 7104),
+        Workload("batch_1_tracks_1536", 1, 1536, (1536,), 7201),
+    )
+    results = {}
+    for workload in cases:
+        value, target, weights, mask = _workload_tensors(workload, device)
+
+        def build_step(graphed):
+            model = _build_model(device)
+            model.load_state_dict(state, strict=True)
+            model.checkpoint_updateformer = True
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=5e-5, weight_decay=1e-5
+            )
+            engine = _ForwardGraphEngine(model, value, mask) if graphed else None
+
+            def step():
+                optimizer.zero_grad(set_to_none=True)
+                if value.grad is not None:
+                    value.grad = None
+                with torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+                ):
+                    outputs = [
+                        engine(value, mask)
+                        if engine is not None
+                        else model(value, point_mask=mask)
+                        for _ in range(calls)
+                    ]
+                    loss = torch.stack(
+                        [
+                            ((output.float() - target) * weights).square().mean()
+                            for output in outputs
+                        ]
+                    ).mean()
+                loss.backward()
+                optimizer.step()
+                return {
+                    "outputs": [output.detach().cpu() for output in outputs],
+                    "input_gradient": value.grad.detach().cpu(),
+                    "parameters": {
+                        name: parameter.detach().cpu()
+                        for name, parameter in model.named_parameters()
+                    },
+                }
+
+            return step
+
+        eager_step = build_step(False)
+        graphed_step = build_step(True)
+        mismatch = _close_mismatch(eager_step(), graphed_step())
+        if mismatch:
+            raise RuntimeError(
+                f"forward graph changed {workload.name}: {mismatch}"
+            )
+        for name, step in (("eager", eager_step), ("forward_graph", graphed_step)):
+            for _ in range(warmup):
+                step()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            durations = []
+            for _ in range(measured):
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                step()
+                torch.cuda.synchronize()
+                durations.append(time.perf_counter() - started)
+            median = statistics.median(durations)
+            results[f"{workload.name}/{name}"] = {
+                "median_seconds": median,
+                "scenes_per_second": workload.batch_size / median,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            }
+    return {
+        "calls": calls,
+        "warmup": warmup,
+        "measured": measured,
+        "results": results,
+    }
