@@ -548,22 +548,6 @@ def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=
             include_scene_ids=include_scene_ids,
             exclude_scene_ids=exclude_scene_ids,
         )
-        if getattr(dataset, "requires_dali_scene_stream", False):
-            from mvtracker.datasets.kubric_dali_dataset import DaliKubricSceneStream
-
-            settings = cfg.datasets.train.get("dali", {})
-            dataset.attach_scene_stream(
-                DaliKubricSceneStream(
-                    dataset.webdataset_root,
-                    split="train",
-                    shard_id=fabric.global_rank,
-                    num_shards=fabric.world_size,
-                    num_threads=int(settings.get("num_threads", 4)),
-                    prefetch_queue_depth=int(settings.get("prefetch_queue_depth", 2)),
-                    initial_fill=int(settings.get("initial_fill", 32)),
-                    random_shuffle=True,
-                )
-            )
         return dataset
     if dataset_name.startswith("pointodyssey-multiview-"):
         return PointOdysseyMultiViewDataset.from_name(

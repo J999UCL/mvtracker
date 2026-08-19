@@ -283,6 +283,9 @@ class SamplePlan:
     depth_sensor_widths: tuple[float, ...]
     depth_focal_lengths: tuple[float, ...]
     metadata: dict[str, Any]
+    # Indexed MV-Kubric media records selected by the live metadata planner.
+    # Other datasets leave this empty and continue using rgb_sources/depth_sources.
+    media_record_indices: tuple[int, ...] = ()
 
 
 @dataclass
