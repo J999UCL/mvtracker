@@ -5,6 +5,7 @@ defaults:
 
 datasets:
   train:
+    num_workers: 0
     physical_batching:
       enabled: false
   eval:
