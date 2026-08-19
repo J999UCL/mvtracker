@@ -147,6 +147,27 @@ modal run --detach --timestamps tools/modal_t4_loader_benchmark.py::profile \
   --run-name t4-loader-baseline
 ```
 
+## Full MV-Kubric scene/view WebDataset conversion
+
+This CPU-only Modal job processes the two pinned MV-Kubric archives one at a
+time. Each archive is copied to local SSD, decompressed with 16-way
+`rapidgzip`, converted into resumable indexed scene/view TAR shards, and
+removed from local SSD before the next archive starts. Progress heartbeats are
+emitted at least every 30 seconds and completed scene/shard events are flushed
+to stdout and W&B. The job uses one 16-CPU, 32-GiB container with a 1-TiB
+ephemeral disk; it does not request a GPU.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
+modal container list --json
+modal run --timestamps tools/modal_mvkubric_full_conversion.py
+```
+
+The function resumes completed TAR plus `.inventory.json` pairs, removes only
+orphan `.partial` files, and publishes train and validation outputs only after
+both splits are finalized.
+
 ## MV-Kubric WebDataset pilot conversion and T4 A/B
 
 The pilot converts exactly scenes `1001`--`1032` into four-scene uncompressed
