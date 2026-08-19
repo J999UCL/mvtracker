@@ -2,60 +2,58 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-import os
-from pathlib import Path
-import sys
+import time
 
 import torch
 import triton
 import triton.language as tl
 
 
-@lru_cache(maxsize=1)
 def _cuda_extension():
-    bundled_cuda = Path(sys.prefix) / "cuda-toolkit"
-    venv_bin = Path(sys.prefix) / "bin"
-    if "CUDA_HOME" not in os.environ and bundled_cuda.is_dir():
-        os.environ["CUDA_HOME"] = str(bundled_cuda)
-    if (venv_bin / "ninja").is_file():
-        os.environ["PATH"] = f"{venv_bin}:{os.environ['PATH']}"
-    toolchain_bin = bundled_cuda / "bin"
-    bundled_gcc = toolchain_bin / "x86_64-conda-linux-gnu-gcc"
-    bundled_gxx = toolchain_bin / "x86_64-conda-linux-gnu-g++"
-    capability = torch.cuda.get_device_capability()
-    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{capability[0]}.{capability[1]}")
-    from torch.utils import cpp_extension
-
-    if cpp_extension.CUDA_HOME is None and bundled_cuda.is_dir():
-        cpp_extension.CUDA_HOME = str(bundled_cuda)
-
-    source_dir = Path(__file__).resolve().parent
-    python_include = bundled_cuda / "include" / (
-        f"python{sys.version_info.major}.{sys.version_info.minor}"
-    )
-    include_flag = f"-I{python_include}"
-    previous_compilers = {key: os.environ.get(key) for key in ("CC", "CXX")}
-    if bundled_gcc.is_file() and bundled_gxx.is_file():
-        os.environ["CC"] = str(bundled_gcc)
-        os.environ["CXX"] = str(bundled_gxx)
-    try:
-        return cpp_extension.load(
-            name="mvtracker_indexed_correlation_cuda",
-            sources=[
-                str(source_dir / "indexed_correlation_cuda.cpp"),
-                str(source_dir / "indexed_correlation_cuda.cu"),
-            ],
-            extra_cflags=["-O3", include_flag],
-            extra_cuda_cflags=["-O3", include_flag],
-            verbose=False,
+    if _CUDA_EXTENSION is None:
+        raise RuntimeError(
+            "The indexed-correlation CUDA extension is not installed. "
+            "Build the MVTracker image before running CUDA training."
         )
-    finally:
-        for key, value in previous_compilers.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    return _CUDA_EXTENSION
+
+
+try:
+    # The Modal image builds this extension before training starts. Keeping the
+    # import optional preserves the CPU reference path for local tests while a
+    # CUDA call fails clearly when an image was built without the extension.
+    from . import mvtracker_indexed_correlation_cuda as _CUDA_EXTENSION
+except ImportError:
+    _CUDA_EXTENSION = None
+
+
+def warmup_indexed_correlation(device: torch.device | str = "cuda") -> float:
+    """Compile and exercise the production forward/backward path once.
+
+    This is deliberately called during startup, before training timings begin.
+    It warms Inductor, Triton and the prebuilt source-gradient extension without
+    touching model parameters or optimizer state.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("indexed-correlation warmup requires a CUDA device")
+    _cuda_extension()
+    started = time.perf_counter()
+    targets = torch.randn(
+        1, 32, 128, device=device, dtype=torch.bfloat16, requires_grad=True
+    )
+    source_features = torch.randn(
+        1, 128, 128, device=device, dtype=torch.bfloat16, requires_grad=True
+    )
+    neighbor_indices = torch.randint(
+        128, (1, 32, 16), device=device, dtype=torch.int32
+    )
+    output = indexed_grouped_correlation(
+        targets, source_features, neighbor_indices, groups=1
+    )
+    output.square().mean().backward()
+    torch.cuda.synchronize(device)
+    return time.perf_counter() - started
 
 
 def _compiled_forward_expression(

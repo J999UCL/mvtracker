@@ -844,6 +844,17 @@ def _project_prediction_batch(pred_trajectories, intrs, extrs):
     return torch.stack(predictions, dim=0)
 
 
+def _assert_real_tracks_visible(
+    visible_any_view: torch.Tensor,
+    track_padding_mask: torch.Tensor | None = None,
+) -> None:
+    """Check visibility only for real tracks, ignoring padded batch slots."""
+    visible = visible_any_view.any(dim=1)
+    if track_padding_mask is not None:
+        visible = visible | track_padding_mask.bool()
+    assert visible.all(), "All real points should be visible in at least one frame."
+
+
 def forward_batch_multi_view(
         batch,
         model,
@@ -891,7 +902,7 @@ def forward_batch_multi_view(
 
     gt_visibilities_any_view = gt_visibilities_per_view.any(dim=1)
     if save_debug_logs:
-        assert gt_visibilities_any_view.any(dim=1).all(), "All points should be visible at in least one frame."
+        _assert_real_tracks_visible(gt_visibilities_any_view, track_padding_mask)
 
     frame_indices = torch.arange(num_frames, device=query_points_3d.device)[None, :, None]
     query_frames = query_points_3d[:, :, 0].long()[:, None, :]
@@ -1837,6 +1848,26 @@ def main(cfg: DictConfig):
             )
         else:
             fabric.load_raw(restore_ckpt_path, model)
+
+    # Compile the indexed-correlation forward, Triton target backward and
+    # prebuilt CUDA source backward before training timings begin. Every DDP
+    # rank warms its own CUDA context; the barrier keeps the first measured
+    # step from waiting on a slower rank's compilation.
+    from mvtracker.models.core.mvtracker.indexed_correlation import (
+        warmup_indexed_correlation,
+    )
+    indexed_correlation_warmup_seconds = warmup_indexed_correlation(fabric.device)
+    logging.info(
+        "Indexed-correlation startup warmup completed in %.3fs (rank=%d)",
+        indexed_correlation_warmup_seconds,
+        fabric.global_rank,
+    )
+    fabric.barrier()
+    if wandb_run_id is not None and fabric.global_rank == 0:
+        wandb.log(
+            {"startup/indexed_correlation_warmup_seconds": indexed_correlation_warmup_seconds},
+            step=total_steps,
+        )
 
     tb_writer = (
         SummaryWriter(log_dir=os.path.join(cfg.experiment_path, "runs"), flush_secs=10)

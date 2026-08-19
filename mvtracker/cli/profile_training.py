@@ -346,6 +346,11 @@ def run(arguments) -> dict:
     model, optimizer = fabric.setup(model, optimizer)
     fabric.load_raw(str(arguments.checkpoint), model)
     model.train()
+    from mvtracker.models.core.mvtracker.indexed_correlation import (
+        warmup_indexed_correlation,
+    )
+    warmup_seconds = warmup_indexed_correlation(fabric.device)
+    print(f"indexed_correlation_warmup_seconds={warmup_seconds:.3f}")
     if arguments.batch_cache is None:
         loader = _build_loader(cfg, fabric, arguments)
         iterator = iter(loader)
@@ -403,11 +408,12 @@ def run(arguments) -> dict:
         "updates": measured,
         "scenes_per_second": scenes_per_second,
         "trajectories_per_second": scenes_per_second * arguments.trajectories,
+        "indexed_correlation_warmup_seconds": warmup_seconds,
         "resolved_config": OmegaConf.to_container(cfg, resolve=True),
     }
 
 
-def compatibility_check(gpu_lane: str | None = None) -> dict[str, str | bool]:
+def compatibility_check(gpu_lane: str | None = None) -> dict[str, str | bool | float]:
     """Import every required compiled backend on exactly one visible GPU."""
     if torch.cuda.device_count() != 1:
         raise RuntimeError("compatibility check requires exactly one visible GPU")
@@ -421,6 +427,7 @@ def compatibility_check(gpu_lane: str | None = None) -> dict[str, str | bool]:
     import spconv
 
     from mvtracker.models.core.mvtracker import indexed_correlation
+    warmup_seconds = indexed_correlation.warmup_indexed_correlation()
 
     return {
         "gpu": actual_name,
@@ -429,6 +436,7 @@ def compatibility_check(gpu_lane: str | None = None) -> dict[str, str | bool]:
         "pointops": getattr(pointops, "__version__", "installed"),
         "spconv": getattr(spconv, "__version__", "installed"),
         "indexed_correlation_source": str(indexed_correlation.__file__),
+        "indexed_correlation_warmup_seconds": warmup_seconds,
     }
 
 

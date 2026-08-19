@@ -79,8 +79,8 @@ def _dependency_image() -> modal.Image:
                 "CC": "gcc",
                 "CXX": "g++",
                 "CUDA_HOME": "/usr/local/cuda",
-                "TORCH_CUDA_ARCH_LIST": "9.0;10.0",
-                "CUMM_CUDA_ARCH_LIST": "9.0;10.0",
+                "TORCH_CUDA_ARCH_LIST": "8.6;9.0;10.0",
+                "CUMM_CUDA_ARCH_LIST": "8.6;9.0;10.0",
                 "MAX_JOBS": "8",
             },
         )
@@ -99,13 +99,23 @@ def _source_image(base: modal.Image) -> modal.Image:
     return (
         base
         .run_commands(clone)
+        .run_commands(
+            "python /opt/mvtracker/tools/build_indexed_correlation_extension.py",
+            env={
+                "CC": "gcc",
+                "CXX": "g++",
+                "CUDA_HOME": "/usr/local/cuda",
+                "TORCH_CUDA_ARCH_LIST": "8.6;9.0;10.0",
+                "MAX_JOBS": "8",
+            },
+        )
         .env(
             {
                 "CUDA_HOME": "/usr/local/cuda",
                 "MVTRACKER_MODAL_COMMIT": commit,
                 "PYTHONPATH": f"{SOURCE_ROOT}:{SOURCE_ROOT / 'tools'}",
-                "TORCH_CUDA_ARCH_LIST": "9.0;10.0",
-                "CUMM_CUDA_ARCH_LIST": "9.0;10.0",
+                "TORCH_CUDA_ARCH_LIST": "8.6;9.0;10.0",
+                "CUMM_CUDA_ARCH_LIST": "8.6;9.0;10.0",
                 "TORCH_EXTENSIONS_DIR": "/tmp/torch-extensions",
                 "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor",
             }
