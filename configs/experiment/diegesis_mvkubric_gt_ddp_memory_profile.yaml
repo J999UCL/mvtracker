@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+  - diegesis_mvkubric_gt_ddp
+  - _self_
+
+datasets:
+  eval:
+    names: []
+
+trainer:
+  num_steps: 2
+  eval_freq: 10000
+  viz_freq: 10000
+  save_ckpt_freq: 2
+  gradient_diagnostics: false
+  expensive_diagnostics_enabled: false
+  hardware_metrics_interval: 1
+  profiler:
+    enabled: true
+    start_step: 1
+    wait: 0
+    warmup: 1
+    active: 1
+    repeat: 1
+    record_shapes: true
+    profile_memory: true
+    with_stack: true
+    with_flops: true
+  memory_profile:
+    enabled: true
+    start_step: 1
+
+modes:
+  validate_at_start: false
+
+logging:
+  tags:
+    - diegesis-mvkubric-50-50
+    - gt-depth
+    - ddp2-h100
+    - memory-profile

@@ -11,10 +11,13 @@ from lightning.fabric.wrappers import _unwrap_objects
 from mvtracker.datasets.generic_scene_dataset import GenericSceneDataset
 
 from torch.utils.tensorboard import SummaryWriter
+import contextlib
+import dataclasses
 import gpustat
 import json
 import statistics
 import threading
+import traceback
 import warnings
 from pathlib import Path
 
@@ -280,10 +283,38 @@ def _create_torch_profiler(cfg, experiment_path, global_rank):
 
     def trace_ready(profiler):
         tensorboard_trace_handler(profiler)
+        averages = profiler.key_averages()
         sort_key = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
-        summary = profiler.key_averages().table(sort_by=sort_key, row_limit=100)
+        summary = averages.table(sort_by=sort_key, row_limit=100)
         summary_path = trace_dir / f"summary_step_{profiler.step_num:06d}.txt"
         summary_path.write_text(summary + "\n", encoding="utf-8")
+        flops = {
+            "profile_step": int(profiler.step_num),
+            "supported_operator_flops": int(
+                sum(int(event.flops or 0) for event in averages)
+            ),
+            "summed_self_cuda_time_us": float(
+                sum(float(event.self_cuda_time_total) for event in averages)
+            ),
+        }
+        (trace_dir / f"flops_step_{profiler.step_num:06d}.json").write_text(
+            json.dumps(flops, indent=2) + "\n", encoding="utf-8"
+        )
+        if torch.cuda.is_available() and bool(profiler_cfg.get("profile_memory", True)):
+            memory_summary = averages.table(
+                sort_by="self_cuda_memory_usage", row_limit=200
+            )
+            (trace_dir / f"memory_summary_step_{profiler.step_num:06d}.txt").write_text(
+                memory_summary + "\n", encoding="utf-8"
+            )
+            profiler.export_memory_timeline(
+                str(trace_dir / f"memory_timeline_step_{profiler.step_num:06d}.html"),
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            profiler.export_memory_timeline(
+                str(trace_dir / f"memory_timeline_step_{profiler.step_num:06d}.raw.json.gz"),
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
         logging.info("Wrote torch.profiler trace and summary to %s", trace_dir)
 
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -303,6 +334,224 @@ def _create_torch_profiler(cfg, experiment_path, global_rank):
         with_stack=bool(profiler_cfg.get("with_stack", False)),
         with_flops=bool(profiler_cfg.get("with_flops", True)),
     )
+
+
+def _cuda_storage_bytes(value) -> int:
+    seen = set()
+
+    def visit(item):
+        if isinstance(item, torch.Tensor):
+            if item.device.type != "cuda" or item.numel() == 0:
+                return 0
+            storage = item.untyped_storage()
+            key = (item.device.index, storage._cdata)
+            if key in seen:
+                return 0
+            seen.add(key)
+            return int(storage.nbytes())
+        if dataclasses.is_dataclass(item):
+            return sum(visit(getattr(item, field.name)) for field in dataclasses.fields(item))
+        if isinstance(item, dict):
+            return sum(visit(entry) for entry in item.values())
+        if isinstance(item, (list, tuple, set)):
+            return sum(visit(entry) for entry in item)
+        return 0
+
+    return visit(value)
+
+
+class _CudaMemoryRecorder:
+    def __init__(self, cfg, experiment_path, global_rank, model, optimizer):
+        profile_cfg = cfg.trainer.get("memory_profile", {})
+        self.enabled = bool(profile_cfg.get("enabled", False))
+        self.start_step = int(profile_cfg.get("start_step", 1))
+        self.output_dir = Path(experiment_path) / "memory_profile" / f"rank_{global_rank}"
+        self.global_rank = int(global_rank)
+        self.model = model
+        self.optimizer = optimizer
+        self.records = []
+        self.groups = []
+        self.current_group = None
+        self.history_started = False
+        self.saved_refs = {}
+        self.saved_live_bytes = 0
+        self.saved_peak_bytes = 0
+        self.saved_unique_bytes = 0
+        self.saved_reference_bytes = 0
+        self.saved_sites = {}
+        self.saved_shapes = {}
+
+    def active(self, completed_steps) -> bool:
+        return self.enabled and int(completed_steps) == self.start_step
+
+    def begin_group(self, completed_steps, group_index, batch, loader_wait_seconds):
+        if not self.active(completed_steps):
+            self.current_group = None
+            return
+        if not self.history_started:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            torch.cuda.memory._record_memory_history(max_entries=100000)
+            self.history_started = True
+        self.current_group = {
+            "optimizer_step": int(completed_steps),
+            "group_index": int(group_index),
+            "scenes": list(batch.seq_name),
+            "batch_size": int(batch.video.shape[0]),
+            "views": int(batch.video.shape[1]),
+            "frames": int(batch.video.shape[2]),
+            "padded_trajectories": int(batch.trajectory.shape[-2]),
+            "real_trajectories": [
+                int((~mask.bool()).sum().item()) for mask in batch.track_padding_mask
+            ],
+            "loader_wait_seconds": float(loader_wait_seconds),
+            "host_to_device_seconds": None,
+            "forward_seconds": None,
+            "backward_seconds": None,
+            "optimizer_seconds": None,
+        }
+        self.group_started_at = time.perf_counter()
+        self.saved_refs = {}
+        self.saved_live_bytes = 0
+        self.saved_peak_bytes = 0
+        self.saved_unique_bytes = 0
+        self.saved_reference_bytes = 0
+        self.saved_sites = {}
+        self.saved_shapes = {}
+        torch.cuda.reset_peak_memory_stats()
+
+    def _saved_callsite(self):
+        for frame in reversed(traceback.extract_stack(limit=32)):
+            if "/mvtracker/" in frame.filename and not frame.filename.endswith("cli/train.py"):
+                return f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        return "unknown"
+
+    def _pack_saved_tensor(self, tensor):
+        if tensor.device.type != "cuda" or tensor.numel() == 0:
+            return tensor
+        storage = tensor.untyped_storage()
+        key = (tensor.device.index, storage._cdata)
+        size = int(storage.nbytes())
+        entry = self.saved_refs.get(key)
+        if entry is None:
+            site = self._saved_callsite()
+            self.saved_refs[key] = [1, size]
+            self.saved_live_bytes += size
+            self.saved_unique_bytes += size
+            self.saved_sites[site] = self.saved_sites.get(site, 0) + size
+        else:
+            entry[0] += 1
+        self.saved_reference_bytes += int(tensor.numel() * tensor.element_size())
+        shape_key = f"{str(tensor.dtype).removeprefix('torch.')}:{tuple(tensor.shape)}"
+        self.saved_shapes[shape_key] = self.saved_shapes.get(shape_key, 0) + int(
+            tensor.numel() * tensor.element_size()
+        )
+        self.saved_peak_bytes = max(self.saved_peak_bytes, self.saved_live_bytes)
+        return tensor
+
+    def _unpack_saved_tensor(self, tensor):
+        if tensor.device.type != "cuda" or tensor.numel() == 0:
+            return tensor
+        storage = tensor.untyped_storage()
+        key = (tensor.device.index, storage._cdata)
+        entry = self.saved_refs[key]
+        entry[0] -= 1
+        if entry[0] == 0:
+            self.saved_live_bytes -= entry[1]
+            del self.saved_refs[key]
+        return tensor
+
+    def saved_tensors(self):
+        if self.current_group is None:
+            return contextlib.nullcontext()
+        return torch.autograd.graph.saved_tensors_hooks(
+            self._pack_saved_tensor, self._unpack_saved_tensor
+        )
+
+    def capture(self, stage, batch=None):
+        if self.current_group is None:
+            return
+        torch.cuda.synchronize()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        parameter_bytes = _cuda_storage_bytes(tuple(self.model.parameters()))
+        gradient_bytes = _cuda_storage_bytes(
+            tuple(parameter.grad for parameter in self.model.parameters())
+        )
+        optimizer_bytes = _cuda_storage_bytes(self.optimizer.state)
+        batch_bytes = _cuda_storage_bytes(batch) if batch is not None else 0
+        allocated_bytes = int(torch.cuda.memory_allocated())
+        reserved_bytes = int(torch.cuda.memory_reserved())
+        known_bytes = parameter_bytes + gradient_bytes + optimizer_bytes + batch_bytes
+        record = {
+            **self.current_group,
+            "stage": str(stage),
+            "seconds_since_group_start": time.perf_counter() - self.group_started_at,
+            "allocated_bytes": allocated_bytes,
+            "reserved_bytes": reserved_bytes,
+            "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            "device_used_bytes": int(total_bytes - free_bytes),
+            "parameter_bytes": parameter_bytes,
+            "gradient_bytes": gradient_bytes,
+            "optimizer_state_bytes": optimizer_bytes,
+            "batch_bytes": batch_bytes,
+            "unattributed_allocated_bytes": max(0, allocated_bytes - known_bytes),
+            "allocator_cache_bytes": max(0, reserved_bytes - allocated_bytes),
+            "non_pytorch_estimate_bytes": max(0, int(total_bytes - free_bytes) - reserved_bytes),
+            "saved_tensor_live_bytes": self.saved_live_bytes,
+            "saved_tensor_peak_bytes": self.saved_peak_bytes,
+        }
+        self.records.append(record)
+        logging.info("MEMORY_PROFILE %s", json.dumps(record, sort_keys=True))
+
+    def set_host_to_device_seconds(self, seconds):
+        if self.current_group is not None:
+            self.current_group["host_to_device_seconds"] = float(seconds)
+
+    def end_group(self, forward_seconds, backward_seconds, optimizer_seconds=None):
+        if self.current_group is None:
+            return
+        self.current_group["forward_seconds"] = float(forward_seconds)
+        self.current_group["backward_seconds"] = float(backward_seconds)
+        if optimizer_seconds is not None:
+            self.current_group["optimizer_seconds"] = float(optimizer_seconds)
+        self.current_group["group_total_seconds"] = (
+            time.perf_counter() - self.group_started_at
+        )
+        self.groups.append(
+            {
+                **self.current_group,
+                "saved_tensor_peak_bytes": self.saved_peak_bytes,
+                "saved_tensor_unique_bytes": self.saved_unique_bytes,
+                "saved_tensor_reference_bytes": self.saved_reference_bytes,
+                "saved_tensor_live_after_backward_bytes": self.saved_live_bytes,
+                "top_saved_sites": sorted(
+                    self.saved_sites.items(), key=lambda item: item[1], reverse=True
+                )[:50],
+                "top_saved_shapes": sorted(
+                    self.saved_shapes.items(), key=lambda item: item[1], reverse=True
+                )[:50],
+            }
+        )
+        self.current_group = None
+
+    def finish(self):
+        if not self.history_started:
+            return
+        torch.cuda.synchronize()
+        torch.cuda.memory._dump_snapshot(
+            str(self.output_dir / "allocator_snapshot.pickle")
+        )
+        torch.cuda.memory._record_memory_history(enabled=None)
+        payload = {
+            "rank": self.global_rank,
+            "start_step": self.start_step,
+            "records": self.records,
+            "groups": self.groups,
+        }
+        (self.output_dir / "memory_accounting.json").write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+        self.history_started = False
 
 
 def fetch_optimizer(trainer_cfg, model):
@@ -1152,65 +1401,69 @@ def _forward_backward_microbatch(
     is_final_microbatch,
     run_expensive_diagnostics,
     gradient_diagnostics,
+    memory_recorder,
 ):
     """Run one microbatch, suppressing DDP synchronization until the last one."""
-    with fabric.no_backward_sync(model, enabled=not is_final_microbatch):
-        forward_started_at = time.time()
-        with torch.profiler.record_function("train/model_and_loss_forward"):
-            output = forward_batch_multi_view(
-                batch=batch,
-                model=model,
-                cfg=cfg,
-                step=completed_steps,
-                train_iters=train_iters,
-                gamma=cfg.trainer.gamma,
-                save_debug_logs=(
-                    is_final_microbatch
-                    and (
-                        completed_steps % cfg.trainer.viz_freq
-                        == cfg.trainer.viz_freq - 1
-                        or completed_steps in (0, 10, 100, cfg.trainer.num_steps - 1)
-                    )
-                ),
-                debug_logs_path=os.path.join(
-                    cfg.experiment_path,
-                    "forward_pass__train_step-"
-                    f"{completed_steps}_global_rank-{fabric.global_rank}",
-                ),
-                run_expensive_diagnostics=run_expensive_diagnostics,
-            )
+    with memory_recorder.saved_tensors():
+        with fabric.no_backward_sync(model, enabled=not is_final_microbatch):
+            forward_started_at = time.time()
+            with torch.profiler.record_function("train/model_and_loss_forward"):
+                output = forward_batch_multi_view(
+                    batch=batch,
+                    model=model,
+                    cfg=cfg,
+                    step=completed_steps,
+                    train_iters=train_iters,
+                    gamma=cfg.trainer.gamma,
+                    save_debug_logs=(
+                        is_final_microbatch
+                        and (
+                            completed_steps % cfg.trainer.viz_freq
+                            == cfg.trainer.viz_freq - 1
+                            or completed_steps in (0, 10, 100, cfg.trainer.num_steps - 1)
+                        )
+                    ),
+                    debug_logs_path=os.path.join(
+                        cfg.experiment_path,
+                        "forward_pass__train_step-"
+                        f"{completed_steps}_global_rank-{fabric.global_rank}",
+                    ),
+                    run_expensive_diagnostics=run_expensive_diagnostics,
+                )
 
-        loss = torch.zeros((), device=fabric.device)
-        component_losses = {}
-        metrics = {}
-        scene_losses = None
-        for name, value in output.items():
-            if name == "metrics":
-                metrics.update({key: float(item) for key, item in value.items()})
-            elif name == "scene_losses":
-                scene_losses = value
-            elif "loss" in value:
-                loss = loss + value["loss"]
-                component_losses[name] = value["loss"].detach()
-            else:
-                raise ValueError(f"Unknown key {name} in output")
-        forward_duration = time.time() - forward_started_at
+            loss = torch.zeros((), device=fabric.device)
+            component_losses = {}
+            metrics = {}
+            scene_losses = None
+            for name, value in output.items():
+                if name == "metrics":
+                    metrics.update({key: float(item) for key, item in value.items()})
+                elif name == "scene_losses":
+                    scene_losses = value
+                elif "loss" in value:
+                    loss = loss + value["loss"]
+                    component_losses[name] = value["loss"].detach()
+                else:
+                    raise ValueError(f"Unknown key {name} in output")
+            forward_duration = time.time() - forward_started_at
+            memory_recorder.capture("after_forward", batch=batch)
 
-        if run_expensive_diagnostics:
-            gradient_diagnostics.begin()
-        backward_started_at = time.time()
-        with torch.profiler.record_function("train/backward"):
-            fabric.backward(
-                _scale_microbatch_loss(loss, gradient_accumulation_steps)
+            if run_expensive_diagnostics:
+                gradient_diagnostics.begin()
+            backward_started_at = time.time()
+            with torch.profiler.record_function("train/backward"):
+                fabric.backward(
+                    _scale_microbatch_loss(loss, gradient_accumulation_steps)
+                )
+            microbatch_gradient = (
+                gradient_diagnostics.finish(
+                    unscale_factor=gradient_accumulation_steps,
+                )
+                if run_expensive_diagnostics
+                else None
             )
-        microbatch_gradient = (
-            gradient_diagnostics.finish(
-                unscale_factor=gradient_accumulation_steps,
-            )
-            if run_expensive_diagnostics
-            else None
-        )
-        backward_duration = time.time() - backward_started_at
+            backward_duration = time.time() - backward_started_at
+            memory_recorder.capture("after_backward", batch=batch)
 
     return (
         output,
@@ -1918,14 +2171,22 @@ def main(cfg: DictConfig):
             ),
         )
 
-    torch_profiler = _create_torch_profiler(
-        cfg,
-        cfg.experiment_path,
-        fabric.global_rank,
+    profiler_start_step = int(
+        cfg.trainer.get("profiler", {}).get("start_step", 0)
     )
+    torch_profiler = None
+    if total_steps >= profiler_start_step:
+        torch_profiler = _create_torch_profiler(
+            cfg,
+            cfg.experiment_path,
+            fabric.global_rank,
+        )
     if torch_profiler is not None:
         logging.info("Starting torch.profiler for successful training microbatches")
         torch_profiler.start()
+    memory_recorder = _CudaMemoryRecorder(
+        cfg, cfg.experiment_path, fabric.global_rank, model, optimizer
+    )
 
     total_durations = deque()
     dataloader_durations = deque()
@@ -2193,8 +2454,31 @@ def main(cfg: DictConfig):
 
             batch_scene_count = int(batch.video.shape[0])
             i_batch += batch_scene_count if planned_physical_batching else 1
+            if torch_profiler is None and total_steps >= profiler_start_step:
+                torch_profiler = _create_torch_profiler(
+                    cfg,
+                    cfg.experiment_path,
+                    fabric.global_rank,
+                )
+                if torch_profiler is not None:
+                    logging.info(
+                        "Starting torch.profiler at optimizer step %d",
+                        total_steps,
+                    )
+                    torch_profiler.start()
+            host_to_device_started_at = time.time()
+            memory_recorder.begin_group(
+                total_steps,
+                microbatches_accumulated,
+                batch,
+                host_to_device_started_at - start_time_1,
+            )
             with torch.profiler.record_function("train/host_to_device"):
                 dataclass_to_cuda_(batch)
+            memory_recorder.set_host_to_device_seconds(
+                time.time() - host_to_device_started_at
+            )
+            memory_recorder.capture("after_batch_to_cuda", batch=batch)
             assert model.training
 
             start_time_2 = time.time()
@@ -2248,7 +2532,8 @@ def main(cfg: DictConfig):
             # once, on its final group; the collective is matched by order,
             # while no_backward_sync suppresses all earlier groups.
             run_expensive_diagnostics = (
-                total_steps % expensive_diagnostics_interval == 0
+                bool(cfg.trainer.get("expensive_diagnostics_enabled", True))
+                and total_steps % expensive_diagnostics_interval == 0
             )
 
             try:
@@ -2274,7 +2559,12 @@ def main(cfg: DictConfig):
                     is_final_microbatch=is_final_microbatch,
                     run_expensive_diagnostics=run_expensive_diagnostics,
                     gradient_diagnostics=gradient_diagnostics,
+                    memory_recorder=memory_recorder,
                 )
+                if not is_final_microbatch:
+                    memory_recorder.end_group(
+                        forward_duration, backward_duration
+                    )
             except Exception as e:
                 logging.critical(f"Forward pass crashed at step {total_steps}: {e}")
 
@@ -2501,9 +2791,18 @@ def main(cfg: DictConfig):
                     )
                 optimizer.step()
                 scheduler.step()
-            accumulated_bwd_duration += time.time() - optimizer_update_started_at
+            optimizer_duration = time.time() - optimizer_update_started_at
+            accumulated_bwd_duration += optimizer_duration
+            memory_recorder.capture("after_optimizer", batch=batch)
+            memory_recorder.end_group(
+                forward_duration,
+                backward_duration,
+                optimizer_seconds=optimizer_duration,
+            )
             training_step_duration = time.time() - accumulation_started_at
             total_steps += 1
+            if total_steps > memory_recorder.start_step:
+                memory_recorder.finish()
             if planned_physical_batching:
                 source_cursors = dict(physical_step.end_cursors)
             hardware_metrics = {}

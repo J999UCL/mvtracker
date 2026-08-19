@@ -96,6 +96,12 @@ modal run --timestamps tools/modal_continual_training.py::smoke
 modal container list --json
 modal run --timestamps tools/modal_continual_training.py::smoke10
 
+# Two-update, two-H100 memory attribution profile. Update 0 warms the live
+# WIDS/DALI physical-batching path; update 1 records both ranks under
+# memory_profile/ and profiler/ in the run directory.
+modal container list --json
+modal run --timestamps tools/modal_continual_training.py::memory-profile
+
 # Reproduce a loader A/B with an identical seed; eager materialization is an
 # explicit benchmark mode and is not the production default.
 modal run --timestamps tools/modal_continual_training.py::smoke10 --run-name <unique-name> --seed <fixed-seed> --materialize-whole-step true

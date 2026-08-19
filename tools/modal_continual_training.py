@@ -67,6 +67,13 @@ EXPERIMENT_PHASES = {
             "target_completed_steps": 10,
         },
     ),
+    "memory_profile": (
+        {
+            "name": "memory_profile",
+            "config": "diegesis_mvkubric_gt_ddp_memory_profile",
+            "target_completed_steps": 2,
+        },
+    ),
     "main": (
         {
             "name": "main",
@@ -254,6 +261,7 @@ def train_remote(
     data_inventory = json.loads(
         (Path(DATA_VOLUME_ROOT) / "direct-volume-data-manifest.json").read_text()
     )
+    modal_tags = PROFILE_TAGS if mode == "memory_profile" else MODAL_TAGS
     manifest = {
         "mode": mode,
         "run_name": run_name,
@@ -274,7 +282,7 @@ def train_remote(
         "wandb_group": WANDB_GROUP,
         "wandb_run_id": wandb_run_id,
         "materialize_whole_step": materialize_whole_step,
-        "modal_tags": MODAL_TAGS,
+        "modal_tags": modal_tags,
     }
     if manifest_path.is_file():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -385,6 +393,22 @@ def smoke10(
         json.dumps(
             train_remote.remote(
                 "smoke10", selected, "", materialize_whole_step, seed
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint(name="memory-profile")
+def memory_profile(run_name: str = "", seed: int = 0) -> None:
+    selected = _prepare_launch("memory_profile", run_name, confirm_main=False)
+    app.set_tags(
+        {**PROFILE_TAGS, "experiment": selected, "gpu": "h100x2"}
+    )
+    print(
+        json.dumps(
+            train_remote.remote(
+                "memory_profile", selected, "", False, seed
             ),
             indent=2,
         )
