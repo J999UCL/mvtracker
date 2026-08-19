@@ -105,10 +105,7 @@ class MixedTrainingIntegrationTests(unittest.TestCase):
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         mvkubric = config["datasets"]["train"]["sources"]["mvkubric"]
         self.assertNotIn("include_scene_ids", mvkubric)
-        self.assertEqual(
-            mvkubric["exclude_scene_ids"],
-            [str(scene) for scene in range(101, 128)],
-        )
+        self.assertNotIn("exclude_scene_ids", mvkubric)
 
     def test_mvkubric_validation_schedule_keeps_datasets_separate(self):
         config_path = Path(__file__).resolve().parents[1] / (
