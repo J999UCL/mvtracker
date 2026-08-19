@@ -34,6 +34,7 @@ class DaliDecoderContractTests(unittest.TestCase):
         self.assertIn('output_type=types.ANY_DATA', source)
         self.assertIn('dtype=types.FLOAT', source)
         self.assertIn('exec_dynamic=False', source)
+        self.assertIn('exec_pipelined=False', source)
         self.assertIn('max_encoded_images: int = 288', source)
         self.assertIn('batch_size=max_encoded_images', source)
 

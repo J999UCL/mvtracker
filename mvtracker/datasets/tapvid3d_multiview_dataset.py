@@ -359,7 +359,7 @@ class DaliEncodedImageDecoder:
                     num_threads=num_threads,
                     device_id=device_id,
                     seed=0,
-                    exec_pipelined=True,
+                    exec_pipelined=False,
                     # DALI 1.53 documents corruption for parallel external
                     # sources with the dynamic executor. The decoder output
                     # is variable-batch, so use the safe static executor.
