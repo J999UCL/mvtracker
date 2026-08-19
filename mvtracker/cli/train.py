@@ -3020,7 +3020,7 @@ def main(cfg: DictConfig):
         mixed_schedule.state_dict() if mixed_training else None,
         source_cursors,
     )
-    if last_eval_step != total_steps:
+    if eval_dataloaders and last_eval_step != total_steps:
         _run_rank_zero_eval(
             fabric,
             cfg,
