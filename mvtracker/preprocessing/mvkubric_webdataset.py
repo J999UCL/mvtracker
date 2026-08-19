@@ -21,11 +21,12 @@ from typing import Iterable, Sequence
 import numpy as np
 
 
+WEB_DATASET_FORMAT = "mvtracker-kubric-webdataset"
 FORMAT_VERSION = 1
 SCENES_PER_SHARD = 4
-META_COMPONENT = "meta"
-RGB_COMPONENTS = tuple(f"rgb{view}" for view in range(6))
-DEPTH_COMPONENTS = tuple(f"depth{view}" for view in range(6))
+META_COMPONENT = "meta.npz"
+RGB_COMPONENTS = tuple(f"rgb{view}.npz" for view in range(6))
+DEPTH_COMPONENTS = tuple(f"depth{view}.npz" for view in range(6))
 COMPONENTS = (META_COMPONENT, *RGB_COMPONENTS, *DEPTH_COMPONENTS)
 
 
@@ -79,7 +80,7 @@ def _packed_encoded_frames(paths: Sequence[Path]) -> bytes:
         payloads.append(payload)
         offsets.append(offsets[-1] + len(payload))
     return _npz_bytes(
-        payload=np.frombuffer(b"".join(payloads), dtype=np.uint8),
+        bytes=np.frombuffer(b"".join(payloads), dtype=np.uint8),
         offsets=np.asarray(offsets, dtype=np.int64),
     )
 
@@ -93,11 +94,7 @@ def _load_tracks(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.nd
         with np.load(scene_root / view_name / "tracks_2d.npz") as payload:
             tracks_2d.append(np.asarray(payload["tracks_2d"], dtype=np.float32))
             occlusion.append(np.asarray(payload["occlusion"], dtype=np.bool_))
-    return {
-        "tracks_3d": tracks_3d,
-        "tracks_2d": np.stack(tracks_2d),
-        "occlusion": np.stack(occlusion),
-    }
+    return {"tracks_3d": tracks_3d, "visibility": ~np.stack(occlusion)}
 
 
 def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.ndarray | str]:
@@ -156,7 +153,7 @@ def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.nd
         "extrinsics": np.stack(extrinsics),
         "sensor_widths": np.asarray(sensor_widths, dtype=np.float32),
         "focal_lengths": np.asarray(focal_lengths, dtype=np.float32),
-        "resolution": np.asarray(resolution, dtype=np.int32),
+        "resolution_hw": np.asarray((resolution[1], resolution[0]), dtype=np.int32),
         "invalid_frame_indices": np.asarray(invalid, dtype=np.int64),
     }
 
@@ -172,14 +169,13 @@ def _scene_components(scene_root: Path, scene_id: str, read_workers: int) -> dic
     tracks = _load_tracks(scene_root, view_names)
     camera = _load_camera(scene_root, view_names)
     n_frames = int(tracks["tracks_3d"].shape[0])
-    if tracks["tracks_2d"].shape[:2] != (6, n_frames):
-        raise ValueError(f"{scene_root}: tracks_2d shape does not match tracks_3d")
+    if tracks["visibility"].shape[1:] != tracks["tracks_3d"].shape[:2]:
+        raise ValueError(f"{scene_root}: visibility shape does not match tracks_3d")
 
     meta = {
         **tracks,
         **camera,
-        "view_names": np.asarray(view_names),
-        "scene_id": np.asarray(str(scene_id)),
+        "scene_name": np.asarray(str(scene_id)),
     }
     jobs: list[tuple[str, tuple[Path, ...]]] = []
     for view_index, view_path in enumerate(view_paths):
@@ -189,12 +185,38 @@ def _scene_components(scene_root: Path, scene_id: str, read_workers: int) -> dic
             raise ValueError(
                 f"{scene_root}: expected {n_frames} RGB/depth frames, got {len(rgb)}/{len(depth)}"
             )
-        jobs.extend(((f"rgb{view_index}", rgb), (f"depth{view_index}", depth)))
+        jobs.extend(((f"rgb{view_index}.npz", rgb), (f"depth{view_index}.npz", depth)))
 
     with ThreadPoolExecutor(max_workers=read_workers) as executor:
         futures = {name: executor.submit(_packed_encoded_frames, paths) for name, paths in jobs}
         encoded = {name: future.result() for name, future in futures.items()}
     return {META_COMPONENT: _npz_bytes(**meta), **encoded}
+
+
+def _scene_manifest(scene_root: Path, results: Sequence[dict[str, object]]) -> dict[str, dict[str, object]]:
+    """Build the catalog consumed before DALI opens any scene payload."""
+    catalog: dict[str, dict[str, object]] = {}
+    for result in results:
+        shard_name = str(result["name"])
+        for scene_id in result["scene_ids"]:
+            scene_path = Path(scene_root) / str(scene_id)
+            view_names = sorted(
+                (path.name for path in scene_path.iterdir() if path.is_dir() and path.name.startswith("view_")),
+                key=lambda name: int(name.rsplit("_", 1)[1]),
+            )
+            with np.load(scene_path / "tracks_3d.npz") as payload:
+                n_frames = int(payload["tracks_3d"].shape[0])
+            invalid = []
+            scene_json = scene_path / "scene.json"
+            if scene_json.is_file():
+                invalid = json.loads(scene_json.read_text()).get("output", {}).get("rgb", {}).get("invalid_frame_indices", [])
+            catalog[str(scene_id)] = {
+                "view_names": view_names,
+                "n_frames": n_frames,
+                "invalid_frame_indices": [int(value) for value in invalid],
+                "shard": f"{shard_name}.tar",
+            }
+    return catalog
 
 
 def _tar_add_bytes(archive: tarfile.TarFile, name: str, payload: bytes) -> None:
@@ -284,12 +306,13 @@ def convert_split(
             raise RuntimeError(f"{shard.name}: scene inventory changed while converting")
         results.append(result)
     manifest = {
-        "format": "mvtracker_mvkubric_webdataset",
+        "format": WEB_DATASET_FORMAT,
         "version": FORMAT_VERSION,
         "split": split_root.name,
         "scenes_per_shard": scenes_per_shard,
         "components": list(COMPONENTS),
         "scene_ids": [scene for result in results for scene in result["scene_ids"]],
+        "scenes": _scene_manifest(scene_root, results),
         "shards": results,
     }
     temporary = split_root / "manifest.json.partial"
@@ -350,12 +373,13 @@ def convert_shards(
                 progress_callback("shard", result, len(results), len(shards))
     results.sort(key=lambda result: result["name"])
     manifest = {
-        "format": "mvtracker_mvkubric_webdataset",
+        "format": WEB_DATASET_FORMAT,
         "version": FORMAT_VERSION,
         "split": split_root.name,
         "scenes_per_shard": scenes_per_shard,
         "components": list(COMPONENTS),
         "scene_ids": [scene for result in results for scene in result["scene_ids"]],
+        "scenes": _scene_manifest(scene_root, results),
         "shards": results,
     }
     temporary = split_root / "manifest.json.partial"

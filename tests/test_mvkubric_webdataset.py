@@ -1,4 +1,3 @@
-import io
 import json
 import tarfile
 import tempfile
@@ -15,6 +14,11 @@ from mvtracker.preprocessing.mvkubric_webdataset import (
     split_scene_ids,
     write_shard,
 )
+
+try:
+    from mvtracker.datasets.kubric_dali_dataset import _record_from_outputs
+except (ImportError, ModuleNotFoundError):
+    _record_from_outputs = None
 
 
 class MvKubricWebDatasetTests(unittest.TestCase):
@@ -56,13 +60,13 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             self._make_scene(root)
             components = _scene_components(root / "900", "900", read_workers=4)
             self.assertEqual(set(components), set(COMPONENTS))
-            metadata = read_component(components["meta"])
+            metadata = read_component(components["meta.npz"])
             np.testing.assert_array_equal(metadata["tracks_3d"], np.ones((3, 4, 3), dtype=np.float32))
             np.testing.assert_array_equal(metadata["invalid_frame_indices"], [1])
-            rgb = read_component(components["rgb2"])
+            rgb = read_component(components["rgb2.npz"])
             offsets = rgb["offsets"]
             self.assertEqual(offsets.tolist(), [0, 3, 6, 9])
-            self.assertEqual(rgb["payload"].tobytes(), bytes([2, 0, 1, 2, 1, 1, 2, 2, 1]))
+            self.assertEqual(rgb["bytes"].tobytes(), bytes([2, 0, 1, 2, 1, 1, 2, 2, 1]))
 
     def test_write_shard_uses_standard_key_components(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -74,8 +78,16 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             with tarfile.open(output, "r") as archive:
                 names = archive.getnames()
                 self.assertEqual(names, [f"900.{component}" for component in COMPONENTS])
-                metadata = read_component(archive.extractfile("900.meta").read())
-                np.testing.assert_array_equal(metadata["resolution"], [3, 2])
+                metadata = read_component(archive.extractfile("900.meta.npz").read())
+                np.testing.assert_array_equal(metadata["resolution_hw"], [2, 3])
+
+                if _record_from_outputs is not None:
+                    outputs = [archive.extractfile(f"900.{component}").read() for component in COMPONENTS]
+                    record = _record_from_outputs(outputs)
+                    self.assertEqual(record.name, "900")
+                    self.assertEqual(record.frame_count, 3)
+                    self.assertEqual(record.view_count, 6)
+                    self.assertEqual(record.rgb_frames[2][1], bytes([2, 1, 1]))
 
     def test_split_scene_ids_is_four_scene_shards(self):
         shards = split_scene_ids(["100", "2", "3", "1", "5"], scenes_per_shard=4)
