@@ -24,27 +24,18 @@ WANDB_PROJECT = "mvtracker-modal-profiling"
 WANDB_ENTITY = "jeetucl-ucl"
 MODAL_TAGS = {**BASE_TAGS, "experiment": "mvkubric-webdataset-pilot"}
 SOURCE_ROOT = DATA_ROOT / "datasets/kubric-multiview/train"
-OUTPUT_ROOT = DATA_ROOT / "datasets/kubric-multiview-webdataset/v1/train"
+OUTPUT_ROOT = DATA_ROOT / "datasets/kubric-multiview-webdataset/train"
 RUN_ROOT = Path("/mnt/mvtracker-runs")
 
 
 app = modal.App(APP_NAME, tags=MODAL_TAGS)
 conversion_image = (
     _runtime_image()
-    .apt_install("curl")
-    .run_commands(
-        "curl -fsSL https://raw.githubusercontent.com/NVIDIA/DALI/v1.53.0/tools/wds2idx.py "
-        "-o /usr/local/bin/wds2idx && chmod 0755 /usr/local/bin/wds2idx"
-    )
+    .pip_install("wids==0.1.11")
 )
-benchmark_image = (
-    conversion_image
-    .pip_install("nvidia-dali-cuda120==1.53.0")
-    .pip_install(
-        "nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20",
-        "nvidia-libnvcomp-cu12==5.3.0.16",
-    )
-)
+# The runtime image already installs DALI and its compatible nvImageCodec /
+# libnvcomp ABI set. Keep the benchmark image source-free after that layer.
+benchmark_image = conversion_image
 
 
 @app.function(
@@ -122,21 +113,28 @@ def convert_remote(
             flush=True,
         )
 
+    target_root = Path(output_root)
+    staging_root = target_root.with_name(target_root.name + ".staging")
+    if target_root.exists():
+        raise FileExistsError(f"refusing to replace existing canonical output: {target_root}")
+    if staging_root.exists():
+        raise FileExistsError(f"refusing to reuse existing staging output: {staging_root}")
     manifest = convert_shards(
         Path(scene_root),
-        Path(output_root),
+        staging_root,
         scene_ids,
         scenes_per_shard=scenes_per_shard,
         shard_workers=shard_workers,
         read_workers=read_workers,
         progress_callback=progress,
     )
+    staging_root.replace(target_root)
     data_volume.commit()
     run.summary.update(
         {
             "scene_count": len(manifest["scene_ids"]),
             "shard_count": len(manifest["shards"]),
-            "output_root": output_root,
+            "output_root": str(target_root),
         }
     )
     run.finish()
@@ -221,7 +219,7 @@ def benchmark_remote(
     try:
         result = benchmark_matrix(
             DATA_ROOT,
-            DATA_ROOT / "datasets/kubric-multiview-webdataset/v1",
+            DATA_ROOT / "datasets/kubric-multiview-webdataset",
             scene_ids,
             warmup=warmup,
             measured=measured,
@@ -235,7 +233,7 @@ def benchmark_remote(
             "modal_tags": MODAL_TAGS,
             "gpu": "T4",
             "data_root": str(DATA_ROOT),
-            "webdataset_root": str(DATA_ROOT / "datasets/kubric-multiview-webdataset/v1"),
+            "webdataset_root": str(DATA_ROOT / "datasets/kubric-multiview-webdataset"),
             "result": result,
         }
         report_path.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")

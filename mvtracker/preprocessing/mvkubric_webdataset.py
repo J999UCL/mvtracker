@@ -1,9 +1,8 @@
 """Convert native MV-Kubric scenes to indexed, uncompressed WebDataset shards.
 
-Each WebDataset sample is one complete scene.  Components intentionally hold
-the original encoded frame bytes; DALI can seek to a sample using the index,
-while MV-Tracker remains responsible for selecting a view subset and decoding
-the selected frames.
+Each scene contributes one metadata sample and one media sample per source
+view.  The media samples retain the native encoded PNG/TIFF bytes and store a
+small offsets array so a random-access loader can fetch only selected views.
 """
 
 from __future__ import annotations
@@ -22,24 +21,12 @@ import numpy as np
 
 
 WEB_DATASET_FORMAT = "mvtracker-kubric-webdataset"
-FORMAT_VERSION = 1
 SCENES_PER_SHARD = 4
 META_COMPONENT = "meta.npz"
-
-
-def component_names(view_count: int) -> tuple[str, ...]:
-    if view_count < 1:
-        raise ValueError("view_count must be positive")
-    return (
-        META_COMPONENT,
-        *(f"rgb{view}.npz" for view in range(view_count)),
-        *(f"depth{view}.npz" for view in range(view_count)),
-    )
-
-
-# Kept as a convenient schema constant for the real MV-Kubric layout.  Shard
-# manifests always use component_names(observed_view_count), not this value.
-COMPONENTS = component_names(10)
+RGB_COMPONENT = "rgb.npz"
+DEPTH_COMPONENT = "depth.npz"
+WIDS_INDEX = "shards.json"
+CATALOG = "catalog.json"
 
 
 @dataclass(frozen=True)
@@ -84,7 +71,7 @@ def _npz_bytes(**arrays: np.ndarray) -> bytes:
 
 
 def _packed_encoded_frames(paths: Sequence[Path]) -> bytes:
-    """Pack encoded files as one byte vector plus offsets without decoding."""
+    """Pack encoded files without decoding or changing their bytes."""
     payloads: list[bytes] = []
     offsets = [0]
     for path in paths:
@@ -97,19 +84,7 @@ def _packed_encoded_frames(paths: Sequence[Path]) -> bytes:
     )
 
 
-def _load_tracks(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.ndarray]:
-    with np.load(scene_root / "tracks_3d.npz") as payload:
-        tracks_3d = np.asarray(payload["tracks_3d"], dtype=np.float32)
-    tracks_2d: list[np.ndarray] = []
-    occlusion: list[np.ndarray] = []
-    for view_name in view_names:
-        with np.load(scene_root / view_name / "tracks_2d.npz") as payload:
-            tracks_2d.append(np.asarray(payload["tracks_2d"], dtype=np.float32))
-            occlusion.append(np.asarray(payload["occlusion"], dtype=np.bool_))
-    return {"tracks_3d": tracks_3d, "visibility": ~np.stack(occlusion)}
-
-
-def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.ndarray | str]:
+def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.ndarray]:
     intrinsics = []
     extrinsics = []
     sensor_widths = []
@@ -147,14 +122,15 @@ def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.nd
         extr = np.diag([1.0, -1.0, -1.0]) @ extr
         intrinsics.append(intr.astype(np.float32))
         extrinsics.append(extr.astype(np.float32))
-        sensor_widths.append(float(metadata["camera"]["sensor_width"]))
-        focal_lengths.append(float(metadata["camera"]["focal_length"]))
+        sensor_widths.append(float(camera["sensor_width"]))
+        focal_lengths.append(float(camera["focal_length"]))
         current_resolution = tuple(int(value) for value in metadata["metadata"]["resolution"])
         if resolution is None:
             resolution = current_resolution
         elif resolution != current_resolution:
             raise ValueError(f"{scene_root}: views have different resolutions")
-    assert resolution is not None
+    if resolution is None:
+        raise ValueError(f"{scene_root}: no views found")
     invalid = []
     scene_json = scene_root / "scene.json"
     if scene_json.is_file():
@@ -170,50 +146,103 @@ def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.nd
     }
 
 
-def _scene_components(scene_root: Path, scene_id: str, read_workers: int) -> dict[str, bytes]:
-    view_paths = sorted(
-        (path for path in scene_root.iterdir() if path.is_dir() and path.name.startswith("view_")),
-        key=lambda path: int(path.name.rsplit("_", 1)[1]),
+def _project_tracks(
+    tracks_3d: np.ndarray, intrinsics: np.ndarray, extrinsics: np.ndarray
+) -> np.ndarray:
+    homogeneous = np.concatenate(
+        [tracks_3d, np.ones_like(tracks_3d[..., :1])], axis=-1
     )
-    if not view_paths:
-        raise ValueError(f"{scene_root}: no view directories found")
-    view_names = tuple(path.name for path in view_paths)
-    tracks = _load_tracks(scene_root, view_names)
-    camera = _load_camera(scene_root, view_names)
-    n_frames = int(tracks["tracks_3d"].shape[0])
-    view_count = len(view_paths)
-    if tracks["visibility"].shape[:1] != (view_count,) or tracks["visibility"].shape[1:] != tracks["tracks_3d"].shape[:2]:
-        raise ValueError(f"{scene_root}: visibility shape does not match tracks_3d")
+    camera = np.einsum("fij,fpj->fpi", extrinsics, homogeneous)
+    pixels = np.einsum("ij,fpj->fpi", intrinsics, camera)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return pixels[..., :2] / pixels[..., 2:]
 
-    meta = {
-        **tracks,
-        **camera,
-        "scene_name": np.asarray(str(scene_id)),
-    }
-    jobs: list[tuple[str, tuple[Path, ...]]] = []
+
+def _load_tracks(
+    scene_root: Path,
+    view_names: Sequence[str],
+    camera: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    with np.load(scene_root / "tracks_3d.npz") as payload:
+        tracks_3d = np.asarray(payload["tracks_3d"], dtype=np.float32)
+    if tracks_3d.ndim != 3 or tracks_3d.shape[-1] != 3:
+        raise ValueError(f"{scene_root}: tracks_3d must have shape (frames, tracks, 3)")
+    occlusion: list[np.ndarray] = []
+    for view_index, view_name in enumerate(view_names):
+        with np.load(scene_root / view_name / "tracks_2d.npz") as payload:
+            projected = np.asarray(payload["tracks_2d"], dtype=np.float32)
+            hidden = np.asarray(payload["occlusion"], dtype=np.bool_)
+        expected = tracks_3d.shape[:2]
+        if projected.shape != (*expected, 2) or hidden.shape != expected:
+            raise ValueError(f"{scene_root}/{view_name}: track metadata shape does not match tracks_3d")
+        occlusion.append(hidden)
+        if camera is not None:
+            predicted = _project_tracks(
+                tracks_3d, camera["intrinsics"][view_index], camera["extrinsics"][view_index]
+            )
+            valid = np.isfinite(projected).all(axis=-1) & np.isfinite(predicted).all(axis=-1)
+            if np.any(valid) and not np.allclose(
+                predicted[valid], projected[valid], atol=1e-3, rtol=0.0
+            ):
+                error = float(np.max(np.abs(predicted[valid] - projected[valid])))
+                raise ValueError(f"{scene_root}/{view_name}: 2D projection check failed (max error {error:g})")
+    return {"tracks_3d": tracks_3d, "visibility": ~np.stack(occlusion)}
+
+
+def _view_paths(scene_root: Path) -> tuple[Path, ...]:
+    paths = tuple(
+        sorted(
+            (path for path in Path(scene_root).iterdir() if path.is_dir() and path.name.startswith("view_")),
+            key=lambda path: int(path.name.rsplit("_", 1)[1]),
+        )
+    )
+    if not paths:
+        raise ValueError(f"{scene_root}: no view directories found")
+    return paths
+
+
+def _scene_records(
+    scene_root: Path, scene_id: str, read_workers: int
+) -> tuple[bytes, dict[int, tuple[bytes, bytes]]]:
+    view_paths = _view_paths(scene_root)
+    view_names = tuple(path.name for path in view_paths)
+    camera = _load_camera(scene_root, view_names)
+    tracks = _load_tracks(scene_root, view_names, camera)
+    n_frames = int(tracks["tracks_3d"].shape[0])
+    if tracks["visibility"].shape != (len(view_paths), *tracks["tracks_3d"].shape[:2]):
+        raise ValueError(f"{scene_root}: visibility shape does not match tracks_3d")
+    meta = {**tracks, **camera, "scene_name": np.asarray(str(scene_id))}
+    jobs: list[tuple[int, str, tuple[Path, ...]]] = []
     for view_index, view_path in enumerate(view_paths):
         rgb = tuple(sorted(view_path.glob("rgba_*")))
         depth = tuple(sorted(view_path.glob("depth_*")))
         if len(rgb) != n_frames or len(depth) != n_frames:
             raise ValueError(
-                f"{scene_root}: expected {n_frames} RGB/depth frames, got {len(rgb)}/{len(depth)}"
+                f"{scene_root}/{view_path.name}: expected {n_frames} RGB/depth frames, got {len(rgb)}/{len(depth)}"
             )
-        jobs.extend(((f"rgb{view_index}.npz", rgb), (f"depth{view_index}.npz", depth)))
-
+        jobs.extend(((view_index, "rgb", rgb), (view_index, "depth", depth)))
     with ThreadPoolExecutor(max_workers=read_workers) as executor:
-        futures = {name: executor.submit(_packed_encoded_frames, paths) for name, paths in jobs}
-        encoded = {name: future.result() for name, future in futures.items()}
-    return {META_COMPONENT: _npz_bytes(**meta), **encoded}
+        futures = {(view, kind): executor.submit(_packed_encoded_frames, paths) for view, kind, paths in jobs}
+        media = {
+            view: (futures[(view, "rgb")].result(), futures[(view, "depth")].result())
+            for view in range(len(view_paths))
+        }
+    return _npz_bytes(**meta), media
+
+
+def _scene_components(scene_root: Path, scene_id: str, read_workers: int) -> dict[str, bytes]:
+    """Return the mixed sample components for one scene."""
+    metadata, media = _scene_records(Path(scene_root), scene_id, read_workers)
+    components = {f"scene-{scene_id}.{META_COMPONENT}": metadata}
+    for view, (rgb, depth) in media.items():
+        key = f"scene-{scene_id}-view-{view:02d}"
+        components[f"{key}.{RGB_COMPONENT}"] = rgb
+        components[f"{key}.{DEPTH_COMPONENT}"] = depth
+    return components
 
 
 def _scene_view_count(scene_root: Path, scene_id: str) -> int:
-    view_count = sum(
-        1 for path in (Path(scene_root) / str(scene_id)).iterdir()
-        if path.is_dir() and path.name.startswith("view_")
-    )
-    if view_count < 1:
-        raise ValueError(f"{scene_root}/{scene_id}: no view directories found")
-    return view_count
+    return len(_view_paths(Path(scene_root) / str(scene_id)))
 
 
 def _require_consistent_view_count(scene_root: Path, scene_ids: Sequence[str]) -> int:
@@ -221,32 +250,6 @@ def _require_consistent_view_count(scene_root: Path, scene_ids: Sequence[str]) -
     if len(counts) != 1:
         raise ValueError(f"scene view counts must be consistent within a split: {sorted(counts)}")
     return counts.pop()
-
-
-def _scene_manifest(scene_root: Path, results: Sequence[dict[str, object]]) -> dict[str, dict[str, object]]:
-    """Build the catalog consumed before DALI opens any scene payload."""
-    catalog: dict[str, dict[str, object]] = {}
-    for result in results:
-        shard_name = str(result["name"])
-        for scene_id in result["scene_ids"]:
-            scene_path = Path(scene_root) / str(scene_id)
-            view_names = sorted(
-                (path.name for path in scene_path.iterdir() if path.is_dir() and path.name.startswith("view_")),
-                key=lambda name: int(name.rsplit("_", 1)[1]),
-            )
-            with np.load(scene_path / "tracks_3d.npz") as payload:
-                n_frames = int(payload["tracks_3d"].shape[0])
-            invalid = []
-            scene_json = scene_path / "scene.json"
-            if scene_json.is_file():
-                invalid = json.loads(scene_json.read_text()).get("output", {}).get("rgb", {}).get("invalid_frame_indices", [])
-            catalog[str(scene_id)] = {
-                "view_names": view_names,
-                "n_frames": n_frames,
-                "invalid_frame_indices": [int(value) for value in invalid],
-                "shard": f"{shard_name}.tar",
-            }
-    return catalog
 
 
 def _tar_add_bytes(archive: tarfile.TarFile, name: str, payload: bytes) -> None:
@@ -265,42 +268,87 @@ def write_shard(
     read_workers: int = 16,
     progress_callback=None,
 ) -> dict[str, object]:
-    """Write one uncompressed TAR and return its inventory."""
+    """Write one uncompressed TAR and return its sample inventory."""
     output_tar = Path(output_tar)
     output_tar.parent.mkdir(parents=True, exist_ok=True)
     partial = output_tar.with_suffix(output_tar.suffix + ".partial")
     partial.unlink(missing_ok=True)
     started = time.perf_counter()
     expected_view_count = _scene_view_count(scene_root, shard.scene_ids[0])
-    expected_components = set(component_names(expected_view_count))
+    sample_records: list[dict[str, object]] = []
     with tarfile.open(partial, mode="w", format=tarfile.USTAR_FORMAT) as archive:
         for completed, scene_id in enumerate(shard.scene_ids, start=1):
-            components = _scene_components(Path(scene_root) / scene_id, scene_id, read_workers)
-            if set(components) != expected_components:
+            view_count = _scene_view_count(scene_root, scene_id)
+            if view_count != expected_view_count:
                 raise ValueError(f"{shard.name}: scene {scene_id} has an inconsistent view count")
-            for component in component_names(expected_view_count):
-                _tar_add_bytes(archive, f"{scene_id}.{component}", components[component])
+            metadata, media = _scene_records(Path(scene_root) / scene_id, scene_id, read_workers)
+            meta_key = f"scene-{scene_id}"
+            _tar_add_bytes(archive, f"{meta_key}.{META_COMPONENT}", metadata)
+            sample_records.append({"key": meta_key, "scene": str(scene_id), "kind": "metadata"})
+            for view in range(view_count):
+                key = f"scene-{scene_id}-view-{view:02d}"
+                rgb, depth = media[view]
+                _tar_add_bytes(archive, f"{key}.{RGB_COMPONENT}", rgb)
+                _tar_add_bytes(archive, f"{key}.{DEPTH_COMPONENT}", depth)
+                sample_records.append({"key": key, "scene": str(scene_id), "view": view, "kind": "media"})
             if progress_callback is not None:
                 progress_callback(shard, scene_id, completed, time.perf_counter() - started)
     partial.replace(output_tar)
     return {
         "name": shard.name,
         "scene_ids": list(shard.scene_ids),
-        "tar": str(output_tar),
+        "tar": output_tar.name,
         "bytes": output_tar.stat().st_size,
         "seconds": time.perf_counter() - started,
-        "components_per_scene": len(expected_components),
         "view_count": expected_view_count,
+        "sample_records": sample_records,
+        "nsamples": len(sample_records),
     }
 
 
-def build_wds_index(archive: Path, index: Path | None = None, command: str = "wds2idx") -> Path:
-    """Create the DALI index with NVIDIA's standard ``wds2idx`` utility."""
-    archive = Path(archive).resolve()
-    index = Path(index or archive.with_suffix(".idx")).resolve()
+def build_wids_index(
+    archives: Sequence[Path], index: Path, command: str = "widsindex"
+) -> Path:
+    """Create the standard WIDS shard-list descriptor for uncompressed TARs."""
+    archives = tuple(Path(archive).resolve() for archive in archives)
+    if not archives:
+        raise ValueError("at least one archive is required")
+    index = Path(index).resolve()
     index.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([command, str(archive), str(index)], check=True)
+    names = [archive.name for archive in archives]
+    subprocess.run(
+        [command, "create", "--output", str(index), *names],
+        cwd=archives[0].parent,
+        check=True,
+    )
     return index
+
+
+def build_wds_index(archive: Path, index: Path | None = None, command: str = "widsindex") -> Path:
+    """Backward-compatible single-shard wrapper around :func:`build_wids_index`."""
+    archive = Path(archive)
+    return build_wids_index((archive,), Path(index or archive.with_suffix(".json")), command)
+
+
+def _publish_catalog(split_root: Path, results: Sequence[dict[str, object]]) -> dict[str, object]:
+    scenes: dict[str, dict[str, object]] = {}
+    sample_index = 0
+    for result in sorted(results, key=lambda item: str(item["name"])):
+        for record in result["sample_records"]:
+            scene = str(record["scene"])
+            entry = scenes.setdefault(scene, {"metadata_index": None, "views": {}})
+            if record["kind"] == "metadata":
+                entry["metadata_index"] = sample_index
+            else:
+                entry["views"][str(int(record["view"]))] = {"media_index": sample_index}
+            sample_index += 1
+    if any(entry["metadata_index"] is None for entry in scenes.values()):
+        raise RuntimeError("catalog contains a scene without metadata")
+    catalog = {"scenes": scenes, "sample_count": sample_index}
+    temporary = split_root / f"{CATALOG}.partial"
+    temporary.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
+    temporary.replace(split_root / CATALOG)
+    return catalog
 
 
 def convert_split(
@@ -310,52 +358,20 @@ def convert_split(
     *,
     scenes_per_shard: int = SCENES_PER_SHARD,
     read_workers: int = 16,
-    index_command: str = "wds2idx",
+    index_command: str = "widsindex",
     progress_callback=None,
 ) -> dict[str, object]:
-    """Convert a split, publishing only completed TAR/index pairs."""
-    split_root = Path(output_root)
-    split_root.mkdir(parents=True, exist_ok=True)
-    view_count = _require_consistent_view_count(scene_root, scene_ids)
-    shards = split_scene_ids(scene_ids, scenes_per_shard)
-    results: list[dict[str, object]] = []
-    for shard in shards:
-        archive = split_root / f"{shard.name}.tar"
-        index = split_root / f"{shard.name}.idx"
-        expected = set(shard.scene_ids)
-        if archive.is_file() and index.is_file():
-            result = {
-                "name": shard.name,
-                "scene_ids": list(shard.scene_ids),
-                "tar": str(archive),
-                "idx": str(index),
-                "bytes": archive.stat().st_size,
-                "status": "skipped-existing",
-            }
-            results.append(result)
-            continue
-        result = write_shard(scene_root, shard, archive, read_workers=read_workers, progress_callback=progress_callback)
-        build_wds_index(archive, index, command=index_command)
-        result["idx"] = str(index)
-        result["status"] = "created"
-        if set(result["scene_ids"]) != expected:
-            raise RuntimeError(f"{shard.name}: scene inventory changed while converting")
-        results.append(result)
-    manifest = {
-        "format": WEB_DATASET_FORMAT,
-        "version": FORMAT_VERSION,
-        "split": split_root.name,
-        "scenes_per_shard": scenes_per_shard,
-        "view_count": view_count,
-        "components": list(component_names(view_count)),
-        "scene_ids": [scene for result in results for scene in result["scene_ids"]],
-        "scenes": _scene_manifest(scene_root, results),
-        "shards": results,
-    }
-    temporary = split_root / "manifest.json.partial"
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    temporary.replace(split_root / "manifest.json")
-    return manifest
+    """Convert a split serially, publishing one WIDS descriptor and catalog."""
+    return convert_shards(
+        scene_root,
+        output_root,
+        scene_ids,
+        scenes_per_shard=scenes_per_shard,
+        shard_workers=1,
+        read_workers=read_workers,
+        index_command=index_command,
+        progress_callback=progress_callback,
+    )
 
 
 def convert_shards(
@@ -366,12 +382,14 @@ def convert_shards(
     scenes_per_shard: int = SCENES_PER_SHARD,
     shard_workers: int = 1,
     read_workers: int = 16,
-    index_command: str = "wds2idx",
+    index_command: str = "widsindex",
     progress_callback=None,
 ) -> dict[str, object]:
-    """Convert all shards in a split concurrently and publish one manifest."""
-    if shard_workers < 1:
-        raise ValueError("shard_workers must be positive")
+    """Convert all shards concurrently and publish a WIDS descriptor/catalog."""
+    if shard_workers < 1 or read_workers < 1:
+        raise ValueError("shard_workers and read_workers must be positive")
+    if not scene_ids:
+        raise ValueError("scene_ids must not be empty")
     split_root = Path(output_root)
     split_root.mkdir(parents=True, exist_ok=True)
     view_count = _require_consistent_view_count(scene_root, scene_ids)
@@ -379,27 +397,11 @@ def convert_shards(
 
     def convert_one(shard: SceneShard) -> dict[str, object]:
         archive = split_root / f"{shard.name}.tar"
-        index = split_root / f"{shard.name}.idx"
-        if archive.is_file() and index.is_file():
-            return {
-                "name": shard.name,
-                "scene_ids": list(shard.scene_ids),
-                "tar": str(archive),
-                "idx": str(index),
-                "bytes": archive.stat().st_size,
-                "status": "skipped-existing",
-            }
-        result = write_shard(
-            scene_root,
-            shard,
-            archive,
-            read_workers=read_workers,
-            progress_callback=progress_callback,
+        if archive.is_file():
+            raise FileExistsError(f"refusing to overwrite existing shard: {archive}")
+        return write_shard(
+            scene_root, shard, archive, read_workers=read_workers, progress_callback=progress_callback
         )
-        build_wds_index(archive, index, command=index_command)
-        result["idx"] = str(index)
-        result["status"] = "created"
-        return result
 
     with ThreadPoolExecutor(max_workers=shard_workers) as executor:
         futures = {executor.submit(convert_one, shard): shard for shard in shards}
@@ -409,25 +411,32 @@ def convert_shards(
             results.append(result)
             if progress_callback is not None:
                 progress_callback("shard", result, len(results), len(shards))
-    results.sort(key=lambda result: result["name"])
+    results.sort(key=lambda result: str(result["name"]))
+    index = build_wids_index(
+        [split_root / str(result["tar"]) for result in results], split_root / WIDS_INDEX, command=index_command
+    )
+    catalog = _publish_catalog(split_root, results)
     manifest = {
         "format": WEB_DATASET_FORMAT,
-        "version": FORMAT_VERSION,
         "split": split_root.name,
         "scenes_per_shard": scenes_per_shard,
         "view_count": view_count,
-        "components": list(component_names(view_count)),
         "scene_ids": [scene for result in results for scene in result["scene_ids"]],
-        "scenes": _scene_manifest(scene_root, results),
-        "shards": results,
+        "shards": [
+            {key: value for key, value in result.items() if key != "sample_records"}
+            for result in results
+        ],
+        "wids_descriptor": index.name,
+        "catalog": CATALOG,
+        "scenes": catalog["scenes"],
     }
     temporary = split_root / "manifest.json.partial"
     temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     temporary.replace(split_root / "manifest.json")
-    return manifest
+    return {**manifest, "catalog_data": catalog}
 
 
 def read_component(payload: bytes) -> dict[str, np.ndarray]:
-    """Decode one metadata or packed-byte component returned by DALI."""
+    """Decode one metadata or packed-byte component."""
     with np.load(io.BytesIO(payload), allow_pickle=False) as arrays:
         return {name: arrays[name].copy() for name in arrays.files}
