@@ -1,0 +1,27 @@
+# @package _global_
+defaults:
+  - diegesis_mvkubric_gt_ddp
+  - _self_
+
+datasets:
+  eval:
+    names: []
+
+trainer:
+  num_steps: 3
+  eval_freq: 10000
+  viz_freq: 10000
+  save_ckpt_freq: 3
+  expensive_diagnostics_interval: 10000
+  hardware_metrics_interval: 1
+
+modes:
+  validate_at_start: false
+
+logging:
+  tags:
+    - diegesis-mvkubric-50-50
+    - gt-depth
+    - single-h100
+    - updateformer-checkpoint
+    - performance-smoke

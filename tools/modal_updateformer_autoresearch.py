@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 
 import modal
 
 from modal_training_profile import (
+    DATA_ROOT,
     RUN_ROOT,
     _dependency_image,
     _source_commit,
     _source_image,
+    data_volume,
     run_volume,
     wandb_secret,
 )
@@ -164,6 +170,73 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
     return {"result_path": str(output_path), **summary}
 
 
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H100!",
+    cpu=32,
+    memory=65536,
+    timeout=2 * 60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def run_single_gpu_smoke(run_name: str) -> dict:
+    commit = _source_commit()
+    run_dir = RUN_ROOT / "single-gpu-performance" / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    wandb_id = __import__("hashlib").sha256(run_name.encode()).hexdigest()[:12]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "MVTRACKER_TRAINING_RUN_DIR": str(run_dir),
+            "MVTRACKER_TRAINING_CHECKPOINT": str(
+                DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth"
+            ),
+            "MVTRACKER_DATA_ROOT": str(DATA_ROOT),
+            "MVTRACKER_MVKUBRIC_INDEX_ROOT": str(
+                DATA_ROOT / "datasets/kubric-multiview/train/MVTracker_index"
+            ),
+            "MVTRACKER_TRAINING_SEED": "20260820",
+            "MVTRACKER_WANDB_RUN_NAME": run_name,
+            "MVTRACKER_WANDB_RUN_ID": wandb_id,
+            "WANDB_ENTITY": "jeetucl-ucl",
+            "WANDB_PROJECT": "mvtracker-continual-training",
+            "WANDB_RUN_GROUP": "updateformer-autoresearch-v2",
+            "WANDB_RUN_ID": wandb_id,
+            "WANDB_RESUME": "allow",
+        }
+    )
+    log_path = run_dir / "training.log"
+    started = time.perf_counter()
+    with log_path.open("w", encoding="utf-8") as log:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mvtracker.cli.train",
+                "+experiment=diegesis_mvkubric_gt_single_gpu_perf",
+            ],
+            cwd="/opt/mvtracker",
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    run_volume.commit()
+    if completed.returncode != 0:
+        raise RuntimeError(f"single-GPU smoke failed; see {log_path}")
+    return {
+        "source_commit": commit,
+        "run_name": run_name,
+        "elapsed_seconds": time.perf_counter() - started,
+        "log_path": str(log_path),
+    }
+
+
 def _launch(action: str, warmup: int = 3, measured: int = 10) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
@@ -211,3 +284,19 @@ def capacity_study() -> None:
 @app.local_entrypoint(name="cuda-graph-study")
 def cuda_graph_study() -> None:
     _launch("cuda-graph-study")
+
+
+@app.local_entrypoint(name="single-gpu-smoke")
+def single_gpu_smoke(run_name: str = "") -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    selected = run_name or f"updateformer-single-h100-{commit[:8]}"
+    app.set_tags(
+        {
+            **TAGS,
+            "experiment": selected,
+            "gpu": "h100",
+        }
+    )
+    print(json.dumps(run_single_gpu_smoke.remote(selected), indent=2))

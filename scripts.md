@@ -16,6 +16,9 @@ modal run --timestamps tools/modal_updateformer_autoresearch.py::capture
 modal run --timestamps tools/modal_updateformer_autoresearch.py::verify
 modal run --timestamps tools/modal_updateformer_autoresearch.py::run_benchmark \
   --warmup 3 --measured 10
+
+# Three-update live training smoke on one H100; no DDP.
+modal run --timestamps tools/modal_updateformer_autoresearch.py::single_gpu_smoke
 ```
 
 ## VGGT-Omega H100 throughput profile
