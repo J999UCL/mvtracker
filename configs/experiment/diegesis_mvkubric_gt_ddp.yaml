@@ -12,6 +12,8 @@ datasets:
     traj_per_sample: 2048
     kubric_metadata_index_root: ${oc.env:MVTRACKER_MVKUBRIC_INDEX_ROOT,${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/kubric-multiview/train/MVTracker_index}
     mvkubric_gpu_decode: true
+    mvkubric_storage: webdataset
+    mvkubric_webdataset_root: ${oc.env:MVTRACKER_MVKUBRIC_WEBDATASET_ROOT,${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/kubric-multiview-webdataset}
     kubric_max_depth: 24
     num_workers: 8
     physical_batching:
@@ -23,6 +25,11 @@ datasets:
       max_scenes: 2
       pair_track_capacity_by_views: {1: 1024, 2: 1024, 3: 1280, 4: 1024}
       singleton_only_views: [5, 6]
+      rank_local: true
+    dali:
+      num_threads: 4
+      prefetch_queue_depth: 2
+      initial_fill: 32
     source_schedule: [diegesis, mvkubric, diegesis, mvkubric]
     sources:
       diegesis:

@@ -20,6 +20,7 @@ _SPEC.loader.exec_module(_MODULE)
 H100_BATCH_CAPACITY = _MODULE.H100_BATCH_CAPACITY
 SceneSummary = _MODULE.SceneSummary
 schedule_physical_batch = _MODULE.schedule_physical_batch
+schedule_rank_local_batch = _MODULE.schedule_rank_local_batch
 
 
 def _scene(index: int, *, views: int = 1, tracks: int = 512, source: str = "d"):
@@ -203,6 +204,19 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
         invalid[0] = _scene(0, tracks=0)
         with self.assertRaisesRegex(ValueError, "track_count"):
             schedule_physical_batch(tuple(invalid))
+
+    def test_rank_local_scheduler_does_not_require_eight_scenes(self):
+        summaries = tuple(_scene(i, views=1, tracks=256 + i) for i in range(4))
+        groups = schedule_rank_local_batch(summaries)
+        self.assertEqual(
+            sorted(
+                (scene.source, scene.scene, scene.cursor)
+                for group in groups
+                for scene in group.scenes
+            ),
+            sorted(_identities_from(summaries)),
+        )
+        self.assertEqual(len(groups), 2)
 
 
 def _identities_from(summaries):

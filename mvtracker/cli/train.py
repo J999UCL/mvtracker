@@ -540,7 +540,7 @@ def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=
         source_cfg.get("exclude_scene_ids", ()) if source_cfg is not None else ()
     )
     if dataset_name.startswith("kubric-multiview-v3"):
-        return KubricMultiViewDataset.from_name(
+        dataset = KubricMultiViewDataset.from_name(
             dataset_name,
             dataset_root,
             cfg,
@@ -548,6 +548,23 @@ def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=
             include_scene_ids=include_scene_ids,
             exclude_scene_ids=exclude_scene_ids,
         )
+        if getattr(dataset, "requires_dali_scene_stream", False):
+            from mvtracker.datasets.kubric_dali_dataset import DaliKubricSceneStream
+
+            settings = cfg.datasets.train.get("dali", {})
+            dataset.attach_scene_stream(
+                DaliKubricSceneStream(
+                    dataset.webdataset_root,
+                    split="train",
+                    shard_id=fabric.global_rank,
+                    num_shards=fabric.world_size,
+                    num_threads=int(settings.get("num_threads", 4)),
+                    prefetch_queue_depth=int(settings.get("prefetch_queue_depth", 2)),
+                    initial_fill=int(settings.get("initial_fill", 32)),
+                    random_shuffle=True,
+                )
+            )
+        return dataset
     if dataset_name.startswith("pointodyssey-multiview-"):
         return PointOdysseyMultiViewDataset.from_name(
             dataset_name, dataset_root, cfg, fabric
@@ -1906,6 +1923,7 @@ def main(cfg: DictConfig):
             lookahead_steps=int(settings.lookahead_steps),
             max_cache_bytes=int(float(settings.cpu_cache_gib_per_rank) * 1024**3),
             capacity=_physical_batch_capacity(cfg),
+            rank_local=bool(settings.get("rank_local", False)),
         )
         physical_decoder = PhysicalBatchDecoder(
             fabric.device,
@@ -2066,9 +2084,10 @@ def main(cfg: DictConfig):
                             raise RuntimeError(
                                 "physical lookahead cursor does not match committed state"
                             )
-                        _assert_matching_step_fingerprint(
-                            fabric, physical_step.fingerprint
-                        )
+                        if not bool(settings.get("rank_local", False)):
+                            _assert_matching_step_fingerprint(
+                                fabric, physical_step.fingerprint
+                            )
                         materialization_succeeded = _all_ranks_succeeded(
                             fabric,
                             physical_step.materialization_error is None,
@@ -2236,6 +2255,10 @@ def main(cfg: DictConfig):
                 microbatches_accumulated + 1
                 == (physical_group_count or gradient_accumulation_steps)
             )
+            # Rank-local physical plans may contain different numbers of
+            # groups.  Each rank still enables DDP synchronization exactly
+            # once, on its final group; the collective is matched by order,
+            # while no_backward_sync suppresses all earlier groups.
             run_expensive_diagnostics = (
                 total_steps % expensive_diagnostics_interval == 0
             )

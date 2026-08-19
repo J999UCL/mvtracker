@@ -341,6 +341,45 @@ def schedule_physical_batch(
     return min(candidates, key=objective)
 
 
+def schedule_rank_local_batch(
+    summaries: Sequence[SceneSummary],
+    *,
+    capacity: BatchCapacity = H100_BATCH_CAPACITY,
+) -> tuple[PhysicalBatchGroup, ...]:
+    """Pair one rank's logical scenes without moving scenes between ranks.
+
+    This is the rank-local counterpart to :func:`schedule_physical_batch`.
+    It intentionally has no world-size assumption; DDP callers can use the
+    resulting group count when coordinating their local accumulation wave.
+    """
+    summaries = tuple(summaries)
+    if not summaries:
+        raise ValueError("rank-local scheduling requires at least one scene")
+    if len(summaries) > capacity.logical_scenes_per_rank:
+        raise ValueError("rank-local batch exceeds logical scene capacity")
+    for scene in summaries:
+        if scene.track_count < 1:
+            raise ValueError("track_count must be positive")
+    candidates = _groupings(tuple(range(len(summaries))), summaries, capacity)
+    if not candidates:
+        raise ValueError("no rank-local physical batching plan exists")
+    groups = []
+    for raw in candidates:
+        groups.append(tuple(
+            PhysicalBatchGroup(tuple(summaries[index] for index in group))
+            for group in raw
+        ))
+    return min(
+        groups,
+        key=lambda candidate: (
+            len(candidate),
+            sum(group.padded_track_count for group in candidate),
+            sum(group.work for group in candidate),
+            _scene_index_signature(candidate, summaries),
+        ),
+    )
+
+
 __all__ = [
     "BatchCapacity",
     "H100_BATCH_CAPACITY",
@@ -348,5 +387,6 @@ __all__ = [
     "RankWave",
     "SceneSummary",
     "SynchronizedBatchWave",
+    "schedule_rank_local_batch",
     "schedule_physical_batch",
 ]

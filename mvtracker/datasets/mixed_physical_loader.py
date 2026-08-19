@@ -19,6 +19,7 @@ from mvtracker.datasets.physical_batch_scheduler import (
     H100_BATCH_CAPACITY,
     PhysicalBatchGroup,
     SceneSummary,
+    schedule_rank_local_batch,
     schedule_physical_batch,
 )
 from mvtracker.datasets.tapvid3d_multiview_dataset import (
@@ -206,6 +207,7 @@ class MixedStepLookahead:
         lookahead_steps: int = 4,
         max_cache_bytes: int = 12 * 1024**3,
         capacity: BatchCapacity = H100_BATCH_CAPACITY,
+        rank_local: bool = False,
     ):
         if remaining_steps < 0:
             raise ValueError("remaining_steps must be non-negative")
@@ -219,6 +221,7 @@ class MixedStepLookahead:
         self.remaining_steps = int(remaining_steps)
         self.worker_count = int(worker_count)
         self.capacity = capacity
+        self.rank_local = bool(rank_local)
         self._next_cursors = {name: int(value) for name, value in source_cursors.items()}
         self._queue = _ByteBoundedQueue(lookahead_steps, max_cache_bytes)
         self._finished = object()
@@ -229,7 +232,37 @@ class MixedStepLookahead:
         start_cursors = dict(self._next_cursors)
         scenes = []
         retries = 0
+        if self.rank_local:
+            for source in self.schedule.source_pattern:
+                cursor = self._next_cursors[source]
+                while True:
+                    request = self.schedule.sample_source(source, cursor, self.rank).request
+                    plan = self.datasets[source].plan_sample(request)
+                    cursor += 1
+                    self._next_cursors[source] = cursor
+                    if plan is None:
+                        retries += 1
+                        continue
+                    scenes.append(PlannedScene(source, plan))
+                    break
+            local_groups = schedule_rank_local_batch(
+                tuple(_plan_summary(scene) for scene in scenes),
+                capacity=self.capacity,
+            )
+            planned_by_identity = {scene.identity: scene for scene in scenes}
+            local_physical_groups = tuple(local_groups)
+            physical = None
+            physical_groups = local_physical_groups
+            local_scenes = tuple(
+                planned_by_identity[(summary.source, summary.scene, summary.cursor)]
+                for group in local_physical_groups
+                for summary in group.scenes
+            )
+        else:
+            local_physical_groups = None
         for source in self.schedule.source_pattern:
+            if self.rank_local:
+                break
             cursor = self._next_cursors[source]
             while True:
                 candidates = []
@@ -246,17 +279,18 @@ class MixedStepLookahead:
                 cursor += 1
                 retries += 1
 
-        physical = schedule_physical_batch(
-            tuple(_plan_summary(scene) for scene in scenes),
-            capacity=self.capacity,
-        )
-        planned_by_identity = {scene.identity: scene for scene in scenes}
-        local_physical_groups = physical.ranks[self.rank].groups
-        local_scenes = [
-            planned_by_identity[(summary.source, summary.scene, summary.cursor)]
-            for group in local_physical_groups
-            for summary in group.scenes
-        ]
+        if not self.rank_local:
+            physical = schedule_physical_batch(
+                tuple(_plan_summary(scene) for scene in scenes),
+                capacity=self.capacity,
+            )
+            planned_by_identity = {scene.identity: scene for scene in scenes}
+            local_physical_groups = physical.ranks[self.rank].groups
+            local_scenes = [
+                planned_by_identity[(summary.source, summary.scene, summary.cursor)]
+                for group in local_physical_groups
+                for summary in group.scenes
+            ]
         return (
             start_cursors,
             dict(self._next_cursors),
@@ -324,26 +358,41 @@ class MixedStepLookahead:
             _sample_nbytes(sample) for group in groups for sample in group.samples
         )
         materialization_seconds = time.perf_counter() - materialization_started
+        if physical is None:
+            pair_count = sum(len(group.scenes) - 1 for group in physical_groups)
+            padding_tracks = sum(group.padded_track_count for group in physical_groups)
+        else:
+            pair_count = physical.pair_count
+            padding_tracks = physical.total_padding_tracks
         return PreparedMixedStep(
             start_cursors=start_cursors,
             end_cursors=end_cursors,
             groups=tuple(groups),
-            fingerprint=_step_fingerprint(
-                scenes,
-                tuple(
-                    group
-                    for rank_wave in physical.ranks
-                    for group in rank_wave.groups
-                ),
-                start_cursors,
-                end_cursors,
+            fingerprint=(
+                _step_fingerprint(
+                    scenes,
+                    tuple(
+                        group
+                        for rank_wave in physical.ranks
+                        for group in rank_wave.groups
+                    ),
+                    start_cursors,
+                    end_cursors,
+                )
+                if physical is not None
+                else _step_fingerprint(
+                    scenes,
+                    tuple(local_physical_groups),
+                    start_cursors,
+                    end_cursors,
+                )
             ),
             retry_count=retries,
             encoded_bytes=encoded_bytes,
             planning_seconds=planning_seconds,
             materialization_seconds=materialization_seconds,
-            pair_count=physical.pair_count,
-            padding_tracks=physical.total_padding_tracks,
+            pair_count=pair_count,
+            padding_tracks=padding_tracks,
             materialization_error=materialization_error,
         )
 

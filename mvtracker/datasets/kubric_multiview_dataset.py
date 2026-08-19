@@ -300,6 +300,18 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         if just_return_kwargs:
             return kubric_kwargs
 
+        if training and str(training_args.datasets.train.get("mvkubric_storage", "native")) == "webdataset":
+            from mvtracker.datasets.kubric_dali_dataset import DaliKubricMultiViewDataset
+
+            webdataset_root = training_args.datasets.train.get("mvkubric_webdataset_root")
+            if webdataset_root is None:
+                raise ValueError("mvkubric_storage=webdataset requires mvkubric_webdataset_root")
+            if not os.path.isabs(str(webdataset_root)):
+                webdataset_root = os.path.join(dataset_root, str(webdataset_root))
+            kubric_kwargs["webdataset_root"] = webdataset_root
+            kubric_kwargs["webdataset_split"] = "train"
+            return DaliKubricMultiViewDataset(**kubric_kwargs)
+
         if training and bool(training_args.datasets.train.get("mvkubric_gpu_decode", False)):
             from mvtracker.datasets.kubric_gpu_dataset import (
                 GpuDecodedKubricMultiViewDataset,
@@ -355,11 +367,14 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             include_scene_ids=None,
             exclude_scene_ids=(),
             metadata_index_root=None,
+            metadata_catalog=None,
     ):
         super(KubricMultiViewDataset, self).__init__()
 
         self.data_root = data_root
-        self.metadata_index = (
+        if metadata_catalog is not None and metadata_index_root is not None:
+            raise ValueError("metadata_catalog and metadata_index_root are mutually exclusive")
+        self.metadata_index = metadata_catalog or (
             KubricMetadataIndex(metadata_index_root)
             if metadata_index_root is not None
             else None
