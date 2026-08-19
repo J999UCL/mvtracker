@@ -11,6 +11,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # From PyTorch internals
@@ -294,7 +295,6 @@ class AttnBlock(nn.Module):
             drop=0,
         )
 
-    @torch.compile(fullgraph=True)
     def forward(self, x, attn_mask=None):
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
         x = x + self.mlp(self.norm2(x))
@@ -332,7 +332,6 @@ class CrossAttnBlock(nn.Module):
             drop=0,
         )
 
-    @torch.compile(fullgraph=True)
     def forward(self, x, context, attn_mask=None):
         x = x + self.cross_attn(self.norm1(x), context=self.norm_context(context), attn_mask=attn_mask)
         x = x + self.mlp(self.norm2(x))
@@ -357,6 +356,7 @@ class EfficientUpdateFormer(nn.Module):
             num_virtual_tracks=64,
             attn_class: Callable[..., nn.Module] = Attention,
             linear_layer_for_vis_conf=False,
+            checkpoint_blocks=True,
     ):
         super().__init__()
         self.out_channels = 2
@@ -365,6 +365,7 @@ class EfficientUpdateFormer(nn.Module):
         self.add_space_attn = add_space_attn
         self.input_transform = torch.nn.Linear(input_dim, hidden_size, bias=True)
         self.linear_layer_for_vis_conf = linear_layer_for_vis_conf
+        self.checkpoint_blocks = checkpoint_blocks
         if self.linear_layer_for_vis_conf:
             self.flow_head = nn.Sequential(
                 nn.Linear(hidden_size, output_dim, bias=True),
@@ -473,7 +474,12 @@ class EfficientUpdateFormer(nn.Module):
         j = 0
         for i in range(len(self.time_blocks)):
             time_tokens = tokens.contiguous().view(B * N, T, -1)  # B N T C -> (B N) T C
-            time_tokens = self.time_blocks[i](time_tokens)
+            if self.checkpoint_blocks and self.training and torch.is_grad_enabled():
+                time_tokens = checkpoint(
+                    self.time_blocks[i], time_tokens, use_reentrant=False
+                )
+            else:
+                time_tokens = self.time_blocks[i](time_tokens)
 
             tokens = time_tokens.view(B, N, T, -1)  # (B N) T C -> B N T C
             if self.add_space_attn and (
@@ -491,13 +497,33 @@ class EfficientUpdateFormer(nn.Module):
                 )
                 point_key_mask = point_mask_bt[:, None, None, :]
 
-                virtual_tokens = self.space_virtual2point_blocks[j](
-                    virtual_tokens, point_tokens, attn_mask=point_key_mask
-                )
-                virtual_tokens = self.space_virtual_blocks[j](virtual_tokens)
-                point_tokens = self.space_point2virtual_blocks[j](
-                    point_tokens, virtual_tokens
-                )
+                if self.checkpoint_blocks and self.training and torch.is_grad_enabled():
+                    virtual_tokens = checkpoint(
+                        self.space_virtual2point_blocks[j],
+                        virtual_tokens,
+                        point_tokens,
+                        point_key_mask,
+                        use_reentrant=False,
+                    )
+                    virtual_tokens = checkpoint(
+                        self.space_virtual_blocks[j],
+                        virtual_tokens,
+                        use_reentrant=False,
+                    )
+                    point_tokens = checkpoint(
+                        self.space_point2virtual_blocks[j],
+                        point_tokens,
+                        virtual_tokens,
+                        use_reentrant=False,
+                    )
+                else:
+                    virtual_tokens = self.space_virtual2point_blocks[j](
+                        virtual_tokens, point_tokens, attn_mask=point_key_mask
+                    )
+                    virtual_tokens = self.space_virtual_blocks[j](virtual_tokens)
+                    point_tokens = self.space_point2virtual_blocks[j](
+                        point_tokens, virtual_tokens
+                    )
                 point_tokens = point_tokens.masked_fill(
                     ~point_mask_bt[:, :, None], 0
                 )
