@@ -114,7 +114,8 @@ def convert_remote(
                 }
             )
             return
-        shard, scene_id, completed, seconds = values
+        shard = event
+        scene_id, completed, seconds = values
         print(
             f"WDS event=scene_completed shard={shard.name} scene={scene_id} "
             f"progress={completed}/{len(shard.scene_ids)} elapsed_seconds={seconds:.1f}",
