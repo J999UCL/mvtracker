@@ -5,6 +5,7 @@ import torch
 
 from mvtracker.profiling.updateformer_contract import (
     WORKLOADS,
+    _close_mismatch,
     _exact_mismatch,
     tensor_record,
 )
@@ -34,6 +35,22 @@ class UpdateFormerContractTests(unittest.TestCase):
             _exact_mismatch(expected, actual),
             "root.gradient[0].sha256: 'abd' != 'abc'",
         )
+
+    def test_float_contract_allows_only_tiny_kernel_noise(self):
+        expected = torch.tensor([1.0, 0.0], dtype=torch.float32)
+
+        self.assertIsNone(
+            _close_mismatch(expected, expected + torch.tensor([1e-5, 1e-6]))
+        )
+        self.assertIsNotNone(
+            _close_mismatch(expected, expected + torch.tensor([1e-2, 0.0]))
+        )
+
+    def test_bfloat16_forward_contract_is_exact(self):
+        expected = torch.tensor([1.0], dtype=torch.bfloat16)
+        actual = torch.tensor([1.01], dtype=torch.bfloat16)
+
+        self.assertIsNotNone(_close_mismatch(expected, actual))
 
     def test_workloads_cover_single_and_padded_physical_batches(self):
         self.assertEqual({workload.batch_size for workload in WORKLOADS}, {1, 2, 4})

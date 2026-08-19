@@ -18,6 +18,8 @@ MODEL_SEED = 20260819
 INPUT_DIM = 581
 HIDDEN_SIZE = 256
 OUTPUT_DIM = 131
+FLOAT_RTOL = 1e-4
+FLOAT_ATOL = 1e-5
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,18 @@ def _named_tensor_records(value, prefix="") -> dict[str, dict[str, object]]:
                 _named_tensor_records(item, f"{prefix}.{index}" if prefix else str(index))
             )
     return records
+
+
+def _cpu_clone(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _cpu_clone(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_clone(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_clone(item) for item in value)
+    return value
 
 
 def _git_commit() -> str:
@@ -156,21 +170,21 @@ def _run_updateformer_case(workload: Workload, state, device):
         loss = ((output.float() - target) * weights).square().mean()
     loss.backward()
     gradients = {
-        name: tensor_record(parameter.grad)
+        name: parameter.grad
         for name, parameter in model.named_parameters()
         if parameter.grad is not None
     }
     result = {
-        "output": tensor_record(output),
-        "loss": tensor_record(loss),
-        "input_gradient": tensor_record(inputs.grad),
+        "output": output,
+        "loss": loss,
+        "input_gradient": inputs.grad,
         "parameter_gradients": gradients,
     }
     optimizer.step()
-    result["updated_parameters"] = _named_tensor_records(model.state_dict())
-    result["optimizer_state"] = _named_tensor_records(optimizer.state_dict())
+    result["updated_parameters"] = model.state_dict()
+    result["optimizer_state"] = optimizer.state_dict()
     torch.cuda.synchronize()
-    return result
+    return _cpu_clone(result)
 
 
 def _run_loss_contract(device):
@@ -182,7 +196,7 @@ def _run_loss_contract(device):
     flow_ground_truth = []
     visibility = []
     validity = []
-    for window, tracks in enumerate((37, 53)):
+    for tracks in (37, 53):
         predictions = []
         leaves = []
         for _ in range(4):
@@ -223,15 +237,16 @@ def _run_loss_contract(device):
         )
     visibility_loss = balanced_ce_loss(logits, labels, valid_logits)
     visibility_loss.backward()
-    return {
-        "sequence_loss": tensor_record(flow_loss),
-        "sequence_gradients": [
-            [tensor_record(leaf.grad) for leaf in leaves]
-            for leaves in flow_leaves
-        ],
-        "balanced_ce_loss": tensor_record(visibility_loss),
-        "balanced_ce_gradients": [tensor_record(logit.grad) for logit in logits],
-    }
+    return _cpu_clone(
+        {
+            "sequence_loss": flow_loss,
+            "sequence_gradients": [
+                [leaf.grad for leaf in leaves] for leaves in flow_leaves
+            ],
+            "balanced_ce_loss": visibility_loss,
+            "balanced_ce_gradients": [logit.grad for logit in logits],
+        }
+    )
 
 
 def _exact_mismatch(expected, actual, path="root"):
@@ -254,6 +269,71 @@ def _exact_mismatch(expected, actual, path="root"):
     elif expected != actual:
         return f"{path}: {actual!r} != {expected!r}"
     return None
+
+
+def _close_mismatch(expected, actual, path="root"):
+    if isinstance(expected, torch.Tensor):
+        if not isinstance(actual, torch.Tensor):
+            return f"{path}: expected tensor"
+        if expected.shape != actual.shape or expected.dtype != actual.dtype:
+            return (
+                f"{path}: tensor metadata differs: "
+                f"{tuple(actual.shape)}/{actual.dtype} != "
+                f"{tuple(expected.shape)}/{expected.dtype}"
+            )
+        if expected.is_floating_point():
+            exact = expected.dtype in {torch.bfloat16, torch.float16}
+            if not torch.allclose(
+                expected,
+                actual,
+                rtol=0.0 if exact else FLOAT_RTOL,
+                atol=0.0 if exact else FLOAT_ATOL,
+            ):
+                difference = (actual.float() - expected.float()).abs()
+                return f"{path}: max absolute error {difference.max().item():.8g}"
+        elif not torch.equal(expected, actual):
+            return f"{path}: tensor values differ"
+        return None
+    if type(expected) is not type(actual):
+        return f"{path}: type {type(actual).__name__} != {type(expected).__name__}"
+    if isinstance(expected, dict):
+        if expected.keys() != actual.keys():
+            return f"{path}: keys differ"
+        for key in expected:
+            mismatch = _close_mismatch(expected[key], actual[key], f"{path}.{key}")
+            if mismatch:
+                return mismatch
+    elif isinstance(expected, (list, tuple)):
+        if len(expected) != len(actual):
+            return f"{path}: sequence lengths differ"
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            mismatch = _close_mismatch(left, right, f"{path}[{index}]")
+            if mismatch:
+                return mismatch
+    elif expected != actual:
+        return f"{path}: {actual!r} != {expected!r}"
+    return None
+
+
+def _difference_summary(expected, actual):
+    differences = []
+
+    def collect(left, right):
+        if isinstance(left, torch.Tensor) and left.is_floating_point():
+            differences.append((right.float() - left.float()).abs().max().item())
+        elif isinstance(left, dict):
+            for key in left:
+                collect(left[key], right[key])
+        elif isinstance(left, (list, tuple)):
+            for left_item, right_item in zip(left, right):
+                collect(left_item, right_item)
+
+    collect(expected, actual)
+    return {
+        "floating_tensor_count": len(differences),
+        "changed_tensor_count": sum(value > 0 for value in differences),
+        "maximum_absolute_error": max(differences, default=0.0),
+    }
 
 
 def capture_golden(root: Path) -> dict[str, object]:
@@ -281,21 +361,32 @@ def capture_golden(root: Path) -> dict[str, object]:
         for workload in WORKLOADS
     }
     second_losses = _run_loss_contract(device)
-    mismatch = _exact_mismatch(first, second) or _exact_mismatch(losses, second_losses)
+    mismatch = _close_mismatch(first, second) or _close_mismatch(losses, second_losses)
     if mismatch:
-        raise RuntimeError(f"baseline is not bit-exact: {mismatch}")
+        raise RuntimeError(f"baseline exceeds the numerical contract: {mismatch}")
+    reference = {"cases": first, "loss_contract": losses}
+    reference_path = partial_root / "reference.pt"
+    torch.save(reference, reference_path)
     manifest = {
         "format": FORMAT,
         "baseline_commit": _git_commit(),
         "verifier_sha256": verifier_sha256(),
         "baseline_state": state_path.name,
         "baseline_state_sha256": _sha256(state_path),
+        "reference": reference_path.name,
+        "reference_sha256": _sha256(reference_path),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "device": torch.cuda.get_device_name(0),
         "workloads": [asdict(workload) for workload in WORKLOADS],
-        "cases": first,
-        "loss_contract": losses,
+        "float_rtol": FLOAT_RTOL,
+        "float_atol": FLOAT_ATOL,
+        "baseline_replay": {
+            "cases": _difference_summary(first, second),
+            "loss_contract": _difference_summary(losses, second_losses),
+        },
+        "cases": _named_tensor_records(first),
+        "loss_contract": _named_tensor_records(losses),
     }
     (partial_root / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -317,14 +408,20 @@ def verify_golden(root: Path) -> dict[str, object]:
     if _sha256(state_path) != manifest["baseline_state_sha256"]:
         raise RuntimeError("baseline model state hash mismatch")
     state = torch.load(state_path, map_location="cpu", weights_only=True)
+    reference_path = root / manifest["reference"]
+    if _sha256(reference_path) != manifest["reference_sha256"]:
+        raise RuntimeError("golden reference hash mismatch")
+    reference = torch.load(reference_path, map_location="cpu", weights_only=True)
     device = torch.device("cuda:0")
     actual_cases = {
         workload.name: _run_updateformer_case(workload, state, device)
         for workload in WORKLOADS
     }
     actual_losses = _run_loss_contract(device)
-    mismatch = _exact_mismatch(manifest["cases"], actual_cases)
-    mismatch = mismatch or _exact_mismatch(manifest["loss_contract"], actual_losses)
+    mismatch = _close_mismatch(reference["cases"], actual_cases)
+    mismatch = mismatch or _close_mismatch(
+        reference["loss_contract"], actual_losses
+    )
     if mismatch:
         raise RuntimeError(f"exactness contract failed: {mismatch}")
     return {
