@@ -324,12 +324,6 @@ def build_wids_index(
     return index
 
 
-def build_wds_index(archive: Path, index: Path | None = None, command: str = "widsindex") -> Path:
-    """Backward-compatible single-shard wrapper around :func:`build_wids_index`."""
-    archive = Path(archive)
-    return build_wids_index((archive,), Path(index or archive.with_suffix(".json")), command)
-
-
 def _publish_catalog(split_root: Path, results: Sequence[dict[str, object]]) -> dict[str, object]:
     scenes: dict[str, dict[str, object]] = {}
     sample_index = 0
