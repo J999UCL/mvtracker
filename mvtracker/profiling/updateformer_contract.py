@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import statistics
-import subprocess
 import time
 
 import torch
@@ -20,6 +21,7 @@ HIDDEN_SIZE = 256
 OUTPUT_DIM = 131
 FLOAT_RTOL = 1e-4
 FLOAT_ATOL = 1e-5
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
 @dataclass(frozen=True)
@@ -94,12 +96,10 @@ def _cpu_clone(value):
 
 
 def _git_commit() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    commit = os.environ.get("MVTRACKER_MODAL_COMMIT", "")
+    if _COMMIT.fullmatch(commit) is None:
+        raise RuntimeError("MVTRACKER_MODAL_COMMIT must be one full Git commit")
+    return commit
 
 
 def _build_model(device):
