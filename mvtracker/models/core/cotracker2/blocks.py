@@ -357,6 +357,7 @@ class EfficientUpdateFormer(nn.Module):
             attn_class: Callable[..., nn.Module] = Attention,
             linear_layer_for_vis_conf=False,
             checkpoint_updateformer=True,
+            track_buckets=(512, 768, 1024, 1280, 1536, 1792, 2048),
     ):
         super().__init__()
         self.out_channels = 2
@@ -366,6 +367,7 @@ class EfficientUpdateFormer(nn.Module):
         self.input_transform = torch.nn.Linear(input_dim, hidden_size, bias=True)
         self.linear_layer_for_vis_conf = linear_layer_for_vis_conf
         self.checkpoint_updateformer = checkpoint_updateformer
+        self.track_buckets = tuple(int(value) for value in track_buckets)
         if self.linear_layer_for_vis_conf:
             self.flow_head = nn.Sequential(
                 nn.Linear(hidden_size, output_dim, bias=True),
@@ -456,19 +458,43 @@ class EfficientUpdateFormer(nn.Module):
             self.vis_conf_head.apply(trunc_init)
 
     def forward(self, input_tensor, point_mask=None):
+        track_count = input_tensor.shape[1]
+        bucket = next(
+            (value for value in self.track_buckets if value >= track_count),
+            None,
+        )
+        if bucket is None:
+            raise ValueError(
+                f"UpdateFormer track count {track_count} exceeds configured buckets"
+            )
+        if point_mask is None:
+            point_mask = torch.ones(
+                input_tensor.shape[0],
+                track_count,
+                dtype=torch.bool,
+                device=input_tensor.device,
+            )
+        if bucket != track_count:
+            input_tensor = F.pad(
+                input_tensor,
+                (0, 0, 0, 0, 0, bucket - track_count),
+            )
+            point_mask = F.pad(point_mask, (0, bucket - track_count), value=False)
         if (
             self.checkpoint_updateformer
             and self.training
             and torch.is_grad_enabled()
         ):
-            return checkpoint(
+            output = checkpoint(
                 self._forward_impl,
                 input_tensor,
                 point_mask,
                 use_reentrant=False,
                 preserve_rng_state=False,
             )
-        return self._forward_impl(input_tensor, point_mask)
+        else:
+            output = self._forward_impl(input_tensor, point_mask)
+        return output[:, :track_count]
 
     def _forward_impl(self, input_tensor, point_mask=None):
         tokens = self.input_transform(input_tensor)
