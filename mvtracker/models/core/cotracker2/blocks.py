@@ -466,6 +466,7 @@ class EfficientUpdateFormer(nn.Module):
                 input_tensor,
                 point_mask,
                 use_reentrant=False,
+                preserve_rng_state=False,
             )
         return self._forward_impl(input_tensor, point_mask)
 
