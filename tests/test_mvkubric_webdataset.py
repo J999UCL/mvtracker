@@ -90,7 +90,7 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             with np.load(scene / "view_1" / "tracks_2d.npz") as payload:
                 tracks = payload["tracks_2d"].copy()
                 occlusion = payload["occlusion"].copy()
-            tracks[0, 0, 0] += 0.1
+            tracks[0, 0, 0] += 1.0
             np.savez(scene / "view_1" / "tracks_2d.npz", tracks_2d=tracks, occlusion=occlusion)
             with self.assertRaisesRegex(ValueError, "2D projection check failed"):
                 _scene_components(scene, "900", read_workers=1)

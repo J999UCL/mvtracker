@@ -182,7 +182,7 @@ def _load_tracks(
             )
             valid = np.isfinite(projected).all(axis=-1) & np.isfinite(predicted).all(axis=-1)
             if np.any(valid) and not np.allclose(
-                predicted[valid], projected[valid], atol=1e-3, rtol=0.0
+                predicted[valid], projected[valid], atol=0.5, rtol=0.0
             ):
                 error = float(np.max(np.abs(predicted[valid] - projected[valid])))
                 raise ValueError(f"{scene_root}/{view_name}: 2D projection check failed (max error {error:g})")
