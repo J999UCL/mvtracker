@@ -12,6 +12,8 @@ from mvtracker.preprocessing.mvkubric_webdataset import (
     _scene_components,
     build_wids_index,
     convert_shards,
+    finalize_shards,
+    inventory_path,
     read_component,
     split_scene_ids,
     write_shard,
@@ -140,6 +142,60 @@ class MvKubricWebDatasetTests(unittest.TestCase):
         self.assertEqual([shard.name for shard in shards], ["mvkubric-00000", "mvkubric-00001"])
         self.assertEqual(shards[0].scene_ids, ("1", "2", "3", "5"))
         self.assertEqual(shards[1].scene_ids, ("100",))
+
+    def test_split_scene_ids_supports_global_archive_offsets(self):
+        first = split_scene_ids([str(scene) for scene in range(1001, 1995)], shard_offset=0)
+        second = split_scene_ids([str(scene) for scene in range(2001, 2999)], shard_offset=249)
+        self.assertEqual(len(first), 249)
+        self.assertEqual(len(second), 250)
+        self.assertEqual(first[-1].name, "mvkubric-00248")
+        self.assertEqual(second[0].name, "mvkubric-00249")
+        self.assertEqual(second[-1].name, "mvkubric-00498")
+        self.assertEqual([shard.index for shard in second], list(range(249, 499)))
+
+    def test_convert_shards_reuses_only_tar_inventory_pairs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._make_scene(root, "1")
+            self._make_scene(root, "2")
+            output = root / "out"
+            with patch(
+                "mvtracker.preprocessing.mvkubric_webdataset.build_wids_index",
+                side_effect=lambda archives, index, command: index.touch() or index,
+            ):
+                convert_shards(root, output, ["1", "2"], read_workers=2)
+                with patch("mvtracker.preprocessing.mvkubric_webdataset.write_shard") as write:
+                    convert_shards(root, output, ["1", "2"], read_workers=2)
+                    write.assert_not_called()
+                inventory = inventory_path(output / "mvkubric-00000.tar")
+                inventory.unlink()
+                with patch(
+                    "mvtracker.preprocessing.mvkubric_webdataset.write_shard",
+                    wraps=write_shard,
+                ) as write:
+                    convert_shards(root, output, ["1", "2"], read_workers=2)
+                    write.assert_called_once()
+
+    def test_finalize_shards_combines_two_global_archive_ranges(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for scene_id in ("1", "2", "3", "4"):
+                self._make_scene(root, scene_id)
+            output = root / "out"
+            with patch(
+                "mvtracker.preprocessing.mvkubric_webdataset.build_wids_index",
+                side_effect=lambda archives, index, command: index.touch() or index,
+            ):
+                convert_shards(root, output, ["1", "2"], read_workers=2, finalize=False)
+                convert_shards(root, output, ["3", "4"], read_workers=2, shard_offset=1, finalize=False)
+                manifest = finalize_shards(output, ["1", "2", "3", "4"])
+            self.assertEqual(manifest["scene_ids"], ["1", "2", "3", "4"])
+            self.assertEqual([shard["name"] for shard in manifest["shards"]], [
+                "mvkubric-00000", "mvkubric-00001",
+            ])
+            catalog = json.loads((output / "catalog.json").read_text())
+            self.assertEqual(catalog["scenes"]["3"]["metadata_index"], 8)
+            self.assertEqual(catalog["sample_count"], 16)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ RGB_COMPONENT = "rgb.npz"
 DEPTH_COMPONENT = "depth.npz"
 WIDS_INDEX = "shards.json"
 CATALOG = "catalog.json"
+INVENTORY_SUFFIX = ".inventory.json"
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class SceneShard:
 
     name: str
     scene_ids: tuple[str, ...]
+    index: int = 0
 
 
 def discover_scene_ids(scene_root: Path, include: Iterable[str] | None = None) -> tuple[str, ...]:
@@ -50,18 +52,29 @@ def discover_scene_ids(scene_root: Path, include: Iterable[str] | None = None) -
 
 
 def split_scene_ids(
-    scene_ids: Sequence[str], scenes_per_shard: int = SCENES_PER_SHARD
+    scene_ids: Sequence[str],
+    scenes_per_shard: int = SCENES_PER_SHARD,
+    shard_offset: int = 0,
 ) -> tuple[SceneShard, ...]:
     if scenes_per_shard <= 0:
         raise ValueError("scenes_per_shard must be positive")
+    if shard_offset < 0:
+        raise ValueError("shard_offset must be non-negative")
     ordered = tuple(sorted((str(scene) for scene in scene_ids), key=int))
     return tuple(
         SceneShard(
-            name=f"mvkubric-{index:05d}",
+            name=f"mvkubric-{shard_offset + index:05d}",
             scene_ids=ordered[start : start + scenes_per_shard],
+            index=shard_offset + index,
         )
         for index, start in enumerate(range(0, len(ordered), scenes_per_shard))
     )
+
+
+def inventory_path(output_tar: Path) -> Path:
+    """Return the adjacent JSON inventory path for a shard TAR."""
+    output_tar = Path(output_tar)
+    return output_tar.with_suffix(INVENTORY_SUFFIX)
 
 
 def _npz_bytes(**arrays: np.ndarray) -> bytes:
@@ -249,6 +262,8 @@ def write_shard(
     output_tar.parent.mkdir(parents=True, exist_ok=True)
     partial = output_tar.with_suffix(output_tar.suffix + ".partial")
     partial.unlink(missing_ok=True)
+    inventory = inventory_path(output_tar)
+    inventory.unlink(missing_ok=True)
     started = time.perf_counter()
     expected_view_count = _scene_view_count(scene_root, shard.scene_ids[0])
     sample_records: list[dict[str, object]] = []
@@ -269,17 +284,29 @@ def write_shard(
                 sample_records.append({"key": key, "scene": str(scene_id), "view": view, "kind": "media"})
             if progress_callback is not None:
                 progress_callback(shard, scene_id, completed, time.perf_counter() - started)
+            print(
+                f"CONVERT event=scene shard={shard.name} scene={scene_id} "
+                f"progress={completed}/{len(shard.scene_ids)} "
+                f"elapsed_seconds={time.perf_counter() - started:.1f}",
+                flush=True,
+            )
     partial.replace(output_tar)
-    return {
+    result = {
         "name": shard.name,
+        "index": shard.index,
         "scene_ids": list(shard.scene_ids),
         "tar": output_tar.name,
+        "inventory": inventory.name,
         "bytes": output_tar.stat().st_size,
         "seconds": time.perf_counter() - started,
         "view_count": expected_view_count,
         "sample_records": sample_records,
         "nsamples": len(sample_records),
     }
+    inventory_partial = inventory.with_suffix(inventory.suffix + ".partial")
+    inventory_partial.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    inventory_partial.replace(inventory)
+    return result
 
 
 def build_wids_index(
@@ -321,6 +348,81 @@ def _publish_catalog(split_root: Path, results: Sequence[dict[str, object]]) -> 
     return catalog
 
 
+def _load_inventory(path: Path) -> dict[str, object]:
+    """Load one completed shard inventory."""
+    with Path(path).open("r", encoding="utf-8") as handle:
+        result = json.load(handle)
+    if not isinstance(result, dict):
+        raise ValueError(f"{path}: shard inventory must be a JSON object")
+    required = {"name", "index", "scene_ids", "tar", "sample_records", "nsamples", "view_count"}
+    missing = required.difference(result)
+    if missing:
+        raise ValueError(f"{path}: shard inventory is missing {sorted(missing)}")
+    tar = Path(path).parent / str(result["tar"])
+    if not tar.is_file():
+        raise FileNotFoundError(f"{path}: inventory TAR does not exist: {tar}")
+    if not isinstance(result["scene_ids"], list) or not isinstance(result["sample_records"], list):
+        raise ValueError(f"{path}: invalid scene_ids or sample_records")
+    return result
+
+
+def finalize_shards(
+    output_root: Path,
+    expected_scene_ids: Sequence[str],
+    *,
+    scenes_per_shard: int = SCENES_PER_SHARD,
+    index_command: str = "widsindex",
+) -> dict[str, object]:
+    """Publish WIDS metadata from all completed adjacent shard inventories.
+
+    Inventories are the completion markers: a TAR without its inventory is not
+    considered complete.  The finalizer requires exactly the expected scene
+    set and contiguous global shard numbering.
+    """
+    if scenes_per_shard <= 0:
+        raise ValueError("scenes_per_shard must be positive")
+    split_root = Path(output_root)
+    expected = tuple(sorted((str(scene) for scene in expected_scene_ids), key=int))
+    if len(set(expected)) != len(expected):
+        raise ValueError("expected_scene_ids must be unique")
+    if not expected:
+        raise ValueError("expected_scene_ids must not be empty")
+
+    inventory_files = sorted(split_root.glob(f"*{INVENTORY_SUFFIX}"), key=lambda path: int(path.name.split("-")[-1].split(".")[0]))
+    if not inventory_files:
+        raise RuntimeError("no completed shard inventories found")
+    expected_shard_count = len(inventory_files)
+    results = [_load_inventory(path) for path in inventory_files]
+    results.sort(key=lambda item: int(item["index"]))
+    if [int(result["index"]) for result in results] != list(range(expected_shard_count)):
+        raise RuntimeError("shard inventories do not have contiguous global numbering")
+    observed = [str(scene) for result in results for scene in result["scene_ids"]]
+    if observed != list(expected):
+        raise RuntimeError("shard inventories do not contain exactly the expected scene IDs")
+
+    archives = [split_root / str(result["tar"]) for result in results]
+    index = build_wids_index(archives, split_root / WIDS_INDEX, command=index_command)
+    catalog = _publish_catalog(split_root, results)
+    manifest = {
+        "format": WEB_DATASET_FORMAT,
+        "split": split_root.name,
+        "scenes_per_shard": scenes_per_shard,
+        "view_count": int(results[0]["view_count"]),
+        "scene_ids": list(expected),
+        "shards": [
+            {key: value for key, value in result.items() if key != "sample_records"}
+            for result in results
+        ],
+        "wids_descriptor": index.name,
+        "catalog": CATALOG,
+        "scenes": catalog["scenes"],
+    }
+    temporary = split_root / "manifest.json.partial"
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(split_root / "manifest.json")
+    return {**manifest, "catalog_data": catalog}
+
+
 def convert_split(
     scene_root: Path,
     output_root: Path,
@@ -330,6 +432,9 @@ def convert_split(
     read_workers: int = 16,
     index_command: str = "widsindex",
     progress_callback=None,
+    shard_offset: int = 0,
+    finalize: bool = True,
+    expected_scene_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
     """Convert a split serially, publishing one WIDS descriptor and catalog."""
     return convert_shards(
@@ -341,6 +446,9 @@ def convert_split(
         read_workers=read_workers,
         index_command=index_command,
         progress_callback=progress_callback,
+        shard_offset=shard_offset,
+        finalize=finalize,
+        expected_scene_ids=expected_scene_ids,
     )
 
 
@@ -354,21 +462,45 @@ def convert_shards(
     read_workers: int = 16,
     index_command: str = "widsindex",
     progress_callback=None,
+    shard_offset: int = 0,
+    finalize: bool = True,
+    expected_scene_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
-    """Convert all shards concurrently and publish a WIDS descriptor/catalog."""
+    """Convert all shards concurrently, reusing completed inventory pairs.
+
+    Set ``finalize=False`` while processing individual source archives.  Once
+    all archive ranges have completed, call :func:`finalize_shards` with the
+    complete expected scene allowlist.
+    """
     if shard_workers < 1 or read_workers < 1:
         raise ValueError("shard_workers and read_workers must be positive")
     if not scene_ids:
         raise ValueError("scene_ids must not be empty")
+    if shard_offset < 0:
+        raise ValueError("shard_offset must be non-negative")
     split_root = Path(output_root)
     split_root.mkdir(parents=True, exist_ok=True)
     view_count = _require_consistent_view_count(scene_root, scene_ids)
-    shards = split_scene_ids(scene_ids, scenes_per_shard)
+    shards = split_scene_ids(scene_ids, scenes_per_shard, shard_offset=shard_offset)
 
     def convert_one(shard: SceneShard) -> dict[str, object]:
         archive = split_root / f"{shard.name}.tar"
+        inventory = inventory_path(archive)
+        partial = archive.with_suffix(archive.suffix + ".partial")
+        inventory_partial = inventory.with_suffix(inventory.suffix + ".partial")
+        partial.unlink(missing_ok=True)
+        inventory_partial.unlink(missing_ok=True)
+        if archive.is_file() and inventory.is_file():
+            result = _load_inventory(inventory)
+            if result["name"] != shard.name or [str(scene) for scene in result["scene_ids"]] != list(shard.scene_ids):
+                raise RuntimeError(f"{inventory}: inventory does not match expected shard {shard.name}")
+            if progress_callback is None:
+                print(f"CONVERT event=shard_skipped shard={shard.name} reason=inventory", flush=True)
+            return result
         if archive.is_file():
-            raise FileExistsError(f"refusing to overwrite existing shard: {archive}")
+            archive.unlink()
+        if inventory.is_file():
+            inventory.unlink()
         return write_shard(
             scene_root, shard, archive, read_workers=read_workers, progress_callback=progress_callback
         )
@@ -381,29 +513,30 @@ def convert_shards(
             results.append(result)
             if progress_callback is not None:
                 progress_callback("shard", result, len(results), len(shards))
+            print(
+                f"CONVERT event=shard completed={len(results)}/{len(shards)} "
+                f"shard={result['name']} bytes={result['bytes']}",
+                flush=True,
+            )
     results.sort(key=lambda result: str(result["name"]))
-    index = build_wids_index(
-        [split_root / str(result["tar"]) for result in results], split_root / WIDS_INDEX, command=index_command
+    if not finalize:
+        return {
+            "format": WEB_DATASET_FORMAT,
+            "split": split_root.name,
+            "scenes_per_shard": scenes_per_shard,
+            "view_count": view_count,
+            "scene_ids": [scene for result in results for scene in result["scene_ids"]],
+            "shards": [
+                {key: value for key, value in result.items() if key != "sample_records"}
+                for result in results
+            ],
+        }
+    return finalize_shards(
+        split_root,
+        expected_scene_ids if expected_scene_ids is not None else scene_ids,
+        scenes_per_shard=scenes_per_shard,
+        index_command=index_command,
     )
-    catalog = _publish_catalog(split_root, results)
-    manifest = {
-        "format": WEB_DATASET_FORMAT,
-        "split": split_root.name,
-        "scenes_per_shard": scenes_per_shard,
-        "view_count": view_count,
-        "scene_ids": [scene for result in results for scene in result["scene_ids"]],
-        "shards": [
-            {key: value for key, value in result.items() if key != "sample_records"}
-            for result in results
-        ],
-        "wids_descriptor": index.name,
-        "catalog": CATALOG,
-        "scenes": catalog["scenes"],
-    }
-    temporary = split_root / "manifest.json.partial"
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    temporary.replace(split_root / "manifest.json")
-    return {**manifest, "catalog_data": catalog}
 
 
 def read_component(payload: bytes) -> dict[str, np.ndarray]:
