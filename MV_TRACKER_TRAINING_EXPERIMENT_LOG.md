@@ -1004,3 +1004,31 @@ scene-level metadata and statistical sampling behavior.
 - Successful T4 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/kiwexyf3
 - Report: `jeet-mvtracker-runs-v2/t4-mvkubric-webdataset/mvkubric-webdataset-t4-pilot-v3.json`
 - Modal app: https://modal.com/apps/ucl-prism/main/ap-Wj4MIHq6n1kfBG3GwNgN7p
+
+## 2026-08-19 — Full MV-Kubric scene/view WebDataset publication
+
+The two pinned training archives were copied to one Modal CPU container's local
+SSD one at a time, extracted locally with rapidgzip, and converted with eight
+concurrent shard workers. Only the large completed TAR shards and their compact
+inventories were written back to the data Volume.
+
+Archive 1001--2000 copied 377.17 GiB in 276.4 seconds, extracted 450.29 GiB and
+771,344 files in 1,402.2 seconds, and produced 994 scenes in 249 shards. Archive
+2001--3000 copied 379.28 GiB in 317.6 seconds, extracted 451.84 GiB and 774,448
+files in 1,410.1 seconds, and produced 998 scenes in 250 shards. All 499 training
+shards were durable after 5,554.3 seconds of the primary run.
+
+The initial finalizer exposed that the `widsindex` CLI imports PyTorch and would
+also reread every TAR to compute MD5 and sample counts. Finalization now writes
+the standard WIDS-v1 descriptor atomically from the already committed shard
+inventories (`url`, `nsamples`, and `filesize`), avoiding PyTorch and an
+unnecessary pass over the full dataset. The successful resume also converted
+the fixed validation scenes 101--127 in 142.4 seconds.
+
+Published dataset:
+
+- Train: 1,992 scenes, 499 shards at `datasets/kubric-multiview-webdataset/train`
+- Validation: 27 scenes, 7 shards at `datasets/kubric-multiview-webdataset/validation`
+- Data Volume: `jeet-mvtracker-data-v2`
+- Successful finalization W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/7sxzztsh
+- Successful Modal app: https://modal.com/apps/ucl-prism/main/ap-BM6BQdVVBFhOkNEEZaB0xD
