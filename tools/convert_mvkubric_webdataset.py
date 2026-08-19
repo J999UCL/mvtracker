@@ -31,7 +31,6 @@ def main() -> None:
     parser.add_argument("--scenes-per-shard", type=int, default=SCENES_PER_SHARD)
     parser.add_argument("--shard-workers", type=int, default=1)
     parser.add_argument("--read-workers", type=int, default=16)
-    parser.add_argument("--index-command", default="widsindex")
     args = parser.parse_args()
     if args.shard_workers < 1 or args.read_workers < 1:
         parser.error("--shard-workers and --read-workers must be positive")
@@ -63,7 +62,6 @@ def main() -> None:
         scenes_per_shard=args.scenes_per_shard,
         shard_workers=args.shard_workers,
         read_workers=args.read_workers,
-        index_command=args.index_command,
         progress_callback=progress,
     )
     print(

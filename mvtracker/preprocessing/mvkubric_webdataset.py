@@ -12,7 +12,6 @@ from dataclasses import dataclass
 import io
 import json
 from pathlib import Path
-import subprocess
 import tarfile
 import time
 from typing import Iterable, Sequence
@@ -310,20 +309,28 @@ def write_shard(
 
 
 def build_wids_index(
-    archives: Sequence[Path], index: Path, command: str = "widsindex"
+    shards: Sequence[dict[str, object]], index: Path
 ) -> Path:
-    """Create the standard WIDS shard-list descriptor for uncompressed TARs."""
-    archives = tuple(Path(archive).resolve() for archive in archives)
-    if not archives:
+    """Create the standard WIDS-v1 descriptor from completed shard inventories."""
+    if not shards:
         raise ValueError("at least one archive is required")
     index = Path(index).resolve()
     index.parent.mkdir(parents=True, exist_ok=True)
-    names = [archive.name for archive in archives]
-    subprocess.run(
-        [command, "create", "--output", str(index), *names],
-        cwd=archives[0].parent,
-        check=True,
-    )
+    descriptor = {
+        "__kind__": "wids-shard-index-v1",
+        "wids_version": 1,
+        "shardlist": [
+            {
+                "url": str(shard["tar"]),
+                "nsamples": int(shard["nsamples"]),
+                "filesize": int(shard["bytes"]),
+            }
+            for shard in shards
+        ],
+    }
+    partial = index.with_suffix(index.suffix + ".partial")
+    partial.write_text(json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
+    partial.replace(index)
     return index
 
 
@@ -371,7 +378,6 @@ def finalize_shards(
     expected_scene_ids: Sequence[str],
     *,
     scenes_per_shard: int = SCENES_PER_SHARD,
-    index_command: str = "widsindex",
 ) -> dict[str, object]:
     """Publish WIDS metadata from all completed adjacent shard inventories.
 
@@ -400,8 +406,7 @@ def finalize_shards(
     if observed != list(expected):
         raise RuntimeError("shard inventories do not contain exactly the expected scene IDs")
 
-    archives = [split_root / str(result["tar"]) for result in results]
-    index = build_wids_index(archives, split_root / WIDS_INDEX, command=index_command)
+    index = build_wids_index(results, split_root / WIDS_INDEX)
     catalog = _publish_catalog(split_root, results)
     manifest = {
         "format": WEB_DATASET_FORMAT,
@@ -430,7 +435,6 @@ def convert_split(
     *,
     scenes_per_shard: int = SCENES_PER_SHARD,
     read_workers: int = 16,
-    index_command: str = "widsindex",
     progress_callback=None,
     shard_offset: int = 0,
     finalize: bool = True,
@@ -444,7 +448,6 @@ def convert_split(
         scenes_per_shard=scenes_per_shard,
         shard_workers=1,
         read_workers=read_workers,
-        index_command=index_command,
         progress_callback=progress_callback,
         shard_offset=shard_offset,
         finalize=finalize,
@@ -460,7 +463,6 @@ def convert_shards(
     scenes_per_shard: int = SCENES_PER_SHARD,
     shard_workers: int = 1,
     read_workers: int = 16,
-    index_command: str = "widsindex",
     progress_callback=None,
     shard_offset: int = 0,
     finalize: bool = True,
@@ -535,7 +537,6 @@ def convert_shards(
         split_root,
         expected_scene_ids if expected_scene_ids is not None else scene_ids,
         scenes_per_shard=scenes_per_shard,
-        index_command=index_command,
     )
 
 

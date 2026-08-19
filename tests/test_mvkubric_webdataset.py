@@ -113,7 +113,7 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             output = root / "out"
             with patch(
                 "mvtracker.preprocessing.mvkubric_webdataset.build_wids_index",
-                side_effect=lambda archives, index, command: index.touch() or index,
+                side_effect=lambda shards, index: index.touch() or index,
             ):
                 manifest = convert_shards(root, output, ["1", "2"], read_workers=2)
             catalog = json.loads((output / "catalog.json").read_text())
@@ -123,18 +123,17 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             self.assertEqual(catalog["scenes"]["1"]["views"]["2"]["media_index"], 3)
             self.assertEqual(catalog["scenes"]["2"]["metadata_index"], 4)
 
-    def test_build_wids_index_invokes_standard_descriptor_command(self):
+    def test_build_wids_index_writes_standard_descriptor(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            archive = root / "mvkubric-00000.tar"
-            archive.touch()
             index = root / "shards.json"
-            with patch("mvtracker.preprocessing.mvkubric_webdataset.subprocess.run") as run:
-                self.assertEqual(build_wids_index([archive], index, command="widsindex"), index.resolve())
-            run.assert_called_once_with(
-                ["widsindex", "create", "--output", str(index.resolve()), archive.name],
-                cwd=archive.parent.resolve(),
-                check=True,
+            shards = [{"tar": "mvkubric-00000.tar", "nsamples": 28, "bytes": 1234}]
+            self.assertEqual(build_wids_index(shards, index), index.resolve())
+            descriptor = json.loads(index.read_text())
+            self.assertEqual(descriptor["wids_version"], 1)
+            self.assertEqual(
+                descriptor["shardlist"],
+                [{"url": "mvkubric-00000.tar", "nsamples": 28, "filesize": 1234}],
             )
 
     def test_split_scene_ids_is_four_scene_shards(self):
@@ -161,7 +160,7 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             output = root / "out"
             with patch(
                 "mvtracker.preprocessing.mvkubric_webdataset.build_wids_index",
-                side_effect=lambda archives, index, command: index.touch() or index,
+                side_effect=lambda shards, index: index.touch() or index,
             ):
                 convert_shards(root, output, ["1", "2"], read_workers=2)
                 with patch("mvtracker.preprocessing.mvkubric_webdataset.write_shard") as write:
@@ -184,7 +183,7 @@ class MvKubricWebDatasetTests(unittest.TestCase):
             output = root / "out"
             with patch(
                 "mvtracker.preprocessing.mvkubric_webdataset.build_wids_index",
-                side_effect=lambda archives, index, command: index.touch() or index,
+                side_effect=lambda shards, index: index.touch() or index,
             ):
                 convert_shards(root, output, ["1", "2"], read_workers=2, finalize=False)
                 convert_shards(root, output, ["3", "4"], read_workers=2, shard_offset=1, finalize=False)
