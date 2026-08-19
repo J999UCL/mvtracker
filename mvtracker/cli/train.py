@@ -284,7 +284,7 @@ def _create_torch_profiler(cfg, experiment_path, global_rank):
     def trace_ready(profiler):
         tensorboard_trace_handler(profiler)
         averages = profiler.key_averages()
-        sort_key = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
+        sort_key = "self_device_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
         summary = averages.table(sort_by=sort_key, row_limit=100)
         summary_path = trace_dir / f"summary_step_{profiler.step_num:06d}.txt"
         summary_path.write_text(summary + "\n", encoding="utf-8")
@@ -294,7 +294,7 @@ def _create_torch_profiler(cfg, experiment_path, global_rank):
                 sum(int(event.flops or 0) for event in averages)
             ),
             "summed_self_cuda_time_us": float(
-                sum(float(event.self_cuda_time_total) for event in averages)
+                sum(float(event.self_device_time_total) for event in averages)
             ),
         }
         (trace_dir / f"flops_step_{profiler.step_num:06d}.json").write_text(
@@ -302,7 +302,7 @@ def _create_torch_profiler(cfg, experiment_path, global_rank):
         )
         if torch.cuda.is_available() and bool(profiler_cfg.get("profile_memory", True)):
             memory_summary = averages.table(
-                sort_by="self_cuda_memory_usage", row_limit=200
+                sort_by="self_device_memory_usage", row_limit=200
             )
             (trace_dir / f"memory_summary_step_{profiler.step_num:06d}.txt").write_text(
                 memory_summary + "\n", encoding="utf-8"
