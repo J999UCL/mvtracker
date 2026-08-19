@@ -1,5 +1,23 @@
 # MV-Tracker Modal profiling runbook
 
+## UpdateFormer single-H100 autoresearch contract
+
+These commands use one H100 and the billing tags `owner=jeet`,
+`project=mvtracker`, `purpose=profiling`. Capture creates the immutable v1
+golden contract once. Every candidate must pass exact output, input-gradient,
+parameter-gradient, Adam-update, and loss checks before its fixed B1/B2/B4
+benchmark runs.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
+
+modal run --timestamps tools/modal_updateformer_autoresearch.py::capture
+modal run --timestamps tools/modal_updateformer_autoresearch.py::verify
+modal run --timestamps tools/modal_updateformer_autoresearch.py::benchmark \
+  --warmup 3 --measured 10
+```
+
 ## VGGT-Omega H100 throughput profile
 
 This profile requests exactly one H100 (`max_containers=1`) and carries the
