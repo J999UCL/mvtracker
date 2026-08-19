@@ -1902,9 +1902,12 @@ def main(cfg: DictConfig):
         planned_physical_batching = _planned_physical_batching(cfg)
         if planned_physical_batching:
             capacity = _physical_batch_capacity(cfg)
-            if fabric.world_size != capacity.rank_count:
+            rank_local = bool(
+                cfg.datasets.train.physical_batching.get("rank_local", False)
+            )
+            if not rank_local and fabric.world_size != capacity.rank_count:
                 raise ValueError(
-                    "physical batching requires exactly "
+                    "global physical batching requires exactly "
                     f"{capacity.rank_count} DDP ranks"
                 )
         else:
