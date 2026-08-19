@@ -37,11 +37,14 @@ class ModalTrainingProfileTests(unittest.TestCase):
         self.assertIn("pip_install_from_requirements", dependency)
         self.assertIn("flash-attn==2.8.3.post1", dependency)
         self.assertIn("pointops", dependency)
+        self.assertIn("build_indexed_correlation_extension.py", dependency)
         self.assertNotIn("_source_commit()", dependency)
         self.assertIn("_source_image(_dependency_image())", runtime)
         self.assertIn(".run_commands(clone)", source_layer)
         self.assertIn("checkout --detach FETCH_HEAD", source_layer)
         self.assertIn("rev-parse HEAD", source_layer)
+        self.assertIn("cp /opt/mvtracker-extension/", source_layer)
+        self.assertNotIn("build_indexed_correlation_extension.py", source_layer)
 
     def test_runtime_installs_lossless_gpu_image_codecs_and_zstd(self):
         source = (

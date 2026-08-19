@@ -31,6 +31,13 @@ PROFILE_BATCH_ROOT = DATA_ROOT / "profile-batches"
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 REQUIREMENTS_FILE = Path(__file__).resolve().parents[1] / "requirements.full.txt"
+CORRELATION_SOURCE_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "mvtracker"
+    / "models"
+    / "core"
+    / "mvtracker"
+)
 
 
 def _source_commit() -> str:
@@ -84,6 +91,33 @@ def _dependency_image() -> modal.Image:
                 "MAX_JOBS": "8",
             },
         )
+        .add_local_file(
+            str(CORRELATION_SOURCE_DIR / "indexed_correlation_cuda.cpp"),
+            "/opt/mvtracker-extension-src/indexed_correlation_cuda.cpp",
+            copy=True,
+        )
+        .add_local_file(
+            str(CORRELATION_SOURCE_DIR / "indexed_correlation_cuda.cu"),
+            "/opt/mvtracker-extension-src/indexed_correlation_cuda.cu",
+            copy=True,
+        )
+        .add_local_file(
+            str(Path(__file__).resolve().parent / "build_indexed_correlation_extension.py"),
+            "/opt/mvtracker-extension-src/build.py",
+            copy=True,
+        )
+        .run_commands(
+            "python /opt/mvtracker-extension-src/build.py "
+            "--source-dir /opt/mvtracker-extension-src "
+            "--build-directory /opt/mvtracker-extension",
+            env={
+                "CC": "gcc",
+                "CXX": "g++",
+                "CUDA_HOME": "/usr/local/cuda",
+                "TORCH_CUDA_ARCH_LIST": "8.6;9.0;10.0",
+                "MAX_JOBS": "8",
+            },
+        )
     )
 
 
@@ -100,14 +134,8 @@ def _source_image(base: modal.Image) -> modal.Image:
         base
         .run_commands(clone)
         .run_commands(
-            "python /opt/mvtracker/tools/build_indexed_correlation_extension.py",
-            env={
-                "CC": "gcc",
-                "CXX": "g++",
-                "CUDA_HOME": "/usr/local/cuda",
-                "TORCH_CUDA_ARCH_LIST": "8.6;9.0;10.0",
-                "MAX_JOBS": "8",
-            },
+            "cp /opt/mvtracker-extension/mvtracker_indexed_correlation_cuda*.so "
+            "/opt/mvtracker/mvtracker/models/core/mvtracker/",
         )
         .env(
             {
