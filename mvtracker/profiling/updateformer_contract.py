@@ -14,7 +14,7 @@ import time
 import torch
 
 
-FORMAT = "mvtracker-updateformer-contract-v2"
+FORMAT = "mvtracker-updateformer-contract-v3"
 MODEL_SEED = 20260819
 INPUT_DIM = 581
 HIDDEN_SIZE = 256
@@ -36,9 +36,10 @@ class Workload:
 
 WORKLOADS = (
     Workload("single_512", 1, 512, (512,), 1101),
+    Workload("single_777", 1, 777, (777,), 1105),
     Workload("single_1536", 1, 1536, (1536,), 1102),
-    Workload("paired_ragged_1024", 2, 1024, (1024, 731), 1103),
-    Workload("quad_ragged_512", 4, 512, (512, 447, 381, 256), 1104),
+    Workload("paired_ragged_900", 2, 900, (900, 623), 1103),
+    Workload("quad_ragged_333", 4, 333, (333, 287, 211, 149), 1104),
 )
 
 
@@ -168,7 +169,11 @@ def _run_updateformer_case(workload: Workload, state, device):
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         output = model(inputs, point_mask=mask)
-        loss = ((output.float() - target) * weights).square().mean()
+        squared_error = ((output.float() - target) * weights).square()
+        valid = mask[:, :, None, None]
+        loss = (squared_error * valid).sum() / (
+            valid.sum() * output.shape[2] * output.shape[3]
+        )
     loss.backward()
     gradients = {
         name: parameter.grad
@@ -176,9 +181,15 @@ def _run_updateformer_case(workload: Workload, state, device):
         if parameter.grad is not None
     }
     result = {
-        "output": output,
+        "output": [
+            output[index, :count]
+            for index, count in enumerate(workload.real_tracks)
+        ],
         "loss": loss,
-        "input_gradient": inputs.grad,
+        "input_gradient": [
+            inputs.grad[index, :count]
+            for index, count in enumerate(workload.real_tracks)
+        ],
         "parameter_gradients": gradients,
     }
     optimizer.step()
@@ -471,7 +482,11 @@ def benchmark(root: Path, warmup=3, measured=10) -> dict[str, object]:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 output = model(inputs, point_mask=mask)
-                loss = ((output.float() - target) * weights).square().mean()
+                squared_error = ((output.float() - target) * weights).square()
+                valid = mask[:, :, None, None]
+                loss = (squared_error * valid).sum() / (
+                    valid.sum() * output.shape[2] * output.shape[3]
+                )
             loss.backward()
             optimizer.step()
 

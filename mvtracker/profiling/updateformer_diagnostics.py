@@ -112,7 +112,11 @@ def benchmark_checkpointing(root: Path, calls=12, warmup=1, measured=5):
         root / manifest["baseline_state"], map_location="cpu", weights_only=True
     )
     device = torch.device("cuda:0")
-    selected = (WORKLOADS[1], WORKLOADS[3])
+    selected = tuple(
+        workload
+        for workload in WORKLOADS
+        if workload.name in {"single_1536", "quad_ragged_333"}
+    )
     results = {}
     for workload in selected:
         base_inputs, target, weights, mask = _workload_tensors(workload, device)

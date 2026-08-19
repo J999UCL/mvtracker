@@ -28,7 +28,7 @@ from mvtracker.profiling.modal_continual_training import (
 
 
 APP_NAME = "jeet-mvtracker-updateformer-research"
-CONTRACT_ROOT = RUN_ROOT / "performance-contracts" / "updateformer-v2"
+CONTRACT_ROOT = RUN_ROOT / "performance-contracts" / "updateformer-v3"
 TAGS = {
     "owner": "jeet",
     "project": "mvtracker",

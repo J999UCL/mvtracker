@@ -56,6 +56,7 @@ class UpdateFormerContractTests(unittest.TestCase):
 
     def test_workloads_cover_single_and_padded_physical_batches(self):
         self.assertEqual({workload.batch_size for workload in WORKLOADS}, {1, 2, 4})
+        self.assertTrue(any(workload.tracks == 777 for workload in WORKLOADS))
         for workload in WORKLOADS:
             self.assertEqual(len(workload.real_tracks), workload.batch_size)
             self.assertTrue(all(0 < count <= workload.tracks for count in workload.real_tracks))
