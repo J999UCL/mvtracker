@@ -119,16 +119,22 @@ def benchmark_dali_case(
     prepare_stream = torch.cuda.Stream(device=device)
     startup_seconds = time.perf_counter() - build_started
 
-    def consume(virtual_index: int) -> tuple[object, float, float, float, int, int, Mapping[str, object]]:
-        plan_started = time.perf_counter()
-        request = SampleRequest(
-            virtual_index=virtual_index,
-            view_count=view_count,
-            scene_index=virtual_index % dataset.real_len,
-        )
-        plan = dataset.plan_sample(request)
-        if plan is None:
-            raise RuntimeError(f"sample planning rejected scene index {request.scene_index}")
+    rejected = 0
+
+    def consume(virtual_index: int) -> tuple[object, int, float, float, float, int, int, Mapping[str, object]]:
+        nonlocal rejected
+        while True:
+            plan_started = time.perf_counter()
+            request = SampleRequest(
+                virtual_index=virtual_index,
+                view_count=view_count,
+                scene_index=virtual_index % dataset.real_len,
+            )
+            plan = dataset.plan_sample(request)
+            if plan is not None:
+                break
+            rejected += 1
+            virtual_index += 1
         plan_seconds = time.perf_counter() - plan_started
         materialize_started = time.perf_counter()
         sample, gotit = dataset.materialize_sample(plan)
@@ -147,12 +153,11 @@ def benchmark_dali_case(
                 prepare_stream=prepare_stream,
             )
         torch.cuda.synchronize(device)
-        return sample, plan_seconds, media_seconds, time.perf_counter() - decode_started, encoded_bytes, len(sample.jpeg_bytes), sample.metadata
+        return sample, virtual_index + 1, plan_seconds, media_seconds, time.perf_counter() - decode_started, encoded_bytes, len(sample.jpeg_bytes), sample.metadata
 
     next_virtual_index = 0
     for _ in range(warmup):
-        consume(next_virtual_index)
-        next_virtual_index += 1
+        _, next_virtual_index, *_ = consume(next_virtual_index)
     plan_times: list[float] = []
     media_times: list[float] = []
     decode_times: list[float] = []
@@ -161,8 +166,7 @@ def benchmark_dali_case(
     media_record_counts: list[int] = []
     measured_started = time.perf_counter()
     for _ in range(measured):
-        _, plan_seconds, media_seconds, decode_seconds, sample_bytes, _, metadata = consume(next_virtual_index)
-        next_virtual_index += 1
+        _, next_virtual_index, plan_seconds, media_seconds, decode_seconds, sample_bytes, _, metadata = consume(next_virtual_index)
         plan_times.append(plan_seconds)
         media_times.append(media_seconds)
         decode_times.append(decode_seconds)
@@ -195,6 +199,7 @@ def benchmark_dali_case(
         "hardware_samples": hardware_samples,
         "warmup": warmup,
         "measured": measured,
+        "rejected_plans": rejected,
     }
 
 
