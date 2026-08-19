@@ -294,7 +294,6 @@ class AttnBlock(nn.Module):
             drop=0,
         )
 
-    @torch.compile(fullgraph=True)
     def forward(self, x, attn_mask=None):
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
         x = x + self.mlp(self.norm2(x))
@@ -332,7 +331,6 @@ class CrossAttnBlock(nn.Module):
             drop=0,
         )
 
-    @torch.compile(fullgraph=True)
     def forward(self, x, context, attn_mask=None):
         x = x + self.cross_attn(self.norm1(x), context=self.norm_context(context), attn_mask=attn_mask)
         x = x + self.mlp(self.norm2(x))

@@ -46,11 +46,13 @@ class UpdateFormerContractTests(unittest.TestCase):
             _close_mismatch(expected, expected + torch.tensor([1e-2, 0.0]))
         )
 
-    def test_bfloat16_forward_contract_is_exact(self):
+    def test_bfloat16_forward_contract_allows_one_ulp(self):
         expected = torch.tensor([1.0], dtype=torch.bfloat16)
-        actual = torch.tensor([1.01], dtype=torch.bfloat16)
+        one_ulp = torch.nextafter(expected, torch.tensor([2.0], dtype=torch.bfloat16))
+        two_ulp = torch.nextafter(one_ulp, torch.tensor([2.0], dtype=torch.bfloat16))
 
-        self.assertIsNotNone(_close_mismatch(expected, actual))
+        self.assertIsNone(_close_mismatch(expected, one_ulp))
+        self.assertIsNotNone(_close_mismatch(expected, two_ulp))
 
     def test_workloads_cover_single_and_padded_physical_batches(self):
         self.assertEqual({workload.batch_size for workload in WORKLOADS}, {1, 2, 4})

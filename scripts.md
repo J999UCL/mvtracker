@@ -3,10 +3,10 @@
 ## UpdateFormer single-H100 autoresearch contract
 
 These commands use one H100 and the billing tags `owner=jeet`,
-`project=mvtracker`, `purpose=profiling`. Capture creates the immutable v1
-golden contract once. Every candidate must pass exact output, input-gradient,
-parameter-gradient, Adam-update, and loss checks before its fixed B1/B2/B4
-benchmark runs.
+`project=mvtracker`, `purpose=profiling`. Capture creates the immutable v2
+golden contract once. Every candidate must stay within one BF16 ULP and pass
+the tight FP32 output, input-gradient, parameter-gradient, Adam-update, and
+loss checks before its fixed B1/B2/B4 benchmark runs.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker

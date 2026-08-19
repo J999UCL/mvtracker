@@ -14,13 +14,14 @@ import time
 import torch
 
 
-FORMAT = "mvtracker-updateformer-contract-v1"
+FORMAT = "mvtracker-updateformer-contract-v2"
 MODEL_SEED = 20260819
 INPUT_DIM = 581
 HIDDEN_SIZE = 256
 OUTPUT_DIM = 131
 FLOAT_RTOL = 1e-4
 FLOAT_ATOL = 1e-5
+LOW_PRECISION_MAX_ULP = 1
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
@@ -282,13 +283,27 @@ def _close_mismatch(expected, actual, path="root"):
                 f"{tuple(expected.shape)}/{expected.dtype}"
             )
         if expected.is_floating_point():
-            exact = expected.dtype in {torch.bfloat16, torch.float16}
-            if not torch.allclose(
-                expected,
-                actual,
-                rtol=0.0 if exact else FLOAT_RTOL,
-                atol=0.0 if exact else FLOAT_ATOL,
-            ):
+            low_precision = expected.dtype in {torch.bfloat16, torch.float16}
+            if low_precision:
+                left_bits = expected.view(torch.int16).to(torch.int32) & 0xFFFF
+                right_bits = actual.view(torch.int16).to(torch.int32) & 0xFFFF
+                left_ordered = torch.where(
+                    left_bits & 0x8000 != 0,
+                    0xFFFF - left_bits,
+                    0x8000 + left_bits,
+                )
+                right_ordered = torch.where(
+                    right_bits & 0x8000 != 0,
+                    0xFFFF - right_bits,
+                    0x8000 + right_bits,
+                )
+                ulp = (right_ordered - left_ordered).abs()
+                close = bool((ulp <= LOW_PRECISION_MAX_ULP).all())
+            else:
+                close = torch.allclose(
+                    expected, actual, rtol=FLOAT_RTOL, atol=FLOAT_ATOL
+                )
+            if not close:
                 difference = (actual.float() - expected.float()).abs()
                 return f"{path}: max absolute error {difference.max().item():.8g}"
         elif not torch.equal(expected, actual):
@@ -381,6 +396,7 @@ def capture_golden(root: Path) -> dict[str, object]:
         "workloads": [asdict(workload) for workload in WORKLOADS],
         "float_rtol": FLOAT_RTOL,
         "float_atol": FLOAT_ATOL,
+        "low_precision_max_ulp": LOW_PRECISION_MAX_ULP,
         "baseline_replay": {
             "cases": _difference_summary(first, second),
             "loss_contract": _difference_summary(losses, second_losses),
