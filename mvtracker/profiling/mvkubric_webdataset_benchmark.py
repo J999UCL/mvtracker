@@ -58,6 +58,7 @@ def benchmark_native_case(
         mvkubric_scene_ids=tuple(scene_ids),
         view_count=view_count,
         hardware_sampler=hardware_sampler,
+        mvkubric_storage="native",
     )
     estimated_bytes = _native_encoded_bytes(data_root, scene_ids, view_count) * measured
     wall_seconds = float(profile["wall_elapsed_seconds"])

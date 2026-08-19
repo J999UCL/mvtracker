@@ -221,6 +221,7 @@ def profile_encoded_loader(
     source_schedule=None,
     simulated_compute_seconds: float = 0.0,
     hardware_sampler=None,
+    mvkubric_storage: str | None = None,
 ) -> dict:
     """Measure encoded TAPVid-3D samples after local extraction.
 
@@ -267,6 +268,8 @@ def profile_encoded_loader(
     config.datasets.train.kubric_metadata_index_root = str(
         datasets_root / "kubric-multiview/train/MVTracker_index"
     )
+    if mvkubric_storage is not None:
+        config.datasets.train.mvkubric_storage = mvkubric_storage
     def build_dataset(dataset_source):
         if dataset_source == "diegesis":
             return TapVid3DMultiViewDataset.from_name(
