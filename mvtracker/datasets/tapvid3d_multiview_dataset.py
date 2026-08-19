@@ -315,6 +315,109 @@ def collate_encoded_tapvid3d(batch):
     )
 
 
+class DaliEncodedImageDecoder:
+    """Persistent DALI decoder for an encoded MV-Kubric physical batch.
+
+    Sampling and augmentation remain outside this class.  It only accepts the
+    selected encoded records and returns GPU tensors, so the caller can use the
+    same assembly path as the existing decoder.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        num_threads: int = 4,
+        prefetch_queue_depth: int = 2,
+    ) -> None:
+        if device.type != "cuda":
+            raise RuntimeError("DALI MV-Kubric decoding requires CUDA")
+        if num_threads < 1 or prefetch_queue_depth < 1:
+            raise ValueError("DALI decoder settings must be positive")
+        try:
+            import nvidia.dali.fn as fn
+            import nvidia.dali.types as types
+            from nvidia.dali import Pipeline
+        except ImportError as error:
+            raise RuntimeError(
+                "DALI MV-Kubric decoding requires nvidia-dali-cuda120==1.53.0"
+            ) from error
+
+        device_id = device.index
+        if device_id is None:
+            device_id = torch.cuda.current_device()
+        self._device = device
+
+        class _Pipeline(Pipeline):
+            def __init__(self):
+                super().__init__(
+                    batch_size=-1,
+                    num_threads=num_threads,
+                    device_id=device_id,
+                    seed=0,
+                    exec_pipelined=True,
+                    # DALI 1.53 documents corruption for parallel external
+                    # sources with the dynamic executor. The decoder output
+                    # is variable-batch, so use the safe static executor.
+                    exec_dynamic=False,
+                    prefetch_queue_depth=prefetch_queue_depth,
+                )
+
+            def define_graph(self):
+                rgb_input = fn.external_source(
+                    name="mvtracker_rgb_encoded", device="cpu", batch=True
+                )
+                depth_input = fn.external_source(
+                    name="mvtracker_depth_encoded", device="cpu", batch=True
+                )
+                rgb = fn.decoders.image(
+                    rgb_input,
+                    device="mixed",
+                    output_type=types.RGB,
+                    dtype=types.UINT8,
+                )
+                depth = fn.decoders.image(
+                    depth_input,
+                    device="mixed",
+                    output_type=types.GRAY,
+                    dtype=types.UINT16,
+                )
+                return rgb, depth
+
+        self._pipeline = _Pipeline()
+        self._pipeline.build()
+
+    def _as_torch(self, output) -> list[torch.Tensor]:
+        """Convert a DALI TensorListGPU without staging it through the CPU."""
+        try:
+            decoded = torch.from_dlpack(output.as_tensor())
+        except (AttributeError, RuntimeError) as error:
+            raise RuntimeError(
+                "DALI GPU output does not expose a torch DLPack tensor"
+            ) from error
+        if decoded.device != self._device:
+            decoded = decoded.to(self._device, non_blocking=True)
+        # DALI reuses TensorListGPU storage after the next ``run``. Keep the
+        # result alive for the model by taking a device-local copy here.
+        decoded = decoded.clone()
+        return list(decoded.unbind(0))
+
+    def decode(
+        self,
+        rgb_encoded: Sequence[bytes | bytearray | memoryview],
+        depth_encoded: Sequence[bytes | bytearray | memoryview],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        if not rgb_encoded or len(rgb_encoded) != len(depth_encoded):
+            raise ValueError("DALI RGB/depth batches must be non-empty and aligned")
+        # Keep the NumPy views alive until ``run`` has consumed external input.
+        rgb_inputs = [np.frombuffer(bytes(value), dtype=np.uint8) for value in rgb_encoded]
+        depth_inputs = [np.frombuffer(bytes(value), dtype=np.uint8) for value in depth_encoded]
+        self._pipeline.feed_input("mvtracker_rgb_encoded", rgb_inputs)
+        self._pipeline.feed_input("mvtracker_depth_encoded", depth_inputs)
+        rgb_output, depth_output = self._pipeline.run()
+        return self._as_torch(rgb_output), self._as_torch(depth_output)
+
+
 def _read_encoded_frames(
     descriptor: int,
     offsets: np.ndarray,
@@ -1228,16 +1331,14 @@ def decode_tapvid3d_batch(
     timing_events: tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event] | None = None,
     nvimagecodec_rgb_decoder=None,
     nvimagecodec_depth_decoder=None,
+    dali_decoder: DaliEncodedImageDecoder | None = None,
     rgb_stream: torch.cuda.Stream | None = None,
     depth_stream: torch.cuda.Stream | None = None,
     prepare_stream: torch.cuda.Stream | None = None,
     decode_image_chunk_size: int = 64,
 ) -> Datapoint:
     if device.type != "cuda":
-        raise RuntimeError("TAPVid-3D training requires CUDA nvJPEG decoding")
-    version = tuple(int(value) for value in torchvision.__version__.split("+")[0].split(".")[:2])
-    if version < (0, 20):
-        raise RuntimeError("batched CUDA JPEG decoding requires torchvision 0.20 or newer")
+        raise RuntimeError("TAPVid-3D training requires CUDA image decoding")
     if decode_image_chunk_size < 1:
         raise ValueError("decode_image_chunk_size must be positive")
     if timing_events is not None:
@@ -1249,6 +1350,9 @@ def decode_tapvid3d_batch(
     flat_encoded = [encoded for sample in batch.samples for encoded in sample.jpeg_bytes]
     decoded_depths = None
     if codec == "jpeg":
+        version = tuple(int(value) for value in torchvision.__version__.split("+")[0].split(".")[:2])
+        if version < (0, 20):
+            raise RuntimeError("batched CUDA JPEG decoding requires torchvision 0.20 or newer")
         if rgb_stream is None or prepare_stream is None:
             raise RuntimeError("GPU image decode requires explicit CUDA streams")
         with torch.cuda.stream(rgb_stream):
@@ -1291,6 +1395,17 @@ def decode_tapvid3d_batch(
         )
         decoded_all = [torch.from_dlpack(image.to_dlpack()) for image in rgb_images]
         decoded_depths = [torch.from_dlpack(image.to_dlpack()) for image in depth_images]
+        prepare_stream.wait_stream(rgb_stream)
+        prepare_stream.wait_stream(depth_stream)
+    elif codec == "dali":
+        if dali_decoder is None:
+            raise RuntimeError("DALI MV-Kubric batches require a persistent DALI decoder")
+        if rgb_stream is None or depth_stream is None or prepare_stream is None:
+            raise RuntimeError("DALI MV-Kubric decoding requires explicit CUDA streams")
+        decoded_all, decoded_depths = dali_decoder.decode(
+            flat_encoded,
+            [encoded for sample in batch.samples for encoded in sample.depth_bytes],
+        )
         prepare_stream.wait_stream(rgb_stream)
         prepare_stream.wait_stream(depth_stream)
     else:

@@ -46,13 +46,16 @@ class ModalTrainingProfileTests(unittest.TestCase):
         self.assertIn("cp /opt/mvtracker-extension/", source_layer)
         self.assertNotIn("build_indexed_correlation_extension.py", source_layer)
 
-    def test_runtime_installs_lossless_gpu_image_codecs_and_zstd(self):
+    def test_runtime_installs_dali_compatible_gpu_image_codecs_and_zstd(self):
         source = (
             Path(__file__).resolve().parents[1] / "tools/modal_training_profile.py"
         ).read_text(encoding="utf-8")
         self.assertIn('"zstd"', source)
-        self.assertIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20"', source)
-        self.assertIn('"nvidia-libnvcomp-cu12==5.3.0.16"', source)
+        self.assertIn('"nvidia-dali-cuda120==1.53.0"', source)
+        self.assertIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.0"', source)
+        self.assertIn('"nvidia-libnvcomp-cu12==5.1.0.21"', source)
+        self.assertNotIn('"nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20"', source)
+        self.assertNotIn('"nvidia-libnvcomp-cu12==5.3.0.16"', source)
 
     def test_3d_embedding_accepts_bfloat16_coordinates(self):
         grid = torch.tensor(

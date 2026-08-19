@@ -23,6 +23,7 @@ from mvtracker.datasets.physical_batch_scheduler import (
     schedule_physical_batch,
 )
 from mvtracker.datasets.tapvid3d_multiview_dataset import (
+    DaliEncodedImageDecoder,
     EncodedTapVid3DBatch,
     EncodedTapVid3DSample,
     SamplePlan,
@@ -483,7 +484,14 @@ def _record_stream(datapoint: Datapoint, stream: torch.cuda.Stream) -> None:
 class PhysicalBatchDecoder:
     """Decode one scheduled physical group on persistent CUDA streams."""
 
-    def __init__(self, device: torch.device, *, decode_image_chunk_size: int = 64):
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        decode_image_chunk_size: int = 64,
+        dali_num_threads: int = 4,
+        dali_prefetch_queue_depth: int = 2,
+    ):
         self.device = device
         self.decode_image_chunk_size = int(decode_image_chunk_size)
         if self.decode_image_chunk_size < 1:
@@ -493,6 +501,11 @@ class PhysicalBatchDecoder:
         self.prepare_stream = torch.cuda.Stream(device=device)
         self.rgb_decoder = None
         self.depth_decoder = None
+        self.dali_decoder = None
+        self.dali_num_threads = int(dali_num_threads)
+        self.dali_prefetch_queue_depth = int(dali_prefetch_queue_depth)
+        if self.dali_num_threads < 1 or self.dali_prefetch_queue_depth < 1:
+            raise ValueError("DALI decoder settings must be positive")
 
     def _ensure_nvimagecodec(self) -> None:
         if self.rgb_decoder is not None:
@@ -507,12 +520,22 @@ class PhysicalBatchDecoder:
         self.rgb_decoder = nvimgcodec.Decoder(device_id=device_id)
         self.depth_decoder = nvimgcodec.Decoder(device_id=device_id)
 
+    def _ensure_dali(self) -> None:
+        if self.dali_decoder is None:
+            self.dali_decoder = DaliEncodedImageDecoder(
+                self.device,
+                num_threads=self.dali_num_threads,
+                prefetch_queue_depth=self.dali_prefetch_queue_depth,
+            )
+
     def decode_async(self, group: PreparedPhysicalGroup):
         codec_groups = {}
         for position, sample in enumerate(group.samples):
             codec_groups.setdefault(sample.image_codec, []).append((position, sample))
         if "nvimagecodec" in codec_groups:
             self._ensure_nvimagecodec()
+        if "dali" in codec_groups:
+            self._ensure_dali()
         decoded = [None] * len(group.samples)
         with torch.cuda.stream(self.prepare_stream):
             for codec_items in codec_groups.values():
@@ -521,6 +544,7 @@ class PhysicalBatchDecoder:
                     self.device,
                     nvimagecodec_rgb_decoder=self.rgb_decoder,
                     nvimagecodec_depth_decoder=self.depth_decoder,
+                    dali_decoder=self.dali_decoder,
                     rgb_stream=self.rgb_stream,
                     depth_stream=self.depth_stream,
                     prepare_stream=self.prepare_stream,
