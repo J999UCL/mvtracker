@@ -19,6 +19,10 @@ modal run --timestamps tools/modal_updateformer_autoresearch.py::run_benchmark \
 
 # Three-update live training smoke on one H100; no DDP.
 modal run --timestamps tools/modal_updateformer_autoresearch.py::single_gpu_smoke
+
+# Matched full-model eager-versus-checkpoint throughput comparison.
+modal run --timestamps tools/modal_checkpoint_net_throughput.py::prepare
+modal run --timestamps tools/modal_checkpoint_net_throughput.py::sweep
 ```
 
 ## VGGT-Omega H100 throughput profile

@@ -342,6 +342,7 @@ def run(arguments) -> dict:
     fabric.launch()
     fabric.seed_everything(int(cfg.reproducibility.seed), workers=True)
     model = hydra.utils.instantiate(cfg.model).cuda()
+    checkpoint_updateformer = bool(model.updateformer.checkpoint_updateformer)
     optimizer, scheduler = fetch_optimizer(cfg.trainer, model)
     model, optimizer = fabric.setup(model, optimizer)
     fabric.load_raw(str(arguments.checkpoint), model)
@@ -392,6 +393,7 @@ def run(arguments) -> dict:
         "status": (
             "safe" if is_memory_safe(peak_observed, total_memory) else "unsafe"
         ),
+        "checkpoint_updateformer": checkpoint_updateformer,
         "views": arguments.views,
         "batch_size": arguments.batch_size,
         "accumulation": arguments.accumulation,
