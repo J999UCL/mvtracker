@@ -68,6 +68,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
         "checkpoint-study",
         "capacity-study",
         "cuda-graph-study",
+        "partial-graph-study",
     }:
         raise ValueError(f"unsupported action: {action}")
     torch.set_float32_matmul_precision("high")
@@ -145,7 +146,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
             summary[f"capacity/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
-    else:
+    elif action == "cuda-graph-study":
         from mvtracker.profiling.updateformer_diagnostics import (
             benchmark_cuda_graphs,
         )
@@ -158,6 +159,21 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
                 "scenes_per_second"
             ]
             summary[f"cuda_graph/{name}/peak_allocated_gib"] = (
+                measurements["peak_allocated_bytes"] / 2**30
+            )
+    else:
+        from mvtracker.profiling.updateformer_diagnostics import (
+            benchmark_graphed_callables,
+        )
+
+        verify_golden(CONTRACT_ROOT)
+        result = benchmark_graphed_callables(CONTRACT_ROOT)
+        summary = {"contract/exact": 1}
+        for name, measurements in result["results"].items():
+            summary[f"partial_graph/{name}/scenes_per_second"] = measurements[
+                "scenes_per_second"
+            ]
+            summary[f"partial_graph/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
     output_root = RUN_ROOT / "performance-results" / _source_commit()
@@ -284,6 +300,11 @@ def capacity_study() -> None:
 @app.local_entrypoint(name="cuda-graph-study")
 def cuda_graph_study() -> None:
     _launch("cuda-graph-study")
+
+
+@app.local_entrypoint(name="partial-graph-study")
+def partial_graph_study() -> None:
+    _launch("partial-graph-study")
 
 
 @app.local_entrypoint(name="single-gpu-smoke")

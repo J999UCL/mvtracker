@@ -13,6 +13,7 @@ from mvtracker.profiling.updateformer_contract import (
     WORKLOADS,
     Workload,
     _build_model,
+    _close_mismatch,
     _run_loss_contract,
     _run_updateformer_case,
     _workload_tensors,
@@ -299,6 +300,118 @@ def benchmark_cuda_graphs(root: Path, calls=12, warmup=3, measured=20):
                 durations.append(time.perf_counter() - started)
             median = statistics.median(durations)
             results[f"{workload.name}/{mode}"] = {
+                "median_seconds": median,
+                "scenes_per_second": workload.batch_size / median,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            }
+    return {
+        "calls": calls,
+        "warmup": warmup,
+        "measured": measured,
+        "results": results,
+    }
+
+
+def benchmark_graphed_callables(root: Path, calls=12, warmup=3, measured=20):
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    state = torch.load(
+        root / manifest["baseline_state"], map_location="cpu", weights_only=True
+    )
+    device = torch.device("cuda:0")
+    cases = (
+        Workload("batch_1_tracks_512", 1, 512, (512,), 6101),
+        Workload("batch_4_tracks_512", 4, 512, (512,) * 4, 6104),
+        Workload("batch_1_tracks_1536", 1, 1536, (1536,), 6201),
+    )
+    results = {}
+    for workload in cases:
+        value, target, weights, mask = _workload_tensors(workload, device)
+
+        def build_step(graphed):
+            model = _build_model(device)
+            model.load_state_dict(state, strict=True)
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=5e-5, weight_decay=1e-5
+            )
+            callables = None
+            if graphed:
+                class Slot(torch.nn.Module):
+                    def __init__(self, core):
+                        super().__init__()
+                        self.core = core
+
+                    def forward(self, input_tensor, point_mask):
+                        return self.core(input_tensor, point_mask)
+
+                slots = tuple(Slot(model) for _ in range(calls))
+                with torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+                ):
+                    callables = torch.cuda.make_graphed_callables(
+                        slots,
+                        tuple((value, mask) for _ in slots),
+                        num_warmup_iters=3,
+                    )
+
+            def step():
+                optimizer.zero_grad(set_to_none=True)
+                if value.grad is not None:
+                    value.grad = None
+                with torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+                ):
+                    outputs = []
+                    for index in range(calls):
+                        output = (
+                            callables[index](value, mask)
+                            if callables is not None
+                            else model(value, point_mask=mask)
+                        )
+                        outputs.append(output.clone())
+                    loss = torch.stack(
+                        [
+                            ((output.float() - target) * weights).square().mean()
+                            for output in outputs
+                        ]
+                    ).mean()
+                loss.backward()
+                optimizer.step()
+                return {
+                    "outputs": [output.detach().cpu() for output in outputs],
+                    "input_gradient": value.grad.detach().cpu(),
+                    "parameters": {
+                        name: parameter.detach().cpu()
+                        for name, parameter in model.named_parameters()
+                    },
+                }
+
+            return step
+
+        eager_step = build_step(False)
+        graphed_step = build_step(True)
+        eager_result = eager_step()
+        graphed_result = graphed_step()
+        mismatch = _close_mismatch(eager_result, graphed_result)
+        if mismatch:
+            raise RuntimeError(
+                f"graphed callable changed {workload.name}: {mismatch}"
+            )
+        for name, step in (("eager", eager_step), ("graphed", graphed_step)):
+            for _ in range(warmup):
+                step()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            durations = []
+            for _ in range(measured):
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                step()
+                torch.cuda.synchronize()
+                durations.append(time.perf_counter() - started)
+            median = statistics.median(durations)
+            results[f"{workload.name}/{name}"] = {
                 "median_seconds": median,
                 "scenes_per_second": workload.batch_size / median,
                 "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
