@@ -54,7 +54,13 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
         verify_golden,
     )
 
-    if action not in {"capture", "verify", "benchmark", "diagnose"}:
+    if action not in {
+        "capture",
+        "verify",
+        "benchmark",
+        "diagnose",
+        "checkpoint-study",
+    }:
         raise ValueError(f"unsupported action: {action}")
     torch.set_float32_matmul_precision("high")
     run = wandb.init(
@@ -91,7 +97,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
             summary[f"benchmark/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
-    else:
+    elif action == "diagnose":
         from mvtracker.profiling.updateformer_diagnostics import compare_candidate
 
         result = compare_candidate(CONTRACT_ROOT)
@@ -101,6 +107,21 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
                 "low_precision_over_one_ulp"
             ],
         }
+    else:
+        from mvtracker.profiling.updateformer_diagnostics import (
+            benchmark_checkpointing,
+        )
+
+        verify_golden(CONTRACT_ROOT)
+        result = benchmark_checkpointing(CONTRACT_ROOT)
+        summary = {"contract/exact": 1}
+        for name, measurements in result["results"].items():
+            summary[f"checkpoint/{name}/median_seconds"] = measurements[
+                "median_seconds"
+            ]
+            summary[f"checkpoint/{name}/peak_allocated_gib"] = (
+                measurements["peak_allocated_bytes"] / 2**30
+            )
     output_root = RUN_ROOT / "performance-results" / _source_commit()
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / f"{action}.json"
@@ -143,3 +164,8 @@ def run_benchmark(warmup: int = 3, measured: int = 10) -> None:
 @app.local_entrypoint(name="diagnose")
 def diagnose() -> None:
     _launch("diagnose")
+
+
+@app.local_entrypoint(name="checkpoint-study")
+def checkpoint_study() -> None:
+    _launch("checkpoint-study")

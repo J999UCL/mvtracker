@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import statistics
+import time
 
 import torch
 
 from mvtracker.profiling.updateformer_contract import (
     WORKLOADS,
+    _build_model,
     _run_loss_contract,
     _run_updateformer_case,
+    _workload_tensors,
 )
 
 
@@ -96,4 +100,63 @@ def compare_candidate(root: Path) -> dict[str, object]:
             key=lambda record: record["maximum_absolute_error"],
             reverse=True,
         )[:20],
+    }
+
+
+def benchmark_checkpointing(root: Path, calls=12, warmup=1, measured=5):
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    state = torch.load(
+        root / manifest["baseline_state"], map_location="cpu", weights_only=True
+    )
+    device = torch.device("cuda:0")
+    selected = (WORKLOADS[1], WORKLOADS[3])
+    results = {}
+    for workload in selected:
+        base_inputs, target, weights, mask = _workload_tensors(workload, device)
+        base_inputs = base_inputs.detach()
+        for enabled in (False, True):
+            model = _build_model(device)
+            model.load_state_dict(state, strict=True)
+            model.checkpoint_updateformer = enabled
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=5e-5, weight_decay=1e-5
+            )
+
+            def step():
+                inputs = [
+                    base_inputs.clone().requires_grad_(True) for _ in range(calls)
+                ]
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    losses = []
+                    for value in inputs:
+                        output = model(value, point_mask=mask)
+                        losses.append(((output.float() - target) * weights).square().mean())
+                    loss = torch.stack(losses).mean()
+                loss.backward()
+                optimizer.step()
+
+            for _ in range(warmup):
+                step()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            durations = []
+            for _ in range(measured):
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                step()
+                torch.cuda.synchronize()
+                durations.append(time.perf_counter() - started)
+            results[f"{workload.name}/checkpoint_{enabled}"] = {
+                "median_seconds": statistics.median(durations),
+                "durations_seconds": durations,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+            }
+    return {
+        "calls": calls,
+        "warmup": warmup,
+        "measured": measured,
+        "results": results,
     }
