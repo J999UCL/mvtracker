@@ -38,6 +38,19 @@ class ModalMvKubricFullConversionContractTests(unittest.TestCase):
         self.assertIn("finalize=False", SOURCE)
         self.assertIn("finalize_shards", SOURCE)
 
+    def test_archive_resume_short_circuits_before_local_staging(self):
+        shortcut = SOURCE.index('"archive_already_converted"')
+        copy = SOURCE.index("_copy_archive(source, local_archive, progress)")
+        self.assertLess(shortcut, copy)
+        self.assertIn('f"{name}.tar"', SOURCE)
+        self.assertIn('f"{name}.inventory.json"', SOURCE)
+
+    def test_remote_result_is_compact(self):
+        self.assertIn('"status": "complete"', SOURCE)
+        self.assertIn('"train_scene_count": len(train_scene_ids)', SOURCE)
+        self.assertIn('"validation_scene_count": len(validation_ids)', SOURCE)
+        self.assertNotIn('"train": train_manifest', SOURCE)
+
     def test_train_and_validation_publish_together(self):
         self.assertIn("validation_source: str = str(VALIDATION_SOURCE)", SOURCE)
         publish = SOURCE.index('progress.emit("published"')

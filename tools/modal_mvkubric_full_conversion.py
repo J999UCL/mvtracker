@@ -396,6 +396,28 @@ def _convert_archive(
 ) -> tuple[tuple[str, ...], dict[str, object]]:
     from mvtracker.preprocessing.mvkubric_webdataset import convert_shards
 
+    expected_ids = tuple(scene for scene in allowlist if start <= int(scene) <= end)
+    shard_count = (len(expected_ids) + SCENES_PER_SHARD - 1) // SCENES_PER_SHARD
+    expected_names = tuple(
+        f"mvkubric-{shard_offset + index:05d}" for index in range(shard_count)
+    )
+    if all(
+        (output_root / f"{name}.tar").is_file()
+        and (output_root / f"{name}.inventory.json").is_file()
+        for name in expected_names
+    ):
+        progress.emit(
+            "archive_already_converted",
+            archive=archive_name,
+            scene_count=len(expected_ids),
+            shard_count=shard_count,
+            shard_offset=shard_offset,
+        )
+        return expected_ids, {
+            "scene_ids": list(expected_ids),
+            "shards": [{"name": name} for name in expected_names],
+        }
+
     source = ARCHIVE_ROOT / archive_name
     local_archive = LOCAL_ROOT / archive_name
     local_extract = LOCAL_ROOT / "native"
@@ -410,7 +432,6 @@ def _convert_archive(
     _extract_archive(local_archive, local_extract, progress)
     local_archive.unlink()
     progress.emit("local_archive_deleted", archive=archive_name)
-    expected_ids = tuple(scene for scene in allowlist if start <= int(scene) <= end)
     observed_ids = _scenes_in_range(local_extract, start, end, None)
     if observed_ids != expected_ids:
         raise RuntimeError(
@@ -586,8 +607,13 @@ def convert_full(
         data_volume.commit()
         progress.emit("published", train_scene_count=len(train_scene_ids), validation_scene_count=len(validation_ids), train_shard_count=shard_offset, validation_shard_count=len(validation_result["shards"]))
         result = {
-            "train": train_manifest,
-            "validation": validation_manifest,
+            "status": "complete",
+            "train_scene_count": len(train_scene_ids),
+            "validation_scene_count": len(validation_ids),
+            "train_shard_count": shard_offset,
+            "validation_shard_count": len(validation_result["shards"]),
+            "train_output": str(output_root),
+            "validation_output": str(validation_root),
             "archives": archive_results,
             "elapsed_seconds": time.perf_counter() - started,
         }
