@@ -208,7 +208,6 @@ class DaliKubricSceneStream(Iterator[KubricSceneRecord]):
                     num_shards=num_shards,
                     random_shuffle=random_shuffle,
                     initial_fill=initial_fill,
-                    shuffle_after_epoch=True,
                 )
 
         self._pipeline = _ScenePipeline()
