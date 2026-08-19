@@ -896,3 +896,64 @@ exact speedup claim.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/b4d7a46acca2
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 2026-08-19 — Direct Modal Volume v2 dataset experiment
+
+The abandoned 2,000-scene dataset-image build was stopped and its six
+dataset-specific image layers were deleted. Shared dependency images and the
+older 100-scene image were preserved. Training, CPU profiling and T4 profiling
+were rewired to mount `jeet-mvtracker-data-v2` read-only at
+`/mnt/mvtracker-data`; the results Volume remains the only writable training
+mount.
+
+The two pinned MV-Kubric archives were expanded once into Volume v2. Extraction
+of scenes 1001--2000 took 3,724.4 seconds and scenes 2001--3000 took 3,969.7
+seconds. The published inventory contains 1,992 training scenes and the 27
+held-out validation scenes 101--127. DIEGESIS contains 21 raw scenes with the
+17/2/2 train/validation/test links and its existing JPEG cache. Both published
+MV-Tracker checkpoints remain present.
+
+The original serial MV-Kubric index pass was stopped after both archive
+extractions had committed. The replacement indexer uses 16 scene workers,
+reports progress every 25 scenes and constructs the source fingerprint from
+the inventory already collected during indexing. It indexed all 2,019
+train-plus-validation scenes in 1,171.1 seconds, avoiding the former second
+filesystem-stat pass.
+
+- Ingestion W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/dmwu2i0j
+- Manifest: `jeet-mvtracker-data-v2/direct-volume-data-manifest.json`
+- Index: `datasets/kubric-multiview/train/MVTracker_index`
+
+Direct-Volume CPU loading was acceptable for DIEGESIS but very slow for native
+MV-Kubric. DIEGESIS warm median was 0.766 seconds/sample, while MV-Kubric warm
+median was 13.999 seconds/sample with 21.507-second p95 and 0.0736 samples/s.
+
+- CPU profile W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/na8soubm
+
+The first T4 matrix exposed a benchmark-only CUDA retention bug: each case had
+eight unused prefetched requests, leaving producer threads and GPU tensors alive
+for later cases. The profiler now requests exactly the samples each source will
+consume, joins producers and releases the CUDA allocator between cases. The
+rerun completed all cases on one T4. The representative alternating
+DIEGESIS/MV-Kubric four-view schedule measured 5.60 samples/s, 0.00048-second
+median exposed wait and 0.045-second p95 exposed wait after warm-up, peaking at
+7.87 GiB VRAM.
+
+- T4 profile W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/fuwpv8v4
+- Artifact: `jeet-mvtracker-runs-v2/t4-loader-benchmark/t4-loader-9cad3860-20260818T235041Z.json`
+
+The bounded two-H100, ten-update training smoke did not complete optimizer step
+1 and was stopped. Dataset initialization eventually found 17 DIEGESIS and
+1,992 MV-Kubric training scenes per rank, but first-update loader waits reached
+655.96 and 1,316.14 seconds. Immediately before termination one rank remained
+at 0% GPU utilization with 64.5 GiB allocated while the other reported 100%
+with 34.9 GiB; both CPUs were busy. There was no OOM or code exception.
+
+This rejects direct access to the expanded native MV-Kubric small-file tree on
+Modal Volume v2 as the production training layout. Prefetch can hide steady
+state in the bounded T4 loader test, but it cannot hide the enormous DDP
+startup/first-update fill cost. The full 1,000-step run was not launched.
+
+- Failed smoke W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/eda46c990e5a
+- Modal app: `ap-UK0R5GUxCWYvn8Mud7IlkB`
+- Run: `direct-volume-v2-smoke10-ddp2-h100-20260819T0110Z`
