@@ -288,13 +288,17 @@ def prepare_profile_batches_remote() -> dict:
         for views in range(1, 5)
     )
     for case in cases:
-        results.append(
-            prepare_profile_batch(
-                data_root=DATA_ROOT / "datasets",
-                output=PROFILE_BATCH_ROOT / f"{case.name}.pt",
-                views=case.views,
-                batch_size=case.batch_size,
-            )
+        print(f"preparing cached profile batch: {case.name}", flush=True)
+        result = prepare_profile_batch(
+            data_root=DATA_ROOT / "datasets",
+            output=PROFILE_BATCH_ROOT / f"{case.name}.pt",
+            views=case.views,
+            batch_size=case.batch_size,
+        )
+        results.append(result)
+        print(
+            f"prepared {case.name}: {result['bytes'] / 2**30:.2f} GiB",
+            flush=True,
         )
     data_volume.commit()
     for index, result in enumerate(results):
