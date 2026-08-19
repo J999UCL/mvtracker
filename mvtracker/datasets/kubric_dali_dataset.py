@@ -37,8 +37,11 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
 
 WEB_DATASET_FORMAT = "mvtracker-kubric-webdataset"
 WEB_DATASET_VERSION = 1
-COMPONENTS = ("meta.npz",) + tuple(f"rgb{view}.npz" for view in range(6)) + tuple(
-    f"depth{view}.npz" for view in range(6)
+SOURCE_VIEW_COUNT = 10
+COMPONENTS = ("meta.npz",) + tuple(
+    f"rgb{view}.npz" for view in range(SOURCE_VIEW_COUNT)
+) + tuple(
+    f"depth{view}.npz" for view in range(SOURCE_VIEW_COUNT)
 )
 
 
@@ -84,7 +87,7 @@ class KubricWebDatasetCatalog:
 
     def scene(self, name: str):
         entry = dict(self.scenes[name])
-        entry.setdefault("view_names", [f"view_{view}" for view in range(6)])
+        entry.setdefault("view_names", [f"view_{view}" for view in range(SOURCE_VIEW_COUNT)])
         entry.setdefault("n_frames", int(entry.get("frame_count", 24)))
         entry.setdefault("invalid_frame_indices", [])
         return entry, {}
@@ -128,10 +131,20 @@ def _record_from_outputs(outputs: Sequence[Any]) -> KubricSceneRecord:
     if visibility.ndim != 3 or visibility.shape[1:] != tracks_3d.shape[:2]:
         raise ValueError("WebDataset metadata visibility does not match tracks_3d")
     view_count = visibility.shape[0]
-    if view_count != 6:
-        raise ValueError(f"WebDataset scene must contain six views, got {view_count}")
+    if view_count != SOURCE_VIEW_COUNT:
+        raise ValueError(
+            f"WebDataset scene must contain {SOURCE_VIEW_COUNT} views, got {view_count}"
+        )
+    for name, array in (
+        ("intrinsics", intrinsics),
+        ("extrinsics", extrinsics),
+        ("sensor_widths", meta["sensor_widths"]),
+        ("focal_lengths", meta["focal_lengths"]),
+    ):
+        if np.asarray(array).shape[0] != SOURCE_VIEW_COUNT:
+            raise ValueError(f"WebDataset metadata {name} does not contain ten views")
     rgb = tuple(_packed_frames(outputs[1 + view]) for view in range(view_count))
-    depth_offset = 1 + 6
+    depth_offset = 1 + SOURCE_VIEW_COUNT
     depth = tuple(_packed_frames(outputs[depth_offset + view]) for view in range(view_count))
     if len(rgb) != view_count or any(len(frames) != tracks_3d.shape[0] for frames in rgb):
         raise ValueError("WebDataset RGB frame count does not match tracks_3d")
@@ -367,4 +380,11 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         return sample, True
 
 
-__all__ = ["DaliKubricMultiViewDataset", "DaliKubricSceneStream", "KubricSceneRecord", "KubricWebDatasetCatalog"]
+__all__ = [
+    "COMPONENTS",
+    "DaliKubricMultiViewDataset",
+    "DaliKubricSceneStream",
+    "KubricSceneRecord",
+    "KubricWebDatasetCatalog",
+    "SOURCE_VIEW_COUNT",
+]

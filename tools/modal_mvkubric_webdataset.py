@@ -22,31 +22,38 @@ from modal_training_profile import (
 APP_NAME = "jeet-mvtracker-mvkubric-webdataset"
 WANDB_PROJECT = "mvtracker-modal-profiling"
 WANDB_ENTITY = "jeetucl-ucl"
-MODAL_TAGS = {**BASE_TAGS, "experiment": "mvkubric-webdataset-conversion", "gpu": "cpu"}
+MODAL_TAGS = {**BASE_TAGS, "experiment": "mvkubric-webdataset-pilot"}
 SOURCE_ROOT = DATA_ROOT / "datasets/kubric-multiview/train"
 OUTPUT_ROOT = DATA_ROOT / "datasets/kubric-multiview-webdataset/v1/train"
 RUN_ROOT = Path("/mnt/mvtracker-runs")
 
 
 app = modal.App(APP_NAME, tags=MODAL_TAGS)
-image = (
+conversion_image = (
     _runtime_image()
     .apt_install("curl")
-    .pip_install("nvidia-dali-cuda120==1.53.0")
     .run_commands(
         "curl -fsSL https://raw.githubusercontent.com/NVIDIA/DALI/v1.53.0/tools/wds2idx.py "
         "-o /usr/local/bin/wds2idx && chmod 0755 /usr/local/bin/wds2idx"
     )
 )
+benchmark_image = (
+    conversion_image
+    .pip_install("nvidia-dali-cuda120==1.53.0")
+    .pip_install(
+        "nvidia-nvimgcodec-cu12[nvtiff]==0.9.0.20",
+        "nvidia-libnvcomp-cu12==5.3.0.16",
+    )
+)
 
 
 @app.function(
-    image=image,
+    image=conversion_image,
     secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume},
     cpu=16,
     memory=32768,
-    ephemeral_disk=256 * 1024,
+    ephemeral_disk=512 * 1024,
     timeout=4 * 60 * 60,
     max_containers=8,
     include_source=False,
@@ -136,7 +143,7 @@ def convert_remote(
 
 
 @app.function(
-    image=image,
+    image=benchmark_image,
     secrets=[wandb_secret],
     volumes={
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
