@@ -28,9 +28,11 @@ class DaliDecoderContractTests(unittest.TestCase):
     def test_decoder_uses_mixed_rgb_and_native_cpu_depth(self):
         source = inspect.getsource(DaliEncodedImageDecoder)
         self.assertIn('fn.external_source', source)
+        self.assertIn('fn.experimental.decoders.image', source)
         self.assertIn('device="mixed"', source)
         self.assertIn('device="cpu"', source)
         self.assertIn('output_type=types.ANY_DATA', source)
+        self.assertIn('dtype=types.FLOAT', source)
         self.assertIn('exec_dynamic=False', source)
         self.assertIn('max_encoded_images: int = 288', source)
         self.assertIn('batch_size=max_encoded_images', source)

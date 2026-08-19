@@ -40,12 +40,12 @@ def check_pair(rgb_path: Path, depth_path: Path) -> dict[str, object]:
             f"depth shape mismatch: {depth_actual.shape} != {depth_reference.shape}"
         )
     rgb_max_abs = int(np.abs(rgb_actual.astype(np.int16) - rgb_reference.astype(np.int16)).max())
-    depth_max_abs = int(
-        np.abs(depth_actual.astype(np.int64) - depth_reference.astype(np.int64)).max()
+    depth_max_abs = float(
+        np.abs(depth_actual.astype(np.float64) - depth_reference.astype(np.float64)).max()
     )
     if rgb_max_abs > 1:
         raise AssertionError(f"RGB decoder disagreement exceeds one code value: {rgb_max_abs}")
-    if depth_max_abs != 0:
+    if depth_max_abs != 0.0:
         raise AssertionError(f"TIFF depth is not lossless: max absolute error {depth_max_abs}")
     return {
         "rgb": str(rgb_path),
