@@ -382,10 +382,10 @@ class DaliEncodedImageDecoder:
                 )
                 depth = fn.experimental.decoders.image(
                     depth_input,
-                    device="mixed",
+                    device="cpu",
                     output_type=types.GRAY,
                     dtype=types.UINT16,
-                )
+                ).gpu()
                 return rgb, depth
 
         self._pipeline = _Pipeline()

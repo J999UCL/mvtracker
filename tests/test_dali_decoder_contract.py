@@ -30,6 +30,7 @@ class DaliDecoderContractTests(unittest.TestCase):
         self.assertIn('fn.external_source', source)
         self.assertIn('fn.experimental.decoders.image', source)
         self.assertIn('device="mixed"', source)
+        self.assertIn('device="cpu"', source)
         self.assertIn('output_type=types.GRAY', source)
         self.assertIn('dtype=types.UINT16', source)
         self.assertIn('exec_dynamic=False', source)
