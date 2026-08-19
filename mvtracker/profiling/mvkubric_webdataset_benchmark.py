@@ -216,9 +216,17 @@ def benchmark_matrix(
 ) -> dict[str, object]:
     results = {}
     for view_count in (1, 2, 4, 6):
+        print(
+            f"WDS_BENCH event=case_start case=views{view_count} path=native",
+            flush=True,
+        )
         native = benchmark_native_case(
             data_root, scene_ids, view_count=view_count, warmup=warmup,
             measured=measured, workers=workers, hardware_sampler=hardware_sampler,
+        )
+        print(
+            f"WDS_BENCH event=case_start case=views{view_count} path=dali",
+            flush=True,
         )
         dali = benchmark_dali_case(
             webdataset_root, scene_ids, view_count=view_count, warmup=warmup,

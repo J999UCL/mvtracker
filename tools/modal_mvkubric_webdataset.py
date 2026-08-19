@@ -162,6 +162,7 @@ def benchmark_remote(
 ) -> dict[str, object]:
     import wandb
 
+    from tools.check_dali_decode import check_pair
     from mvtracker.profiling.mvkubric_webdataset_benchmark import benchmark_matrix
     from mvtracker.profiling.t4_loader_benchmark import ContainerHardwareMonitor, GpuHardwareMonitor
 
@@ -193,6 +194,26 @@ def benchmark_remote(
 
     def hardware_sample():
         return {"cpu_ram": container_monitor.sample(), "gpu": gpu_monitor.sample()}
+
+    parity_root = DATA_ROOT / "datasets/kubric-multiview/train/1001/view_0"
+    print("WDS_BENCH event=parity_start scene=1001 view=0 frame=0", flush=True)
+    dali_parity = check_pair(
+        parity_root / "rgba_00000.png",
+        parity_root / "depth_00000.tiff",
+    )
+    print(
+        "WDS_BENCH event=parity_complete "
+        f"rgb_max_abs_error={dali_parity['rgb_max_abs_error']} "
+        f"depth_max_abs_error={dali_parity['depth_max_abs_error']}",
+        flush=True,
+    )
+    run.summary.update({"dali_parity": dali_parity})
+    run.log(
+        {
+            "dali_parity/rgb_max_abs_error": dali_parity["rgb_max_abs_error"],
+            "dali_parity/depth_max_abs_error": dali_parity["depth_max_abs_error"],
+        }
+    )
 
     def progress(case_name, result):
         print(
@@ -232,6 +253,7 @@ def benchmark_remote(
             "data_root": str(DATA_ROOT),
             "webdataset_root": str(DATA_ROOT / "datasets/kubric-multiview-webdataset"),
             "result": result,
+            "dali_parity": dali_parity,
         }
         report_path.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
         run.summary.update({"report_path": str(report_path), "scene_count": len(scene_ids)})
