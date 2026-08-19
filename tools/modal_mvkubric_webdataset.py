@@ -29,10 +29,7 @@ RUN_ROOT = Path("/mnt/mvtracker-runs")
 
 
 app = modal.App(APP_NAME, tags=MODAL_TAGS)
-conversion_image = (
-    _runtime_image()
-    .pip_install("wids==0.1.11")
-)
+conversion_image = _runtime_image()
 # The runtime image already installs DALI and its compatible nvImageCodec /
 # libnvcomp ABI set. Keep the benchmark image source-free after that layer.
 benchmark_image = conversion_image
