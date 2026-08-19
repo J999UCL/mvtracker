@@ -161,12 +161,14 @@ ephemeral disk; it does not request a GPU.
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 modal container list --json
-modal run --timestamps tools/modal_mvkubric_full_conversion.py
+modal run --detach --timestamps tools/modal_mvkubric_full_conversion.py
 ```
 
 The function resumes completed TAR plus `.inventory.json` pairs, removes only
 orphan `.partial` files, and publishes train and validation outputs only after
-both splits are finalized.
+both splits are finalized. The command prints the Modal call ID immediately;
+monitor it with `modal app logs <app-id>` or resume inspection from the same
+repository, commit and output paths shown in the startup event.
 
 ## MV-Kubric WebDataset pilot conversion and T4 A/B
 

@@ -173,14 +173,10 @@ class _Progress:
 
     def _heartbeat(self) -> None:
         while not self._stop.wait(HEARTBEAT_SECONDS):
-            with self._lock:
-                phase = self._phase
-                tracked_root = self._fields.get("extraction_root")
-            fields: dict[str, object] = {}
-            if phase == "extract" and tracked_root:
-                files, bytes_ = _directory_stats(Path(str(tracked_root)))
-                fields = {"extracted_files": files, "extracted_bytes": bytes_}
-            self.emit("heartbeat", **fields)
+            # Do not recursively scan the extracted tree while rapidgzip/tar
+            # is running.  That would compete with the extraction itself.
+            # Exact file/byte counts are collected once at phase completion.
+            self.emit("heartbeat")
 
     def close(self) -> None:
         self._stop.set()
