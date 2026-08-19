@@ -100,7 +100,7 @@ modal run --timestamps tools/modal_continual_training.py::smoke10
 # WIDS/DALI physical-batching path; update 1 records both ranks under
 # memory_profile/ and profiler/ in the run directory.
 modal container list --json
-modal run --timestamps tools/modal_continual_training.py::memory-profile
+modal run --timestamps tools/modal_continual_training.py::memory_profile
 
 # Reproduce a loader A/B with an identical seed; eager materialization is an
 # explicit benchmark mode and is not the production default.
