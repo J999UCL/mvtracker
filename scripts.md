@@ -146,6 +146,35 @@ modal container list --json
 modal run --detach --timestamps tools/modal_t4_loader_benchmark.py::profile \
   --run-name t4-loader-baseline
 ```
+
+## MV-Kubric WebDataset pilot conversion and T4 A/B
+
+The pilot converts exactly scenes `1001`--`1032` into four-scene uncompressed
+TAR shards and creates NVIDIA DALI `.idx` files. It preserves the native
+dataset and writes the derived dataset under a new Volume prefix.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
+modal run --timestamps tools/modal_mvkubric_webdataset.py::convert \
+  --scene-root /mnt/mvtracker-data/datasets/kubric-multiview/train \
+  --output-root /mnt/mvtracker-data/datasets/kubric-multiview-webdataset/v1/train \
+  --scenes 1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,1015,1016,1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1027,1028,1029,1030,1031,1032 \
+  --scenes-per-shard 4 --shard-workers 1 --read-workers 16
+```
+
+After the derived manifest exists, the tagged one-T4 benchmark compares the
+native loader and DALI path at 1, 2, 4 and 6 selected views. It runs four
+warm-ups and sixteen measured samples per path/view case, with no model or
+optimizer.
+
+```bash
+modal container list --json
+modal run --detach --timestamps tools/modal_mvkubric_webdataset.py::benchmark \
+  --run-name mvkubric-webdataset-t4-pilot \
+  --scenes 1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,1015,1016,1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1027,1028,1029,1030,1031,1032 \
+  --warmup 4 --measured 16 --workers 8
+```
 ### Inspect the current sequential mixed-source sampler on Dopey
 
 After pulling the desired commit and building the MV-Kubric metadata index,

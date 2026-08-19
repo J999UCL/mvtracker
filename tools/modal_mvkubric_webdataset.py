@@ -14,6 +14,7 @@ from modal_training_profile import (
     _runtime_image,
     _source_commit,
     data_volume,
+    run_volume,
     wandb_secret,
 )
 
@@ -24,6 +25,7 @@ WANDB_ENTITY = "jeetucl-ucl"
 MODAL_TAGS = {**BASE_TAGS, "experiment": "mvkubric-webdataset-conversion", "gpu": "cpu"}
 SOURCE_ROOT = DATA_ROOT / "datasets/kubric-multiview/train"
 OUTPUT_ROOT = DATA_ROOT / "datasets/kubric-multiview-webdataset/v1/train"
+RUN_ROOT = Path("/mnt/mvtracker-runs")
 
 
 app = modal.App(APP_NAME, tags=MODAL_TAGS)
@@ -133,6 +135,111 @@ def convert_remote(
     return manifest
 
 
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="T4",
+    cpu=16,
+    memory=32768,
+    timeout=2 * 60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def benchmark_remote(
+    run_name: str,
+    *,
+    scenes: tuple[str, ...] = tuple(str(scene) for scene in range(1001, 1033)),
+    warmup: int = 4,
+    measured: int = 16,
+    workers: int = 8,
+) -> dict[str, object]:
+    import wandb
+
+    from mvtracker.profiling.mvkubric_webdataset_benchmark import benchmark_matrix
+    from mvtracker.profiling.t4_loader_benchmark import ContainerHardwareMonitor, GpuHardwareMonitor
+
+    if not run_name or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in run_name):
+        raise ValueError("run_name contains unsupported characters")
+    scene_ids = tuple(str(scene) for scene in scenes)
+    if len(scene_ids) != 32:
+        raise ValueError("the T4 pilot uses exactly 32 MV-Kubric scenes")
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        job_type="mvkubric-webdataset-t4-benchmark",
+        tags=["modal", "t4", "loader", "native-vs-dali", "pilot"],
+        config={
+            "source_commit": _source_commit(),
+            "gpu": "T4",
+            "scenes": list(scene_ids),
+            "warmup": warmup,
+            "measured": measured,
+            "workers": workers,
+            **MODAL_TAGS,
+        },
+    )
+    output_dir = RUN_ROOT / "t4-mvkubric-webdataset"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / f"{run_name}.json"
+    container_monitor = ContainerHardwareMonitor()
+    gpu_monitor = GpuHardwareMonitor()
+
+    def hardware_sample():
+        return {"cpu_ram": container_monitor.sample(), "gpu": gpu_monitor.sample()}
+
+    def progress(case_name, result):
+        print(
+            f"WDS_BENCH event=case_complete case={case_name} "
+            f"native_samples_per_second={result['native']['samples_per_second']:.3f} "
+            f"dali_samples_per_second={result['dali']['samples_per_second']:.3f}",
+            flush=True,
+        )
+        scalars = {}
+        for path, profile in result.items():
+            for key in (
+                "startup_seconds", "cold_first_sample_seconds", "read_unpack_seconds_p50",
+                "read_unpack_seconds_p95", "gpu_decode_seconds_p50", "gpu_decode_seconds_p95",
+                "exposed_wait_seconds_p50", "exposed_wait_seconds_p95", "samples_per_second",
+                "encoded_bytes_per_second",
+            ):
+                if key in profile:
+                    scalars[f"cases/{case_name}/{path}/{key}"] = profile[key]
+        run.log(scalars)
+
+    try:
+        result = benchmark_matrix(
+            DATA_ROOT,
+            DATA_ROOT / "datasets/kubric-multiview-webdataset/v1",
+            scene_ids,
+            warmup=warmup,
+            measured=measured,
+            workers=workers,
+            hardware_sampler=hardware_sample,
+            progress_callback=progress,
+        )
+        report = {
+            "format": "mvtracker_mvkubric_webdataset_t4_benchmark",
+            "source_commit": _source_commit(),
+            "modal_tags": MODAL_TAGS,
+            "gpu": "T4",
+            "data_root": str(DATA_ROOT),
+            "webdataset_root": str(DATA_ROOT / "datasets/kubric-multiview-webdataset/v1"),
+            "result": result,
+        }
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        run.summary.update({"report_path": str(report_path), "scene_count": len(scene_ids)})
+        run.summary["view_counts"] = [1, 2, 4, 6]
+        run.finish()
+        run_volume.commit()
+        return {"report_path": str(report_path), **report}
+    finally:
+        gpu_monitor.close()
+
+
 @app.local_entrypoint(name="convert")
 def convert(
     scene_root: str = str(SOURCE_ROOT),
@@ -151,4 +258,20 @@ def convert(
         shard_workers=shard_workers,
         read_workers=read_workers,
     )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+@app.local_entrypoint(name="benchmark")
+def benchmark(
+    run_name: str = "",
+    scenes: str = ",".join(str(scene) for scene in range(1001, 1033)),
+    warmup: int = 4,
+    measured: int = 16,
+    workers: int = 8,
+) -> None:
+    import datetime
+
+    selected = tuple(scene.strip() for scene in scenes.split(",") if scene.strip())
+    name = run_name or f"mvkubric-webdataset-t4-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}"
+    result = benchmark_remote.remote(name, scenes=selected, warmup=warmup, measured=measured, workers=workers)
     print(json.dumps(result, indent=2, sort_keys=True))
