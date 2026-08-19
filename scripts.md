@@ -14,7 +14,7 @@ export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
 
 modal run --timestamps tools/modal_updateformer_autoresearch.py::capture
 modal run --timestamps tools/modal_updateformer_autoresearch.py::verify
-modal run --timestamps tools/modal_updateformer_autoresearch.py::benchmark \
+modal run --timestamps tools/modal_updateformer_autoresearch.py::run_benchmark \
   --warmup 3 --measured 10
 ```
 
