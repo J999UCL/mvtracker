@@ -54,13 +54,13 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
         verify_golden,
     )
 
-    if action not in {"capture", "verify", "benchmark"}:
+    if action not in {"capture", "verify", "benchmark", "diagnose"}:
         raise ValueError(f"unsupported action: {action}")
     torch.set_float32_matmul_precision("high")
     run = wandb.init(
         entity="jeetucl-ucl",
         project="mvtracker-modal-profiling",
-        group="updateformer-autoresearch-v1",
+        group="updateformer-autoresearch-v2",
         job_type=f"updateformer-{action}",
         tags=["modal", "h100", "single-gpu", "updateformer", action],
         config={
@@ -81,7 +81,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
     elif action == "verify":
         result = verify_golden(CONTRACT_ROOT)
         summary = {"contract/exact": 1}
-    else:
+    elif action == "benchmark":
         result = benchmark(CONTRACT_ROOT, warmup=warmup, measured=measured)
         summary = {"contract/exact": 1}
         for name, measurements in result["results"].items():
@@ -91,6 +91,16 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
             summary[f"benchmark/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
+    else:
+        from mvtracker.profiling.updateformer_diagnostics import compare_candidate
+
+        result = compare_candidate(CONTRACT_ROOT)
+        summary = {
+            "diagnostics/changed_tensors": result["changed_tensors"],
+            "diagnostics/low_precision_over_one_ulp": result[
+                "low_precision_over_one_ulp"
+            ],
+        }
     output_root = RUN_ROOT / "performance-results" / _source_commit()
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / f"{action}.json"
@@ -128,3 +138,8 @@ def verify() -> None:
 @app.local_entrypoint(name="benchmark")
 def run_benchmark(warmup: int = 3, measured: int = 10) -> None:
     _launch("benchmark", warmup, measured)
+
+
+@app.local_entrypoint(name="diagnose")
+def diagnose() -> None:
+    _launch("diagnose")
