@@ -53,6 +53,7 @@ def _dependency_image() -> modal.Image:
             "nvidia/cuda:12.8.1-devel-ubuntu22.04",
             add_python="3.10",
         )
+        .env({"DALI_DISABLE_NVML": "1"})
         .apt_install(
             "build-essential",
             "ffmpeg",
