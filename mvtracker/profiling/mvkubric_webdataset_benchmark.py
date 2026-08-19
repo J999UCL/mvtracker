@@ -1,4 +1,4 @@
-"""T4-only native versus DALI MV-Kubric loader measurements."""
+"""T4-only native versus indexed-WIDS MV-Kubric loader measurements."""
 
 from __future__ import annotations
 
@@ -81,48 +81,6 @@ def benchmark_native_case(
     }
 
 
-def _encoded_sample(record, view_count: int):
-    import torch
-    from mvtracker.datasets.tapvid3d_multiview_dataset import EncodedTapVid3DSample
-
-    views = tuple(range(view_count))
-    frames = record.frame_count
-    jpeg = tuple(record.rgb_frames[view][frame] for view in views for frame in range(frames))
-    depth = tuple(record.depth_frames[view][frame] for view in views for frame in range(frames))
-    theta = torch.zeros((view_count, frames, 2, 3), device="cpu")
-    theta[..., 0, 0] = 1
-    theta[..., 1, 1] = 1
-    tracks = torch.zeros((frames, 1, 3), dtype=torch.float32)
-    visibility = torch.ones((view_count, frames, 1), dtype=torch.bool)
-    return EncodedTapVid3DSample(
-        jpeg_bytes=jpeg,
-        depth=None,
-        theta=theta,
-        intrs=torch.from_numpy(record.intrinsics[list(views), None].repeat(frames, axis=1)),
-        extrs=torch.from_numpy(record.extrinsics[list(views)]),
-        trajectory=torch.zeros((view_count, frames, 1, 3), dtype=torch.float32),
-        trajectory_3d=tracks,
-        visibility=visibility,
-        valid=torch.ones((frames, 1), dtype=torch.float32),
-        query_points_3d=torch.zeros((1, 3), dtype=torch.float32),
-        seq_name=record.name,
-        metadata={"gotit": True},
-        output_size=record.resolution_hw,
-        apply_rgb_aug=False,
-        rgb_augmentation=None,
-        apply_depth_aug=False,
-        augmentation_seed=0,
-        depth_scale=1.0,
-        track_upscaling_factor=1.0,
-        max_depth=100.0,
-        depth_patch_operations=(),
-        image_codec="nvimagecodec",
-        depth_bytes=depth,
-        depth_sensor_widths=tuple(float(value) for value in record.sensor_widths[list(views)]),
-        depth_focal_lengths=tuple(float(value) for value in record.focal_lengths[list(views)]),
-    )
-
-
 def benchmark_dali_case(
     webdataset_root: Path,
     scene_ids: Sequence[str],
@@ -133,59 +91,83 @@ def benchmark_dali_case(
     hardware_sampler: Callable[[], Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     import torch
-    from nvidia import nvimgcodec
-    from mvtracker.datasets.kubric_dali_dataset import DaliKubricSceneStream
-    from mvtracker.datasets.tapvid3d_multiview_dataset import EncodedTapVid3DBatch, decode_tapvid3d_batch
+    from mvtracker.datasets.kubric_dali_dataset import DaliKubricMultiViewDataset
+    from mvtracker.datasets.tapvid3d_multiview_dataset import (
+        DaliEncodedImageDecoder,
+        EncodedTapVid3DBatch,
+        decode_tapvid3d_batch,
+    )
+    from mvtracker.datasets.utils import SampleRequest
 
     build_started = time.perf_counter()
-    stream = DaliKubricSceneStream(
-        webdataset_root,
-        split="train",
-        num_threads=4,
-        prefetch_queue_depth=2,
-        initial_fill=32,
-        random_shuffle=False,
+    dataset = DaliKubricMultiViewDataset(
+        data_root=str(webdataset_root),
+        webdataset_root=str(webdataset_root),
+        webdataset_split="train",
+        seq_len=24,
+        num_views=view_count,
+        traj_per_sample=512,
+        max_depth=24,
+        seed=72,
+        include_scene_ids=list(scene_ids),
+        augmentation_probability=0.0,
     )
-    startup_seconds = time.perf_counter() - build_started
     device = torch.device("cuda", torch.cuda.current_device())
-    rgb_decoder = nvimgcodec.Decoder(device_id=device.index or 0)
-    depth_decoder = nvimgcodec.Decoder(device_id=device.index or 0)
+    dali_decoder = DaliEncodedImageDecoder(device, num_threads=4, prefetch_queue_depth=2)
     rgb_stream = torch.cuda.Stream(device=device)
     depth_stream = torch.cuda.Stream(device=device)
     prepare_stream = torch.cuda.Stream(device=device)
+    startup_seconds = time.perf_counter() - build_started
 
-    def consume() -> tuple[object, float, float, int, int, list[Mapping[str, object]]]:
-        read_started = time.perf_counter()
-        record = next(stream)
-        read_seconds = time.perf_counter() - read_started
-        sample = _encoded_sample(record, view_count)
+    def consume(virtual_index: int) -> tuple[object, float, float, float, int, int, Mapping[str, object]]:
+        plan_started = time.perf_counter()
+        request = SampleRequest(
+            virtual_index=virtual_index,
+            view_count=view_count,
+            scene_index=virtual_index % dataset.real_len,
+        )
+        plan = dataset.plan_sample(request)
+        if plan is None:
+            raise RuntimeError(f"sample planning rejected scene index {request.scene_index}")
+        plan_seconds = time.perf_counter() - plan_started
+        materialize_started = time.perf_counter()
+        sample, gotit = dataset.materialize_sample(plan)
+        if not gotit:
+            raise RuntimeError("indexed MV-Kubric materialization returned gotit=False")
+        media_seconds = time.perf_counter() - materialize_started
         encoded_bytes = sum(len(value) for value in sample.jpeg_bytes) + sum(len(value) for value in sample.depth_bytes)
         decode_started = time.perf_counter()
         with torch.no_grad():
             decode_tapvid3d_batch(
                 EncodedTapVid3DBatch([sample]),
                 device,
-                nvimagecodec_rgb_decoder=rgb_decoder,
-                nvimagecodec_depth_decoder=depth_decoder,
+                dali_decoder=dali_decoder,
                 rgb_stream=rgb_stream,
                 depth_stream=depth_stream,
                 prepare_stream=prepare_stream,
             )
         torch.cuda.synchronize(device)
-        return record, read_seconds, time.perf_counter() - decode_started, encoded_bytes, len(sample.jpeg_bytes), []
+        return sample, plan_seconds, media_seconds, time.perf_counter() - decode_started, encoded_bytes, len(sample.jpeg_bytes), sample.metadata
 
+    next_virtual_index = 0
     for _ in range(warmup):
-        consume()
-    read_times: list[float] = []
+        consume(next_virtual_index)
+        next_virtual_index += 1
+    plan_times: list[float] = []
+    media_times: list[float] = []
     decode_times: list[float] = []
     hardware_samples = []
     encoded_bytes = 0
+    media_record_counts: list[int] = []
     measured_started = time.perf_counter()
     for _ in range(measured):
-        _, read_seconds, decode_seconds, sample_bytes, _, _ = consume()
-        read_times.append(read_seconds)
+        _, plan_seconds, media_seconds, decode_seconds, sample_bytes, _, metadata = consume(next_virtual_index)
+        next_virtual_index += 1
+        plan_times.append(plan_seconds)
+        media_times.append(media_seconds)
         decode_times.append(decode_seconds)
         encoded_bytes += sample_bytes
+        media_record_counts.append(int(metadata.get("media_record_count", view_count)))
         if hardware_sampler is not None:
             hardware_samples.append(hardware_sampler())
     wall_seconds = time.perf_counter() - measured_started
@@ -193,16 +175,22 @@ def benchmark_dali_case(
         "path": "dali",
         "view_count": view_count,
         "startup_seconds": startup_seconds,
-        "cold_first_sample_seconds": startup_seconds + (read_times[0] if read_times else 0.0),
-        "read_unpack_seconds_p50": _percentile(read_times, 0.50),
-        "read_unpack_seconds_p95": _percentile(read_times, 0.95),
+        "cold_first_sample_seconds": startup_seconds + (plan_times[0] + media_times[0] + decode_times[0] if plan_times else 0.0),
+        "metadata_plan_seconds_p50": _percentile(plan_times, 0.50),
+        "metadata_plan_seconds_p95": _percentile(plan_times, 0.95),
+        "media_read_seconds_p50": _percentile(media_times, 0.50),
+        "media_read_seconds_p95": _percentile(media_times, 0.95),
+        "read_unpack_seconds_p50": _percentile(media_times, 0.50),
+        "read_unpack_seconds_p95": _percentile(media_times, 0.95),
         "gpu_decode_seconds_p50": _percentile(decode_times, 0.50),
         "gpu_decode_seconds_p95": _percentile(decode_times, 0.95),
-        "exposed_wait_seconds_p50": _percentile(read_times, 0.50),
-        "exposed_wait_seconds_p95": _percentile(read_times, 0.95),
+        "exposed_wait_seconds_p50": _percentile(media_times, 0.50),
+        "exposed_wait_seconds_p95": _percentile(media_times, 0.95),
         "samples_per_second": measured / wall_seconds if wall_seconds else 0.0,
         "encoded_bytes_per_second": encoded_bytes / wall_seconds if wall_seconds else 0.0,
         "encoded_bytes": encoded_bytes,
+        "media_record_count_p50": _percentile(media_record_counts, 0.50),
+        "media_record_count_p95": _percentile(media_record_counts, 0.95),
         "wall_elapsed_seconds": wall_seconds,
         "hardware_samples": hardware_samples,
         "warmup": warmup,
