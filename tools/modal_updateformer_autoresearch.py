@@ -60,6 +60,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
         "benchmark",
         "diagnose",
         "checkpoint-study",
+        "capacity-study",
     }:
         raise ValueError(f"unsupported action: {action}")
     torch.set_float32_matmul_precision("high")
@@ -107,7 +108,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
                 "low_precision_over_one_ulp"
             ],
         }
-    else:
+    elif action == "checkpoint-study":
         from mvtracker.profiling.updateformer_diagnostics import (
             benchmark_checkpointing,
         )
@@ -120,6 +121,21 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
                 "median_seconds"
             ]
             summary[f"checkpoint/{name}/peak_allocated_gib"] = (
+                measurements["peak_allocated_bytes"] / 2**30
+            )
+    else:
+        from mvtracker.profiling.updateformer_diagnostics import (
+            benchmark_checkpoint_capacity,
+        )
+
+        verify_golden(CONTRACT_ROOT)
+        result = benchmark_checkpoint_capacity(CONTRACT_ROOT)
+        summary = {"contract/exact": 1}
+        for name, measurements in result["results"].items():
+            summary[f"capacity/{name}/scenes_per_second"] = measurements[
+                "scenes_per_second"
+            ]
+            summary[f"capacity/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
     output_root = RUN_ROOT / "performance-results" / _source_commit()
@@ -169,3 +185,8 @@ def diagnose() -> None:
 @app.local_entrypoint(name="checkpoint-study")
 def checkpoint_study() -> None:
     _launch("checkpoint-study")
+
+
+@app.local_entrypoint(name="capacity-study")
+def capacity_study() -> None:
+    _launch("capacity-study")

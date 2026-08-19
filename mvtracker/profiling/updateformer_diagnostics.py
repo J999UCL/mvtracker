@@ -11,6 +11,7 @@ import torch
 
 from mvtracker.profiling.updateformer_contract import (
     WORKLOADS,
+    Workload,
     _build_model,
     _run_loss_contract,
     _run_updateformer_case,
@@ -154,6 +155,80 @@ def benchmark_checkpointing(root: Path, calls=12, warmup=1, measured=5):
                 "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
                 "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
             }
+    return {
+        "calls": calls,
+        "warmup": warmup,
+        "measured": measured,
+        "results": results,
+    }
+
+
+def benchmark_checkpoint_capacity(root: Path, calls=12, warmup=1, measured=3):
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    state = torch.load(
+        root / manifest["baseline_state"], map_location="cpu", weights_only=True
+    )
+    device = torch.device("cuda:0")
+    cases = [
+        Workload(f"batch_{batch}_tracks_512", batch, 512, (512,) * batch, 3000 + batch)
+        for batch in (1, 2, 4, 8, 16, 32)
+    ] + [
+        Workload(
+            f"batch_{batch}_tracks_1536",
+            batch,
+            1536,
+            (1536,) * batch,
+            4000 + batch,
+        )
+        for batch in (1, 2, 4, 8, 16)
+    ]
+    results = {}
+    for workload in cases:
+        model = _build_model(device)
+        model.load_state_dict(state, strict=True)
+        model.checkpoint_updateformer = True
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=5e-5, weight_decay=1e-5
+        )
+        base_inputs, target, weights, mask = _workload_tensors(workload, device)
+        base_inputs = base_inputs.detach()
+
+        def step():
+            inputs = [
+                base_inputs.clone().requires_grad_(True) for _ in range(calls)
+            ]
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                losses = []
+                for value in inputs:
+                    output = model(value, point_mask=mask)
+                    losses.append(((output.float() - target) * weights).square().mean())
+                loss = torch.stack(losses).mean()
+            loss.backward()
+            optimizer.step()
+
+        for _ in range(warmup):
+            step()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        durations = []
+        for _ in range(measured):
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            step()
+            torch.cuda.synchronize()
+            durations.append(time.perf_counter() - started)
+        median = statistics.median(durations)
+        results[workload.name] = {
+            "median_seconds": median,
+            "scenes_per_second": workload.batch_size / median,
+            "track_sequences_per_second": (
+                workload.batch_size * workload.tracks / median
+            ),
+            "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        }
     return {
         "calls": calls,
         "warmup": warmup,
