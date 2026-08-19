@@ -1912,6 +1912,10 @@ def main(cfg: DictConfig):
         physical_decoder = PhysicalBatchDecoder(
             fabric.device,
             decode_image_chunk_size=int(settings.decode_image_chunk_size),
+            dali_num_threads=int(cfg.datasets.train.dali.num_threads),
+            dali_prefetch_queue_depth=int(
+                cfg.datasets.train.dali.prefetch_queue_depth
+            ),
         )
 
     torch_profiler = _create_torch_profiler(
