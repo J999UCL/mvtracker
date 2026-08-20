@@ -343,6 +343,8 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
         "gate/visibility_mean_abs": result["final_visibility"]["mean"],
         "gate/gradient_cosine": result["gradients"]["cosine"],
         "gate/update_cosine": result["parameter_updates"]["cosine"],
+        "gate/five_update_trajectory_rms_m": result["multi_update"]["final_trajectory"]["rms"],
+        "gate/five_update_update_cosine": result["multi_update"]["parameter_updates"]["cosine"],
         "timing/eager_forward_seconds": result["timing"]["eager"]["forward_seconds"],
         "timing/fused_forward_seconds": result["timing"]["fused"]["forward_seconds"],
         "timing/eager_warm_update_seconds": result["timing"]["eager"]["warm_update_median_seconds"],

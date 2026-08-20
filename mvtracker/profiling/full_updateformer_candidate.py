@@ -50,7 +50,7 @@ def _cpu(value):
     return value
 
 
-def _run_backend(cfg, checkpoint, batch, backend, warm_updates=2):
+def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
     cfg.model.updateformer_backend = backend
     cfg.model.checkpoint_updateformer = False
     model = hydra.utils.instantiate(cfg.model).cuda().train()
@@ -156,6 +156,22 @@ def _run_backend(cfg, checkpoint, batch, backend, warm_updates=2):
     result["timing"]["warm_update_median_seconds"] = statistics.median(
         warm_timings
     )
+    final_parameters = {
+        name: parameter.detach().float().cpu().clone()
+        for name, parameter in model.named_parameters()
+    }
+    result["multi_update"] = {
+        "updates": warm_updates + 1,
+        "loss": float(warm_loss.detach()),
+        "final_trajectories": _cpu(
+            warm_output["flow"]["predictions_worldspace"]
+        ),
+        "final_visibility": _cpu(warm_output["visibility"]["predictions"]),
+        "parameter_updates": {
+            name: final_parameters[name] - value
+            for name, value in initial.items()
+        },
+    }
     del model, optimizer, batch, output, loss
     torch.cuda.empty_cache()
     return result
@@ -247,6 +263,18 @@ def compare_real_update(
         eager["parameter_updates"], fused["parameter_updates"]
     )
     trace = _trace_difference(eager["trace"], fused["trace"])
+    multi_trajectory = _difference(
+        eager["multi_update"]["final_trajectories"],
+        fused["multi_update"]["final_trajectories"],
+    )
+    multi_visibility = _difference(
+        eager["multi_update"]["final_visibility"],
+        fused["multi_update"]["final_visibility"],
+    )
+    multi_updates = _vector_agreement(
+        eager["multi_update"]["parameter_updates"],
+        fused["multi_update"]["parameter_updates"],
+    )
     passed = all((
         final_trajectory["rms"] <= TRAJECTORY_RMS_METERS,
         final_trajectory["p99"] <= TRAJECTORY_P99_METERS,
@@ -276,6 +304,16 @@ def compare_real_update(
         "trace": trace,
         "gradients": gradients,
         "parameter_updates": updates,
+        "multi_update": {
+            "updates": eager["multi_update"]["updates"],
+            "loss": {
+                "eager": eager["multi_update"]["loss"],
+                "fused": fused["multi_update"]["loss"],
+            },
+            "final_trajectory": multi_trajectory,
+            "final_visibility": multi_visibility,
+            "parameter_updates": multi_updates,
+        },
         "timing": {"eager": eager["timing"], "fused": fused["timing"]},
         "memory": {
             backend: {
