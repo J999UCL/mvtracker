@@ -271,6 +271,8 @@ def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
     torch.cuda.current_stream().wait_stream(capture_stream)
     torch.cuda.synchronize()
     capture_seconds = time.perf_counter() - capture_started
+    graph.replay()
+    torch.cuda.synchronize()
 
     gradients = {
         name: parameter.grad.detach().float().cpu().clone()
