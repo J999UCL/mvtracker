@@ -56,6 +56,9 @@ def _cache_path(views: int) -> Path:
     include_source=False,
 )
 def prepare_batches_remote() -> dict:
+    import dataclasses
+
+    import torch
     import wandb
 
     from mvtracker.cli.profile_training import prepare_profile_batch
@@ -75,12 +78,28 @@ def prepare_batches_remote() -> dict:
             f"B{CACHE_BATCH_SIZE} cache",
             flush=True,
         )
+        source_path = CACHE_ROOT / f"views{views}-traj{TRAJECTORIES}-batch8.source.pt"
         result = prepare_profile_batch(
             data_root=DATA_ROOT / "datasets",
-            output=_cache_path(views),
+            output=source_path,
             views=views,
-            batch_size=CACHE_BATCH_SIZE,
+            batch_size=8,
             trajectories=TRAJECTORIES,
+        )
+        batch = torch.load(source_path, map_location="cpu", weights_only=False)
+        for field in dataclasses.fields(batch):
+            value = getattr(batch, field.name)
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                setattr(batch, field.name, torch.cat((value, value), dim=0))
+            elif isinstance(value, list) and len(value) == 8:
+                setattr(batch, field.name, value + value)
+        target = _cache_path(views)
+        torch.save(batch, target)
+        source_path.unlink()
+        result.update(
+            path=str(target),
+            batch_size=CACHE_BATCH_SIZE,
+            bytes=target.stat().st_size,
         )
         results.append(result)
         data_volume.commit()
