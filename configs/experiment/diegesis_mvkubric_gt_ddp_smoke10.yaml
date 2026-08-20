@@ -4,6 +4,8 @@ defaults:
   - _self_
 
 datasets:
+  train:
+    mvkubric_storage: dali_stream
   eval:
     names: []
 
