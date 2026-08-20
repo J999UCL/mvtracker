@@ -129,7 +129,10 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         entrypoints = source[source.index('@app.local_entrypoint(name="smoke")') :]
-        self.assertIn("train_remote.spawn(", source)
+        self.assertIn(
+            'modal.Function.from_name(APP_NAME, "train_remote")', source
+        )
+        self.assertIn("deployed_training.spawn(", source)
         self.assertIn('"function_call_id": call.object_id', source)
         self.assertNotIn("train_remote.remote(", entrypoints)
 

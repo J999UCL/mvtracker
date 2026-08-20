@@ -113,6 +113,9 @@ source archive is retained.
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
 
+# Deploy the durable worker after each source commit used for training.
+modal deploy tools/modal_continual_training.py
+
 # One-time CPU-only direct-Volume ingestion. It expands DIEGESIS and both
 # MV-Kubric archives into jeet-mvtracker-data-v2, copies validation 101--127,
 # rebuilds the metadata index, and prints the detached Function call ID.
@@ -148,7 +151,8 @@ Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
 `owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
 directory. Training entrypoints submit with Modal `Function.spawn()` and print a
-durable Function Call ID; the remote job therefore survives CLI disconnection.
+durable Function Call ID against the deployed worker; the remote job therefore
+survives both CLI disconnection and closure of the ephemeral launcher app.
 
 The CPU setup expands the DIEGESIS archive and each official 1,000-scene
 MV-Kubric archive once under `/mnt/mvtracker-data`. It copies validation scenes

@@ -83,7 +83,10 @@ EXPERIMENT_PHASES = {
     ),
 }
 
-app = modal.App(APP_NAME, tags={**MODAL_TAGS, "experiment": "unclassified"})
+app = modal.App(
+    APP_NAME,
+    tags={**MODAL_TAGS, "experiment": "continual-training-worker"},
+)
 
 
 training_image = _source_image(_dependency_image())
@@ -366,7 +369,8 @@ def _spawn_training(
     materialize_whole_step: bool = False,
     seed: int = 0,
 ) -> None:
-    call = train_remote.spawn(
+    deployed_training = modal.Function.from_name(APP_NAME, "train_remote")
+    call = deployed_training.spawn(
         mode,
         run_name,
         confirmation,
