@@ -1008,9 +1008,11 @@ INDEX_HTML = r"""<!doctype html>
     .grid-2, .grid-3 { display: grid; gap: 24px; }
     .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .loss-stack { display: grid; gap: 28px; }
     .chart-panel { min-width: 0; }
     .chart-wrap { position: relative; height: 250px; width: 100%; }
     .chart-wrap.compact { height: 190px; }
+    .chart-wrap.loss-large { height: 360px; }
     .chart-note { color: var(--muted); margin-top: 7px; font-size: 12px; }
     .validation-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
     .chart-controls { display: flex; justify-content: flex-end; margin: 4px 0 18px; }
@@ -1061,10 +1063,10 @@ INDEX_HTML = r"""<!doctype html>
 
   <section>
     <h2>Training losses</h2>
-    <div class="grid-3">
-      <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap"><canvas id="loss-combined"></canvas></div></div>
-      <div class="chart-panel"><h3>DIEGESIS</h3><div class="chart-wrap"><canvas id="loss-diegesis"></canvas></div></div>
-      <div class="chart-panel"><h3>MV-Kubric</h3><div class="chart-wrap"><canvas id="loss-mvkubric"></canvas></div></div>
+    <div class="loss-stack">
+      <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap loss-large"><canvas id="loss-combined"></canvas></div></div>
+      <div class="chart-panel"><h3>DIEGESIS</h3><div class="chart-wrap loss-large"><canvas id="loss-diegesis"></canvas></div></div>
+      <div class="chart-panel"><h3>MV-Kubric</h3><div class="chart-wrap loss-large"><canvas id="loss-mvkubric"></canvas></div></div>
     </div>
     <div class="chart-note">Faint points are raw updates; solid lines are trailing 50-sample means. Each panel shows total, visibility, and 3D trajectory loss.</div>
   </section>
@@ -1149,8 +1151,8 @@ const alphaColor=(hex,alpha)=>{
   return match?`rgba(${parseInt(match[1],16)},${parseInt(match[2],16)},${parseInt(match[3],16)},${alpha})`:hex;
 };
 const meanLine=(label,stroke,extra={})=>line(`${label} · 50-sample mean`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
-const rawPoints=(label,stroke)=>line(`${label} · raw`,alphaColor(stroke,.35),{showInLegend:false,showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0,isRawPoints:true,rawStroke:stroke});
-const lossLines=()=>[rawPoints('Total',palette.s1),meanLine('Total',palette.s1),rawPoints('Visibility',palette.s2),meanLine('Visibility',palette.s2,{borderDash:[6,4]}),rawPoints('Trajectory',palette.s3),meanLine('Trajectory',palette.s3)];
+const rawPoints=(label,stroke,extra={})=>line(`${label} · raw`,alphaColor(stroke,.35),{showInLegend:false,showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0,isRawPoints:true,rawStroke:stroke,...extra});
+const lossLines=()=>[rawPoints('Total',palette.s1,{seriesKey:'total'}),meanLine('Total',palette.s1,{seriesKey:'total'}),rawPoints('Visibility',palette.s2,{seriesKey:'visibility'}),meanLine('Visibility',palette.s2,{borderDash:[6,4],seriesKey:'visibility'}),rawPoints('Trajectory',palette.s3,{seriesKey:'trajectory'}),meanLine('Trajectory',palette.s3,{seriesKey:'trajectory'})];
 const compactNumber=value=>{
   const number=Number(value), magnitude=Math.abs(number);
   if(!Number.isFinite(number)) return value;
@@ -1158,12 +1160,13 @@ const compactNumber=value=>{
   return number.toLocaleString(undefined,{maximumFractionDigits:3});
 };
 function options(xTitle,yTitle,extra={}){
-  return {responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:180},interaction:{mode:'index',intersect:false},plugins:{legend:{display:extra.legend!==false,position:'bottom',labels:{color:palette.text,usePointStyle:true,boxWidth:8,filter:(item,data)=>data.datasets[item.datasetIndex].showInLegend!==false}},tooltip:{enabled:true,backgroundColor:palette.panel,titleColor:palette.text,bodyColor:palette.text,borderColor:palette.border,borderWidth:1}},scales:{x:{type:'linear',grid:{color:palette.border},ticks:{color:palette.muted,maxTicksLimit:10},title:{display:true,text:xTitle,color:palette.muted}},y:{min:extra.min,max:extra.max,grid:{color:palette.border},ticks:{color:palette.muted,callback:extra.tickCallback||compactNumber},title:{display:true,text:yTitle,color:palette.muted}},...(extra.scales||{})}};
+  return {responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:180},interaction:{mode:'index',intersect:false},plugins:{legend:{display:extra.legend!==false,position:'bottom',...(extra.legendOnClick?{onClick:extra.legendOnClick}:{}),labels:{color:palette.text,usePointStyle:true,boxWidth:8,filter:(item,data)=>data.datasets[item.datasetIndex].showInLegend!==false}},tooltip:{enabled:true,backgroundColor:palette.panel,titleColor:palette.text,bodyColor:palette.text,borderColor:palette.border,borderWidth:1}},scales:{x:{type:'linear',grid:{color:palette.border},ticks:{color:palette.muted,maxTicksLimit:10},title:{display:true,text:xTitle,color:palette.muted}},y:{min:extra.min,max:extra.max,grid:{color:palette.border},ticks:{color:palette.muted,callback:extra.tickCallback||compactNumber},title:{display:true,text:yTitle,color:palette.muted}},...(extra.scales||{})}};
 }
+function toggleLossSeries(_event,legendItem,legend){const chart=legend.chart,key=chart.data.datasets[legendItem.datasetIndex].seriesKey,visible=chart.isDatasetVisible(legendItem.datasetIndex);chart.data.datasets.forEach((dataset,index)=>{if(dataset.seriesKey===key)chart.setDatasetVisibility(index,!visible);});chart.update(reduced?'none':undefined);}
 const charts={
-  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss')}),
-  diegesis:new Chart(document.getElementById('loss-diegesis'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss')}),
-  mvkubric:new Chart(document.getElementById('loss-mvkubric'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss')}),
+  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries})}),
+  diegesis:new Chart(document.getElementById('loss-diegesis'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries})}),
+  mvkubric:new Chart(document.getElementById('loss-mvkubric'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries})}),
   stationary:new Chart(document.getElementById('stationary-baseline'),{type:'line',data:{datasets:[rawPoints('Model trajectory',palette.s1),meanLine('Model trajectory',palette.s1),rawPoints('Stationary baseline',palette.s4),meanLine('Stationary baseline',palette.s4,{borderDash:[6,4]})]},options:options('Optimizer step','Trajectory loss')}),
   stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[rawPoints('Model / stationary',palette.s1),meanLine('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0})}),
   validationCombined:new Chart(document.getElementById('validation-combined'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
