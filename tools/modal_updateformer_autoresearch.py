@@ -406,6 +406,51 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
     gpu="H100!",
     cpu=8,
     memory=65536,
+    timeout=60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def run_real_update_profile() -> dict:
+    import wandb
+
+    from mvtracker.profiling.full_updateformer_candidate import profile_real_update
+
+    commit = _source_commit()
+    run = wandb.init(
+        entity="jeetucl-ucl",
+        project="mvtracker-modal-profiling",
+        group="updateformer-autoresearch-v2",
+        job_type="real-update-operator-profile",
+        tags=["modal", "h100", "single-gpu", "autoresearch", "operator-profile"],
+        config={"source_commit": commit, **TAGS},
+    )
+    result = profile_real_update(
+        data_root=DATA_ROOT / "datasets",
+        checkpoint=DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth",
+        batch_cache=CANDIDATE_BATCH,
+    )
+    output_root = RUN_ROOT / "performance-results" / commit
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_path = output_root / "real-update-operator-profile.json"
+    output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    run_volume.commit()
+    for name, row in result["regions"].items():
+        run.summary[f"regions/{name}/device_ms"] = row["device_time_us"] / 1000
+    run.summary["result_path"] = str(output_path)
+    run.finish()
+    return {"result_path": str(output_path), **result}
+
+
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H100!",
+    cpu=8,
+    memory=65536,
     timeout=6 * 60 * 60,
     max_containers=1,
     include_source=False,
@@ -678,6 +723,19 @@ def fused_candidate_gate(candidate_backend: str = "fused") -> None:
         }
     )
     print(json.dumps(run_fused_candidate_gate.remote(candidate_backend), indent=2))
+
+
+@app.local_entrypoint(name="real-update-profile")
+def real_update_profile() -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    app.set_tags({
+        **TAGS,
+        "experiment": f"real-update-profile-{commit[:8]}",
+        "gpu": "h100",
+    })
+    print(json.dumps(run_real_update_profile.remote(), indent=2))
 
 
 @app.local_entrypoint(name="candidate-sweep")

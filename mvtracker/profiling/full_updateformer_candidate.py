@@ -207,6 +207,120 @@ def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
     return result
 
 
+def profile_real_update(
+    *,
+    data_root: Path,
+    checkpoint: Path,
+    batch_cache: Path,
+):
+    batch = torch.load(batch_cache, map_location="cpu", weights_only=False)
+    arguments = _arguments(
+        data_root,
+        checkpoint,
+        Path("profile.json"),
+        int(batch.video.shape[0]),
+        int(batch.video.shape[1]),
+        int(batch.query_points_3d.shape[1]),
+    )
+    cfg = _compose_config(arguments)
+    cfg.model.updateformer_backend = "eager"
+    cfg.model.checkpoint_updateformer = False
+    model = hydra.utils.instantiate(cfg.model).cuda().train()
+    Fabric(devices=1, precision=cfg.trainer.precision).load_raw(
+        str(checkpoint), model
+    )
+    optimizer, _ = fetch_optimizer(cfg.trainer, model)
+    batch = copy.deepcopy(batch)
+    dataclass_to_cuda_(batch)
+
+    def update(profile=False):
+        optimizer.zero_grad(set_to_none=True)
+        forward_context = (
+            torch.profiler.record_function("training/forward")
+            if profile else nullcontext()
+        )
+        with forward_context:
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+            ):
+                output = forward_batch_multi_view(
+                    batch=batch,
+                    model=model,
+                    cfg=cfg,
+                    step=1,
+                    train_iters=cfg.trainer.train_iters,
+                    gamma=cfg.trainer.gamma,
+                    save_debug_logs=False,
+                    debug_logs_path=None,
+                    run_expensive_diagnostics=False,
+                )
+                loss = output["flow"]["loss"] + output["visibility"]["loss"]
+        backward_context = (
+            torch.profiler.record_function("training/backward")
+            if profile else nullcontext()
+        )
+        with backward_context:
+            loss.backward()
+        optimizer_context = (
+            torch.profiler.record_function("training/optimizer")
+            if profile else nullcontext()
+        )
+        with optimizer_context:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.trainer.grad_clip)
+            optimizer.step()
+
+    from contextlib import nullcontext
+
+    update()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=(
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as profiler:
+        update(profile=True)
+        torch.cuda.synchronize()
+    rows = []
+    for event in profiler.key_averages():
+        rows.append({
+            "name": event.key,
+            "calls": int(event.count),
+            "self_device_time_us": float(
+                getattr(event, "self_device_time_total", 0.0)
+            ),
+            "device_time_us": float(getattr(event, "device_time_total", 0.0)),
+            "self_cpu_time_us": float(event.self_cpu_time_total),
+            "cpu_time_us": float(event.cpu_time_total),
+            "self_device_memory_bytes": int(
+                getattr(event, "self_device_memory_usage", 0)
+            ),
+        })
+    rows.sort(key=lambda row: row["self_device_time_us"], reverse=True)
+    regions = {
+        row["name"]: row
+        for row in rows
+        if row["name"].startswith("training/")
+        or row["name"].startswith("mvtracker/")
+    }
+    return {
+        "shape": {
+            "batch_size": int(batch.video.shape[0]),
+            "views": int(batch.video.shape[1]),
+            "tracks": int(batch.query_points_3d.shape[1]),
+        },
+        "regions": regions,
+        "top_self_device_time": rows[:100],
+        "table": profiler.key_averages().table(
+            sort_by="self_cuda_time_total",
+            row_limit=100,
+        ),
+    }
+
+
 def _run_whole_graph(
     cfg,
     checkpoint,
