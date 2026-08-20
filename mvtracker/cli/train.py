@@ -40,6 +40,7 @@ from mvtracker.datasets import (
     TapVid3DMultiViewDataset,
 )
 from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
+from mvtracker.datasets.kubric_dali_dataset import DaliKubricValidationDataset
 from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
 from mvtracker.datasets.mixed_physical_loader import (
     MixedStepLookahead,
@@ -947,16 +948,38 @@ def _load_mixed_step(
     return ordered, loaded_count, failed_count
 
 
-def _run_rank_zero_eval(fabric, cfg, evaluator, model, dataloaders, writer, step):
-    """Run validation once using the unwrapped model while other ranks wait."""
+def _run_eval(fabric, cfg, evaluator, model, dataloaders, writer, step):
+    """Run validation across ranks and write the combined metrics once."""
     fabric.barrier()
-    if fabric.global_rank == 0:
-        scheduled_names = set(_eval_dataset_names_for_step(cfg, step))
-        dataloaders = [
-            (name, dataloader)
-            for name, dataloader in dataloaders
-            if name in scheduled_names
-        ]
+    scheduled_names = tuple(_eval_dataset_names_for_step(cfg, step))
+    dataloaders = [
+        (name, dataloader)
+        for name, dataloader in dataloaders
+        if name in scheduled_names
+    ]
+    if _mixed_source_name(cfg) and fabric.world_size > 1:
+        local_metrics = run_test_eval(
+            cfg,
+            evaluator,
+            _unwrap_objects(model),
+            dataloaders,
+            None,
+            step,
+            write_results=False,
+        )
+        gathered_metrics = [None] * fabric.world_size
+        torch.distributed.all_gather_object(gathered_metrics, local_metrics)
+        if fabric.global_rank == 0:
+            combined_metrics = {}
+            for dataset_name in scheduled_names:
+                scenes = [
+                    scene_metrics
+                    for rank_metrics in gathered_metrics
+                    for scene_metrics in rank_metrics.get(dataset_name, {}).values()
+                ]
+                combined_metrics[dataset_name] = dict(enumerate(scenes))
+            _write_eval_metrics(cfg, writer, step, combined_metrics)
+    elif fabric.global_rank == 0:
         run_test_eval(
             cfg,
             evaluator,
@@ -1571,14 +1594,49 @@ def _forward_backward_microbatch(
     )
 
 
-def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
+def _write_eval_metrics(cfg, writer, step, metrics_by_dataset):
+    for ds_name, metrics in metrics_by_dataset.items():
+        if not metrics:
+            continue
+        first = next(iter(metrics.values()))
+        metrics_to_log = {
+            key: np.nanmean(
+                [value[key] for value in metrics.values() if key in value]
+            ).round(2)
+            for key in first
+        }
+        if writer is not None:
+            for key, value in metrics_to_log.items():
+                writer.add_scalar(f"eval/{ds_name}/{key}", value, step)
+
+        logging.info(f"Per-sequence Metrics for {ds_name}: {pd.DataFrame(metrics)}")
+        logging.info(
+            f"Average metrics for {ds_name}: {json.dumps(metrics_to_log, indent=4)}"
+        )
+        log_dir_ds = os.path.join(cfg.experiment_path, f"eval_{ds_name}")
+        os.makedirs(log_dir_ds, exist_ok=True)
+        frame = pd.DataFrame(metrics).T
+        frame = frame.map(
+            lambda value: value[0]
+            if isinstance(value, np.ndarray) or isinstance(value, list)
+            else value
+        )
+        frame.to_csv(f"{log_dir_ds}/step-{step}_metrics.csv")
+        pd.DataFrame(metrics_to_log, index=["score"]).T.to_csv(
+            f"{log_dir_ds}/step-{step}_metrics_avg.csv"
+        )
+        logging.info(f"Saved metrics to {log_dir_ds}/step-{step}_metrics_avg.csv")
+
+
+def run_test_eval(cfg, evaluator, model, dataloaders, writer, step, *, write_results=True):
     if len(dataloaders) == 0:
-        return
+        return {}
 
     logging.info(f"Eval – GPU usage A: {gpustat.new_query()}")
 
     log_dir = cfg.experiment_path
     model.eval()
+    metrics_by_dataset = {}
     for ds_name, dataloader in dataloaders:
         if ds_name.startswith("kubric"):
             predictor_settings = cfg.evaluation.predictor_settings["kubric"]
@@ -1613,38 +1671,12 @@ def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
             step=step,
             log_dir=log_dir_ds,
         )
+        metrics_by_dataset[ds_name] = metrics
         if cfg.evaluation.consume_model_stats and hasattr(model, "consume_stats"):
             model.consume_stats()
 
-        metrics_to_log = {
-            k: np.nanmean([v[k] for v in metrics.values() if k in v]).round(2)
-            for k in metrics[0].keys()
-        }
-        for k, v in metrics_to_log.items():
-            writer.add_scalar(f"eval/{ds_name}/{k}", v, step)
-
-        with pd.option_context(
-                'display.max_rows', None,
-                'display.max_columns', None,
-                'display.max_colwidth', None,
-                'display.width', None,
-        ):
-            logging.info(f"Per-sequence Metrics for {ds_name}: {pd.DataFrame(metrics)}")
-            logging.info(f"Average metrics for {ds_name}: {json.dumps(metrics_to_log, indent=4)}")
-
-        # Save metrics to csv
-        if log_dir_ds is not None:
-            df = pd.DataFrame(metrics)
-            df = df.T
-            assert df.map(lambda x: (len(x) == 1) if isinstance(x, np.ndarray) else True).all().all()
-            df = df.map(lambda x: x[0] if isinstance(x, np.ndarray) or isinstance(x, list) else x)
-            df.to_csv(f"{log_dir_ds}/step-{step}_metrics.csv")
-
-            df = pd.DataFrame(metrics_to_log, index=["score"])
-            df = df.T
-            df.to_csv(f"{log_dir_ds}/step-{step}_metrics_avg.csv")
-            logging.info(f"Saved metrics to {log_dir_ds}/step-{step}_metrics_avg.csv")
-        # logging.info(f"Eval – GPU usage (after {ds_name}): {gpustat.new_query()}")
+    if write_results:
+        _write_eval_metrics(cfg, writer, step, metrics_by_dataset)
 
     # logging.info(f"Eval – GPU usage B: {gpustat.new_query()}")
     del predictor
@@ -1654,6 +1686,7 @@ def run_test_eval(cfg, evaluator, model, dataloaders, writer, step):
     # logging.info(f"Eval – GPU usage D: {gpustat.new_query()}")
 
     model.train()
+    return metrics_by_dataset
 
 
 def augment_train_iters(train_iters: int, current_step: int, warmup_steps: int = 1000) -> int:
@@ -1759,11 +1792,16 @@ def main(cfg: DictConfig):
     for dataset_name in cfg.datasets.eval.names:
         if _mixed_source_name(cfg) and dataset_name == "tapvid3d-multiview-validation":
             source_cfg = cfg.datasets.eval.sources.diegesis
+            include_scene_ids = list(source_cfg.include_scene_ids)
+            if fabric.world_size > 1:
+                include_scene_ids = include_scene_ids[
+                    fabric.global_rank::fabric.world_size
+                ]
             eval_dataset = TapVid3DMultiViewDataset.from_name(
                 dataset_name,
                 source_cfg.root,
                 cfg,
-                include_scene_ids=source_cfg.include_scene_ids,
+                include_scene_ids=include_scene_ids,
             )
             expected_views = list(source_cfg.views)
             if any(
@@ -1776,11 +1814,19 @@ def main(cfg: DictConfig):
             "kubric-multiview-v3-validation-full",
         }:
             source_cfg = cfg.datasets.eval.sources.mvkubric
-            include_scene_ids = (
+            include_scene_ids = list(
                 source_cfg.subset_scene_ids
                 if dataset_name.endswith("-subset")
                 else source_cfg.full_scene_ids
             )
+            stream_rank = fabric.global_rank
+            stream_world_size = fabric.world_size
+            if dataset_name.endswith("-subset") and fabric.world_size > 1:
+                include_scene_ids = include_scene_ids[
+                    fabric.global_rank::fabric.world_size
+                ]
+                stream_rank = 0
+                stream_world_size = 1
             kubric_kwargs = KubricMultiViewDataset.from_name(
                 "kubric-multiview-v3",
                 source_cfg.root,
@@ -1789,9 +1835,16 @@ def main(cfg: DictConfig):
                 include_scene_ids=include_scene_ids,
                 just_return_kwargs=True,
             )
-            kubric_kwargs["views_to_return"] = list(source_cfg.views)
-            kubric_kwargs["num_views"] = -1
-            eval_dataset = KubricMultiViewDataset(**kubric_kwargs)
+            kubric_kwargs.pop("include_scene_ids", None)
+            eval_dataset = DaliKubricValidationDataset(
+                **kubric_kwargs,
+                webdataset_root=cfg.datasets.train.mvkubric_webdataset_root,
+                include_scene_ids=include_scene_ids,
+                views=tuple(source_cfg.views),
+                stream_rank=stream_rank,
+                stream_world_size=stream_world_size,
+                stream_seed=int(cfg.reproducibility.seed),
+            )
         elif dataset_name.startswith("tapvid2d-davis-"):
             eval_dataset = TapVidDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("kubric-multiview-v3-25views"):
@@ -1879,18 +1932,26 @@ def main(cfg: DictConfig):
             )
         else:
             raise ValueError(f"Dataset {dataset_name} not supported for evaluation.")
+        dali_validation = isinstance(eval_dataset, DaliKubricValidationDataset)
         eval_dataloader = torch.utils.data.DataLoader(
             eval_dataset,
-            batch_size=1,
+            batch_size=2 if dali_validation else 1,
             shuffle=False,
-            num_workers=cfg.datasets.eval.num_workers,
+            num_workers=0 if dali_validation else cfg.datasets.eval.num_workers,
             collate_fn=getattr(eval_dataset, "collate_fn", collate_fn),
             pin_memory=True,
-            persistent_workers=cfg.datasets.eval.num_workers > 0,
-            prefetch_factor=2 if cfg.datasets.eval.num_workers > 0 else None,
+            persistent_workers=(
+                not dali_validation and cfg.datasets.eval.num_workers > 0
+            ),
+            prefetch_factor=(
+                2
+                if not dali_validation and cfg.datasets.eval.num_workers > 0
+                else None
+            ),
             multiprocessing_context=(
                 "spawn"
-                if getattr(eval_dataset, "requires_cuda_prefetch", False)
+                if not dali_validation
+                and getattr(eval_dataset, "requires_cuda_prefetch", False)
                 and cfg.datasets.eval.num_workers > 0
                 else None
             ),
@@ -1898,8 +1959,13 @@ def main(cfg: DictConfig):
         if getattr(eval_dataset, "requires_cuda_prefetch", False):
             eval_dataloader = CudaPrefetchLoader(
                 eval_dataloader,
+                device=fabric.device,
                 queue_depth=int(cfg.datasets.train.cuda_prefetch_queue_depth),
-                decode_batch_size=int(cfg.datasets.train.cuda_decode_batch_size),
+                decode_batch_size=(
+                    2
+                    if dali_validation
+                    else int(cfg.datasets.train.cuda_decode_batch_size)
+                ),
             )
         eval_dataloaders.append((dataset_name, eval_dataloader))
 
@@ -2265,7 +2331,7 @@ def main(cfg: DictConfig):
     )
     last_eval_step = None
     if cfg.modes.eval_only or cfg.modes.validate_at_start:
-        _run_rank_zero_eval(
+        _run_eval(
             fabric,
             cfg,
             evaluator,
@@ -3185,7 +3251,7 @@ def main(cfg: DictConfig):
                 )
 
             if total_steps % cfg.trainer.eval_freq == 0:
-                _run_rank_zero_eval(
+                _run_eval(
                     fabric,
                     cfg,
                     evaluator,
@@ -3521,7 +3587,7 @@ def main(cfg: DictConfig):
         source_cursors,
     )
     if eval_dataloaders and last_eval_step != total_steps:
-        _run_rank_zero_eval(
+        _run_eval(
             fabric,
             cfg,
             evaluator,

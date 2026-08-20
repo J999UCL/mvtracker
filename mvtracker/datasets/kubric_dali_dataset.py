@@ -463,7 +463,7 @@ class DaliKubricValidationDataset(DaliKubricMultiViewDataset):
             stream_world_size=stream_world_size,
             stream_seed=stream_seed,
             stream_scenes_per_batch=1,
-            stream_repeat=False,
+            stream_repeat=True,
             stream_shuffle_shards=False,
             stream_include_scene_ids=selected_scenes,
             stream_allow_empty=True,

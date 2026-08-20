@@ -157,11 +157,19 @@ class DDPTrainingContractTests(unittest.TestCase):
             )
             self.assertEqual(manifest["completed_steps"], 250)
 
-    def test_rank_zero_eval_wraps_validation_in_barriers(self):
-        source = ast.unparse(_function_node("_run_rank_zero_eval"))
+    def test_distributed_eval_gathers_metrics_and_writes_once(self):
+        source = ast.unparse(_function_node("_run_eval"))
         self.assertEqual(source.count("fabric.barrier()"), 2)
+        self.assertIn("torch.distributed.all_gather_object", source)
         self.assertIn("if fabric.global_rank == 0", source)
+        self.assertIn("_write_eval_metrics", source)
         self.assertIn("_unwrap_objects(model)", source)
+
+    def test_main_batches_native_dali_validation(self):
+        source = ast.unparse(_function_node("main"))
+        self.assertIn("DaliKubricValidationDataset", source)
+        self.assertIn("batch_size=2 if dali_validation else 1", source)
+        self.assertIn("fabric.global_rank::fabric.world_size", source)
 
     def test_main_uses_canonical_resume_and_rank_zero_writer(self):
         source = ast.unparse(_function_node("main"))
