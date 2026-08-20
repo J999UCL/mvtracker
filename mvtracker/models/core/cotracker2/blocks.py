@@ -71,31 +71,6 @@ class Mlp(nn.Module):
         return x
 
 
-def _transformer_engine_mlp(norm, mlp, value):
-    fused = getattr(mlp, "_transformer_engine_module", None)
-    if fused is None:
-        from transformer_engine.pytorch import LayerNormMLP
-
-        fused = LayerNormMLP(
-            value.shape[-1],
-            mlp.fc1.out_features,
-            eps=norm.eps,
-            bias=True,
-            activation="gelu",
-            params_dtype=mlp.fc1.weight.dtype,
-            device=value.device,
-        )
-        fused.layer_norm_weight.requires_grad_(False)
-        fused.layer_norm_bias.requires_grad_(False)
-        fused.fc1_weight = mlp.fc1.weight
-        fused.fc1_bias = mlp.fc1.bias
-        fused.fc2_weight = mlp.fc2.weight
-        fused.fc2_bias = mlp.fc2.bias
-        object.__setattr__(mlp, "_transformer_engine_module", fused)
-    fused.train(mlp.training)
-    return fused(value)
-
-
 class ResidualBlock(nn.Module):
     def __init__(self, in_planes, planes, norm_fn="group", stride=1):
         super(ResidualBlock, self).__init__()
@@ -407,7 +382,6 @@ class AttnBlock(nn.Module):
             num_heads,
             mlp_ratio=4.0,
             attn_class: Callable[..., nn.Module] = Attention,
-            use_transformer_engine_mlp=False,
             **block_kwargs,
     ):
         super().__init__()
@@ -423,14 +397,10 @@ class AttnBlock(nn.Module):
             act_layer=approx_gelu,
             drop=0,
         )
-        self.use_transformer_engine_mlp = use_transformer_engine_mlp
 
     def forward(self, x, attn_mask=None):
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
-        if self.use_transformer_engine_mlp:
-            x = x + _transformer_engine_mlp(self.norm2, self.mlp, x)
-        else:
-            x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -442,7 +412,6 @@ class CrossAttnBlock(nn.Module):
             num_heads,
             mlp_ratio=4.0,
             attn_class: Callable[..., nn.Module] = Attention,
-            use_transformer_engine_mlp=False,
             **block_kwargs,
     ):
         super().__init__()
@@ -465,14 +434,10 @@ class CrossAttnBlock(nn.Module):
             act_layer=approx_gelu,
             drop=0,
         )
-        self.use_transformer_engine_mlp = use_transformer_engine_mlp
 
     def forward(self, x, context, attn_mask=None):
         x = x + self.cross_attn(self.norm1(x), context=self.norm_context(context), attn_mask=attn_mask)
-        if self.use_transformer_engine_mlp:
-            x = x + _transformer_engine_mlp(self.norm2, self.mlp, x)
-        else:
-            x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -519,7 +484,6 @@ class EfficientUpdateFormer(nn.Module):
             "graphed_bucketed",
             "bucketed",
             "bucketed_reduce",
-            "te_mlp",
         }:
             raise ValueError(f"unknown UpdateFormer backend: {execution_backend}")
         if self.linear_layer_for_vis_conf:
@@ -548,7 +512,6 @@ class EfficientUpdateFormer(nn.Module):
                     num_heads,
                     mlp_ratio=mlp_ratio,
                     attn_class=attn_class,
-                    use_transformer_engine_mlp=execution_backend == "te_mlp",
                 )
                 for _ in range(time_depth)
             ]
@@ -562,7 +525,6 @@ class EfficientUpdateFormer(nn.Module):
                         num_heads,
                         mlp_ratio=mlp_ratio,
                         attn_class=attn_class,
-                        use_transformer_engine_mlp=execution_backend == "te_mlp",
                     )
                     for _ in range(space_depth)
                 ]
@@ -575,7 +537,6 @@ class EfficientUpdateFormer(nn.Module):
                         num_heads,
                         mlp_ratio=mlp_ratio,
                         attn_class=attn_class,
-                        use_transformer_engine_mlp=execution_backend == "te_mlp",
                     )
                     for _ in range(space_depth)
                 ]
@@ -588,7 +549,6 @@ class EfficientUpdateFormer(nn.Module):
                         num_heads,
                         mlp_ratio=mlp_ratio,
                         attn_class=attn_class,
-                        use_transformer_engine_mlp=execution_backend == "te_mlp",
                     )
                     for _ in range(space_depth)
                 ]

@@ -16,7 +16,8 @@ void tiled_knn_query_out_cuda(
     const torch::Tensor& offsets,
     const torch::Tensor& query_offsets,
     torch::Tensor indices,
-    torch::Tensor squared_distances);
+    torch::Tensor squared_distances,
+    torch::Tensor fallback);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(

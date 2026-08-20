@@ -54,9 +54,13 @@ __global__ void knn_query_kernel(
     const int* offsets,
     const int* query_offsets,
     int* indices,
-    float* squared_distances) {
+    float* squared_distances,
+    const bool* fallback = nullptr) {
   const int query_index = blockIdx.x * blockDim.x + threadIdx.x;
   if (query_index >= queries) {
+    return;
+  }
+  if (fallback != nullptr && !fallback[query_index]) {
     return;
   }
   query += query_index * 3;
@@ -93,6 +97,7 @@ constexpr int kTiledThreads = 128;
 constexpr int kTiledItems = 4;
 constexpr int kTiledPoints = kTiledThreads * kTiledItems;
 constexpr int kTiledMaxNeighbors = 16;
+constexpr int kTiledMaxCandidates = kTiledMaxNeighbors + 1;
 
 __global__ void tiled_knn_query_kernel(
     int queries,
@@ -102,14 +107,15 @@ __global__ void tiled_knn_query_kernel(
     const int* offsets,
     const int* query_offsets,
     int* indices,
-    float* squared_distances) {
+    float* squared_distances,
+    bool* fallback) {
   using Sort = cub::BlockRadixSort<
       float, kTiledThreads, kTiledItems, int>;
   __shared__ typename Sort::TempStorage sort_storage;
-  __shared__ float tile_distances[kTiledMaxNeighbors];
-  __shared__ int tile_indices[kTiledMaxNeighbors];
-  __shared__ float best_distances[kTiledMaxNeighbors];
-  __shared__ int best_indices[kTiledMaxNeighbors];
+  __shared__ float tile_distances[kTiledMaxCandidates];
+  __shared__ int tile_indices[kTiledMaxCandidates];
+  __shared__ float best_distances[kTiledMaxCandidates];
+  __shared__ int best_indices[kTiledMaxCandidates];
   __shared__ int begin;
   __shared__ int end;
 
@@ -121,7 +127,7 @@ __global__ void tiled_knn_query_kernel(
     const int batch = batch_index(query_index, query_offsets);
     begin = batch == 0 ? 0 : offsets[batch - 1];
     end = offsets[batch];
-    for (int rank = 0; rank < neighbors; ++rank) {
+    for (int rank = 0; rank < neighbors + 1; ++rank) {
       best_distances[rank] = 1e10f;
       best_indices[rank] = -1;
     }
@@ -152,21 +158,21 @@ __global__ void tiled_knn_query_kernel(
 #pragma unroll
     for (int item = 0; item < kTiledItems; ++item) {
       const int rank = threadIdx.x * kTiledItems + item;
-      if (rank < neighbors) {
+      if (rank < neighbors + 1) {
         tile_distances[rank] = keys[item];
         tile_indices[rank] = values[item];
       }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-      float merged_distances[kTiledMaxNeighbors];
-      int merged_indices[kTiledMaxNeighbors];
+      float merged_distances[kTiledMaxCandidates];
+      int merged_indices[kTiledMaxCandidates];
       int best_position = 0;
       int tile_position = 0;
-      for (int rank = 0; rank < neighbors; ++rank) {
+      for (int rank = 0; rank < neighbors + 1; ++rank) {
         const bool take_best =
-            tile_position >= neighbors ||
-            (best_position < neighbors &&
+            tile_position >= neighbors + 1 ||
+            (best_position < neighbors + 1 &&
              best_distances[best_position] <= tile_distances[tile_position]);
         if (take_best) {
           merged_distances[rank] = best_distances[best_position];
@@ -178,12 +184,19 @@ __global__ void tiled_knn_query_kernel(
           ++tile_position;
         }
       }
-      for (int rank = 0; rank < neighbors; ++rank) {
+      for (int rank = 0; rank < neighbors + 1; ++rank) {
         best_distances[rank] = merged_distances[rank];
         best_indices[rank] = merged_indices[rank];
       }
     }
     __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    bool has_tie = best_distances[neighbors - 1] == best_distances[neighbors];
+    for (int rank = 1; rank < neighbors; ++rank) {
+      has_tie = has_tie || best_distances[rank - 1] == best_distances[rank];
+    }
+    fallback[query_index] = has_tie;
   }
   if (threadIdx.x < neighbors) {
     indices[query_index * neighbors + threadIdx.x] = best_indices[threadIdx.x];
@@ -220,7 +233,8 @@ void capturable_knn_query_out_cuda(
       offsets.data_ptr<int>(),
       query_offsets.data_ptr<int>(),
       indices.data_ptr<int>(),
-      squared_distances.data_ptr<float>());
+      squared_distances.data_ptr<float>(),
+      nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -231,7 +245,8 @@ void tiled_knn_query_out_cuda(
     const torch::Tensor& offsets,
     const torch::Tensor& query_offsets,
     torch::Tensor indices,
-    torch::Tensor squared_distances) {
+    torch::Tensor squared_distances,
+    torch::Tensor fallback) {
   TORCH_CHECK(neighbors > 0 && neighbors <= kTiledMaxNeighbors);
   TORCH_CHECK(xyz.is_cuda() && query.is_cuda());
   TORCH_CHECK(xyz.scalar_type() == torch::kFloat32);
@@ -239,6 +254,8 @@ void tiled_knn_query_out_cuda(
   TORCH_CHECK(offsets.scalar_type() == torch::kInt32);
   TORCH_CHECK(query_offsets.scalar_type() == torch::kInt32);
   const int queries = query.size(0);
+  TORCH_CHECK(fallback.scalar_type() == torch::kBool);
+  TORCH_CHECK(fallback.numel() == queries);
   const auto stream = at::cuda::getCurrentCUDAStream();
   tiled_knn_query_kernel<<<queries, kTiledThreads, 0, stream>>>(
       queries,
@@ -248,6 +265,20 @@ void tiled_knn_query_out_cuda(
       offsets.data_ptr<int>(),
       query_offsets.data_ptr<int>(),
       indices.data_ptr<int>(),
-      squared_distances.data_ptr<float>());
+      squared_distances.data_ptr<float>(),
+      fallback.data_ptr<bool>());
+  constexpr int fallback_threads = 256;
+  const int fallback_blocks =
+      (queries + fallback_threads - 1) / fallback_threads;
+  knn_query_kernel<<<fallback_blocks, fallback_threads, 0, stream>>>(
+      queries,
+      static_cast<int>(neighbors),
+      xyz.data_ptr<float>(),
+      query.data_ptr<float>(),
+      offsets.data_ptr<int>(),
+      query_offsets.data_ptr<int>(),
+      indices.data_ptr<int>(),
+      squared_distances.data_ptr<float>(),
+      fallback.data_ptr<bool>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

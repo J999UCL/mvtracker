@@ -113,7 +113,7 @@ def _knn_cuda_extension(
     squared_distances = torch.empty(
         batch * query_count, k, dtype=torch.float32, device=xyz_ref.device
     )
-    getattr(mvtracker_capturable_knn_cuda, operation)(
+    arguments = [
         k,
         reference,
         query,
@@ -121,7 +121,12 @@ def _knn_cuda_extension(
         query_offsets,
         indices,
         squared_distances,
-    )
+    ]
+    if operation == "tiled_knn_query_out":
+        arguments.append(torch.empty(
+            batch * query_count, dtype=torch.bool, device=xyz_ref.device
+        ))
+    getattr(mvtracker_capturable_knn_cuda, operation)(*arguments)
     indices = indices.view(batch, query_count, k)
     indices = indices - (
         torch.arange(batch, device=indices.device, dtype=torch.int32)[:, None, None]
@@ -195,7 +200,6 @@ class MVTracker(nn.Module):
             "compiled",
             "bucketed",
             "bucketed_reduce",
-            "te_mlp",
         }:
             raise ValueError(f"unknown UpdateFormer backend: {updateformer_backend}")
         self.add_space_attn = add_space_attn
@@ -272,8 +276,6 @@ class MVTracker(nn.Module):
                 if updateformer_backend == "bucketed_reduce"
                 else "graphed_bucketed"
                 if updateformer_backend == "graphed_bucketed"
-                else "te_mlp"
-                if updateformer_backend == "te_mlp"
                 else updateformer_backend
                 if updateformer_backend in {"fused", "graphed"}
                 else "eager"

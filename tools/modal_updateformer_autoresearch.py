@@ -41,25 +41,7 @@ TAGS = {
 }
 
 app = modal.App(APP_NAME, tags={**TAGS, "experiment": "unclassified", "gpu": "h100"})
-image = _source_image(
-    _dependency_image().run_commands(
-        "mkdir -p /opt/nvte-cuda/include /opt/nvte-cuda/bin && "
-        "cp -a /usr/local/cuda/include/. /opt/nvte-cuda/include/ && "
-        "cp -a /usr/local/lib/python3.10/site-packages/nvidia/cudnn/include/. "
-        "/opt/nvte-cuda/include/ && "
-        "ln -s /usr/local/cuda/bin/nvcc /opt/nvte-cuda/bin/nvcc && "
-        "python -m pip install --no-build-isolation "
-        "'transformer-engine[pytorch]==2.6.0.post1'",
-        env={
-            "CC": "gcc",
-            "CXX": "g++",
-            "CUDA_HOME": "/opt/nvte-cuda",
-            "NVTE_FRAMEWORK": "pytorch",
-            "NVTE_CUDA_ARCHS": "90",
-            "MAX_JOBS": "8",
-        },
-    ).pip_install("numpy==1.24.3", "ml-dtypes==0.5.4")
-)
+image = _source_image(_dependency_image())
 
 
 @app.function(
@@ -461,7 +443,6 @@ def run_candidate_sweep() -> dict:
     commit = _source_commit()
     candidates = (
         "tiled_knn",
-        "te_mlp",
         "bucketed_reduce",
         "graphed",
         "graphed_bucketed",
@@ -569,7 +550,6 @@ def run_candidate_sweep() -> dict:
     ]
     live_candidates = {
         "tiled_knn",
-        "te_mlp",
         "bucketed",
         "bucketed_reduce",
         "graphed",
