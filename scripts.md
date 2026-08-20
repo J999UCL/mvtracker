@@ -233,6 +233,19 @@ modal run --timestamps tools/modal_mvkubric_tar_index.py::index \
 
 Use `--force true` only when rebuilding all sidecars from the TAR contents.
 
+## CPU-only direct DALI WebDataset throughput smoke
+
+This reads eight randomly ordered full MV-Kubric shards directly from the
+mounted Volume through `fn.readers.webdataset`. It uses no GPU, model, Python
+TAR reader, WIDS cache, or local staging. Ten-second heartbeats expose any
+blocked DALI batch.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
+modal run --timestamps tools/modal_dali_webdataset_cpu_smoke.py --shards 8
+```
+
 ## Production-parity two-H100 smoke
 
 This launcher requests exactly `H100!:2`, sets Modal retries to zero, and runs
