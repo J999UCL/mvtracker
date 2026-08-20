@@ -15,6 +15,8 @@ model:
   time_depth: 6
   num_virtual_tracks: 64
   use_flash_attention: true
+  updateformer_backend: eager
+  checkpoint_updateformer: false
   corr_n_groups: 1
   corr_n_levels: 4
   corr_neighbors: 16

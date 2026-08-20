@@ -1115,6 +1115,7 @@ def forward_batch_multi_view(
         save_debug_logs=False,
         debug_logs_path='',
         run_expensive_diagnostics=True,
+        capture_training_trace=False,
 ):
     # Per view data
     rgbs = batch.video
@@ -1386,6 +1387,20 @@ def forward_batch_multi_view(
         #     if "per_track" not in k
         # },
     }
+    if capture_training_trace:
+        output["training_trace"] = {
+            "coordinates": [
+                prediction.detach()
+                for scene in scene_records
+                for window in scene["coord_predictions"]
+                for prediction in window
+            ],
+            "visibility_logits": [
+                prediction.detach()
+                for scene in scene_records
+                for prediction in scene["vis_predictions"]
+            ],
+        }
     return output
 
 

@@ -174,6 +174,7 @@ def sweep_remote(run_name: str) -> dict:
                 "0",
                 "--gpu-lane",
                 GPU_LANE,
+                "--checkpoint-updateformer",
             ]
             completed = subprocess.run(command, cwd="/opt/mvtracker", check=False)
             if completed.returncode != 0:

@@ -29,6 +29,11 @@ from mvtracker.profiling.modal_continual_training import (
 
 APP_NAME = "jeet-mvtracker-updateformer-research"
 CONTRACT_ROOT = RUN_ROOT / "performance-contracts" / "updateformer-v3"
+CANDIDATE_BATCH = (
+    RUN_ROOT
+    / "continual-training/direct-volume-v2-smoke10-ddp2-h100-20260819T0110Z"
+    / "crash_batch_step_000000.pt"
+)
 TAGS = {
     "owner": "jeet",
     "project": "mvtracker",
@@ -269,6 +274,62 @@ def run_single_gpu_smoke(run_name: str) -> dict:
     }
 
 
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H100!",
+    cpu=8,
+    memory=65536,
+    timeout=3 * 60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def run_fused_candidate_gate() -> dict:
+    import torch
+    import wandb
+
+    from mvtracker.profiling.full_updateformer_candidate import compare_real_update
+
+    commit = _source_commit()
+    run = wandb.init(
+        entity="jeetucl-ucl",
+        project="mvtracker-modal-profiling",
+        group="updateformer-fused-backend",
+        job_type="full-update-candidate-gate",
+        tags=["modal", "h100", "single-gpu", "updateformer", "fused-backend"],
+        config={"source_commit": commit, **TAGS},
+    )
+    torch.set_float32_matmul_precision("high")
+    output_root = RUN_ROOT / "performance-results" / commit
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_path = output_root / "fused-candidate-gate.json"
+    result = compare_real_update(
+        data_root=DATA_ROOT / "datasets",
+        checkpoint=DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth",
+        batch_cache=CANDIDATE_BATCH,
+        output=output_path,
+    )
+    output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    run_volume.commit()
+    run.summary.update({
+        "gate/passed": int(result["passed"]),
+        "gate/trajectory_rms_m": result["final_trajectory"]["rms"],
+        "gate/trajectory_p99_m": result["final_trajectory"]["p99"],
+        "gate/visibility_mean_abs": result["final_visibility"]["mean"],
+        "gate/gradient_cosine": result["gradients"]["cosine"],
+        "gate/update_cosine": result["parameter_updates"]["cosine"],
+        "timing/eager_forward_seconds": result["timing"]["eager"]["forward_seconds"],
+        "timing/fused_forward_seconds": result["timing"]["fused"]["forward_seconds"],
+        "result_path": str(output_path),
+    })
+    run.finish()
+    return {"result_path": str(output_path), **result}
+
+
 def _launch(action: str, warmup: int = 3, measured: int = 10) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
@@ -342,3 +403,18 @@ def single_gpu_smoke(run_name: str = "") -> None:
         }
     )
     print(json.dumps(run_single_gpu_smoke.remote(selected), indent=2))
+
+
+@app.local_entrypoint(name="fused-candidate-gate")
+def fused_candidate_gate() -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    app.set_tags(
+        {
+            **TAGS,
+            "experiment": f"updateformer-fused-gate-{commit[:8]}",
+            "gpu": "h100",
+        }
+    )
+    print(json.dumps(run_fused_candidate_gate.remote(), indent=2))

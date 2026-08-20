@@ -77,6 +77,8 @@ def _compose_config(arguments):
         "logging.log_wandb=false",
         "datasets.eval.names=[]",
     ]
+    if getattr(arguments, "checkpoint_updateformer", False):
+        overrides.append("model.checkpoint_updateformer=true")
     with initialize_config_dir(config_dir=str(config_dir), version_base="1.3"):
         return compose(config_name="train", overrides=overrides)
 
@@ -457,6 +459,7 @@ def _arguments():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--gpu-lane", choices=("H100!", "H200", "B200"))
     parser.add_argument("--compatibility-only", action="store_true")
+    parser.add_argument("--checkpoint-updateformer", action="store_true")
     return parser.parse_args()
 
 

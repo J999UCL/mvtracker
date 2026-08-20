@@ -272,6 +272,50 @@ class FlashAttention(nn.Module):
         return self.to_out(x)
 
 
+class FusedFlashAttention(FlashAttention):
+    """Flash attention with one QKV projection for self-attention."""
+
+    def forward(self, x, context=None, attn_mask=None):
+        B, N1, _ = x.shape
+        h = self.num_heads
+
+        if context is None:
+            qkv = F.linear(
+                x,
+                torch.cat((self.to_q.weight, self.to_kv.weight), dim=0),
+                torch.cat((self.to_q.bias, self.to_kv.bias), dim=0),
+            )
+            q, k, v = qkv.split(
+                (h * self.dim_head, h * self.dim_head, h * self.dim_head),
+                dim=-1,
+            )
+            context_length = N1
+        else:
+            q = self.to_q(x)
+            k, v = self.to_kv(context).chunk(2, dim=-1)
+            context_length = context.shape[1]
+
+        q = q.reshape(B, N1, h, self.dim_head).transpose(1, 2)
+        k = k.reshape(B, context_length, h, self.dim_head).transpose(1, 2)
+        v = v.reshape(B, context_length, h, self.dim_head).transpose(1, 2)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        x = x.transpose(1, 2).reshape(B, N1, -1)
+        return self.to_out(x)
+
+
+UPDATEFORMER_TRACK_CAPACITIES = (512, 1024, 1280, 2048)
+
+
+def updateformer_track_capacity(track_count):
+    for capacity in UPDATEFORMER_TRACK_CAPACITIES:
+        if track_count <= capacity:
+            return capacity
+    raise ValueError(
+        f"fused UpdateFormer supports at most "
+        f"{UPDATEFORMER_TRACK_CAPACITIES[-1]} tracks, got {track_count}"
+    )
+
+
 class AttnBlock(nn.Module):
     def __init__(
             self,
@@ -356,7 +400,8 @@ class EfficientUpdateFormer(nn.Module):
             num_virtual_tracks=64,
             attn_class: Callable[..., nn.Module] = Attention,
             linear_layer_for_vis_conf=False,
-            checkpoint_updateformer=True,
+            checkpoint_updateformer=False,
+            execution_backend="eager",
     ):
         super().__init__()
         self.out_channels = 2
@@ -366,6 +411,10 @@ class EfficientUpdateFormer(nn.Module):
         self.input_transform = torch.nn.Linear(input_dim, hidden_size, bias=True)
         self.linear_layer_for_vis_conf = linear_layer_for_vis_conf
         self.checkpoint_updateformer = checkpoint_updateformer
+        self.execution_backend = execution_backend
+        self._compiled_impl = None
+        if execution_backend not in {"eager", "fused"}:
+            raise ValueError(f"unknown UpdateFormer backend: {execution_backend}")
         if self.linear_layer_for_vis_conf:
             self.flow_head = nn.Sequential(
                 nn.Linear(hidden_size, output_dim, bias=True),
@@ -456,6 +505,8 @@ class EfficientUpdateFormer(nn.Module):
             self.vis_conf_head.apply(trunc_init)
 
     def forward(self, input_tensor, point_mask=None):
+        if self.execution_backend == "fused":
+            return self._forward_fused(input_tensor, point_mask)
         if (
             self.checkpoint_updateformer
             and self.training
@@ -472,6 +523,30 @@ class EfficientUpdateFormer(nn.Module):
             output = self._forward_impl(input_tensor, point_mask)
         return output
 
+    def _forward_fused(self, input_tensor, point_mask=None):
+        batch_size, track_count, _, _ = input_tensor.shape
+        if point_mask is None:
+            point_mask = torch.ones(
+                batch_size,
+                track_count,
+                dtype=torch.bool,
+                device=input_tensor.device,
+            )
+        capacity = updateformer_track_capacity(track_count)
+        padding = capacity - track_count
+        if padding:
+            input_tensor = F.pad(input_tensor, (0, 0, 0, 0, 0, padding))
+            point_mask = F.pad(point_mask, (0, padding), value=False)
+        if self._compiled_impl is None:
+            self._compiled_impl = torch.compile(
+                self._forward_impl,
+                fullgraph=True,
+                dynamic=False,
+                mode="max-autotune",
+            )
+        output = self._compiled_impl(input_tensor, point_mask)
+        return output[:, :track_count]
+
     def _forward_impl(self, input_tensor, point_mask=None):
         tokens = self.input_transform(input_tensor)
         B, _, T, _ = tokens.shape
@@ -484,7 +559,7 @@ class EfficientUpdateFormer(nn.Module):
                 f"point_mask must have shape {(B, tokens.shape[1])}, "
                 f"got {tuple(point_mask.shape)}"
             )
-        virtual_tokens = self.virual_tracks.repeat(B, 1, T, 1)
+        virtual_tokens = self.virual_tracks.expand(B, -1, T, -1)
         tokens = torch.cat([tokens, virtual_tokens], dim=1)
         _, N, _, _ = tokens.shape
 

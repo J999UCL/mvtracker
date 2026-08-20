@@ -276,3 +276,14 @@ bounded numerical parity check uses no model or optimizer and can be run on a
 python tools/profile_mixed_physical_loader.py \
   --mode parity --parity-device cuda:0
 ```
+## UpdateFormer fused-backend candidate gate
+
+Run the single-H100 real-update gate comparing the eager UpdateFormer against
+the fused QKV + fixed-capacity + Inductor/CUDA-graph backend. The command uses
+the saved real mixed-source crash batch and writes its JSON result to the Modal
+run Volume.
+
+```bash
+MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
+  modal run tools/modal_updateformer_autoresearch.py::fused-candidate-gate
+```

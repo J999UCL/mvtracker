@@ -12,7 +12,10 @@ from torch import nn as nn
 
 from mvtracker.datasets.utils import transform_scene
 from mvtracker.models.core.cotracker2.blocks import Attention, FlashAttention
-from mvtracker.models.core.cotracker2.blocks import EfficientUpdateFormer
+from mvtracker.models.core.cotracker2.blocks import (
+    EfficientUpdateFormer,
+    FusedFlashAttention,
+)
 from mvtracker.models.core.embeddings import (
     get_3d_sincos_pos_embed_from_grid,
     get_1d_sincos_pos_embed_from_grid,
@@ -112,6 +115,8 @@ class MVTracker(nn.Module):
             corr_add_neighbor_offset=True,
             corr_add_neighbor_xyz=False,
             corr_filter_invalid_depth=False,
+            updateformer_backend="eager",
+            checkpoint_updateformer=False,
     ):
         super().__init__()
 
@@ -128,6 +133,7 @@ class MVTracker(nn.Module):
         self.corr_add_neighbor_offset = corr_add_neighbor_offset
         self.corr_add_neighbor_xyz = corr_add_neighbor_xyz
         self.corr_filter_invalid_depth = corr_filter_invalid_depth
+        self.updateformer_backend = updateformer_backend
         self.add_space_attn = add_space_attn
         self.updateformer_input_dim = (
             # The positional encoding of the 3D flow from t=i to t=0
@@ -172,8 +178,14 @@ class MVTracker(nn.Module):
             mlp_ratio=4.0,
             add_space_attn=add_space_attn,
             num_virtual_tracks=num_virtual_tracks,
-            attn_class=FlashAttention if use_flash_attention else Attention,
+            attn_class=(
+                FusedFlashAttention
+                if updateformer_backend == "fused"
+                else FlashAttention if use_flash_attention else Attention
+            ),
             linear_layer_for_vis_conf=False,
+            checkpoint_updateformer=checkpoint_updateformer,
+            execution_backend=updateformer_backend,
         )
 
         # Feature update + visibility

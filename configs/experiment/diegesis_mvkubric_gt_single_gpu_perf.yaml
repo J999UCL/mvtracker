@@ -18,6 +18,9 @@ trainer:
   expensive_diagnostics_interval: 10000
   hardware_metrics_interval: 1
 
+model:
+  checkpoint_updateformer: true
+
 modes:
   validate_at_start: false
 

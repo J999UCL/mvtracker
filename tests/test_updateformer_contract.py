@@ -9,9 +9,46 @@ from mvtracker.profiling.updateformer_contract import (
     _exact_mismatch,
     tensor_record,
 )
+from mvtracker.models.core.cotracker2.blocks import (
+    EfficientUpdateFormer,
+    FlashAttention,
+    FusedFlashAttention,
+    updateformer_track_capacity,
+)
 
 
 class UpdateFormerContractTests(unittest.TestCase):
+    def test_fused_backend_uses_stable_capacity_shapes(self):
+        self.assertEqual(updateformer_track_capacity(333), 512)
+        self.assertEqual(updateformer_track_capacity(777), 1024)
+        self.assertEqual(updateformer_track_capacity(1100), 1280)
+        self.assertEqual(updateformer_track_capacity(1536), 2048)
+        with self.assertRaises(ValueError):
+            updateformer_track_capacity(2049)
+
+    def test_fused_attention_loads_the_eager_state_dict(self):
+        eager = FlashAttention(24, num_heads=3, dim_head=8, qkv_bias=True)
+        fused = FusedFlashAttention(24, num_heads=3, dim_head=8, qkv_bias=True)
+        fused.load_state_dict(eager.state_dict(), strict=True)
+
+        inputs = torch.randn(2, 7, 24)
+        torch.testing.assert_close(eager(inputs), fused(inputs), rtol=1e-5, atol=1e-6)
+
+    def test_checkpointing_is_not_the_default_execution_path(self):
+        model = EfficientUpdateFormer(
+            space_depth=1,
+            time_depth=1,
+            input_dim=16,
+            hidden_size=24,
+            num_heads=3,
+            output_dim=8,
+            num_virtual_tracks=4,
+            attn_class=FlashAttention,
+        )
+
+        self.assertFalse(model.checkpoint_updateformer)
+        self.assertEqual(model.execution_backend, "eager")
+
     def test_tensor_record_detects_a_single_value_change(self):
         original = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
         changed = original.clone()
