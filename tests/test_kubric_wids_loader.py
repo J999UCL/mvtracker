@@ -8,19 +8,8 @@ import numpy as np
 
 from mvtracker.datasets.kubric_dali_dataset import (
     KubricWebDatasetCatalog,
-    _WidsRecordStore,
     _packed_frames,
 )
-
-
-class _Reader:
-    def __init__(self, records, calls):
-        self.records = records
-        self.calls = calls
-
-    def __getitem__(self, index):
-        self.calls.append(int(index))
-        return self.records[int(index)]
 
 
 def _packed(*frames):
@@ -34,18 +23,18 @@ def _packed(*frames):
     return stream.getvalue()
 
 
-class KubricWidsLoaderTests(unittest.TestCase):
+class KubricIndexedLoaderTests(unittest.TestCase):
     def test_catalog_reads_only_catalog_and_maps_selected_views(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             split = root / "train"
             split.mkdir()
-            (split / "shards.json").write_text("{}", encoding="utf-8")
+            (split / "record-locator.npz").touch()
             (split / "manifest.json").write_text(
                 json.dumps(
                     {
                         "format": "mvtracker-kubric-webdataset",
-                        "wids_descriptor": "shards.json",
+                        "record_locator": "record-locator.npz",
                         "scenes": {
                             "1001": {
                                 "metadata_index": 7,
@@ -61,21 +50,13 @@ class KubricWidsLoaderTests(unittest.TestCase):
             self.assertEqual(catalog.scene("1001")[0]["metadata_index"], 7)
             self.assertEqual(catalog.scene("1001")[0]["views"]["4"]["media_index"], 24)
 
-    def test_wids_reader_is_lazy_and_media_reads_are_exact(self):
-        calls = []
-        records = {
-            7: {".meta.npz": b"metadata"},
-            20: {".rgb.npz": _packed(b"r0", b"r1"), ".depth.npz": _packed(b"d0", b"d1")},
-            24: {".rgb.npz": _packed(b"R0", b"R1"), ".depth.npz": _packed(b"D0", b"D1")},
+    def test_packed_media_reads_are_exact(self):
+        record = {
+            ".rgb.npz": _packed(b"r0", b"r1"),
+            ".depth.npz": _packed(b"D0", b"D1"),
         }
-        store = _WidsRecordStore(
-            "/tmp/descriptor.json",
-            reader_factory=lambda _: _Reader(records, calls),
-        )
-        self.assertEqual(calls, [])
-        self.assertEqual(_packed_frames(store.get(20), "rgb.npz"), (b"r0", b"r1"))
-        self.assertEqual(_packed_frames(store.get(24), "depth.npz"), (b"D0", b"D1"))
-        self.assertEqual(calls, [20, 24])
+        self.assertEqual(_packed_frames(record, "rgb.npz"), (b"r0", b"r1"))
+        self.assertEqual(_packed_frames(record, "depth.npz"), (b"D0", b"D1"))
 
 
 if __name__ == "__main__":
