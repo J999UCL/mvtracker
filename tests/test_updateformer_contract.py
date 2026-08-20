@@ -31,8 +31,26 @@ class UpdateFormerContractTests(unittest.TestCase):
         fused = FusedFlashAttention(24, num_heads=3, dim_head=8, qkv_bias=True)
         fused.load_state_dict(eager.state_dict(), strict=True)
 
-        inputs = torch.randn(2, 7, 24)
-        torch.testing.assert_close(eager(inputs), fused(inputs), rtol=1e-5, atol=1e-6)
+        eager_inputs = torch.randn(2, 7, 24, requires_grad=True)
+        fused_inputs = eager_inputs.detach().clone().requires_grad_(True)
+        eager_output = eager(eager_inputs)
+        fused_output = fused(fused_inputs)
+        torch.testing.assert_close(eager_output, fused_output, rtol=1e-5, atol=1e-6)
+        weights = torch.randn_like(eager_output)
+        (eager_output * weights).sum().backward()
+        (fused_output * weights).sum().backward()
+        torch.testing.assert_close(
+            eager_inputs.grad, fused_inputs.grad, rtol=1e-5, atol=1e-6
+        )
+        for eager_parameter, fused_parameter in zip(
+            eager.parameters(), fused.parameters()
+        ):
+            torch.testing.assert_close(
+                eager_parameter.grad,
+                fused_parameter.grad,
+                rtol=1e-5,
+                atol=1e-6,
+            )
 
     def test_checkpointing_is_not_the_default_execution_path(self):
         model = EfficientUpdateFormer(

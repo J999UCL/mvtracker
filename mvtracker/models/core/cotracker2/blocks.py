@@ -272,6 +272,55 @@ class FlashAttention(nn.Module):
         return self.to_out(x)
 
 
+class _FusedQKVProjection(torch.autograd.Function):
+    """One forward GEMM with the original two-linear backward decomposition."""
+
+    @staticmethod
+    def forward(ctx, x, q_weight, q_bias, kv_weight, kv_bias):
+        autocast = x.is_cuda and torch.is_autocast_enabled("cuda")
+        compute_dtype = torch.get_autocast_dtype("cuda") if autocast else x.dtype
+        x_compute = x.to(compute_dtype)
+        q_weight_compute = q_weight.to(compute_dtype)
+        kv_weight_compute = kv_weight.to(compute_dtype)
+        q_bias_compute = q_bias.to(compute_dtype)
+        kv_bias_compute = kv_bias.to(compute_dtype)
+        ctx.input_dtype = x.dtype
+        ctx.q_weight_dtype = q_weight.dtype
+        ctx.q_bias_dtype = q_bias.dtype
+        ctx.kv_weight_dtype = kv_weight.dtype
+        ctx.kv_bias_dtype = kv_bias.dtype
+        ctx.q_width = q_weight.shape[0]
+        ctx.save_for_backward(x_compute, q_weight_compute, kv_weight_compute)
+        return F.linear(
+            x_compute,
+            torch.cat((q_weight_compute, kv_weight_compute), dim=0),
+            torch.cat((q_bias_compute, kv_bias_compute), dim=0),
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, q_weight, kv_weight = ctx.saved_tensors
+        q_grad, kv_grad = grad_output.split(
+            (ctx.q_width, grad_output.shape[-1] - ctx.q_width), dim=-1
+        )
+        x_flat = x.reshape(-1, x.shape[-1])
+        q_grad_flat = q_grad.reshape(-1, q_grad.shape[-1])
+        kv_grad_flat = kv_grad.reshape(-1, kv_grad.shape[-1])
+        input_grad = q_grad_flat @ q_weight
+        input_grad.add_(kv_grad_flat @ kv_weight)
+        q_weight_grad = q_grad_flat.transpose(0, 1) @ x_flat
+        kv_weight_grad = kv_grad_flat.transpose(0, 1) @ x_flat
+        q_bias_grad = q_grad_flat.sum(dim=0)
+        kv_bias_grad = kv_grad_flat.sum(dim=0)
+        return (
+            input_grad.reshape_as(x).to(ctx.input_dtype),
+            q_weight_grad.to(ctx.q_weight_dtype),
+            q_bias_grad.to(ctx.q_bias_dtype),
+            kv_weight_grad.to(ctx.kv_weight_dtype),
+            kv_bias_grad.to(ctx.kv_bias_dtype),
+        )
+
+
 class FusedFlashAttention(FlashAttention):
     """Flash attention with one QKV projection for self-attention."""
 
@@ -280,10 +329,12 @@ class FusedFlashAttention(FlashAttention):
         h = self.num_heads
 
         if context is None:
-            qkv = F.linear(
+            qkv = _FusedQKVProjection.apply(
                 x,
-                torch.cat((self.to_q.weight, self.to_kv.weight), dim=0),
-                torch.cat((self.to_q.bias, self.to_kv.bias), dim=0),
+                self.to_q.weight,
+                self.to_q.bias,
+                self.to_kv.weight,
+                self.to_kv.bias,
             )
             q, k, v = qkv.split(
                 (h * self.dim_head, h * self.dim_head, h * self.dim_head),
