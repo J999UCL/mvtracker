@@ -152,7 +152,15 @@ class KubricDaliSceneStream:
         )
         watcher.start()
         try:
-            outputs = self._pipeline.run()
+            try:
+                outputs = self._pipeline.run()
+            except StopIteration:
+                self._pipeline.reset()
+                print(
+                    f"DALI_STREAM event=epoch_reset rank={self.rank}",
+                    flush=True,
+                )
+                outputs = self._pipeline.run()
         finally:
             stop.set()
             watcher.join()

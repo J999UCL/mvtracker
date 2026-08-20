@@ -100,6 +100,22 @@ class _Pipeline:
         return self.outputs
 
 
+class _ResettingPipeline:
+    def __init__(self, outputs):
+        self.outputs = outputs
+        self.calls = 0
+        self.resets = 0
+
+    def run(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise StopIteration
+        return self.outputs
+
+    def reset(self):
+        self.resets += 1
+
+
 def _scene_outputs(scene_names):
     metadata = []
     rgb = []
@@ -147,6 +163,21 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
                     for view in range(10)
                 ),
             )
+
+    def test_native_reader_resets_at_epoch_boundary(self):
+        scene_names = ("scene-a", "scene-b", "scene-c", "scene-d")
+        stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
+        stream.rank = 0
+        stream.heartbeat_seconds = 60.0
+        stream._expected_scenes = scene_names
+        stream._scene_cursor = 0
+        stream._batch_index = 0
+        stream._pipeline = _ResettingPipeline(_scene_outputs(scene_names))
+
+        group = stream.next_scene_group()
+
+        self.assertEqual(tuple(scene.scene_name for scene in group.scenes), scene_names)
+        self.assertEqual(stream._pipeline.resets, 1)
 
     def test_ranks_receive_disjoint_shards_from_the_same_shuffle(self):
         reader_calls = []
