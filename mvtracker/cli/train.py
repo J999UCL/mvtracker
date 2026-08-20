@@ -1139,6 +1139,27 @@ def build_camera_inverses(batch):
     return intrs_inv, extrs_inv
 
 
+def build_pointcloud_grids(batch, stride, levels):
+    height = int(batch.video.shape[-2]) // int(stride)
+    width = int(batch.video.shape[-1]) // int(stride)
+    grids = []
+    for level in range(int(levels)):
+        level_height = height // 2**level
+        level_width = width // 2**level
+        level_stride = int(stride) * 2**level
+        y, x = torch.meshgrid(
+            (torch.arange(level_height, device=batch.video.device) + 0.5)
+            * level_stride
+            - 0.5,
+            (torch.arange(level_width, device=batch.video.device) + 0.5)
+            * level_stride
+            - 0.5,
+            indexing="ij",
+        )
+        grids.append(torch.stack((x, y, torch.ones_like(x)), dim=-1).float())
+    return tuple(grids)
+
+
 def forward_batch_multi_view(
         batch,
         model,
@@ -1153,6 +1174,7 @@ def forward_batch_multi_view(
         execution_schedule=None,
         graph_capture=False,
         camera_inverses=None,
+        pointcloud_grids=None,
 ):
     # Per view data
     rgbs = batch.video
@@ -1211,6 +1233,7 @@ def forward_batch_multi_view(
         track_padding_mask=track_padding_mask,
         execution_schedule=execution_schedule,
         camera_inverses=camera_inverses,
+        pointcloud_grids=pointcloud_grids,
     )
     pred_trajectories = results["traj_e"]
     pred_visibilities = results["vis_e"]

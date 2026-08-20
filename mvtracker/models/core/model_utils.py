@@ -428,6 +428,7 @@ def init_pointcloud_from_rgbd(
         return_validity_mask=False,
         intrs_inv=None,
         extrs_inv=None,
+        pixel_xy_homo=None,
 ):
     B, V, S, C, H, W = fmaps.shape
     assert fmaps.shape == (B, V, S, C, H, W)
@@ -463,13 +464,14 @@ def init_pointcloud_from_rgbd(
     assert extrs_inv.shape == (B, V, S, 4, 4)
 
     # Pixel --> Camera --> World
-    pixel_xy = torch.stack(torch.meshgrid(
-        (torch.arange(0, H) + 0.5) * stride - 0.5,
-        (torch.arange(0, W) + 0.5) * stride - 0.5,
-        indexing="ij",
-    )[::-1], dim=-1)
-    pixel_xy = pixel_xy.to(device=fmaps.device, dtype=fmaps.dtype)
-    pixel_xy_homo = to_homogeneous(pixel_xy)
+    if pixel_xy_homo is None:
+        pixel_xy = torch.stack(torch.meshgrid(
+            (torch.arange(0, H) + 0.5) * stride - 0.5,
+            (torch.arange(0, W) + 0.5) * stride - 0.5,
+            indexing="ij",
+        )[::-1], dim=-1)
+        pixel_xy = pixel_xy.to(device=fmaps.device, dtype=fmaps.dtype)
+        pixel_xy_homo = to_homogeneous(pixel_xy)
     depthmap_camera_xyz = torch.einsum('BVSij,HWj->BVSHWi', intrs_inv, pixel_xy_homo)
     depthmap_camera_xyz = depthmap_camera_xyz * depths[..., 0, :, :, None]
     depthmap_camera_xyz_homo = to_homogeneous(depthmap_camera_xyz)

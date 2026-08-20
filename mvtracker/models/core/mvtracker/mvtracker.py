@@ -288,6 +288,7 @@ class MVTracker(nn.Module):
             track_padding_mask=None,
             intrs_inv=None,
             extrs_inv=None,
+            pointcloud_grids=None,
             iters=4,
             feat_init=None,
             save_debug_logs=False,
@@ -342,6 +343,10 @@ class MVTracker(nn.Module):
                     return_validity_mask=self.corr_filter_invalid_depth or save_rerun_logs,
                     intrs_inv=intrs_inv,
                     extrs_inv=extrs_inv,
+                    pixel_xy_homo=(
+                        pointcloud_grids[lvl]
+                        if pointcloud_grids is not None else None
+                    ),
                 )
             if self.corr_filter_invalid_depth or save_rerun_logs:
                 pc_xyz, pc_fvec, pc_valid = pc
@@ -461,6 +466,7 @@ class MVTracker(nn.Module):
             save_rerun_logs_output_rrd_path: Optional[str] = None,
             execution_schedule=None,
             camera_inverses=None,
+            pointcloud_grids=None,
             **kwargs,
     ):
         device = extrs.device
@@ -537,6 +543,7 @@ class MVTracker(nn.Module):
                         camera_inverses[0].index_select(0, index),
                         camera_inverses[1].index_select(0, index),
                     ) if camera_inverses is not None else None,
+                    pointcloud_grids=pointcloud_grids,
                 )
                 for local_index, scene_index in enumerate(scene_indices):
                     grouped_results[scene_index] = {
@@ -817,6 +824,10 @@ class MVTracker(nn.Module):
                             camera_inverses[1][:, :, new_seq_t0:new_seq_t1]
                             if camera_inverses is not None else None
                         ),
+                        pixel_xy_homo=(
+                            pointcloud_grids[0]
+                            if pointcloud_grids is not None else None
+                        ),
                     )
 
                 new_num_frames = _fmaps_seq_new.shape[2]
@@ -906,6 +917,7 @@ class MVTracker(nn.Module):
                 track_padding_mask=active_padding_mask,
                 intrs_inv=intrs_inv_seq,
                 extrs_inv=extrs_inv_seq,
+                pointcloud_grids=pointcloud_grids,
                 iters=iters,
                 save_debug_logs=save_debug_logs,
                 debug_logs_path=debug_logs_path,

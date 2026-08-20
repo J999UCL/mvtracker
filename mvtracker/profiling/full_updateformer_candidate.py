@@ -15,6 +15,7 @@ import torch
 from mvtracker.cli.profile_training import _compose_config
 from mvtracker.cli.train import (
     build_model_execution_schedule,
+    build_pointcloud_grids,
     build_camera_inverses,
     dataclass_to_cuda_,
     fetch_optimizer,
@@ -198,6 +199,9 @@ def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
     execution_schedule = build_model_execution_schedule(batch)
     dataclass_to_cuda_(batch)
     camera_inverses = build_camera_inverses(batch)
+    pointcloud_grids = build_pointcloud_grids(
+        batch, cfg.model.stride, cfg.model.corr_n_levels
+    )
     parameters = tuple(model.parameters())
 
     def forward_backward(capture_trace):
@@ -218,6 +222,7 @@ def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
                 execution_schedule=execution_schedule,
                 graph_capture=True,
                 camera_inverses=camera_inverses,
+                pointcloud_grids=pointcloud_grids,
             )
             loss = output["flow"]["loss"] + output["visibility"]["loss"]
         loss.backward()
