@@ -1277,3 +1277,30 @@ checkpoints were saved and both H100s were released.
 - Run: `gt-replay-prod-smoke10-5e02fdc2-20260820T184325Z`
 - Modal worker: `ap-tUkVEprbY1lYixfRLGOXJh`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/7c737df3cd1f
+
+## 20 August 2026: distributed batched validation and main training launch
+
+Validation was moved from rank 0 to both DDP ranks. DIEGESIS scenes are split
+one per rank; the 27-scene MV-Kubric validation set is partitioned by whole
+DALI shards and evaluated in physical batches of two scenes. Rank 0 gathers
+the small metric dictionaries and writes the combined TensorBoard, W&B and CSV
+outputs once. The same finite validation loaders cycle cleanly for later
+checkpoints.
+
+The first integration launch reached DIEGESIS validation but exposed a missing
+persistent DALI image decoder in the generic CUDA prefetch wrapper. It stopped
+before optimizer step 1 and released both H100s. The wrapper now constructs one
+DALI decoder per iterator and reuses it. A physical validation batch remains
+two scenes; one such batch is submitted to the decoder at a time.
+
+The fresh run on source `dd10c76bf21f4847c2dfd918bc7b51ec4f8be1a0`
+completed initial distributed validation: rank 0 evaluated 12 MV-Kubric scenes
+and rank 1 evaluated 15, while both ranks also evaluated their DIEGESIS scene.
+Training then completed optimizer steps 1 and 2. Step 1 took 31.73 seconds and
+step 2 took 8.50 seconds. The run remains live.
+
+- Run: `gt-replay-main-ddp2-h100-batched-val-dd10c76-20260820T210000Z`
+- Modal app: `ap-5Nq2R5RjEZatlxmos742LI`
+- Function call: `fc-01M0GADM4K96P8PNRQRTAKDMEQ`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/e70a1c037710
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
