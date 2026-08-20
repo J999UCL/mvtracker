@@ -1436,3 +1436,38 @@ step 2 took 8.50 seconds. The run remains live.
 - Function call: `fc-01M0GADM4K96P8PNRQRTAKDMEQ`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/e70a1c037710
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 21 August 2026: final mixed-replay checkpoint external evaluation
+
+The canonical 1,000-step `model_final.pth` from the mixed DIEGESIS/MV-Kubric
+continuation was transferred to dopey and verified as SHA-256
+`f70af6596ad29ebce8d60ac5c00d69bb06e1d43f573fb646cf3db6c58df6aab0`.
+It was evaluated with the same checkout, cached inputs, four-view selections
+and evaluator settings as the released mixed/noisy-depth checkpoint. The job
+completed all 46 sequences on dopey's RTX 3090 with exit code zero in 3 minutes
+11 seconds. W&B was unavailable on dopey, so the matched evaluation remained
+file-logged like the original baseline.
+
+| Benchmark | Metric | Published mixed-depth | Final step 1000 | Delta |
+|---|---|---:|---:|---:|
+| MV-Kubric | AJ | 73.59 | 72.58 | -1.01 |
+| MV-Kubric | Delta-avg | 84.22 | 83.54 | -0.68 |
+| MV-Kubric | MTE | 7.76 | 8.03 | +0.27 |
+| MV-Kubric | Occlusion accuracy | 91.88 | 91.66 | -0.22 |
+| Panoptic | AJ | 86.03 | 86.84 | +0.81 |
+| Panoptic | Delta-avg | 94.71 | 95.79 | +1.08 |
+| Panoptic | MTE | 3.13 | 2.94 | -0.19 |
+| Panoptic | Occlusion accuracy | 92.28 | 92.13 | -0.15 |
+| DexYCB | AJ | 72.99 | 72.46 | -0.53 |
+| DexYCB | Delta-avg | 82.22 | 82.07 | -0.15 |
+| DexYCB | MTE | 1.85 | 1.87 | +0.02 |
+| DexYCB | Occlusion accuracy | 91.05 | 91.05 | 0.00 |
+
+The continuation modestly regressed MV-Kubric, improved Panoptic trajectory
+metrics, and was nearly neutral on DexYCB. It did not produce broad external
+catastrophic forgetting, but it also did not improve all benchmark domains.
+
+- UCL run: `mvtracker-final-gt-replay-eval-20260821T000300Z`
+- Checkpoint: `/media/data3/jthakwani/mvtracker/checkpoints/diegesis-mvkubric-gt-replay-step1000/model_final.pth`
+- Results: `/media/data3/jthakwani/mvtracker-evals/mvtracker-final-gt-replay-eval-20260821T000300Z/final-gt-replay-step1000-mixed-init/`
+- Log: `/media/data3/jthakwani/mvtracker-evals/mvtracker-final-gt-replay-eval-20260821T000300Z.ucl.log`
