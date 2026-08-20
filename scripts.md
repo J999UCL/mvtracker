@@ -214,6 +214,39 @@ both splits are finalized. The command prints the Modal call ID immediately;
 monitor it with `modal app logs <app-id>` or resume inspection from the same
 repository, commit and output paths shown in the startup event.
 
+## Direct DALI indexing for existing MV-Kubric TARs
+
+This CPU-only job mounts `jeet-mvtracker-data-v2` read/write, leaves existing
+train and validation TARs unchanged, and creates one DALI `wds2idx` `.idx`
+sidecar per archive. Eight bounded workers report each completed archive to
+stdout and W&B. After all indices exist, it calls
+`publish_record_locator(split_root)` to write the record-locator sidecar.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
+modal run --timestamps tools/modal_mvkubric_tar_index.py::index \
+  --train-root /mnt/mvtracker-data/datasets/kubric-multiview-webdataset/train \
+  --validation-root /mnt/mvtracker-data/datasets/kubric-multiview-webdataset/validation \
+  --workers 8
+```
+
+Use `--force true` only when rebuilding all sidecars from the TAR contents.
+
+## Production-parity two-H100 smoke
+
+This launcher requests exactly `H100!:2`, sets Modal retries to zero, and runs
+the production mixed DIEGESIS/MV-Kubric config for exactly ten optimizer steps.
+The config inherits the main evaluation schedule, including startup/step-0
+validation over all 27 MV-Kubric validation scenes, and keeps W&B enabled.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
+modal container list --json
+modal run --timestamps tools/modal_continual_training.py::production-smoke10
+```
+
 ## MV-Kubric WebDataset pilot conversion and T4 A/B
 
 The pilot converts exactly scenes `1001`--`1032` into four-scene uncompressed

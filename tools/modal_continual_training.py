@@ -67,6 +67,13 @@ EXPERIMENT_PHASES = {
             "target_completed_steps": 10,
         },
     ),
+    "production_smoke10": (
+        {
+            "name": "production_smoke10",
+            "config": "diegesis_mvkubric_gt_ddp_production_smoke10",
+            "target_completed_steps": 10,
+        },
+    ),
     "memory_profile": (
         {
             "name": "memory_profile",
@@ -242,6 +249,7 @@ def profile_h100_loader_remote() -> dict:
     memory=65536,
     timeout=6 * 60 * 60,
     max_containers=MAX_CONTAINERS,
+    retries=0,
     include_source=False,
 )
 def train_remote(
@@ -416,6 +424,21 @@ def smoke10(
 ) -> None:
     selected = _prepare_launch("smoke10", run_name, confirm_main=False)
     _spawn_training("smoke10", selected, materialize_whole_step=materialize_whole_step, seed=seed)
+
+
+@app.local_entrypoint(name="production-smoke10")
+def production_smoke10(
+    run_name: str = "",
+    materialize_whole_step: bool = False,
+    seed: int = 0,
+) -> None:
+    selected = _prepare_launch("production_smoke10", run_name, confirm_main=False)
+    _spawn_training(
+        "production_smoke10",
+        selected,
+        materialize_whole_step=materialize_whole_step,
+        seed=seed,
+    )
 
 
 @app.local_entrypoint(name="memory-profile")

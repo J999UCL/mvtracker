@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - diegesis_mvkubric_gt_ddp
+  - _self_
+
+trainer:
+  num_steps: 10
+  save_ckpt_freq: 10
+
+logging:
+  tags:
+    - diegesis-mvkubric-50-50
+    - gt-depth
+    - ddp2-h100
+    - full-model
+    - continual-training
+    - production-parity-smoke10

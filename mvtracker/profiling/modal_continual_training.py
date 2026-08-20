@@ -119,7 +119,7 @@ def require_pushed_main_commit(
 
 
 def require_main_confirmation(mode: str, confirm_main: bool) -> None:
-    if mode not in {"smoke", "smoke10", "memory_profile", "main"}:
+    if mode not in {"smoke", "smoke10", "production_smoke10", "memory_profile", "main"}:
         raise ValueError("unsupported continual-training mode")
     if mode == "main" and not confirm_main:
         raise RuntimeError("main training requires --confirm-main")
