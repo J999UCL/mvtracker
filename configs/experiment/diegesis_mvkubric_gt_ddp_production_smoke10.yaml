@@ -3,9 +3,18 @@ defaults:
   - diegesis_mvkubric_gt_ddp
   - _self_
 
+datasets:
+  eval:
+    names: []
+
 trainer:
   num_steps: 10
+  eval_freq: 10000
+  viz_freq: 10000
   save_ckpt_freq: 10
+
+modes:
+  validate_at_start: false
 
 logging:
   tags:

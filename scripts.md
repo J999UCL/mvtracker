@@ -236,9 +236,10 @@ Use `--force true` only when rebuilding all sidecars from the TAR contents.
 ## Production-parity two-H100 smoke
 
 This launcher requests exactly `H100!:2`, sets Modal retries to zero, and runs
-the production mixed DIEGESIS/MV-Kubric config for exactly ten optimizer steps.
-The config inherits the main evaluation schedule, including startup/step-0
-validation over all 27 MV-Kubric validation scenes, and keeps W&B enabled.
+the production mixed DIEGESIS/MV-Kubric loader and training path for exactly ten
+optimizer steps. Smoke runs disable validation and visualization so they test
+only startup, data loading, forward/backward, and optimizer execution. W&B stays
+enabled.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
