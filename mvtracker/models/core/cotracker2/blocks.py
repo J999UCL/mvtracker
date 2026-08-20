@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from mvtracker.models.core.mvtracker.cuda_capture import CUDA_CAPTURE_LOCK
+
 
 # From PyTorch internals
 def _ntuple(n):
@@ -667,11 +669,12 @@ class EfficientUpdateFormer(nn.Module):
             enabled=autocast_enabled,
             cache_enabled=False,
         ):
-            callables = torch.cuda.make_graphed_callables(
-                tuple(slots),
-                tuple(sample_args),
-                num_warmup_iters=3,
-            )
+            with CUDA_CAPTURE_LOCK:
+                callables = torch.cuda.make_graphed_callables(
+                    tuple(slots),
+                    tuple(sample_args),
+                    num_warmup_iters=3,
+                )
         for parameter in self.parameters():
             parameter.grad = None
         object.__setattr__(self, "_graphed_callables", callables)

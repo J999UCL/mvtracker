@@ -30,6 +30,7 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
     decode_tapvid3d_batch,
 )
 from mvtracker.datasets.utils import Datapoint
+from mvtracker.models.core.mvtracker.cuda_capture import CUDA_CAPTURE_LOCK
 
 
 @dataclass(frozen=True)
@@ -537,36 +538,36 @@ class PhysicalBatchDecoder:
             )
 
     def decode_async(self, group: PreparedPhysicalGroup):
-        codec_groups = {}
-        for position, sample in enumerate(group.samples):
-            codec_groups.setdefault(sample.image_codec, []).append((position, sample))
-        if "nvimagecodec" in codec_groups:
-            self._ensure_nvimagecodec()
-        if "dali" in codec_groups:
-            self._ensure_dali()
-        decoded = [None] * len(group.samples)
-        with torch.cuda.stream(self.prepare_stream):
-            for codec_items in codec_groups.values():
-                datapoint = decode_tapvid3d_batch(
-                    EncodedTapVid3DBatch([sample for _, sample in codec_items]),
-                    self.device,
-                    nvimagecodec_rgb_decoder=self.rgb_decoder,
-                    nvimagecodec_depth_decoder=self.depth_decoder,
-                    dali_decoder=self.dali_decoder,
-                    rgb_stream=self.rgb_stream,
-                    depth_stream=self.depth_stream,
-                    prepare_stream=self.prepare_stream,
-                    decode_image_chunk_size=self.decode_image_chunk_size,
-                )
-                if len(codec_items) == len(group.samples):
+        with CUDA_CAPTURE_LOCK:
+            codec_groups = {}
+            for position, sample in enumerate(group.samples):
+                codec_groups.setdefault(sample.image_codec, []).append((position, sample))
+            if "nvimagecodec" in codec_groups:
+                self._ensure_nvimagecodec()
+            if "dali" in codec_groups:
+                self._ensure_dali()
+            decoded = [None] * len(group.samples)
+            with torch.cuda.stream(self.prepare_stream):
+                for codec_items in codec_groups.values():
+                    datapoint = decode_tapvid3d_batch(
+                        EncodedTapVid3DBatch([sample for _, sample in codec_items]),
+                        self.device,
+                        nvimagecodec_rgb_decoder=self.rgb_decoder,
+                        nvimagecodec_depth_decoder=self.depth_decoder,
+                        dali_decoder=self.dali_decoder,
+                        rgb_stream=self.rgb_stream,
+                        depth_stream=self.depth_stream,
+                        prepare_stream=self.prepare_stream,
+                        decode_image_chunk_size=self.decode_image_chunk_size,
+                    )
                     for offset, (position, _) in enumerate(codec_items):
-                        decoded[position] = _slice_datapoint(datapoint, offset, offset + 1)
-                else:
-                    for offset, (position, _) in enumerate(codec_items):
-                        decoded[position] = _slice_datapoint(datapoint, offset, offset + 1)
-            merged = merge_decoded_datapoints(decoded)
-            ready_event = torch.cuda.Event()
-            ready_event.record(self.prepare_stream)
+                        decoded[position] = _slice_datapoint(
+                            datapoint, offset, offset + 1
+                        )
+                merged = merge_decoded_datapoints(decoded)
+                ready_event = torch.cuda.Event()
+                ready_event.record(self.prepare_stream)
+            ready_event.synchronize()
         return merged, ready_event
 
 
