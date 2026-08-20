@@ -34,13 +34,6 @@ MODAL_TAGS = {
 app = modal.App(APP_NAME, tags=MODAL_TAGS)
 
 
-def _record_count(index_path: Path) -> int:
-    version, count = index_path.open(encoding="utf-8").readline().split()
-    if version != "v1.2":
-        raise ValueError(f"{index_path}: expected DALI v1.2 index")
-    return int(count)
-
-
 def _heartbeat(stop: threading.Event, state: dict[str, object]) -> None:
     while not stop.wait(10):
         print(
@@ -67,11 +60,13 @@ def benchmark(shards: int = 8) -> dict[str, object]:
     from nvidia.dali import pipeline_def
     import wandb
 
-    pairs = []
-    for tar_path in sorted(TRAIN_ROOT.glob("*.tar")):
-        index_path = tar_path.with_suffix(".idx")
-        if index_path.is_file() and _record_count(index_path) == 44:
-            pairs.append((tar_path, index_path))
+    print("DALI_CPU event=initializing", flush=True)
+    manifest = json.loads((TRAIN_ROOT / "manifest.json").read_text())
+    pairs = [
+        (TRAIN_ROOT / shard["tar"], (TRAIN_ROOT / shard["tar"]).with_suffix(".idx"))
+        for shard in manifest["shards"]
+        if int(shard["nsamples"]) == 44
+    ]
     if not 1 <= shards <= len(pairs):
         raise ValueError(f"shards must be between 1 and {len(pairs)}")
 
