@@ -707,6 +707,7 @@ class MVTracker(nn.Module):
             iters,
             batch_size,
         )
+        graph_window_index = 0
         while w_idx_start < num_frames - self.S // 2:
             p_idx_ends = [
                 bisect_left(times, w_idx_start + self.S)
@@ -898,8 +899,10 @@ class MVTracker(nn.Module):
                     track_mask_current[:, -1:].repeat(1, self.S - S_local, 1, 1),
                 ], 1)
 
-            active_counts = torch.tensor(
-                p_idx_ends, device=device
+            active_counts = (
+                execution_schedule["active_count_tensors"][graph_window_index]
+                if execution_schedule is not None
+                else torch.tensor(p_idx_ends, device=device)
             )[:, None]
             active_padding_mask = (
                 torch.arange(p_idx_end, device=device)[None] >= active_counts
@@ -958,6 +961,7 @@ class MVTracker(nn.Module):
                 ] = 0.0
             w_idx_start = w_idx_start + self.S // 2
             p_idx_starts = p_idx_ends
+            graph_window_index += 1
 
         self.updateformer.end_graphed_sequence()
 

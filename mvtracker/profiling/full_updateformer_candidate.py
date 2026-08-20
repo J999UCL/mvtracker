@@ -198,6 +198,10 @@ def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
     batch = copy.deepcopy(batch)
     execution_schedule = build_model_execution_schedule(batch)
     dataclass_to_cuda_(batch)
+    execution_schedule["active_count_tensors"] = tuple(
+        torch.tensor(values, device=batch.video.device)
+        for values in execution_schedule["active_counts"]
+    )
     camera_inverses = build_camera_inverses(batch)
     pointcloud_grids = build_pointcloud_grids(
         batch, cfg.model.stride, cfg.model.corr_n_levels

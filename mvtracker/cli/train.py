@@ -1121,10 +1121,21 @@ def build_model_execution_schedule(batch):
         query_times.append(sorted_times)
         real_track_counts.append(len(sorted_times))
         schedule_starts.append(sorted_times[0])
+    active_counts = []
+    window_start = schedule_starts[0]
+    frame_count = int(batch.video.shape[2])
+    window_length = 12
+    while window_start < frame_count - window_length // 2:
+        active_counts.append([
+            int(np.searchsorted(times, window_start + window_length))
+            for times in query_times
+        ])
+        window_start += window_length // 2
     return {
         "schedule_starts": schedule_starts,
         "real_track_counts": real_track_counts,
         "query_times": query_times,
+        "active_counts": active_counts,
     }
 
 
