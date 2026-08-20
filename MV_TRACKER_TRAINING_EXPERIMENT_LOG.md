@@ -1238,3 +1238,20 @@ the whole-update graph. It reached 2.08x steady-state (0.807 s to 0.389 s) and
 1.51x over a 1,000-update horizon after its 154-second setup. It was rejected
 for production because it is static-shape-only and its first Adam update cosine
 was 0.548. W&B: `jj3wr5c3` (combined) and `o1im1wxb` (Inductor only).
+
+## 20 August 2026: CPU-native DALI WebDataset throughput
+
+A CPU-only Modal function tested the exact storage reader used by Modal's
+ResNet50 example: `fn.readers.webdataset` received eight randomly ordered
+MV-Kubric TARs and their DALI indexes directly from the mounted Volume, with
+`random_shuffle=False`. No GPU, WIDS, Python TAR reader, local staging, image
+decode, model, or validation was involved.
+
+The pipeline built in 4.51 seconds. It streamed 32 scenes / 12.31 GB in 40.75
+seconds: 288.0 MiB/s and 0.785 scenes/s. Four-scene batches had a 5.31-second
+median; the first took 5.73 seconds. All eight batches preserved the expected
+one metadata plus ten paired RGB/depth view-record grouping.
+
+- Source: `165d4c626f336618f83418d968a21a4a26e09dde`
+- Modal app: `ap-k5yiMFEKFRsDpoorbe4qK3`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/1v5bptbx
