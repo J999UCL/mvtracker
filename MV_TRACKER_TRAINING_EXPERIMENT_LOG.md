@@ -897,6 +897,34 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+## 20 August 2026: H200 universal-pair training restart
+
+The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
+79.18/79.65 GiB; while the model retained the current batch's activations, the
+one-group-ahead DALI decoder requested another contiguous 192 MiB and failed.
+The stale rank was stopped after the failure.
+
+The continual-training lane was moved to two H200s. Physical batching still
+has a maximum of two scenes and the logical optimizer batch remains eight
+scenes. Same-view scenes may now pair up to 2,048 tracks for views 1--4, 819
+for view 5 and 512 for view 6; views 5 and 6 are no longer forced to remain
+singletons. These limits use the existing H200 profiles.
+
+The fresh run on source `532dbe83e8aab01bc56a614538e3b000f3e5784a`
+completed distributed initial validation and optimizer step 1. Rank 0 evaluated
+12 MV-Kubric scenes and rank 1 evaluated 15. Step 1 scheduled five physical
+groups for eight logical scenes: one pair on rank 0 and two pairs on rank 1.
+It took 40.70 seconds cold (16.98 data, 14.72 forward, 8.87 backward). Sampled
+peak memory during that first forward was 37,925 MiB on GPU 0 and 105,127 MiB
+on GPU 1. The run remained healthy past step 32; its median step time at that
+point was 5.80 seconds.
+
+- Run: `gt-replay-main-ddp2-h200-paired-532dbe8-20260820T220000Z`
+- Modal app: `ap-r6vflpmIFACf2d8jT7RwB4`
+- Function call: `fc-01M0GBJ5Q7ZD0PYMXT1M79NHR7`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/8dd8bd8df50a
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
 ## 2026-08-19 — Direct Modal Volume v2 dataset experiment
 
 The abandoned 2,000-scene dataset-image build was stopped and its six
