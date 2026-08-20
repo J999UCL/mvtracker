@@ -989,7 +989,9 @@ resume rewinds 14 rank-1 DIEGESIS attempts. Both ranks' MV-Kubric cursor was
 The resumed run completed all 1,000 optimizer updates. Canonical
 `latest_checkpoint.json` points to `model_final.pth` at step 1000; periodic
 `model_001000.pth` is also present. Median optimizer-step time was 5.29
-seconds. After mmap was disabled, container RAM stabilized near 85.5 GiB
+seconds; total active container runtime across both segments was approximately
+96 minutes. The final logged LR was effectively zero at `-5.24e-8`, a tiny
+linear-scheduler endpoint overshoot. After mmap was disabled, container RAM stabilized near 85.5 GiB
 through steps 930--990 and ended at 82.5 GiB.
 
 Trailing 50-update training means changed from steps 1--50 to 951--1000:
