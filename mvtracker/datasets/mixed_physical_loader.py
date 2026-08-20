@@ -87,6 +87,7 @@ def _plan_summary(scene: PlannedScene) -> SceneSummary:
         frame_count=len(plan.frame_indices),
         resolution=tuple(plan.output_size),
         track_count=plan.track_count,
+        schedule_start=int(np.asarray(plan.query_points_3d)[:, 0].min()),
     )
 
 

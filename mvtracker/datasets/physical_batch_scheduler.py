@@ -15,7 +15,7 @@ from typing import Sequence
 
 
 Resolution = tuple[int, int]
-ShapeKey = tuple[int, int, Resolution]
+ShapeKey = tuple[int, int, Resolution, int]
 
 
 @dataclass(frozen=True)
@@ -29,10 +29,16 @@ class SceneSummary:
     frame_count: int
     resolution: Resolution
     track_count: int
+    schedule_start: int = 0
 
     @property
     def shape_key(self) -> ShapeKey:
-        return (self.view_count, self.frame_count, self.resolution)
+        return (
+            self.view_count,
+            self.frame_count,
+            self.resolution,
+            self.schedule_start,
+        )
 
 
 @dataclass(frozen=True)
