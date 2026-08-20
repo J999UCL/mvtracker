@@ -383,6 +383,7 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
 
         source = inspect.getsource(kubric_dali_stream)
         self.assertIn("fn.readers.webdataset", source)
+        self.assertIn("dont_use_mmap=True", source)
         self.assertNotIn("ShardListDataset", source)
         self.assertNotIn("_WidsRecordStore", source)
         self.assertNotIn("os.pread", source)

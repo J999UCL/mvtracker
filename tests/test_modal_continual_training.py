@@ -23,6 +23,8 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
     def test_exact_gpu_container_and_billing_contract(self):
         self.assertEqual(contract.GPU_REQUEST, "H200:2")
         self.assertEqual(contract.GPU_COUNT, 2)
+        self.assertEqual(contract.TRAIN_MEMORY_REQUEST_MIB, 64 * 1024)
+        self.assertEqual(contract.TRAIN_MEMORY_LIMIT_MIB, 128 * 1024)
         self.assertEqual(contract.MAX_CONTAINERS, 1)
         self.assertEqual(contract.EPHEMERAL_DISK_MIB, 512 * 1024)
         self.assertEqual(contract.CONTINUAL_RUN_SUBDIR, "continual-training")
@@ -56,6 +58,12 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertIn("image=training_image", source)
         self.assertIn("training_image = _source_image(_dependency_image())", source)
         self.assertNotIn(".run_function(", source)
+        self.assertEqual(
+            source.count(
+                "memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB)"
+            ),
+            1,
+        )
         self.assertIn('"MVTRACKER_DATA_ROOT": DATA_VOLUME_ROOT', training)
         self.assertNotIn("stage_continual_training_data", training)
         self.assertIn(

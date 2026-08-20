@@ -151,6 +151,7 @@ class KubricDaliSceneStream:
                     paths=paths,
                     index_paths=index_paths,
                     ext=["meta.npz", "rgb.npz", "depth.npz"],
+                    dont_use_mmap=True,
                     missing_component_behavior="empty",
                     random_shuffle=False,
                     prefetch_queue_depth=int(prefetch_queue_depth),
