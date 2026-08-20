@@ -208,6 +208,55 @@ class WandbRunReaderTests(unittest.TestCase):
         self.assertEqual(series[1]["vram_used_gib"], 64.0)
 
 
+class SourceSeriesTests(unittest.TestCase):
+    def test_groups_combined_and_per_source_losses(self):
+        point = [{"step": 1, "value": 0.2}]
+        losses = dashboard.loss_series_from_scalars(
+            {
+                "live_flow_loss": point,
+                "source/diegesis/component/flow": point,
+                "source/mvkubric/component/flow": point,
+            }
+        )
+
+        self.assertEqual(losses["combined"]["flow"], point)
+        self.assertEqual(losses["diegesis"]["flow"], point)
+        self.assertEqual(losses["mvkubric"]["flow"], point)
+
+    def test_keeps_full_and_subset_mvkubric_validation_separate(self):
+        diegesis = [{"step": 250, "value": 80.0}]
+        mvkubric = [{"step": 250, "value": 70.0}]
+        validation = dashboard.validation_series_from_scalars(
+            {
+                "eval/tapvid3d-multiview-validation/"
+                "eval_tapvid3d-multiview-validation/model__average_jaccard__any": diegesis,
+                "eval/kubric-multiview-v3-validation-full/"
+                "eval_kubric-multiview-v3-validation-full/model__average_jaccard__any": mvkubric,
+                "eval/kubric-multiview-v3-validation-subset/"
+                "eval_kubric-multiview-v3-validation-subset/model__average_jaccard__any": mvkubric,
+            }
+        )
+
+        self.assertEqual(
+            set(validation),
+            {
+                "combined_full",
+                "combined_subset",
+                "diegesis",
+                "mvkubric_full",
+                "mvkubric_subset",
+            },
+        )
+        self.assertEqual(
+            validation["mvkubric_subset"]["model__average_jaccard__any"],
+            mvkubric,
+        )
+        self.assertEqual(
+            validation["combined_subset"]["model__average_jaccard__any"],
+            [{"step": 250, "value": 75.0}],
+        )
+
+
 class GPUHistoryTests(unittest.TestCase):
     def test_samples_at_bounded_frequency_and_capacity(self):
         calls = []
@@ -272,6 +321,12 @@ class DashboardStateTests(unittest.TestCase):
                     "live_total_loss": [{"step": 0, "value": 0.3, "wall_time": 1.0}],
                     "live_flow_loss": [{"step": 0, "value": 0.1, "wall_time": 1.0}],
                     "live_visibility_loss": [{"step": 0, "value": 0.2, "wall_time": 1.0}],
+                    "source/diegesis/loss": [
+                        {"step": 0, "value": 0.25, "wall_time": 1.0}
+                    ],
+                    "source/mvkubric/loss": [
+                        {"step": 0, "value": 0.35, "wall_time": 1.0}
+                    ],
                     "baseline/stationary_trajectory_loss": [
                         {"step": 0, "value": 0.5, "wall_time": 1.0}
                     ],
@@ -289,12 +344,16 @@ class DashboardStateTests(unittest.TestCase):
                 error=None,
             )
             snapshot = state.snapshot()
+            self.assertEqual(snapshot["schema_version"], 2)
             self.assertEqual(snapshot["status"], "running")
             self.assertEqual(snapshot["progress"]["completed_steps"], 1)
             self.assertEqual(snapshot["summary"]["accepted_samples"], 1)
             self.assertEqual(snapshot["series"]["pipeline"][0]["tracks_mean"], 64)
             self.assertEqual(snapshot["series"]["gpu"][0]["utilization_percent"], 100)
             self.assertEqual(snapshot["series"]["baseline"]["stationary"][0]["value"], 0.5)
+            self.assertEqual(snapshot["series"]["losses"]["combined"]["total"][0]["value"], 0.3)
+            self.assertEqual(snapshot["series"]["losses"]["diegesis"]["total"][0]["value"], 0.25)
+            self.assertEqual(snapshot["series"]["losses"]["mvkubric"]["total"][0]["value"], 0.35)
             self.assertEqual(snapshot["series"]["gradients"]["pre_clip"][0]["value"], 2.0)
             self.assertEqual(snapshot["series"]["motion"]["window_mean"][0]["value"], 0.2)
             self.assertEqual(
@@ -335,12 +394,13 @@ class DashboardHTTPTests(unittest.TestCase):
             html = response.read().decode("utf-8")
         for chart_id in (
             "loss-combined",
-            "loss-total",
-            "loss-visibility",
-            "loss-flow",
+            "loss-diegesis",
+            "loss-mvkubric",
             "stationary-baseline",
             "stationary-ratio",
-            "validation",
+            "validation-combined",
+            "validation-diegesis",
+            "validation-mvkubric",
             "step-timing",
             "learning-rate",
             "gradient-norms",
@@ -367,7 +427,9 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("setRawOpacity", html)
         self.assertIn("Trailing 50-sample means", html)
         self.assertIn("`${label} · 50-sample mean`", html)
-        self.assertIn("meanLine('Total'", html)
+        self.assertIn("lossLines", html)
+        self.assertIn("combined_full:'Combined · full 27'", html)
+        self.assertIn("Full (27 scenes) and subset (101–102) remain separate", html)
         self.assertIn("movingAverageXY(trackMean)", html)
         self.assertNotIn("emaPoints", html)
         self.assertIn("Clipped steps (last 50)", html)

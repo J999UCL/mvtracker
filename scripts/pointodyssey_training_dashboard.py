@@ -380,6 +380,81 @@ def gpu_series_from_scalars(
     ]
 
 
+def loss_series_from_scalars(
+    scalars: dict[str, list[dict[str, float | int]]],
+) -> dict[str, dict[str, list[dict[str, float | int]]]]:
+    return {
+        "combined": {
+            "total": scalars.get("live_total_loss", []),
+            "visibility": scalars.get("live_visibility_loss", []),
+            "flow": scalars.get("live_flow_loss", []),
+        },
+        "diegesis": {
+            "total": scalars.get("source/diegesis/loss", []),
+            "visibility": scalars.get(
+                "source/diegesis/component/visibility", []
+            ),
+            "flow": scalars.get("source/diegesis/component/flow", []),
+        },
+        "mvkubric": {
+            "total": scalars.get("source/mvkubric/loss", []),
+            "visibility": scalars.get(
+                "source/mvkubric/component/visibility", []
+            ),
+            "flow": scalars.get("source/mvkubric/component/flow", []),
+        },
+    }
+
+
+def validation_series_from_scalars(
+    scalars: dict[str, list[dict[str, float | int]]],
+) -> dict[str, dict[str, list[dict[str, float | int]]]]:
+    """Group validation metrics without mixing full and subset populations."""
+    grouped: dict[str, dict[str, list[dict[str, float | int]]]] = {}
+    for tag, points in scalars.items():
+        if tag.startswith("eval/"):
+            _, dataset_name, remainder = tag.split("/", 2)
+            metric = remainder.rsplit("/", 1)[-1]
+        elif tag.startswith("eval_") and "/" in tag:
+            dataset_name, metric = tag.split("/", 1)
+            dataset_name = dataset_name.removeprefix("eval_")
+        else:
+            continue
+        if not metric.startswith("model__"):
+            continue
+        if dataset_name == "tapvid3d-multiview-validation":
+            source_name = "diegesis"
+        elif dataset_name.endswith("validation-full"):
+            source_name = "mvkubric_full"
+        elif dataset_name.endswith("validation-subset"):
+            source_name = "mvkubric_subset"
+        else:
+            source_name = dataset_name
+        grouped.setdefault(source_name, {})[metric] = points
+
+    diegesis = grouped.get("diegesis", {})
+    for cohort in ("full", "subset"):
+        mvkubric = grouped.get(f"mvkubric_{cohort}", {})
+        combined = {}
+        for metric in diegesis.keys() & mvkubric.keys():
+            left = {int(point["step"]): point for point in diegesis[metric]}
+            right = {int(point["step"]): point for point in mvkubric[metric]}
+            combined[metric] = [
+                {
+                    "step": step,
+                    "value": (
+                        float(left[step]["value"])
+                        + float(right[step]["value"])
+                    )
+                    / 2.0,
+                }
+                for step in sorted(left.keys() & right.keys())
+            ]
+        if combined:
+            grouped[f"combined_{cohort}"] = combined
+    return grouped
+
+
 class TrainingLogReader:
     """Incrementally parse the append-only training log."""
 
@@ -716,11 +791,7 @@ class TrainingDashboardState:
             accepted = len(self.log_reader.samples)
             failed = len(self.log_reader.failure_events)
 
-            losses = {
-                "total": scalars.get("live_total_loss", []),
-                "visibility": scalars.get("live_visibility_loss", []),
-                "flow": scalars.get("live_flow_loss", []),
-            }
+            losses = loss_series_from_scalars(scalars)
             baseline = {
                 "stationary": scalars.get(
                     "baseline/stationary_trajectory_loss",
@@ -802,9 +873,7 @@ class TrainingDashboardState:
                     ),
                 }.items()
             }
-            validation = {
-                tag: points for tag, points in scalars.items() if tag.startswith("eval_")
-            }
+            validation = validation_series_from_scalars(scalars)
             performance = {
                 name: scalars.get(f"performance/{name}", [])
                 for name in (
@@ -841,7 +910,7 @@ class TrainingDashboardState:
             }
             total_steps = config.total_steps if config is not None else None
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "format": "mvtracker_training_dashboard",
                 "server_time": utc_iso(now),
                 "run_dir": self.run_label,
@@ -992,12 +1061,12 @@ INDEX_HTML = r"""<!doctype html>
 
   <section>
     <h2>Training losses</h2>
-    <div class="chart-panel"><h3>Combined trend</h3><div class="chart-wrap"><canvas id="loss-combined"></canvas></div><div class="chart-note">Trailing 50-sample means. Raw values are shown as faint, unconnected points in the detail plots below.</div></div>
-    <div class="grid-3" style="margin-top:22px">
-      <div class="chart-panel"><h3>Total loss</h3><div class="chart-wrap compact"><canvas id="loss-total"></canvas></div></div>
-      <div class="chart-panel"><h3>Visibility loss</h3><div class="chart-wrap compact"><canvas id="loss-visibility"></canvas></div></div>
-      <div class="chart-panel"><h3>3D trajectory loss</h3><div class="chart-wrap compact"><canvas id="loss-flow"></canvas></div></div>
+    <div class="grid-3">
+      <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap"><canvas id="loss-combined"></canvas></div></div>
+      <div class="chart-panel"><h3>DIEGESIS</h3><div class="chart-wrap"><canvas id="loss-diegesis"></canvas></div></div>
+      <div class="chart-panel"><h3>MV-Kubric</h3><div class="chart-wrap"><canvas id="loss-mvkubric"></canvas></div></div>
     </div>
+    <div class="chart-note">Faint points are raw updates; solid lines are trailing 50-sample means. Each panel shows total, visibility, and 3D trajectory loss.</div>
   </section>
 
   <section>
@@ -1013,7 +1082,11 @@ INDEX_HTML = r"""<!doctype html>
       <h2>Validation through training</h2>
       <label>Metric<select id="validation-select" disabled><option>No validation metrics yet</option></select></label>
     </div>
-    <div class="chart-wrap" id="validation-chart-wrap" hidden><canvas id="validation"></canvas></div>
+    <div class="grid-3" id="validation-chart-wrap" hidden>
+      <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap"><canvas id="validation-combined"></canvas></div><div class="chart-note">Equal-weight mean of DIEGESIS and MV-Kubric at the same step. Full and subset cohorts remain separate.</div></div>
+      <div class="chart-panel"><h3>DIEGESIS</h3><div class="chart-wrap"><canvas id="validation-diegesis"></canvas></div></div>
+      <div class="chart-panel"><h3>MV-Kubric</h3><div class="chart-wrap"><canvas id="validation-mvkubric"></canvas></div><div class="chart-note">Full (27 scenes) and subset (101–102) remain separate so unlike populations are never joined into one trend.</div></div>
+    </div>
     <div class="empty" id="validation-empty"><div><strong>No validation series recorded</strong><div class="muted" id="validation-reason">Waiting for evaluation scalars…</div></div></div>
   </section>
 
@@ -1077,6 +1150,7 @@ const alphaColor=(hex,alpha)=>{
 };
 const meanLine=(label,stroke,extra={})=>line(`${label} · 50-sample mean`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
 const rawPoints=(label,stroke)=>line(`${label} · raw`,alphaColor(stroke,.35),{showInLegend:false,showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0,isRawPoints:true,rawStroke:stroke});
+const lossLines=()=>[rawPoints('Total',palette.s1),meanLine('Total',palette.s1),rawPoints('Visibility',palette.s2),meanLine('Visibility',palette.s2,{borderDash:[6,4]}),rawPoints('Trajectory',palette.s3),meanLine('Trajectory',palette.s3)];
 const compactNumber=value=>{
   const number=Number(value), magnitude=Math.abs(number);
   if(!Number.isFinite(number)) return value;
@@ -1087,13 +1161,14 @@ function options(xTitle,yTitle,extra={}){
   return {responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:180},interaction:{mode:'index',intersect:false},plugins:{legend:{display:extra.legend!==false,position:'bottom',labels:{color:palette.text,usePointStyle:true,boxWidth:8,filter:(item,data)=>data.datasets[item.datasetIndex].showInLegend!==false}},tooltip:{enabled:true,backgroundColor:palette.panel,titleColor:palette.text,bodyColor:palette.text,borderColor:palette.border,borderWidth:1}},scales:{x:{type:'linear',grid:{color:palette.border},ticks:{color:palette.muted,maxTicksLimit:10},title:{display:true,text:xTitle,color:palette.muted}},y:{min:extra.min,max:extra.max,grid:{color:palette.border},ticks:{color:palette.muted,callback:extra.tickCallback||compactNumber},title:{display:true,text:yTitle,color:palette.muted}},...(extra.scales||{})}};
 }
 const charts={
-  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:[meanLine('Total',palette.s1),meanLine('Visibility',palette.s2,{borderDash:[6,4]}),meanLine('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
-  total:new Chart(document.getElementById('loss-total'),{type:'line',data:{datasets:[rawPoints('Total',palette.s1),meanLine('Total',palette.s1)]},options:options('Optimizer step','Loss')}),
-  visibility:new Chart(document.getElementById('loss-visibility'),{type:'line',data:{datasets:[rawPoints('Visibility',palette.s2),meanLine('Visibility',palette.s2)]},options:options('Optimizer step','Loss')}),
-  flow:new Chart(document.getElementById('loss-flow'),{type:'line',data:{datasets:[rawPoints('Trajectory',palette.s3),meanLine('Trajectory',palette.s3)]},options:options('Optimizer step','Loss')}),
+  combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss')}),
+  diegesis:new Chart(document.getElementById('loss-diegesis'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss')}),
+  mvkubric:new Chart(document.getElementById('loss-mvkubric'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss')}),
   stationary:new Chart(document.getElementById('stationary-baseline'),{type:'line',data:{datasets:[rawPoints('Model trajectory',palette.s1),meanLine('Model trajectory',palette.s1),rawPoints('Stationary baseline',palette.s4),meanLine('Stationary baseline',palette.s4,{borderDash:[6,4]})]},options:options('Optimizer step','Trajectory loss')}),
   stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[rawPoints('Model / stationary',palette.s1),meanLine('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0})}),
-  validation:new Chart(document.getElementById('validation'),{type:'line',data:{datasets:[line('Validation',palette.s1)]},options:options('Optimizer step','Score',{legend:false})}),
+  validationCombined:new Chart(document.getElementById('validation-combined'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
+  validationDiegesis:new Chart(document.getElementById('validation-diegesis'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
+  validationMvkubric:new Chart(document.getElementById('validation-mvkubric'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
   timing:new Chart(document.getElementById('step-timing'),{type:'line',data:{datasets:[line('Total',palette.s1),line('Data wait',palette.s2),line('Forward',palette.s3),line('Backward',palette.s4)]},options:options('Optimizer step','Seconds')}),
   learningRate:new Chart(document.getElementById('learning-rate'),{type:'line',data:{datasets:[line('Learning rate',palette.s1)]},options:options('Optimizer step','Learning rate',{legend:false,tickCallback:value=>Number(value).toExponential(1)})}),
   gradientNorms:new Chart(document.getElementById('gradient-norms'),{type:'line',data:{datasets:[rawPoints('Pre-clip',palette.s1),meanLine('Pre-clip',palette.s1),rawPoints('Post-clip',palette.s2),meanLine('Post-clip',palette.s2,{borderDash:[6,4]}),rawPoints('Microbatch mean',palette.s3),meanLine('Microbatch mean',palette.s3,{borderDash:[2,3]})]},options:options('Optimizer step','Global L2 norm',{min:0})}),
@@ -1140,6 +1215,9 @@ const parityPoints=series=>points(series).map(point=>({x:point.x,y:1}));
 const pipePoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.step),y:Number(point[key])}));
 const gpuPoints=(series,key,gpuIndex=null)=>(series||[]).filter(point=>point[key]!=null&&(gpuIndex==null||Number(point.gpu_index)===gpuIndex)).map(point=>({x:Number(point.elapsed_seconds)/60,y:Number(point[key])}));
 function update(chart,datasets){datasets.forEach((data,index)=>{chart.data.datasets[index].data=data;});chart.update(reduced?'none':undefined);}
+const validationLabels={combined_full:'Combined · full 27',combined_subset:'Combined · scenes 101–102',diegesis:'DIEGESIS',mvkubric_full:'MV-Kubric · full 27',mvkubric_subset:'MV-Kubric · scenes 101–102'};
+const validationColors={combined_full:palette.s1,combined_subset:palette.s4,diegesis:palette.s3,mvkubric_full:palette.s1,mvkubric_subset:palette.s4};
+function updateValidation(chart,entries){chart.data.datasets=entries.map(([name,series],index)=>line(validationLabels[name]||name,validationColors[name]||[palette.s1,palette.s2,palette.s3,palette.s4,palette.s5][index%5],{data:points(series)}));chart.update(reduced?'none':undefined);}
 const text=(id,value)=>{document.getElementById(id).textContent=value;};
 function render(state){
   const summary=state.summary||{}, config=state.config||{}, progress=state.progress||{};
@@ -1155,11 +1233,11 @@ function render(state){
   const errors=document.getElementById('errors'), entries=Object.entries(state.errors||{}); errors.className=entries.length?'error visible':'error'; errors.textContent=entries.map(([key,value])=>`${key}: ${value}`).join('\n');
   text('latest-message',state.latest_log_message||'Waiting for training log…');
 
-  const losses=state.series?.losses||{};
-  update(charts.combined,[movingAveragePoints(losses.total),movingAveragePoints(losses.visibility),movingAveragePoints(losses.flow)]);
-  update(charts.total,[points(losses.total),movingAveragePoints(losses.total)]); update(charts.visibility,[points(losses.visibility),movingAveragePoints(losses.visibility)]); update(charts.flow,[points(losses.flow),movingAveragePoints(losses.flow)]);
+  const losses=state.series?.losses||{}, combinedLosses=losses.combined||{}, diegesisLosses=losses.diegesis||{}, mvkubricLosses=losses.mvkubric||{};
+  const lossData=source=>[points(source.total),movingAveragePoints(source.total),points(source.visibility),movingAveragePoints(source.visibility),points(source.flow),movingAveragePoints(source.flow)];
+  update(charts.combined,lossData(combinedLosses)); update(charts.diegesis,lossData(diegesisLosses)); update(charts.mvkubric,lossData(mvkubricLosses));
   const baseline=state.series?.baseline||{};
-  update(charts.stationary,[points(losses.flow),movingAveragePoints(losses.flow),points(baseline.stationary),movingAveragePoints(baseline.stationary)]);
+  update(charts.stationary,[points(combinedLosses.flow),movingAveragePoints(combinedLosses.flow),points(baseline.stationary),movingAveragePoints(baseline.stationary)]);
   update(charts.stationaryRatio,[points(baseline.model_ratio),movingAveragePoints(baseline.model_ratio),parityPoints(baseline.model_ratio)]);
   const timing=state.series?.timing||{};
   update(charts.timing,[points(timing.total),points(timing.data),points(timing.fwd),points(timing.bwd)]);
@@ -1186,12 +1264,13 @@ function render(state){
   update(charts.containerCpu,[points(hardware.cpu_utilization_percent),points(hardware.cpu_cores_used)]);
   update(charts.containerMemory,[points(hardware.memory_used_gib),points(hardware.memory_utilization_percent)]);
 
-  const validation=state.series?.validation||{}, tags=Object.keys(validation).sort(), select=document.getElementById('validation-select');
+  const validation=state.series?.validation||{}, tags=[...new Set(Object.values(validation).flatMap(metrics=>Object.keys(metrics)))].sort(), select=document.getElementById('validation-select');
   const previous=select.value;
   select.replaceChildren(...tags.map(tag=>{const option=document.createElement('option');option.value=tag;option.textContent=tag;return option;}));
-  if(tags.length){select.disabled=false;select.value=tags.includes(previous)?previous:tags[0];document.getElementById('validation-chart-wrap').hidden=false;document.getElementById('validation-empty').hidden=true;charts.validation.data.datasets[0].label=select.value;update(charts.validation,[points(validation[select.value])]);}
+  const renderValidation=metric=>{const entries=Object.entries(validation).filter(([,metrics])=>metrics[metric]).map(([name,metrics])=>[name,metrics[metric]]);updateValidation(charts.validationCombined,entries.filter(([name])=>name.startsWith('combined_')));updateValidation(charts.validationDiegesis,entries.filter(([name])=>name==='diegesis'));updateValidation(charts.validationMvkubric,entries.filter(([name])=>name.startsWith('mvkubric_')));};
+  if(tags.length){select.disabled=false;select.value=tags.includes(previous)?previous:tags[0];document.getElementById('validation-chart-wrap').hidden=false;document.getElementById('validation-empty').hidden=true;renderValidation(select.value);}
   else{select.disabled=true;const option=document.createElement('option');option.textContent='No validation metrics yet';select.append(option);document.getElementById('validation-chart-wrap').hidden=true;document.getElementById('validation-empty').hidden=false;text('validation-reason',(config.eval_datasets||[]).length?'Waiting for the first scheduled evaluation…':'No evaluation datasets are configured.');}
-  select.onchange=()=>{charts.validation.data.datasets[0].label=select.value;update(charts.validation,[points(validation[select.value])]);};
+  select.onchange=()=>renderValidation(select.value);
 }
 const stream=new EventSource('/api/stream');
 stream.onmessage=event=>{try{render(JSON.parse(event.data));}catch(error){const box=document.getElementById('errors');box.className='error visible';box.textContent=`render: ${error.message}`;}};
