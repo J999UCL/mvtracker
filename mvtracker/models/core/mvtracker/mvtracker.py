@@ -452,6 +452,7 @@ class MVTracker(nn.Module):
             debug_logs_path="",
             save_rerun_logs: bool = False,
             save_rerun_logs_output_rrd_path: Optional[str] = None,
+            execution_schedule=None,
             **kwargs,
     ):
         device = extrs.device
@@ -484,13 +485,18 @@ class MVTracker(nn.Module):
                 f"track_padding_mask must have shape {(batch_size, num_points)}, "
                 f"got {tuple(track_padding_mask.shape)}"
             )
-        if track_padding_mask.all(dim=1).any():
+        if execution_schedule is None and track_padding_mask.all(dim=1).any():
             raise ValueError("every scene must contain at least one real trajectory")
 
-        query_frames_for_schedule = query_points[:, :, 0].long().masked_fill(
-            track_padding_mask, num_frames
-        )
-        schedule_starts = query_frames_for_schedule.amin(dim=1).detach().cpu().tolist()
+        if execution_schedule is None:
+            query_frames_for_schedule = query_points[:, :, 0].long().masked_fill(
+                track_padding_mask, num_frames
+            )
+            schedule_starts = (
+                query_frames_for_schedule.amin(dim=1).detach().cpu().tolist()
+            )
+        else:
+            schedule_starts = list(execution_schedule["schedule_starts"])
         if batch_size > 1 and len(set(schedule_starts)) > 1:
             if self.normalize_scene_in_fwd_pass:
                 raise ValueError("batched VGGT scene normalization is not supported")
@@ -515,6 +521,10 @@ class MVTracker(nn.Module):
                     is_train=is_train,
                     save_debug_logs=save_debug_logs,
                     debug_logs_path=debug_logs_path,
+                    execution_schedule={
+                        name: [values[index] for index in scene_indices]
+                        for name, values in execution_schedule.items()
+                    } if execution_schedule is not None else None,
                 )
                 for local_index, scene_index in enumerate(scene_indices):
                     grouped_results[scene_index] = {
@@ -630,11 +640,17 @@ class MVTracker(nn.Module):
         vis_init_ = gather_tracks(vis_init, 2).clone()
         track_mask_ = gather_tracks(track_mask, 2).clone()
         track_padding_mask_ = gather_tracks(track_padding_mask, 1)
-        real_track_counts = (~track_padding_mask_).sum(dim=1).detach().cpu().tolist()
-        query_times = [
-            query_points_t_[batch_index, :count].detach().cpu().tolist()
-            for batch_index, count in enumerate(real_track_counts)
-        ]
+        if execution_schedule is None:
+            real_track_counts = (
+                (~track_padding_mask_).sum(dim=1).detach().cpu().tolist()
+            )
+            query_times = [
+                query_points_t_[batch_index, :count].detach().cpu().tolist()
+                for batch_index, count in enumerate(real_track_counts)
+            ]
+        else:
+            real_track_counts = list(execution_schedule["real_track_counts"])
+            query_times = [list(values) for values in execution_schedule["query_times"]]
 
         # Delete the unsorted variables (for safety)
         del coords_init, vis_init, query_points_t, query_points, query_points_xyz_worldspace, track_mask

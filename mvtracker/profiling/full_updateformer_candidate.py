@@ -13,7 +13,12 @@ from lightning.fabric import Fabric
 import torch
 
 from mvtracker.cli.profile_training import _compose_config
-from mvtracker.cli.train import dataclass_to_cuda_, fetch_optimizer, forward_batch_multi_view
+from mvtracker.cli.train import (
+    build_model_execution_schedule,
+    dataclass_to_cuda_,
+    fetch_optimizer,
+    forward_batch_multi_view,
+)
 
 
 TRAJECTORY_RMS_METERS = 0.001
@@ -177,6 +182,134 @@ def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
     return result
 
 
+def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
+    cfg.model.updateformer_backend = "eager"
+    cfg.model.checkpoint_updateformer = False
+    model = hydra.utils.instantiate(cfg.model).cuda().train()
+    fabric = Fabric(devices=1, precision=cfg.trainer.precision)
+    fabric.load_raw(str(checkpoint), model)
+    optimizer, _ = fetch_optimizer(cfg.trainer, model)
+    initial = {
+        name: parameter.detach().float().cpu().clone()
+        for name, parameter in model.named_parameters()
+    }
+    batch = copy.deepcopy(batch)
+    execution_schedule = build_model_execution_schedule(batch)
+    dataclass_to_cuda_(batch)
+    parameters = tuple(model.parameters())
+
+    def forward_backward(capture_trace):
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+        ):
+            output = forward_batch_multi_view(
+                batch=batch,
+                model=model,
+                cfg=cfg,
+                step=1,
+                train_iters=cfg.trainer.train_iters,
+                gamma=cfg.trainer.gamma,
+                save_debug_logs=False,
+                debug_logs_path=None,
+                run_expensive_diagnostics=False,
+                capture_training_trace=capture_trace,
+                execution_schedule=execution_schedule,
+                graph_capture=True,
+            )
+            loss = output["flow"]["loss"] + output["visibility"]["loss"]
+        loss.backward()
+        return output, loss
+
+    optimizer.zero_grad(set_to_none=True)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        forward_backward(False)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    for parameter in parameters:
+        parameter.grad.zero_()
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    capture_started = time.perf_counter()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        for parameter in parameters:
+            parameter.grad.zero_()
+        output, loss = forward_backward(True)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+    capture_seconds = time.perf_counter() - capture_started
+
+    gradients = {
+        name: parameter.grad.detach().float().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    first_result = {
+        "loss": float(loss.detach()),
+        "flow_loss": float(output["flow"]["loss"].detach()),
+        "visibility_loss": float(output["visibility"]["loss"].detach()),
+        "final_trajectories": _cpu(output["flow"]["predictions_worldspace"]),
+        "final_visibility": _cpu(output["visibility"]["predictions"]),
+        "trace": _cpu(output["training_trace"]),
+        "gradients": gradients,
+    }
+    started = time.perf_counter()
+    torch.nn.utils.clip_grad_norm_(parameters, cfg.trainer.grad_clip)
+    optimizer.step()
+    torch.cuda.synchronize()
+    optimizer_seconds = time.perf_counter() - started
+    first_updated = {
+        name: parameter.detach().float().cpu().clone()
+        for name, parameter in model.named_parameters()
+    }
+    first_result["parameter_updates"] = {
+        name: first_updated[name] - value for name, value in initial.items()
+    }
+
+    warm_timings = []
+    for _ in range(warm_updates):
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        graph.replay()
+        torch.nn.utils.clip_grad_norm_(parameters, cfg.trainer.grad_clip)
+        optimizer.step()
+        torch.cuda.synchronize()
+        warm_timings.append(time.perf_counter() - started)
+    final_parameters = {
+        name: parameter.detach().float().cpu().clone()
+        for name, parameter in model.named_parameters()
+    }
+    first_result.update({
+        "timing": {
+            "capture_seconds": capture_seconds,
+            "optimizer_seconds": optimizer_seconds,
+            "warm_update_seconds": warm_timings,
+            "warm_update_median_seconds": statistics.median(warm_timings),
+        },
+        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+        "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        "multi_update": {
+            "updates": warm_updates + 1,
+            "loss": float(loss.detach()),
+            "final_trajectories": _cpu(
+                output["flow"]["predictions_worldspace"]
+            ),
+            "final_visibility": _cpu(output["visibility"]["predictions"]),
+            "parameter_updates": {
+                name: final_parameters[name] - value
+                for name, value in initial.items()
+            },
+        },
+    })
+    return first_result
+
+
 def _difference(left, right):
     difference = (left.float() - right.float()).abs().reshape(-1)
     return {
@@ -243,7 +376,11 @@ def compare_real_update(
     )
     cfg = _compose_config(arguments)
     eager = _run_backend(cfg, checkpoint, batch, "eager")
-    fused = _run_backend(cfg, checkpoint, batch, candidate_backend)
+    fused = (
+        _run_whole_graph(cfg, checkpoint, batch)
+        if candidate_backend == "whole_graph"
+        else _run_backend(cfg, checkpoint, batch, candidate_backend)
+    )
 
     final_trajectory = _difference(
         eager["final_trajectories"], fused["final_trajectories"]

@@ -1105,6 +1105,29 @@ def _assert_real_tracks_visible(
     assert visible.all(), "All real points should be visible in at least one frame."
 
 
+def build_model_execution_schedule(batch):
+    query_points = batch.query_points_3d.detach().cpu()
+    padding = getattr(batch, "track_padding_mask", None)
+    if padding is None:
+        padding = torch.zeros(query_points.shape[:2], dtype=torch.bool)
+    else:
+        padding = padding.detach().cpu().bool()
+    query_times = []
+    real_track_counts = []
+    schedule_starts = []
+    for scene_index in range(query_points.shape[0]):
+        real_times = query_points[scene_index, ~padding[scene_index], 0].long()
+        sorted_times = torch.sort(real_times).values.tolist()
+        query_times.append(sorted_times)
+        real_track_counts.append(len(sorted_times))
+        schedule_starts.append(sorted_times[0])
+    return {
+        "schedule_starts": schedule_starts,
+        "real_track_counts": real_track_counts,
+        "query_times": query_times,
+    }
+
+
 def forward_batch_multi_view(
         batch,
         model,
@@ -1116,6 +1139,8 @@ def forward_batch_multi_view(
         debug_logs_path='',
         run_expensive_diagnostics=True,
         capture_training_trace=False,
+        execution_schedule=None,
+        graph_capture=False,
 ):
     # Per view data
     rgbs = batch.video
@@ -1172,6 +1197,7 @@ def forward_batch_multi_view(
         save_debug_logs=save_debug_logs,
         debug_logs_path=debug_logs_path,
         track_padding_mask=track_padding_mask,
+        execution_schedule=execution_schedule,
     )
     pred_trajectories = results["traj_e"]
     pred_visibilities = results["vis_e"]
@@ -1245,24 +1271,25 @@ def forward_batch_multi_view(
     # same sliding windows, valid masks, refinement weights, and Z scaling as
     # the model trajectory loss.
     diagnostic_metrics = {}
-    if track_padding_mask is None:
-        real_track_counts = torch.full(
-            (batch_size,), num_points, device=query_points_3d.device
-        )
-    else:
-        real_track_counts = (~track_padding_mask.bool()).sum(dim=1)
-    real_track_mean, padded_track_mean, fill_fraction = torch.stack((
-        real_track_counts.float().mean(),
-        num_points - real_track_counts.float().mean(),
-        real_track_counts.sum() / float(batch_size * num_points),
-    )).detach().cpu().tolist()
-    diagnostic_metrics.update({
-        "batching/physical_scenes": float(batch_size),
-        "batching/real_tracks_mean": real_track_mean,
-        "batching/padded_tracks_per_scene": padded_track_mean,
-        "batching/track_fill_fraction": fill_fraction,
-        "batching/view_count": float(num_views),
-    })
+    if not graph_capture:
+        if track_padding_mask is None:
+            real_track_counts = torch.full(
+                (batch_size,), num_points, device=query_points_3d.device
+            )
+        else:
+            real_track_counts = (~track_padding_mask.bool()).sum(dim=1)
+        real_track_mean, padded_track_mean, fill_fraction = torch.stack((
+            real_track_counts.float().mean(),
+            num_points - real_track_counts.float().mean(),
+            real_track_counts.sum() / float(batch_size * num_points),
+        )).detach().cpu().tolist()
+        diagnostic_metrics.update({
+            "batching/physical_scenes": float(batch_size),
+            "batching/real_tracks_mean": real_track_mean,
+            "batching/padded_tracks_per_scene": padded_track_mean,
+            "batching/track_fill_fraction": fill_fraction,
+            "batching/view_count": float(num_views),
+        })
     if run_expensive_diagnostics:
         with torch.no_grad():
             stationary_losses = []
