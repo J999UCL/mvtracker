@@ -368,6 +368,7 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
         ),
         "timing/eager_warm_update_seconds": result["timing"]["eager"]["warm_update_median_seconds"],
         "timing/fused_warm_update_seconds": result["timing"]["fused"]["warm_update_median_seconds"],
+        "timing/amortized_speedup_1000": result["amortized_speedup"],
         "result_path": str(output_path),
     })
     if result["eager_repeat"] is not None:
@@ -412,7 +413,6 @@ def run_candidate_sweep() -> dict:
         "graphed",
         "graphed_bucketed",
         "whole_graph",
-        "whole_graph_compiled",
     )
     run = wandb.init(
         entity="jeetucl-ucl",
@@ -456,6 +456,7 @@ def run_candidate_sweep() -> dict:
             summary.update({
                 f"{candidate}/behavior_passed": int(result["behavior_passed"]),
                 f"{candidate}/speedup": result["speedup"],
+                f"{candidate}/amortized_speedup": result["amortized_speedup"],
                 f"{candidate}/peak_allocated_gib": (
                     result["memory"]["fused"]["peak_allocated_bytes"] / 2**30
                 ),
@@ -509,6 +510,7 @@ def run_candidate_sweep() -> dict:
                     "behavior_passed",
                     "performance_passed",
                     "speedup",
+                    "amortized_speedup",
                     "target_2x_reached",
                     "error",
                 }

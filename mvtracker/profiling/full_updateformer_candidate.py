@@ -31,6 +31,7 @@ LOSS_RELATIVE_ERROR = 0.001
 GRADIENT_COSINE = 0.9999
 GRADIENT_NORM_RELATIVE_ERROR = 0.01
 MINIMUM_SPEEDUP = 1.05
+AMORTIZATION_UPDATES = 1000
 
 
 def _verify_capturable_knn():
@@ -258,6 +259,8 @@ def _run_whole_graph(
         loss.backward()
         return output, loss
 
+    torch.cuda.synchronize()
+    setup_started = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
     forward_backward(False)
     torch.cuda.synchronize()
@@ -280,6 +283,7 @@ def _run_whole_graph(
     capture_seconds = time.perf_counter() - capture_started
     graph.replay()
     torch.cuda.synchronize()
+    setup_seconds = time.perf_counter() - setup_started
 
     gradients = {
         name: parameter.grad.detach().float().cpu().clone()
@@ -324,6 +328,7 @@ def _run_whole_graph(
     first_result.update({
         "timing": {
             "capture_seconds": capture_seconds,
+            "setup_seconds": setup_seconds,
             "optimizer_seconds": optimizer_seconds,
             "warm_update_seconds": warm_timings,
             "warm_update_median_seconds": statistics.median(warm_timings),
@@ -601,13 +606,37 @@ def compare_real_update(
     eager_seconds = eager["timing"]["warm_update_median_seconds"]
     candidate_seconds = fused["timing"]["warm_update_median_seconds"]
     speedup = eager_seconds / candidate_seconds
-    performance_passed = speedup >= MINIMUM_SPEEDUP
+    eager_first_seconds = sum(
+        eager["timing"][name]
+        for name in ("forward_seconds", "backward_seconds", "optimizer_seconds")
+    )
+    if "setup_seconds" in fused["timing"]:
+        candidate_first_seconds = fused["timing"]["setup_seconds"]
+    else:
+        candidate_first_seconds = sum(
+            fused["timing"][name]
+            for name in ("forward_seconds", "backward_seconds", "optimizer_seconds")
+        )
+    eager_amortized_seconds = (
+        eager_first_seconds + eager_seconds * (AMORTIZATION_UPDATES - 1)
+    )
+    candidate_amortized_seconds = (
+        candidate_first_seconds
+        + candidate_seconds * (AMORTIZATION_UPDATES - 1)
+    )
+    amortized_speedup = eager_amortized_seconds / candidate_amortized_seconds
+    performance_passed = (
+        speedup >= MINIMUM_SPEEDUP
+        and amortized_speedup >= MINIMUM_SPEEDUP
+    )
     return {
         "passed": behavior_passed and performance_passed,
         "strict_passed": strict_passed,
         "behavior_passed": behavior_passed,
         "performance_passed": performance_passed,
         "speedup": speedup,
+        "amortized_updates": AMORTIZATION_UPDATES,
+        "amortized_speedup": amortized_speedup,
         "target_2x_reached": speedup >= 2.0,
         "candidate_backend": candidate_backend,
         "knn_parity": knn_parity,
