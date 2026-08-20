@@ -49,7 +49,8 @@ image = _source_image(
         "/opt/nvte-cuda/include/ && "
         "ln -s /usr/local/cuda/bin/nvcc /opt/nvte-cuda/bin/nvcc && "
         "python -m pip install --no-build-isolation "
-        "'transformer-engine[pytorch]==2.6.0.post1'",
+        "'transformer-engine[pytorch]==2.6.0.post1' && "
+        "python -m pip install numpy==1.24.3",
         env={
             "CC": "gcc",
             "CXX": "g++",
