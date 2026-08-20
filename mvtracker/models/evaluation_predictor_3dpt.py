@@ -54,6 +54,7 @@ class EvaluationPredictor(torch.nn.Module):
             save_debug_logs=False,
             debug_logs_path="",
             query_points_view=None,
+            track_padding_mask=None,
             **kwargs,
     ):
         batch_size, num_views, num_frames, _, height_raw, width_raw = rgbs.shape
@@ -65,8 +66,59 @@ class EvaluationPredictor(torch.nn.Module):
         assert intrs.shape == (batch_size, num_views, num_frames, 3, 3)
         assert extrs.shape == (batch_size, num_views, num_frames, 3, 4)
 
-        if batch_size != 1:
-            raise NotImplementedError
+        if track_padding_mask is None:
+            track_padding_mask = torch.zeros(
+                batch_size,
+                num_points,
+                dtype=torch.bool,
+                device=query_points_3d.device,
+            )
+        else:
+            track_padding_mask = track_padding_mask.to(
+                device=query_points_3d.device,
+                dtype=torch.bool,
+            )
+        if track_padding_mask.shape != (batch_size, num_points):
+            raise ValueError(
+                f"track_padding_mask must have shape {(batch_size, num_points)}, "
+                f"got {tuple(track_padding_mask.shape)}"
+            )
+
+        if batch_size > 1 and self.single_point:
+            if save_debug_logs:
+                raise ValueError("batched single-point debug logging is not supported")
+
+            outputs = []
+            for batch_index in range(batch_size):
+                scene_kwargs = {
+                    name: (
+                        value[batch_index:batch_index + 1]
+                        if torch.is_tensor(value)
+                        and value.ndim > 0
+                        and value.shape[0] == batch_size
+                        else value
+                    )
+                    for name, value in kwargs.items()
+                }
+                outputs.append(self.forward(
+                    rgbs=rgbs[batch_index:batch_index + 1],
+                    depths=depths[batch_index:batch_index + 1],
+                    query_points_3d=query_points_3d[batch_index:batch_index + 1],
+                    intrs=intrs[batch_index:batch_index + 1],
+                    extrs=extrs[batch_index:batch_index + 1],
+                    save_debug_logs=False,
+                    debug_logs_path=debug_logs_path,
+                    query_points_view=(
+                        query_points_view[batch_index:batch_index + 1]
+                        if query_points_view is not None else None
+                    ),
+                    track_padding_mask=track_padding_mask[batch_index:batch_index + 1],
+                    **scene_kwargs,
+                ))
+            return {
+                name: torch.cat([output[name] for output in outputs], dim=0)
+                for name in outputs[0]
+            }
 
         # Interpolate the inputs to the desired resolution, if needed
         if self.interp_shape is None:
@@ -101,11 +153,12 @@ class EvaluationPredictor(torch.nn.Module):
         grid_points = []
         if self.grid_size > 0:
             pixel_xy = get_points_on_a_grid(self.grid_size, (height, width), device=rgbs.device)
+            pixel_xy = pixel_xy.expand(batch_size, -1, -1)
             pixel_xy_homo = to_homogeneous(pixel_xy)
             for t in range(0, num_frames, max(1, num_frames // self.n_grids_per_view)):
                 for view_idx in range(num_views):
                     camera_z = bilinear_sample2d(
-                        depths[0, view_idx, t][None],
+                        depths[:, view_idx, t],
                         pixel_xy[..., 0],
                         pixel_xy[..., 1],
                     ).permute(0, 2, 1)
@@ -157,35 +210,36 @@ class EvaluationPredictor(torch.nn.Module):
             y_samples = sampled_pts[:, 1].float()
             x_samples = sampled_pts[:, 2].float()
 
-            pixel_xy = torch.stack([x_samples, y_samples], dim=-1)[None]  # (1, N, 2)
-            pixel_xy_homo = to_homogeneous(pixel_xy)
+            for batch_index in range(batch_size):
+                scene_support_points = []
+                for idx in range(sampled_pts.shape[0]):
+                    t = t_samples[idx].item()
+                    x = x_samples[idx].item()
+                    y = y_samples[idx].item()
 
-            for idx in range(sampled_pts.shape[0]):
-                t = t_samples[idx].item()
-                x = x_samples[idx].item()
-                y = y_samples[idx].item()
+                    for view_idx in range(num_views):
+                        depth_val = bilinear_sample2d(
+                            depths[batch_index, view_idx, t][None],
+                            torch.tensor([[x]], device=rgbs.device),
+                            torch.tensor([[y]], device=rgbs.device),
+                        ).item()
 
-                for view_idx in range(num_views):
-                    depth_val = bilinear_sample2d(
-                        depths[0, view_idx, t][None],  # shape (1, 1, H, W)
-                        torch.tensor([[x]], device=rgbs.device),
-                        torch.tensor([[y]], device=rgbs.device),
-                    ).item()
+                        cam_xy_h = torch.tensor([[x, y, 1.0]], device=rgbs.device).T
+                        K_inv = intrs_inv[batch_index, view_idx, t]
+                        extr_inv = extrs_inv[batch_index, view_idx, t]
 
-                    cam_xy_h = torch.tensor([[x, y, 1.0]], device=rgbs.device).T
-                    K_inv = intrs_inv[0, view_idx, t]
-                    extr_inv = extrs_inv[0, view_idx, t]
+                        cam_xyz = (K_inv @ cam_xy_h).squeeze() * depth_val
+                        cam_xyz_h = to_homogeneous(cam_xyz[None])[0]
+                        world_xyz_h = extr_inv @ cam_xyz_h
+                        world_xyz = from_homogeneous(world_xyz_h[None])[0]
 
-                    cam_xyz = (K_inv @ cam_xy_h).squeeze() * depth_val
-                    cam_xyz_h = to_homogeneous(cam_xyz[None])[0]
-                    world_xyz_h = extr_inv @ cam_xyz_h
-                    world_xyz = from_homogeneous(world_xyz_h[None])[0]
-
-                    support_point = torch.cat([torch.tensor([t], device=rgbs.device), world_xyz])
-                    support_uniform_pts.append(support_point)
+                        scene_support_points.append(torch.cat([
+                            torch.tensor([t], device=rgbs.device), world_xyz
+                        ]))
+                support_uniform_pts.append(torch.stack(scene_support_points, dim=0))
 
             if support_uniform_pts:
-                support_uniform_pts = torch.stack(support_uniform_pts, dim=0)[None]  # (1, N, 4)
+                support_uniform_pts = torch.stack(support_uniform_pts, dim=0)
                 support_points = torch.cat([support_points, support_uniform_pts], dim=1)
 
         if self.single_point:
@@ -214,6 +268,8 @@ class EvaluationPredictor(torch.nn.Module):
             traj_e = torch.zeros((batch_size, num_frames, num_points, 3), device=rgbs.device)
             vis_e = torch.zeros((batch_size, num_frames, num_points), device=rgbs.device)
             for point_idx in tqdm(range(num_points), desc="Single point evaluation"):
+                if track_padding_mask[:, point_idx].all():
+                    continue
                 # Support points for this query point
                 support_points_i = torch.zeros((batch_size, 0, 4), device=rgbs.device)
 
@@ -340,6 +396,15 @@ class EvaluationPredictor(torch.nn.Module):
 
         else:
             query_points_3d = torch.cat([query_points_3d, support_points], dim=1)
+            model_track_padding_mask = torch.cat([
+                track_padding_mask,
+                torch.zeros(
+                    batch_size,
+                    support_points.shape[1],
+                    dtype=torch.bool,
+                    device=track_padding_mask.device,
+                ),
+            ], dim=1)
             if query_points_view is not None:
                 query_points_view = torch.cat([
                     query_points_view, query_points_view.new_zeros(support_points[:, :, 0].shape)
@@ -354,6 +419,7 @@ class EvaluationPredictor(torch.nn.Module):
                 save_debug_logs=save_debug_logs,
                 debug_logs_path=debug_logs_path,
                 query_points_view=query_points_view,
+                track_padding_mask=model_track_padding_mask,
                 **kwargs,
             )
             traj_e = results["traj_e"][:, :, :num_points, :]
