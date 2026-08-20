@@ -283,6 +283,45 @@ Other previously completed semantics-preserving cleanup includes removing or
 throttling GPU synchronization loops, reprojection audits, stationary baseline
 work, and expensive dashboard diagnostics from ordinary microbatches.
 
+### 6.7 Integrated fused-backend gate
+
+A real mixed-source B2 microbatch (one view, 599 padded trajectory slots) was
+used to compare complete eager and candidate updates. The gate records all
+refinement coordinates and visibility logits, final predictions, component and
+total losses, every gradient, clipped Adam updates, peak memory, and warm
+five-update behavior.
+
+The exact eager cleanup passed the original golden contract. Replacing
+`repeat` with a virtual-token view and disabling checkpointing by default did
+not change the locked outputs, gradients, optimizer update, or losses.
+
+Three larger candidates were rejected:
+
+| Candidate | Warm update | Trajectory RMS after first update | Five-update result |
+|---|---:|---:|---:|
+| Fixed 1,024-track padding + compiled QKV/UpdateFormer | cold compile only | 28.4 mm | rejected before continuation |
+| Exact-shape dynamic Inductor + fused QKV | 0.539 s vs 0.750 s eager | 27.5 mm | rejected |
+| Fused QKV only | about 2--5% faster | exactly zero | 33--40 mm after five updates |
+
+The component diagnostic showed why. Fused QKV by itself changed a standalone
+UpdateFormer update by at most `2.38e-7`, while padding 900 tracks to 1,024
+caused up to `7.91e-5` update difference. The iterative tracker amplifies even
+the smaller backward difference: QKV-only forward values and first-step loss
+were exactly equal, but its first Adam-update cosine was about `0.998`, and the
+cumulative five-update cosine fell to about `0.95`.
+
+Generic dynamic Inductor did provide a real 1.39x warm-update speedup, but its
+cold compile took roughly 565 seconds because the three sliding windows expose
+different active trajectory counts and each forward/backward shape was
+autotuned separately. It also failed the numerical gate. Neither its speed nor
+QKV's small speedup is accepted.
+
+CUDA itself supports `cudaGraphExecUpdate`, but PyTorch does not provide an
+autograd-aware dynamic-shape wrapper for this use. Exploiting it would require
+a custom C++ graph manager with stable workspaces and controlled forward and
+backward accumulation. That is now the boundary for a genuinely large,
+behavior-preserving rewrite.
+
 ## 7. What changes if small numerical drift is acceptable
 
 If strict one-ULP equivalence is relaxed, the opportunity becomes materially
@@ -379,14 +418,18 @@ timing.
 
 ## 10. Candidate research queue
 
-### Priority A: full-loop drift harness
+### Priority A: custom dynamic training backend
 
-Build the verifier described above. This determines whether measured compile or
-bucketing drift is genuinely harmful after four refinements and three windows.
+The full-loop gate is complete and proved that local noise is amplified. A new
+backend must keep exact active trajectory counts, control reduction order in
+both directions, and use persistent workspaces or CUDA graph-exec updates
+without changing padding semantics.
 
 ### Priority B: bucketing plus official partial CUDA Graphs
 
-If the calibrated drift gate passes:
+The fixed-padding candidate failed the calibrated drift gate. Revisit graph
+capture only after the backend can represent dynamic active counts without
+adding masked trajectory slots.
 
 1. Choose trajectory buckets using the observed training distribution.
 2. Measure padding overhead and graph-cache hit rate.
@@ -433,8 +476,10 @@ For immediate training with current code:
 - Disable UpdateFormer checkpointing when the ordinary eager shape fits.
 - Enable checkpointing only to prevent OOM or to support a required larger
   physical batch; do not claim it is faster.
-- Keep CUDA Graphs and track bucketing experimental until the full-refinement
-  drift harness is complete.
+- Do not enable the experimental `qkv` or `fused` backend in training. Both
+  failed the five-update gate.
+- Keep CUDA Graphs and track bucketing experimental; fixed padding has now been
+  shown to alter the iterative tracker materially.
 - Continue optimizing on one GPU before spending effort on DDP scaling.
 
 ## 12. Key artifacts
@@ -445,6 +490,8 @@ For immediate training with current code:
   `jeet-mvtracker-runs-v2/checkpoint-net-throughput-8fa3abc8/summary.json`
 - H200 checkpoint throughput:
   `jeet-mvtracker-runs-v2/checkpoint-net-throughput-h200-3cbae668/summary.json`
+- Integrated candidate results:
+  `jeet-mvtracker-runs-v2/performance-results/{abc604e...,f8c4351...,db5cff8...}/`
 - General training research record: `MV_TRACKER_TRAINING_EXPERIMENT_LOG.md`
 - Reusable Modal commands: `scripts.md`
 
@@ -456,3 +503,8 @@ Relevant W&B runs:
 - Official partial-graph study: `ywz00xip`
 - H100 full-model checkpoint sweep: `96kk758r`
 - H200 full-model checkpoint sweep: `jtrt2nk6`
+- Exact eager replay: `5pwgqitz`
+- Fixed-padding fused candidate: `qrp6tvk9`
+- Component isolation: `myhpn5un`
+- Exact-shape dynamic compile: `5dcc96ai`
+- Five-update QKV gate: `j5qf7qf3`

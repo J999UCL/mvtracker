@@ -278,12 +278,13 @@ python tools/profile_mixed_physical_loader.py \
 ```
 ## UpdateFormer fused-backend candidate gate
 
-Run the single-H100 real-update gate comparing the eager UpdateFormer against
-the fused QKV + fixed-capacity + Inductor/CUDA-graph backend. The command uses
-the saved real mixed-source crash batch and writes its JSON result to the Modal
-run Volume.
+Run the single-H100 real-update gate comparing eager UpdateFormer against one
+experimental backend. The command uses the saved real mixed-source crash batch,
+checks one and five updates, and writes its JSON result to the Modal run Volume.
+`qkv` and `fused` are research candidates; neither is approved for training.
 
 ```bash
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run tools/modal_updateformer_autoresearch.py::fused_candidate_gate
+  modal run tools/modal_updateformer_autoresearch.py::fused_candidate_gate \
+    --candidate-backend qkv
 ```

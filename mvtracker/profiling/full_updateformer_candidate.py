@@ -271,6 +271,15 @@ def compare_real_update(
         eager["multi_update"]["final_visibility"],
         fused["multi_update"]["final_visibility"],
     )
+    multi_visibility_flips = float(
+        (
+            (eager["multi_update"]["final_visibility"] >= 0.5)
+            != (fused["multi_update"]["final_visibility"] >= 0.5)
+        ).float().mean()
+    )
+    multi_loss_relative_error = abs(
+        fused["multi_update"]["loss"] - eager["multi_update"]["loss"]
+    ) / max(abs(eager["multi_update"]["loss"]), 1e-12)
     multi_updates = _vector_agreement(
         eager["multi_update"]["parameter_updates"],
         fused["multi_update"]["parameter_updates"],
@@ -285,6 +294,13 @@ def compare_real_update(
         gradients["norm_relative_error"] <= GRADIENT_NORM_RELATIVE_ERROR,
         updates["cosine"] >= GRADIENT_COSINE,
         updates["norm_relative_error"] <= GRADIENT_NORM_RELATIVE_ERROR,
+        multi_trajectory["rms"] <= TRAJECTORY_RMS_METERS,
+        multi_trajectory["p99"] <= TRAJECTORY_P99_METERS,
+        multi_visibility["mean"] <= VISIBILITY_MEAN_ABS,
+        multi_visibility_flips <= VISIBILITY_FLIP_FRACTION,
+        multi_loss_relative_error <= LOSS_RELATIVE_ERROR,
+        multi_updates["cosine"] >= GRADIENT_COSINE,
+        multi_updates["norm_relative_error"] <= GRADIENT_NORM_RELATIVE_ERROR,
     ))
     return {
         "passed": passed,
@@ -309,9 +325,13 @@ def compare_real_update(
             "loss": {
                 "eager": eager["multi_update"]["loss"],
                 "fused": fused["multi_update"]["loss"],
+                "relative_error": multi_loss_relative_error,
             },
             "final_trajectory": multi_trajectory,
-            "final_visibility": multi_visibility,
+            "final_visibility": {
+                **multi_visibility,
+                "flip_fraction": multi_visibility_flips,
+            },
             "parameter_updates": multi_updates,
         },
         "timing": {"eager": eager["timing"], "fused": fused["timing"]},

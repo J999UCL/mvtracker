@@ -1155,3 +1155,45 @@ plateau before the checkpointed capacity frontier.
 - H200 sweep: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/jtrt2nk6
 - H200 cache preparation: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/he7wltnk
 - Results: `checkpoint-net-throughput-h200-3cbae668/summary.json` on `jeet-mvtracker-runs-v2`
+
+## 2026-08-20 — Integrated UpdateFormer fused-backend rejection
+
+The eager reference was replayed after the no-math cleanup and passed the
+locked v3 golden contract. Virtual-track `expand` and disabling UpdateFormer
+checkpointing by default are accepted; checkpointing remains an explicit OOM
+lever.
+
+A full real-update gate then compared eager against fused candidates on the
+saved mixed-source B2 crash batch (one view, 599 trajectory slots). It checks
+every refinement coordinate/logit, final predictions, losses, all parameter
+gradients, the clipped Adam update, five repeated updates, timing, and memory.
+
+The fixed-capacity 1,024-track candidate failed with 28.4 mm final trajectory
+RMS, 2.59% visibility flips, gradient cosine 0.9853, and Adam-update cosine
+0.5406. A component diagnostic found that fixed padding, not fused QKV, was the
+main local source: padding caused up to `7.91e-5` one-update difference, versus
+`2.38e-7` for QKV.
+
+Removing padding and CUDA graphs produced an exact-shape dynamic Inductor
+candidate. Warm full updates improved from 0.750 to 0.539 seconds (1.39x), but
+the cold compile took about 565 seconds across the sliding-window shapes and
+the candidate still drifted by 27.5 mm RMS with Adam-update cosine 0.4302. It
+was rejected.
+
+QKV-only fusion produced exactly identical first forward traces, predictions,
+visibility and loss, and improved warm update time by roughly 2--5%. Its
+backward accumulation still changed the first Adam update (cosine about 0.998).
+After five identical updates, trajectory RMS divergence reached 33--40 mm and
+cumulative update cosine approximately 0.95. Manual and recomputed-original
+custom backward variants did not meet the gate. QKV remains experimental and
+is not enabled by default.
+
+This pass cost $1.7447 on Modal: $1.3960 H100, $0.1718 CPU and $0.1768 memory.
+All jobs used `owner=jeet`, `project=mvtracker`, `purpose=profiling`; unrelated
+workspace jobs were excluded.
+
+- Exact replay: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/5pwgqitz
+- Fixed-padding candidate: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/qrp6tvk9
+- Component diagnostic: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/myhpn5un
+- Dynamic Inductor candidate: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/5dcc96ai
+- Five-update QKV gate: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/j5qf7qf3
