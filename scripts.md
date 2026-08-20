@@ -244,7 +244,7 @@ validation over all 27 MV-Kubric validation scenes, and keeps W&B enabled.
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
 modal container list --json
-modal run --timestamps tools/modal_continual_training.py::production-smoke10
+modal run --timestamps tools/modal_continual_training.py::production_smoke10
 ```
 
 ## MV-Kubric WebDataset pilot conversion and T4 A/B

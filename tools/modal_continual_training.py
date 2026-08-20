@@ -356,6 +356,8 @@ def train_remote(
 
 def _default_run_name(mode: str, commit: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if mode == "production_smoke10":
+        return f"gt-replay-prod-smoke10-{commit[:8]}-{timestamp}"
     return f"gt-depth-replay-{mode}-ddp2-h100-{commit[:8]}-{timestamp}"
 
 
@@ -426,7 +428,7 @@ def smoke10(
     _spawn_training("smoke10", selected, materialize_whole_step=materialize_whole_step, seed=seed)
 
 
-@app.local_entrypoint(name="production-smoke10")
+@app.local_entrypoint(name="production_smoke10")
 def production_smoke10(
     run_name: str = "",
     materialize_whole_step: bool = False,
