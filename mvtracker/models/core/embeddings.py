@@ -62,7 +62,7 @@ def get_3d_sincos_pos_embed_from_grid_cuda(embed_dim, grid):
     )
     omega = 1.0 / 10000 ** (omega / (axis_dim / 2.0))
     values = []
-    flat = grid.reshape(-1, 3).double()
+    flat = grid.detach().reshape(-1, 3).double()
     for axis in range(3):
         phase = flat[:, axis:axis + 1] * omega[None]
         values.extend((torch.sin(phase), torch.cos(phase)))
