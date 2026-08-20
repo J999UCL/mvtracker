@@ -1131,3 +1131,27 @@ headroom or if an otherwise required shape OOMs.
 
 - Checkpointed H100 sweep: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/96kk758r
 - Results: `checkpoint-net-throughput-8fa3abc8/summary.json` on `jeet-mvtracker-runs-v2`
+
+### H200 B1--B16 follow-up
+
+The same 1-view and 4-view, 1,024-track full-model comparison was repeated on
+one H200. Deterministic B8 tensors were duplicated along the batch axis to
+provide B16 shapes; B1--B8 therefore use the same deterministic prefix as the
+H100 test, and duplication affects neither per-scene computation nor throughput
+arithmetic. The eager reference is the prior matched H200 profile.
+
+| Views | Eager best | Eager scenes/s | Checkpoint best | Checkpoint scenes/s | Ratio |
+|---:|---:|---:|---:|---:|---:|
+| 1 | B5 | 3.3005 | B16 | 3.0482 | 0.9235× |
+| 4 | B3 | 1.9328 | B7 | 1.8279 | 0.9457× |
+
+For one view, checkpoint B16 was safe at 66.5% peak H200 memory but remained
+7.6% slower than eager B5. For four views, checkpoint B7 was the largest safe
+batch at 83.3% memory and remained 5.4% slower than eager B3; B8 exceeded the
+90% safety threshold and B9+ OOMed. Extra H200 VRAM therefore does not turn
+checkpointing into a throughput optimization. The GPU reaches its compute
+plateau before the checkpointed capacity frontier.
+
+- H200 sweep: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/jtrt2nk6
+- H200 cache preparation: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/he7wltnk
+- Results: `checkpoint-net-throughput-h200-3cbae668/summary.json` on `jeet-mvtracker-runs-v2`
