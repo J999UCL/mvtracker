@@ -49,8 +49,7 @@ image = _source_image(
         "/opt/nvte-cuda/include/ && "
         "ln -s /usr/local/cuda/bin/nvcc /opt/nvte-cuda/bin/nvcc && "
         "python -m pip install --no-build-isolation "
-        "'transformer-engine[pytorch]==2.6.0.post1' && "
-        "python -m pip install numpy==1.24.3",
+        "'transformer-engine[pytorch]==2.6.0.post1'",
         env={
             "CC": "gcc",
             "CXX": "g++",
@@ -59,7 +58,7 @@ image = _source_image(
             "NVTE_CUDA_ARCHS": "90",
             "MAX_JOBS": "8",
         },
-    )
+    ).pip_install("numpy==1.24.3")
 )
 
 
