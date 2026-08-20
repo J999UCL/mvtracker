@@ -359,6 +359,28 @@ def _prepare_launch(mode: str, run_name: str, confirm_main: bool) -> str:
     return selected
 
 
+def _spawn_training(
+    mode: str,
+    run_name: str,
+    confirmation: str = "",
+    materialize_whole_step: bool = False,
+    seed: int = 0,
+) -> None:
+    call = train_remote.spawn(
+        mode,
+        run_name,
+        confirmation,
+        materialize_whole_step,
+        seed,
+    )
+    print(
+        json.dumps(
+            {"run_name": run_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
+
+
 @app.local_entrypoint(name="profile-cpu-loader")
 def profile_cpu_loader() -> None:
     commit = _source_commit()
@@ -379,7 +401,7 @@ def profile_h100_loader() -> None:
 @app.local_entrypoint(name="smoke")
 def smoke(run_name: str = "") -> None:
     selected = _prepare_launch("smoke", run_name, confirm_main=False)
-    print(json.dumps(train_remote.remote("smoke", selected, ""), indent=2))
+    _spawn_training("smoke", selected)
 
 
 @app.local_entrypoint(name="smoke10")
@@ -389,14 +411,7 @@ def smoke10(
     seed: int = 0,
 ) -> None:
     selected = _prepare_launch("smoke10", run_name, confirm_main=False)
-    print(
-        json.dumps(
-            train_remote.remote(
-                "smoke10", selected, "", materialize_whole_step, seed
-            ),
-            indent=2,
-        )
-    )
+    _spawn_training("smoke10", selected, materialize_whole_step=materialize_whole_step, seed=seed)
 
 
 @app.local_entrypoint(name="memory-profile")
@@ -405,17 +420,10 @@ def memory_profile(run_name: str = "", seed: int = 0) -> None:
     app.set_tags(
         {**PROFILE_TAGS, "experiment": selected, "gpu": "h100x2"}
     )
-    print(
-        json.dumps(
-            train_remote.remote(
-                "memory_profile", selected, "", False, seed
-            ),
-            indent=2,
-        )
-    )
+    _spawn_training("memory_profile", selected, seed=seed)
 
 
 @app.local_entrypoint(name="train")
 def train(run_name: str = "", confirm_main: bool = False) -> None:
     selected = _prepare_launch("main", run_name, confirm_main)
-    print(json.dumps(train_remote.remote("main", selected, MAIN_CONFIRMATION), indent=2))
+    _spawn_training("main", selected, MAIN_CONFIRMATION)

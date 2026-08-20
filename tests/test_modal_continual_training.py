@@ -124,6 +124,15 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
                 ),
             )
 
+    def test_training_entrypoints_spawn_durable_function_calls(self):
+        source = (ROOT / "tools/modal_continual_training.py").read_text(
+            encoding="utf-8"
+        )
+        entrypoints = source[source.index('@app.local_entrypoint(name="smoke")') :]
+        self.assertIn("train_remote.spawn(", source)
+        self.assertIn('"function_call_id": call.object_id', source)
+        self.assertNotIn("train_remote.remote(", entrypoints)
+
 
 if __name__ == "__main__":
     unittest.main()

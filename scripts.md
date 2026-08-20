@@ -147,7 +147,8 @@ modal run --timestamps tools/modal_continual_training.py::train --confirm-main
 Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
 `owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
-directory.
+directory. Training entrypoints submit with Modal `Function.spawn()` and print a
+durable Function Call ID; the remote job therefore survives CLI disconnection.
 
 The CPU setup expands the DIEGESIS archive and each official 1,000-scene
 MV-Kubric archive once under `/mnt/mvtracker-data`. It copies validation scenes
