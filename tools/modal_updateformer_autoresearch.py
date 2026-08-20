@@ -243,8 +243,6 @@ def run_single_gpu_smoke(
     steps: int = 10,
 ) -> dict:
     commit = _source_commit()
-    inductor_cache = RUN_ROOT / "torchinductor-cache" / "torch2.7.1-cu128-h100"
-    inductor_cache.mkdir(parents=True, exist_ok=True)
     run_dir = RUN_ROOT / "single-gpu-performance" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     wandb_id = __import__("hashlib").sha256(run_name.encode()).hexdigest()[:12]
@@ -267,7 +265,6 @@ def run_single_gpu_smoke(
             "WANDB_RUN_GROUP": "updateformer-autoresearch-v2",
             "WANDB_RUN_ID": wandb_id,
             "WANDB_RESUME": "allow",
-            "TORCHINDUCTOR_CACHE_DIR": str(inductor_cache),
         }
     )
     log_path = run_dir / "training.log"
@@ -318,9 +315,6 @@ def run_single_gpu_smoke(
     include_source=False,
 )
 def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
-    inductor_cache = RUN_ROOT / "torchinductor-cache" / "torch2.7.1-cu128-h100"
-    inductor_cache.mkdir(parents=True, exist_ok=True)
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor_cache)
     import torch
     import wandb
 
@@ -399,9 +393,6 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
     include_source=False,
 )
 def run_candidate_sweep() -> dict:
-    inductor_cache = RUN_ROOT / "torchinductor-cache" / "torch2.7.1-cu128-h100"
-    inductor_cache.mkdir(parents=True, exist_ok=True)
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor_cache)
     import torch
     import wandb
 

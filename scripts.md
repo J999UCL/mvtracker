@@ -9,7 +9,7 @@ the tight FP32 output, input-gradient, parameter-gradient, Adam-update, and
 loss checks before its fixed B1/B2/B4 benchmark runs. The end-to-end command
 also compares whole-update and reusable live backends against eager run-to-run
 nondeterminism, selects the fastest valid live backend, then confirms it for ten
-real changing optimizer steps. Inductor kernels persist on the run Volume.
+real changing optimizer steps.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
