@@ -10,9 +10,8 @@ datasets:
     batch_size: 1
     sequence_len: 24
     traj_per_sample: 2048
-    kubric_metadata_index_root: ${oc.env:MVTRACKER_MVKUBRIC_INDEX_ROOT,${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/kubric-multiview/train/MVTracker_index}
     mvkubric_gpu_decode: true
-    mvkubric_storage: webdataset
+    mvkubric_storage: dali_stream
     mvkubric_webdataset_root: ${oc.env:MVTRACKER_MVKUBRIC_WEBDATASET_ROOT,${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/kubric-multiview-webdataset}
     kubric_max_depth: 24
     num_workers: 8

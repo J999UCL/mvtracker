@@ -3,6 +3,13 @@ defaults:
   - diegesis_mvkubric_gt_ddp_smoke
   - _self_
 
+datasets:
+  eval:
+    names: []
+
 trainer:
   num_steps: 3
   save_ckpt_freq: 3
+
+modes:
+  validate_at_start: false

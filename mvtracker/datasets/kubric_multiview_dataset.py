@@ -300,17 +300,27 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
         if just_return_kwargs:
             return kubric_kwargs
 
-        if training and str(training_args.datasets.train.get("mvkubric_storage", "native")) == "webdataset":
+        mvkubric_storage = str(
+            training_args.datasets.train.get("mvkubric_storage", "native")
+        ) if training else "native"
+        if training and mvkubric_storage == "dali_stream":
             from mvtracker.datasets.kubric_dali_dataset import DaliKubricMultiViewDataset
 
             webdataset_root = training_args.datasets.train.get("mvkubric_webdataset_root")
             if webdataset_root is None:
-                raise ValueError("mvkubric_storage=webdataset requires mvkubric_webdataset_root")
+                raise ValueError(
+                    "mvkubric_storage=dali_stream requires mvkubric_webdataset_root"
+                )
             if not os.path.isabs(str(webdataset_root)):
                 webdataset_root = os.path.join(dataset_root, str(webdataset_root))
             kubric_kwargs["webdataset_root"] = webdataset_root
             kubric_kwargs["webdataset_split"] = "train"
+            kubric_kwargs["stream_rank"] = int(fabric.global_rank)
+            kubric_kwargs["stream_world_size"] = int(fabric.world_size)
+            kubric_kwargs["stream_seed"] = int(training_args.reproducibility.seed)
             return DaliKubricMultiViewDataset(**kubric_kwargs)
+        if training and mvkubric_storage not in {"native", "dali_stream"}:
+            raise ValueError(f"unsupported mvkubric_storage={mvkubric_storage!r}")
 
         if training and bool(training_args.datasets.train.get("mvkubric_gpu_decode", False)):
             from mvtracker.datasets.kubric_gpu_dataset import (

@@ -749,6 +749,10 @@ def _planned_physical_batching(cfg):
     return settings is not None and bool(settings.get("enabled", False))
 
 
+def _mvkubric_dali_stream(cfg):
+    return str(cfg.datasets.train.get("mvkubric_storage", "native")) == "dali_stream"
+
+
 def _physical_batch_capacity(cfg):
     settings = cfg.datasets.train.physical_batching
     return BatchCapacity(
@@ -1982,6 +1986,33 @@ def main(cfg: DictConfig):
             )
             for source, source_cfg in cfg.datasets.train.sources.items()
         }
+        if _mvkubric_dali_stream(cfg):
+            local_stream_build_seconds = float(
+                train_datasets["mvkubric"].stream.build_seconds
+            )
+            logging.info(
+                "MV-Kubric DALI stream built in %.3fs (rank=%d)",
+                local_stream_build_seconds,
+                fabric.global_rank,
+            )
+            stream_build_seconds_max = _reduce_scalar(
+                fabric, local_stream_build_seconds, reduce_op="max"
+            )
+            stream_build_seconds_mean = _reduce_scalar(
+                fabric, local_stream_build_seconds, reduce_op="mean"
+            )
+            if wandb_run_id is not None and fabric.global_rank == 0:
+                wandb.log(
+                    {
+                        "startup/dali_stream_build_seconds_max": (
+                            stream_build_seconds_max
+                        ),
+                        "startup/dali_stream_build_seconds_mean": (
+                            stream_build_seconds_mean
+                        ),
+                    },
+                    step=0,
+                )
         mixed_schedule = BalancedMixedSourceSchedule(
             {source: dataset.real_len for source, dataset in train_datasets.items()},
             source_pattern,
@@ -1990,6 +2021,17 @@ def main(cfg: DictConfig):
         )
         source_cursors = {source: 0 for source in train_datasets}
         planned_physical_batching = _planned_physical_batching(cfg)
+        if _mvkubric_dali_stream(cfg):
+            if not planned_physical_batching:
+                raise ValueError(
+                    "mvkubric_storage=dali_stream requires physical batching"
+                )
+            if not bool(
+                cfg.datasets.train.physical_batching.get("rank_local", False)
+            ):
+                raise ValueError(
+                    "mvkubric_storage=dali_stream requires rank-local batching"
+                )
         if planned_physical_batching:
             capacity = _physical_batch_capacity(cfg)
             rank_local = bool(
@@ -2264,6 +2306,8 @@ def main(cfg: DictConfig):
             ),
         )
 
+    dali_stream_batches_seen = set()
+
     profiler_start_step = int(
         cfg.trainer.get("profiler", {}).get("start_step", 0)
     )
@@ -2392,12 +2436,10 @@ def main(cfg: DictConfig):
         accumulated_gpu_jpeg_decode_ms = 0.0
         accumulated_gpu_prepare_ms = 0.0
         accumulated_sampling_metrics = {}
-        accumulated_indexed_io_metrics = {
-            "requested_bytes": 0.0,
-            "read_bytes": 0.0,
-            "read_seconds": 0.0,
-            "local_cache_bytes": 0.0,
-            "sample_count": 0.0,
+        accumulated_dali_stream_metrics = {
+            "batch_count": 0.0,
+            "payload_bytes": 0.0,
+            "batch_wait_seconds": 0.0,
         }
         accumulated_loss_value = None
         accumulated_component_losses = {}
@@ -2608,21 +2650,19 @@ def main(cfg: DictConfig):
                             + float(np.mean([item[name] for item in metadata]))
                         )
                 for item in metadata:
-                    if item.get("record_store") != "direct-pread":
+                    if item.get("record_store") != "dali-webdataset":
                         continue
-                    accumulated_indexed_io_metrics["requested_bytes"] += float(
-                        item["indexed_requested_bytes"]
+                    batch_index = int(item["dali_batch_index"])
+                    if batch_index in dali_stream_batches_seen:
+                        continue
+                    dali_stream_batches_seen.add(batch_index)
+                    accumulated_dali_stream_metrics["batch_count"] += 1.0
+                    accumulated_dali_stream_metrics["payload_bytes"] += float(
+                        item["dali_payload_bytes"]
                     )
-                    accumulated_indexed_io_metrics["read_bytes"] += float(
-                        item["indexed_read_bytes"]
-                    )
-                    accumulated_indexed_io_metrics["read_seconds"] += float(
-                        item["indexed_read_seconds"]
-                    )
-                    accumulated_indexed_io_metrics["local_cache_bytes"] += float(
-                        item["indexed_local_cache_bytes"]
-                    )
-                    accumulated_indexed_io_metrics["sample_count"] += 1.0
+                    accumulated_dali_stream_metrics[
+                        "batch_wait_seconds"
+                    ] += float(item["dali_read_seconds"])
             source_view_count = int(batch.video.shape[1])
             if batch.track_padding_mask is not None:
                 scene_track_counts = (
@@ -3214,26 +3254,39 @@ def main(cfg: DictConfig):
                 },
             )
             logging.info(
-                "[indexed_io:%06d rank=%d] requested_bytes=%d read_bytes=%d "
-                "read_seconds=%.3f local_cache_bytes=%d samples=%d",
+                "[dali_stream:%06d rank=%d] batches=%d payload_bytes=%d "
+                "batch_wait_seconds=%.3f",
                 total_steps,
                 fabric.global_rank,
-                int(accumulated_indexed_io_metrics["requested_bytes"]),
-                int(accumulated_indexed_io_metrics["read_bytes"]),
-                accumulated_indexed_io_metrics["read_seconds"],
-                int(accumulated_indexed_io_metrics["local_cache_bytes"]),
-                int(accumulated_indexed_io_metrics["sample_count"]),
+                int(accumulated_dali_stream_metrics["batch_count"]),
+                int(accumulated_dali_stream_metrics["payload_bytes"]),
+                accumulated_dali_stream_metrics["batch_wait_seconds"],
             )
-            reduced_indexed_io_metrics = {
-                name: _reduce_scalar(fabric, value, reduce_op="sum")
-                for name, value in accumulated_indexed_io_metrics.items()
+            reduced_dali_stream_metrics = {
+                "batch_count": _reduce_scalar(
+                    fabric,
+                    accumulated_dali_stream_metrics["batch_count"],
+                    reduce_op="sum",
+                ),
+                "payload_bytes": _reduce_scalar(
+                    fabric,
+                    accumulated_dali_stream_metrics["payload_bytes"],
+                    reduce_op="sum",
+                ),
+                "batch_wait_seconds": _reduce_scalar(
+                    fabric,
+                    accumulated_dali_stream_metrics["batch_wait_seconds"],
+                    reduce_op="max",
+                ),
             }
-            indexed_read_seconds = reduced_indexed_io_metrics["read_seconds"]
-            reduced_indexed_io_metrics["effective_mib_per_second"] = (
-                reduced_indexed_io_metrics["read_bytes"]
-                / indexed_read_seconds
+            dali_wait_seconds = reduced_dali_stream_metrics[
+                "batch_wait_seconds"
+            ]
+            reduced_dali_stream_metrics["effective_mib_per_second"] = (
+                reduced_dali_stream_metrics["payload_bytes"]
+                / dali_wait_seconds
                 / 1024**2
-                if indexed_read_seconds > 0
+                if dali_wait_seconds > 0
                 else 0.0
             )
             reduced_physical_batching_metrics = None
@@ -3313,8 +3366,10 @@ def main(cfg: DictConfig):
                         tb_writer.add_scalar(
                             f"batching/{name}", value, total_steps
                         )
-                for name, value in reduced_indexed_io_metrics.items():
-                    tb_writer.add_scalar(f"io/indexed/{name}", value, total_steps)
+                for name, value in reduced_dali_stream_metrics.items():
+                    tb_writer.add_scalar(
+                        f"io/dali_stream/{name}", value, total_steps
+                    )
                 if sampling_metrics:
                     for name, value in sampling_metrics.items():
                         tb_writer.add_scalar(f"sampling/{name}", value, total_steps)
@@ -3409,12 +3464,10 @@ def main(cfg: DictConfig):
             accumulated_gpu_jpeg_decode_ms = 0.0
             accumulated_gpu_prepare_ms = 0.0
             accumulated_sampling_metrics = {}
-            accumulated_indexed_io_metrics = {
-                "requested_bytes": 0.0,
-                "read_bytes": 0.0,
-                "read_seconds": 0.0,
-                "local_cache_bytes": 0.0,
-                "sample_count": 0.0,
+            accumulated_dali_stream_metrics = {
+                "batch_count": 0.0,
+                "payload_bytes": 0.0,
+                "batch_wait_seconds": 0.0,
             }
             accumulated_loss_value = None
             accumulated_component_losses = {}
