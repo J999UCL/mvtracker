@@ -42,7 +42,21 @@ TAGS = {
 
 app = modal.App(APP_NAME, tags={**TAGS, "experiment": "unclassified", "gpu": "h100"})
 image = _source_image(
-    _dependency_image().pip_install("transformer-engine[pytorch]==2.18.0")
+    _dependency_image().run_commands(
+        "mkdir -p /opt/nvte-cuda/include /opt/nvte-cuda/bin && "
+        "cp -a /usr/local/cuda/include/. /opt/nvte-cuda/include/ && "
+        "cp -a /usr/local/lib/python3.10/site-packages/nvidia/cudnn/include/. "
+        "/opt/nvte-cuda/include/ && "
+        "ln -s /usr/local/cuda/bin/nvcc /opt/nvte-cuda/bin/nvcc && "
+        "python -m pip install --no-build-isolation "
+        "'transformer-engine[pytorch]==2.6.0.post1'",
+        env={
+            "CUDA_HOME": "/opt/nvte-cuda",
+            "NVTE_FRAMEWORK": "pytorch",
+            "NVTE_CUDA_ARCHS": "90",
+            "MAX_JOBS": "8",
+        },
+    )
 )
 
 
