@@ -32,6 +32,25 @@ GRADIENT_COSINE = 0.9999
 GRADIENT_NORM_RELATIVE_ERROR = 0.01
 
 
+def _verify_capturable_knn():
+    from mvtracker.models.core.mvtracker.mvtracker import (
+        _knn_capturable,
+        _knn_pointops,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20260820)
+    reference = torch.randn(4, 257, 3, device="cuda", generator=generator)
+    query = torch.randn(4, 31, 3, device="cuda", generator=generator)
+    expected_distance, expected_index = _knn_pointops(16, reference, query)
+    actual_distance, actual_index = _knn_capturable(16, reference, query)
+    torch.cuda.synchronize()
+    if not torch.equal(expected_index, actual_index):
+        raise RuntimeError("capture-safe KNN indices differ from PointOps")
+    if not torch.equal(expected_distance, actual_distance):
+        raise RuntimeError("capture-safe KNN distances differ from PointOps")
+    return {"indices_exact": True, "distances_exact": True}
+
+
 def _arguments(data_root, checkpoint, output, batch_size, views, trajectories):
     return SimpleNamespace(
         data_root=Path(data_root),
@@ -383,6 +402,7 @@ def compare_real_update(
         data_root, checkpoint, output, batch_size, views, trajectories
     )
     cfg = _compose_config(arguments)
+    knn_parity = _verify_capturable_knn() if candidate_backend == "whole_graph" else None
     eager = _run_backend(cfg, checkpoint, batch, "eager")
     fused = (
         _run_whole_graph(cfg, checkpoint, batch)
@@ -450,6 +470,7 @@ def compare_real_update(
     return {
         "passed": passed,
         "candidate_backend": candidate_backend,
+        "knn_parity": knn_parity,
         "shape": {
             "views": views,
             "batch_size": batch_size,

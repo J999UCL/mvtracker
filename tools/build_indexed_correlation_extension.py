@@ -36,6 +36,17 @@ def main() -> None:
         extra_cuda_cflags=["-O3"],
         verbose=True,
     )
+    load(
+        name="mvtracker_capturable_knn_cuda",
+        sources=[
+            str(package_dir / "capturable_knn_cuda.cpp"),
+            str(package_dir / "capturable_knn_cuda.cu"),
+        ],
+        build_directory=str(build_directory),
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3"],
+        verbose=True,
+    )
 
 
 if __name__ == "__main__":

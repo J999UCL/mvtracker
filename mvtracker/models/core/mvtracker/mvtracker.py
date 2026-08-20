@@ -85,15 +85,47 @@ def _knn_torch(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
     return sorted_dists, indices
 
 
-# Select backend once (safe if pointops missing).
-try:
-    import importlib
+def _knn_capturable(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
+    if not xyz_ref.is_cuda:
+        return _knn_torch(k, xyz_ref, xyz_query)
+    from mvtracker.models.core.mvtracker import mvtracker_capturable_knn_cuda
 
-    importlib.import_module("pointops")
-    knn = _knn_pointops
-except Exception:
-    logging.warning("pointops not found, falling back to slower KNN implementation.")
-    knn = _knn_torch
+    batch, reference_count, _ = xyz_ref.shape
+    query_count = xyz_query.shape[1]
+    reference = xyz_ref.contiguous().view(batch * reference_count, 3).float()
+    query = xyz_query.contiguous().view(batch * query_count, 3).float()
+    offsets = (
+        torch.arange(1, batch + 1, device=xyz_ref.device, dtype=torch.int32)
+        * reference_count
+    )
+    query_offsets = (
+        torch.arange(1, batch + 1, device=xyz_ref.device, dtype=torch.int32)
+        * query_count
+    )
+    indices = torch.empty(
+        batch * query_count, k, dtype=torch.int32, device=xyz_ref.device
+    )
+    squared_distances = torch.empty(
+        batch * query_count, k, dtype=torch.float32, device=xyz_ref.device
+    )
+    mvtracker_capturable_knn_cuda.knn_query_out(
+        k,
+        reference,
+        query,
+        offsets,
+        query_offsets,
+        indices,
+        squared_distances,
+    )
+    indices = indices.view(batch, query_count, k)
+    indices = indices - (
+        torch.arange(batch, device=indices.device, dtype=torch.int32)[:, None, None]
+        * reference_count
+    )
+    return squared_distances.sqrt().view(batch, query_count, k).to(xyz_ref.dtype), indices
+
+
+knn = _knn_capturable
 
 
 class MVTracker(nn.Module):

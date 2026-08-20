@@ -336,8 +336,8 @@ def run(arguments) -> dict:
     import flash_attn  # noqa: F401
     from mvtracker.models.core.mvtracker import mvtracker as mvtracker_module
 
-    if mvtracker_module.knn.__name__ != "_knn_pointops":
-        raise RuntimeError("PointOps KNN is required for profiling")
+    if mvtracker_module.knn.__name__ != "_knn_capturable":
+        raise RuntimeError("capture-safe KNN is required for profiling")
 
     cfg = _compose_config(arguments)
     fabric = Fabric(devices=1, precision=cfg.trainer.precision)

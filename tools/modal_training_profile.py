@@ -107,6 +107,16 @@ def _dependency_image() -> modal.Image:
             copy=True,
         )
         .add_local_file(
+            str(CORRELATION_SOURCE_DIR / "capturable_knn_cuda.cpp"),
+            "/opt/mvtracker-extension-src/capturable_knn_cuda.cpp",
+            copy=True,
+        )
+        .add_local_file(
+            str(CORRELATION_SOURCE_DIR / "capturable_knn_cuda.cu"),
+            "/opt/mvtracker-extension-src/capturable_knn_cuda.cu",
+            copy=True,
+        )
+        .add_local_file(
             str(Path(__file__).resolve().parent / "build_indexed_correlation_extension.py"),
             "/opt/mvtracker-extension-src/build.py",
             copy=True,
@@ -140,7 +150,7 @@ def _source_image(base: modal.Image) -> modal.Image:
         base
         .run_commands(clone)
         .run_commands(
-            "cp /opt/mvtracker-extension/mvtracker_indexed_correlation_cuda*.so "
+            "cp /opt/mvtracker-extension/mvtracker_*_cuda*.so "
             "/opt/mvtracker/mvtracker/models/core/mvtracker/",
         )
         .env(
