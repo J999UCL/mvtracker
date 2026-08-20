@@ -1962,7 +1962,7 @@ def main(cfg: DictConfig):
                 device=fabric.device,
                 queue_depth=int(cfg.datasets.train.cuda_prefetch_queue_depth),
                 decode_batch_size=(
-                    2
+                    1
                     if dali_validation
                     else int(cfg.datasets.train.cuda_decode_batch_size)
                 ),

@@ -1630,7 +1630,7 @@ class _CudaPrefetchIterator:
             values[field.name] = value
         return Datapoint(**values)
 
-    def _decode_group(self, items, rgb_decoder, depth_decoder):
+    def _decode_group(self, items, rgb_decoder, depth_decoder, dali_decoder):
         samples = [sample for _, encoded, _ in items for sample in encoded.samples]
         events = None
         record_timing = (
@@ -1646,6 +1646,7 @@ class _CudaPrefetchIterator:
                 timing_events=events,
                 nvimagecodec_rgb_decoder=rgb_decoder,
                 nvimagecodec_depth_decoder=depth_decoder,
+                dali_decoder=dali_decoder,
                 rgb_stream=self.rgb_stream,
                 depth_stream=self.depth_stream,
                 prepare_stream=self.prepare_stream,
@@ -1675,6 +1676,7 @@ class _CudaPrefetchIterator:
             torch.cuda.set_device(self.device)
             rgb_decoder = None
             depth_decoder = None
+            dali_decoder = None
             while True:
                 window = []
                 for _ in range(self.queue_depth):
@@ -1708,6 +1710,11 @@ class _CudaPrefetchIterator:
                     )
                     rgb_decoder = nvimgcodec.Decoder(device_id=device_id)
                     depth_decoder = nvimgcodec.Decoder(device_id=device_id)
+                if (
+                    dali_decoder is None
+                    and any(key[0] == "dali" for key in grouped)
+                ):
+                    dali_decoder = DaliEncodedImageDecoder(self.device)
 
                 next_output = 0
                 for items in grouped.values():
@@ -1716,6 +1723,7 @@ class _CudaPrefetchIterator:
                             items[start:start + self.decode_batch_size],
                             rgb_decoder,
                             depth_decoder,
+                            dali_decoder,
                         ):
                             outputs[position] = (datapoint, gotit, events, ready_event)
                         while next_output < len(outputs) and outputs[next_output] is not None:

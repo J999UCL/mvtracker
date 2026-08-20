@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 
 from mvtracker.datasets.tapvid3d_multiview_dataset import DaliEncodedImageDecoder
+from mvtracker.datasets.tapvid3d_multiview_dataset import _CudaPrefetchIterator
 
 
 class _TensorOutput:
@@ -37,6 +38,12 @@ class DaliDecoderContractTests(unittest.TestCase):
         self.assertIn('exec_pipelined=False', source)
         self.assertIn('max_encoded_images: int = 288', source)
         self.assertIn('batch_size=max_encoded_images', source)
+
+    def test_cuda_prefetch_reuses_one_dali_decoder(self):
+        producer = inspect.getsource(_CudaPrefetchIterator._produce)
+        decode_group = inspect.getsource(_CudaPrefetchIterator._decode_group)
+        self.assertIn("dali_decoder = DaliEncodedImageDecoder(self.device)", producer)
+        self.assertIn("dali_decoder=dali_decoder", decode_group)
 
     def test_modal_dependency_image_uses_one_dali_codec_abi(self):
         source = (Path(__file__).parents[1] / "tools/modal_training_profile.py").read_text()
