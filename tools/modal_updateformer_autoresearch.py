@@ -408,14 +408,11 @@ def run_candidate_sweep() -> dict:
 
     commit = _source_commit()
     candidates = (
-        "bucketed",
         "bucketed_reduce",
         "graphed",
         "graphed_bucketed",
         "whole_graph",
-        "whole_graph_qkv",
         "whole_graph_compiled",
-        "whole_graph_fused",
     )
     run = wandb.init(
         entity="jeetucl-ucl",
