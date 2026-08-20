@@ -2392,6 +2392,13 @@ def main(cfg: DictConfig):
         accumulated_gpu_jpeg_decode_ms = 0.0
         accumulated_gpu_prepare_ms = 0.0
         accumulated_sampling_metrics = {}
+        accumulated_indexed_io_metrics = {
+            "requested_bytes": 0.0,
+            "read_bytes": 0.0,
+            "read_seconds": 0.0,
+            "local_cache_bytes": 0.0,
+            "sample_count": 0.0,
+        }
         accumulated_loss_value = None
         accumulated_component_losses = {}
         accumulated_metrics = {}
@@ -2600,6 +2607,22 @@ def main(cfg: DictConfig):
                             accumulated_sampling_metrics.get(name, 0.0)
                             + float(np.mean([item[name] for item in metadata]))
                         )
+                for item in metadata:
+                    if item.get("record_store") != "direct-pread":
+                        continue
+                    accumulated_indexed_io_metrics["requested_bytes"] += float(
+                        item["indexed_requested_bytes"]
+                    )
+                    accumulated_indexed_io_metrics["read_bytes"] += float(
+                        item["indexed_read_bytes"]
+                    )
+                    accumulated_indexed_io_metrics["read_seconds"] += float(
+                        item["indexed_read_seconds"]
+                    )
+                    accumulated_indexed_io_metrics["local_cache_bytes"] += float(
+                        item["indexed_local_cache_bytes"]
+                    )
+                    accumulated_indexed_io_metrics["sample_count"] += 1.0
             source_view_count = int(batch.video.shape[1])
             if batch.track_padding_mask is not None:
                 scene_track_counts = (
@@ -3190,6 +3213,29 @@ def main(cfg: DictConfig):
                     for name, value in accumulated_sampling_metrics.items()
                 },
             )
+            logging.info(
+                "[indexed_io:%06d rank=%d] requested_bytes=%d read_bytes=%d "
+                "read_seconds=%.3f local_cache_bytes=%d samples=%d",
+                total_steps,
+                fabric.global_rank,
+                int(accumulated_indexed_io_metrics["requested_bytes"]),
+                int(accumulated_indexed_io_metrics["read_bytes"]),
+                accumulated_indexed_io_metrics["read_seconds"],
+                int(accumulated_indexed_io_metrics["local_cache_bytes"]),
+                int(accumulated_indexed_io_metrics["sample_count"]),
+            )
+            reduced_indexed_io_metrics = {
+                name: _reduce_scalar(fabric, value, reduce_op="sum")
+                for name, value in accumulated_indexed_io_metrics.items()
+            }
+            indexed_read_seconds = reduced_indexed_io_metrics["read_seconds"]
+            reduced_indexed_io_metrics["effective_mib_per_second"] = (
+                reduced_indexed_io_metrics["read_bytes"]
+                / indexed_read_seconds
+                / 1024**2
+                if indexed_read_seconds > 0
+                else 0.0
+            )
             reduced_physical_batching_metrics = None
             if physical_batching_metrics is not None:
                 reduced_physical_batching_metrics = {
@@ -3267,6 +3313,8 @@ def main(cfg: DictConfig):
                         tb_writer.add_scalar(
                             f"batching/{name}", value, total_steps
                         )
+                for name, value in reduced_indexed_io_metrics.items():
+                    tb_writer.add_scalar(f"io/indexed/{name}", value, total_steps)
                 if sampling_metrics:
                     for name, value in sampling_metrics.items():
                         tb_writer.add_scalar(f"sampling/{name}", value, total_steps)
@@ -3361,6 +3409,13 @@ def main(cfg: DictConfig):
             accumulated_gpu_jpeg_decode_ms = 0.0
             accumulated_gpu_prepare_ms = 0.0
             accumulated_sampling_metrics = {}
+            accumulated_indexed_io_metrics = {
+                "requested_bytes": 0.0,
+                "read_bytes": 0.0,
+                "read_seconds": 0.0,
+                "local_cache_bytes": 0.0,
+                "sample_count": 0.0,
+            }
             accumulated_loss_value = None
             accumulated_component_losses = {}
             accumulated_metrics = {}
