@@ -55,13 +55,17 @@ def _heartbeat(stop: threading.Event, state: dict[str, object]) -> None:
     include_source=False,
 )
 def benchmark(shards: int = 8) -> dict[str, object]:
+    print("DALI_CPU event=function_started", flush=True)
     import numpy as np
+    print("DALI_CPU event=numpy_imported", flush=True)
     import nvidia.dali.fn as fn
     from nvidia.dali import pipeline_def
+    print("DALI_CPU event=dali_imported", flush=True)
     import wandb
+    print("DALI_CPU event=wandb_imported", flush=True)
 
-    print("DALI_CPU event=initializing", flush=True)
     manifest = json.loads((TRAIN_ROOT / "manifest.json").read_text())
+    print("DALI_CPU event=manifest_loaded", flush=True)
     pairs = [
         (TRAIN_ROOT / shard["tar"], (TRAIN_ROOT / shard["tar"]).with_suffix(".idx"))
         for shard in manifest["shards"]
@@ -109,6 +113,7 @@ def benchmark(shards: int = 8) -> dict[str, object]:
     )
 
     build_started = time.perf_counter()
+    print("DALI_CPU event=pipeline_build_started", flush=True)
     pipeline = reader_pipeline(
         batch_size=batch_records,
         num_threads=8,
@@ -117,6 +122,10 @@ def benchmark(shards: int = 8) -> dict[str, object]:
     )
     pipeline.build()
     build_seconds = time.perf_counter() - build_started
+    print(
+        f"DALI_CPU event=pipeline_build_complete seconds={build_seconds:.3f}",
+        flush=True,
+    )
 
     total_bytes = 0
     batch_seconds = []
