@@ -475,7 +475,13 @@ class EfficientUpdateFormer(nn.Module):
         self._graphed_iterations = None
         self._graphed_callables = None
         self._graphed_cursor = 0
-        if execution_backend not in {"eager", "fused", "graphed", "bucketed"}:
+        if execution_backend not in {
+            "eager",
+            "fused",
+            "graphed",
+            "bucketed",
+            "bucketed_reduce",
+        }:
             raise ValueError(f"unknown UpdateFormer backend: {execution_backend}")
         if self.linear_layer_for_vis_conf:
             self.flow_head = nn.Sequential(
@@ -569,7 +575,7 @@ class EfficientUpdateFormer(nn.Module):
     def forward(self, input_tensor, point_mask=None):
         if self.execution_backend == "graphed":
             return self._forward_graphed(input_tensor, point_mask)
-        if self.execution_backend == "bucketed":
+        if self.execution_backend in {"bucketed", "bucketed_reduce"}:
             return self._forward_bucketed(input_tensor, point_mask)
         if self.execution_backend == "fused":
             return self._forward_fused(input_tensor, point_mask)
@@ -726,7 +732,11 @@ class EfficientUpdateFormer(nn.Module):
                 self._forward_impl,
                 fullgraph=True,
                 dynamic=False,
-                mode="max-autotune",
+                mode=(
+                    "reduce-overhead"
+                    if self.execution_backend == "bucketed_reduce"
+                    else "max-autotune"
+                ),
             )
         return self._compiled_impl(input_tensor, point_mask)[:, :track_count]
 

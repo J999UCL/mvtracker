@@ -174,6 +174,7 @@ class MVTracker(nn.Module):
             "graphed",
             "compiled",
             "bucketed",
+            "bucketed_reduce",
         }:
             raise ValueError(f"unknown UpdateFormer backend: {updateformer_backend}")
         self.add_space_attn = add_space_attn
@@ -246,6 +247,8 @@ class MVTracker(nn.Module):
                 if updateformer_backend == "compiled"
                 else "bucketed"
                 if updateformer_backend == "bucketed"
+                else "bucketed_reduce"
+                if updateformer_backend == "bucketed_reduce"
                 else updateformer_backend
                 if updateformer_backend in {"fused", "graphed"}
                 else "eager"
