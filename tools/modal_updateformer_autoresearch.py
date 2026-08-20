@@ -237,8 +237,14 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
     max_containers=1,
     include_source=False,
 )
-def run_single_gpu_smoke(run_name: str) -> dict:
+def run_single_gpu_smoke(
+    run_name: str,
+    backend: str = "eager",
+    steps: int = 10,
+) -> dict:
     commit = _source_commit()
+    inductor_cache = RUN_ROOT / "torchinductor-cache" / "torch2.7.1-cu128-h100"
+    inductor_cache.mkdir(parents=True, exist_ok=True)
     run_dir = RUN_ROOT / "single-gpu-performance" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     wandb_id = __import__("hashlib").sha256(run_name.encode()).hexdigest()[:12]
@@ -261,6 +267,7 @@ def run_single_gpu_smoke(run_name: str) -> dict:
             "WANDB_RUN_GROUP": "updateformer-autoresearch-v2",
             "WANDB_RUN_ID": wandb_id,
             "WANDB_RESUME": "allow",
+            "TORCHINDUCTOR_CACHE_DIR": str(inductor_cache),
         }
     )
     log_path = run_dir / "training.log"
@@ -272,6 +279,10 @@ def run_single_gpu_smoke(run_name: str) -> dict:
                 "-m",
                 "mvtracker.cli.train",
                 "+experiment=diegesis_mvkubric_gt_single_gpu_perf",
+                f"model.updateformer_backend={backend}",
+                "model.checkpoint_updateformer=false",
+                f"trainer.num_steps={steps}",
+                f"trainer.save_ckpt_freq={steps}",
             ],
             cwd="/opt/mvtracker",
             env=environment,
@@ -285,6 +296,8 @@ def run_single_gpu_smoke(run_name: str) -> dict:
     return {
         "source_commit": commit,
         "run_name": run_name,
+        "backend": backend,
+        "steps": steps,
         "elapsed_seconds": time.perf_counter() - started,
         "log_path": str(log_path),
     }
@@ -565,11 +578,15 @@ def component_diagnose() -> None:
 
 
 @app.local_entrypoint(name="single-gpu-smoke")
-def single_gpu_smoke(run_name: str = "") -> None:
+def single_gpu_smoke(
+    run_name: str = "",
+    backend: str = "eager",
+    steps: int = 10,
+) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
     preflight_active_containers(required_free_slots=1)
-    selected = run_name or f"updateformer-single-h100-{commit[:8]}"
+    selected = run_name or f"updateformer-{backend}-h100-{commit[:8]}"
     app.set_tags(
         {
             **TAGS,
@@ -577,7 +594,9 @@ def single_gpu_smoke(run_name: str = "") -> None:
             "gpu": "h100",
         }
     )
-    print(json.dumps(run_single_gpu_smoke.remote(selected), indent=2))
+    print(json.dumps(
+        run_single_gpu_smoke.remote(selected, backend, steps), indent=2
+    ))
 
 
 @app.local_entrypoint(name="fused-candidate-gate")
