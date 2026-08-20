@@ -1197,3 +1197,38 @@ workspace jobs were excluded.
 - Component diagnostic: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/myhpn5un
 - Dynamic Inductor candidate: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/5dcc96ai
 - Five-update QKV gate: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/j5qf7qf3
+## 20 August 2026: single-H100 performance autoresearch
+
+The performance harness was extended from isolated UpdateFormer tests to a
+complete real forward/loss/backward/clip/Adam update. It records eager
+run-to-run nondeterminism, candidate drift after one and five updates, memory,
+steady-state time and amortized 1,000-update time. Candidates run in fresh GPU
+subprocesses so compiler and CUDA-graph pools cannot contaminate one another.
+
+The strongest repeated-batch result was a whole-update CUDA graph at 1.46x,
+with a bit-identical first forward and first loss. It is not usable for live
+training: changing trajectory schedules caused 66.3 seconds of graph capture
+in the first optimizer step and 61.2 GiB of retained graph-private pools before
+an OOM in step two. Fixed buckets, Transformer Engine MLP, channels-last CNN and
+external FlashAttention-2 were all rejected on speed, behavior, or both.
+
+A real operator profile found KNN (67.9 ms), FlashAttention backward (61.9 ms),
+copies (54.0 ms), GEMMs (46.5 ms), reductions (31.7 ms), adds (23.4 ms) and
+LayerNorm (25.8 ms) as the primary GPU costs. A tiled KNN plus exact serial tie
+fallback restored bit-identical first-pass behavior but cost 124 ms because
+invalid-depth point clouds produce many ties; it was rejected.
+
+Key W&B runs:
+
+- Isolated candidate sweep: `spr9xn8p`
+- Whole-graph nondeterminism calibration: `9nzq3u66`
+- Live exact-graph failure: `116c68a5bfed`
+- Transformer Engine MLP: `5hfzxmg6`
+- Serial operator profile: `48cp0l06`
+- Exact tiled-KNN gate: `4o4ov1fi`
+- Tiled-KNN operator profile: `rpojngwh`
+- Channels-last CNN: `61s9iiw0`
+- External FlashAttention-2: `o7oz7cj4`
+
+The current production default remains eager UpdateFormer, contiguous CNN and
+the original serial capture-safe KNN. No rejected candidate was promoted.

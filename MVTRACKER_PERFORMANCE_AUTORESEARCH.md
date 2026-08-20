@@ -508,3 +508,74 @@ Relevant W&B runs:
 - Component isolation: `myhpn5un`
 - Exact-shape dynamic compile: `5dcc96ai`
 - Five-update QKV gate: `j5qf7qf3`
+
+## 13. End-to-end autoresearch results, 20 August 2026
+
+The research loop now runs each candidate in a fresh subprocess, records a
+15-second heartbeat, enforces an eight-minute candidate budget, compares one
+and five optimizer updates against eager and eager-repeat baselines, and scores
+both steady-state and 1,000-update amortized time. This fixed an early harness
+error where compiler and CUDA graph pools from one candidate contaminated the
+next candidate's memory measurement.
+
+The complete static forward/backward CUDA graph is bit-identical before the
+first optimizer update. Its five-update divergence is of the same order as two
+ordinary eager runs because the indexed-correlation backward is already atomic
+and nondeterministic. On the repeated B2, one-view, 599-track batch, the clean
+isolated result was 0.6742 s eager versus 0.4620 s graphed, or 1.46x steady and
+1.46x over a 1,000-update horizon.
+
+That result is not deployable on ordinary changing samples. Exact ordered
+UpdateFormer graphs took 79.5 seconds for the first real optimizer step, of
+which 66.3 seconds was forward graph recording. The second step accumulated
+61.2 GiB in graph-private pools and OOMed. Thread-local capture successfully
+allows DALI/nvTIFF work to continue concurrently, so this is a shape-reuse and
+pool-retention failure rather than a decoder failure.
+
+Other measured candidates were:
+
+| Candidate | Warm speedup | Behavior | Outcome |
+|---|---:|---|---|
+| Low-overhead fixed trajectory buckets | 1.14x | failed | padding drift; Graph Trees also miss their fast path across 12 pending backwards |
+| Exact ordered UpdateFormer graphs | 1.21x | passed | rejected live due repeated recapture/private-pool growth |
+| Bucketed ordered graphs | 0.93x | failed | padding cost and drift exceed graph savings |
+| Transformer Engine LayerNormMLP | 0.79x | failed | backward slower; first update cosine 0.66 |
+| Exact tiled KNN with serial tie fallback | 1.05x | exact first update | tiled 82 ms + fallback 42 ms versus original 68 ms |
+| Channels-last CNN | 1.02x | failed | different cuDNN algorithm; negligible gain |
+| External FlashAttention-2 | 0.95x | failed | slower than PyTorch SDPA at these short sequences |
+
+The real warmed operator profile on the same batch measured about 465 ms of
+GPU kernel time. The largest self-device totals were:
+
+| Operator family | CUDA time |
+|---|---:|
+| KNN query kernel, 94 calls | 67.9 ms |
+| Flash-attention backward, 216 calls | 61.9 ms |
+| Tensor copies, 12,125 calls | 54.0 ms |
+| `mm` + `addmm` | 46.5 ms |
+| reductions | 31.7 ms |
+| convolution backward | 23.5 ms |
+| residual/in-place adds | 23.4 ms |
+| LayerNorm forward + backward | 25.8 ms |
+| Flash-attention forward | 14.9 ms |
+
+The KNN result initially looked like an easy win because the old kernel assigns
+one thread per query and scans all source points serially. A CUB tiled kernel
+was exact on random data but changed real predictions because invalid-depth
+point clouds contain many exactly tied positions and the old heap's tie order
+is model-visible. Detecting ties and rerunning only those rows restored exact
+behavior, but ties are so common that the hybrid became slower than the old
+kernel.
+
+The physical batch scheduler now includes the first query frame in its shape
+key. Previously it could label two scenes as B2 even though MVTracker
+immediately split differing query schedules into two recursive B1 forwards.
+The change preserves samples and loss semantics while preventing fake physical
+batches.
+
+The remaining credible route to a large gain is a dynamic regional compiler or
+custom UpdateFormer backend that fuses copies, reductions, residual epilogues
+and LayerNorm while leaving GEMM/attention ordering controlled. Default-mode
+dynamic Inductor, alone and wrapped by the static whole-update graph, is the
+next active candidate. CUDA graphs alone, generic fused libraries, memory
+format changes and a replacement attention implementation are not sufficient.
