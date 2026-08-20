@@ -426,6 +426,8 @@ def init_pointcloud_from_rgbd(
         level=0,
         depth_interp_mode='nearest',
         return_validity_mask=False,
+        intrs_inv=None,
+        extrs_inv=None,
 ):
     B, V, S, C, H, W = fmaps.shape
     assert fmaps.shape == (B, V, S, C, H, W)
@@ -451,10 +453,12 @@ def init_pointcloud_from_rgbd(
     stride = stride * 2 ** level
 
     # Invert intrinsics and extrinsics
-    intrs_inv = torch.inverse(intrs.float()).type(intrs.dtype)
-    extrs_square = torch.eye(4).to(extrs.device)[None].repeat(B, V, S, 1, 1)
-    extrs_square[:, :, :, :3, :] = extrs
-    extrs_inv = torch.inverse(extrs_square.float()).type(extrs.dtype)
+    if intrs_inv is None:
+        intrs_inv = torch.inverse(intrs.float()).type(intrs.dtype)
+    if extrs_inv is None:
+        extrs_square = torch.eye(4).to(extrs.device)[None].repeat(B, V, S, 1, 1)
+        extrs_square[:, :, :, :3, :] = extrs
+        extrs_inv = torch.inverse(extrs_square.float()).type(extrs.dtype)
     assert intrs_inv.shape == (B, V, S, 3, 3)
     assert extrs_inv.shape == (B, V, S, 4, 4)
 

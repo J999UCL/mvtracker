@@ -15,6 +15,7 @@ import torch
 from mvtracker.cli.profile_training import _compose_config
 from mvtracker.cli.train import (
     build_model_execution_schedule,
+    build_camera_inverses,
     dataclass_to_cuda_,
     fetch_optimizer,
     forward_batch_multi_view,
@@ -68,6 +69,7 @@ def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
     }
     batch = copy.deepcopy(batch)
     dataclass_to_cuda_(batch)
+    camera_inverses = build_camera_inverses(batch)
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -215,6 +217,7 @@ def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
                 capture_training_trace=capture_trace,
                 execution_schedule=execution_schedule,
                 graph_capture=True,
+                camera_inverses=camera_inverses,
             )
             loss = output["flow"]["loss"] + output["visibility"]["loss"]
         loss.backward()

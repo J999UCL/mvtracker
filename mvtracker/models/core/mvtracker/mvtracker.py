@@ -157,6 +157,20 @@ class MVTracker(nn.Module):
                 # The whether-the-point-is-tracked mask
                 + 1
         )
+        time_embed_dim = self.updateformer_input_dim
+        if time_embed_dim % 2 != 0:
+            time_embed_dim += 1
+        time_grid = (
+            torch.linspace(0, self.S - 1, self.S).reshape(1, self.S, 1) / self.S
+        )
+        time_embedding = torch.from_numpy(
+            get_1d_sincos_pos_embed_from_grid(time_embed_dim, time_grid[0])
+        )[None].float()[..., :self.updateformer_input_dim]
+        self.register_buffer(
+            "_updateformer_time_embedding",
+            time_embedding,
+            persistent=False,
+        )
 
         # Feature encoder
         self.fnet = BasicEncoder(
@@ -272,6 +286,8 @@ class MVTracker(nn.Module):
             vis_init,
             track_mask,
             track_padding_mask=None,
+            intrs_inv=None,
+            extrs_inv=None,
             iters=4,
             feat_init=None,
             save_debug_logs=False,
@@ -324,6 +340,8 @@ class MVTracker(nn.Module):
                     stride=self.stride,
                     level=lvl,
                     return_validity_mask=self.corr_filter_invalid_depth or save_rerun_logs,
+                    intrs_inv=intrs_inv,
+                    extrs_inv=extrs_inv,
                 )
             if self.corr_filter_invalid_depth or save_rerun_logs:
                 pc_xyz, pc_fvec, pc_valid = pc
@@ -351,18 +369,7 @@ class MVTracker(nn.Module):
             pos_embed = pos_embed[:, :self.updateformer_input_dim, :]
         pos_embed = rearrange(pos_embed, "b e n -> (b n) e").unsqueeze(1)
 
-        times_ = torch.linspace(0, S - 1, S).reshape(1, S, 1) / S
-        embed_dim = self.updateformer_input_dim
-        if embed_dim % 2 != 0:
-            embed_dim += 2 - (embed_dim % 2)
-        times_embed = (
-            torch.from_numpy(get_1d_sincos_pos_embed_from_grid(embed_dim, times_[0]))[None]
-            .repeat(B, 1, 1)
-            .float()
-            .to(device)
-        )
-        if embed_dim > self.updateformer_input_dim:
-            times_embed = times_embed[:, :, :self.updateformer_input_dim]
+        times_embed = self._updateformer_time_embedding.expand(B, -1, -1)
         times_embed = (
             times_embed[:, None]
             .expand(B, N, S, self.updateformer_input_dim)
@@ -453,6 +460,7 @@ class MVTracker(nn.Module):
             save_rerun_logs: bool = False,
             save_rerun_logs_output_rrd_path: Optional[str] = None,
             execution_schedule=None,
+            camera_inverses=None,
             **kwargs,
     ):
         device = extrs.device
@@ -525,6 +533,10 @@ class MVTracker(nn.Module):
                         name: [values[index] for index in scene_indices]
                         for name, values in execution_schedule.items()
                     } if execution_schedule is not None else None,
+                    camera_inverses=(
+                        camera_inverses[0].index_select(0, index),
+                        camera_inverses[1].index_select(0, index),
+                    ) if camera_inverses is not None else None,
                 )
                 for local_index, scene_index in enumerate(scene_indices):
                     grouped_results[scene_index] = {
@@ -699,6 +711,16 @@ class MVTracker(nn.Module):
 
             intrs_seq = intrs[:, :, w_idx_start:w_idx_start + self.S]
             extrs_seq = extrs[:, :, w_idx_start:w_idx_start + self.S]
+            intrs_inv_seq = (
+                camera_inverses[0][
+                    :, :, w_idx_start:w_idx_start + self.S
+                ] if camera_inverses is not None else None
+            )
+            extrs_inv_seq = (
+                camera_inverses[1][
+                    :, :, w_idx_start:w_idx_start + self.S
+                ] if camera_inverses is not None else None
+            )
 
             # Compute fmaps and interpolated depth on a rolling basis
             # to reduce peak GPU memory consumption, but don't recompute
@@ -768,6 +790,15 @@ class MVTracker(nn.Module):
                 depths_seq = torch.cat([depths_seq, depths_seq[:, :, -1:].repeat(1, 1, diff, 1, 1, 1)], 2)
                 intrs_seq = torch.cat([intrs_seq, intrs_seq[:, :, -1:].repeat(1, 1, diff, 1, 1)], 2)
                 extrs_seq = torch.cat([extrs_seq, extrs_seq[:, :, -1:].repeat(1, 1, diff, 1, 1)], 2)
+                if intrs_inv_seq is not None:
+                    intrs_inv_seq = torch.cat([
+                        intrs_inv_seq,
+                        intrs_inv_seq[:, :, -1:].repeat(1, 1, diff, 1, 1),
+                    ], 2)
+                    extrs_inv_seq = torch.cat([
+                        extrs_inv_seq,
+                        extrs_inv_seq[:, :, -1:].repeat(1, 1, diff, 1, 1),
+                    ], 2)
 
             # Compute query features independently per scene and query frame.
             if any(end > start for start, end in zip(p_idx_starts, p_idx_ends)):
@@ -778,6 +809,14 @@ class MVTracker(nn.Module):
                         intrs=intrs[:, :, new_seq_t0:new_seq_t1],
                         extrs=extrs[:, :, new_seq_t0:new_seq_t1],
                         stride=self.stride,
+                        intrs_inv=(
+                            camera_inverses[0][:, :, new_seq_t0:new_seq_t1]
+                            if camera_inverses is not None else None
+                        ),
+                        extrs_inv=(
+                            camera_inverses[1][:, :, new_seq_t0:new_seq_t1]
+                            if camera_inverses is not None else None
+                        ),
                     )
 
                 new_num_frames = _fmaps_seq_new.shape[2]
@@ -865,6 +904,8 @@ class MVTracker(nn.Module):
                 vis_init=vis_init_[:, :, :p_idx_end],
                 track_mask=track_mask_current,
                 track_padding_mask=active_padding_mask,
+                intrs_inv=intrs_inv_seq,
+                extrs_inv=extrs_inv_seq,
                 iters=iters,
                 save_debug_logs=save_debug_logs,
                 debug_logs_path=debug_logs_path,

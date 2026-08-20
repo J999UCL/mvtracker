@@ -1128,6 +1128,17 @@ def build_model_execution_schedule(batch):
     }
 
 
+def build_camera_inverses(batch):
+    intrs_inv = torch.inverse(batch.intrs.float()).type(batch.intrs.dtype)
+    batch_size, views, frames = batch.extrs.shape[:3]
+    extrs_square = torch.eye(
+        4, device=batch.extrs.device, dtype=batch.extrs.dtype
+    )[None, None, None].repeat(batch_size, views, frames, 1, 1)
+    extrs_square[:, :, :, :3, :] = batch.extrs
+    extrs_inv = torch.inverse(extrs_square.float()).type(batch.extrs.dtype)
+    return intrs_inv, extrs_inv
+
+
 def forward_batch_multi_view(
         batch,
         model,
@@ -1141,6 +1152,7 @@ def forward_batch_multi_view(
         capture_training_trace=False,
         execution_schedule=None,
         graph_capture=False,
+        camera_inverses=None,
 ):
     # Per view data
     rgbs = batch.video
@@ -1198,6 +1210,7 @@ def forward_batch_multi_view(
         debug_logs_path=debug_logs_path,
         track_padding_mask=track_padding_mask,
         execution_schedule=execution_schedule,
+        camera_inverses=camera_inverses,
     )
     pred_trajectories = results["traj_e"]
     pred_visibilities = results["vis_e"]
