@@ -285,5 +285,5 @@ run Volume.
 
 ```bash
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run tools/modal_updateformer_autoresearch.py::fused-candidate-gate
+  modal run tools/modal_updateformer_autoresearch.py::fused_candidate_gate
 ```

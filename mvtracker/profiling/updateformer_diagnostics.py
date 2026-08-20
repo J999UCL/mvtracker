@@ -8,6 +8,7 @@ import statistics
 import time
 
 import torch
+import torch.nn.functional as F
 
 from mvtracker.profiling.updateformer_contract import (
     WORKLOADS,
@@ -72,6 +73,107 @@ def compare_candidate(root: Path) -> dict[str, object]:
         workload.name: _run_updateformer_case(workload, state, device)
         for workload in WORKLOADS
     }
+
+
+def diagnose_fused_components(root: Path) -> dict[str, object]:
+    """Separate numerical drift from track padding and fused self-QKV."""
+    from mvtracker.models.core.cotracker2.blocks import (
+        FlashAttention,
+        FusedFlashAttention,
+        updateformer_track_capacity,
+    )
+
+    root = Path(root)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    state = torch.load(
+        root / manifest["baseline_state"], map_location="cpu", weights_only=True
+    )
+    device = torch.device("cuda:0")
+    workload = next(item for item in WORKLOADS if item.name == "paired_ragged_900")
+    inputs, target, weights, mask = _workload_tensors(workload, device)
+    base_inputs = inputs.detach()
+
+    def run(*, padded, fused_qkv):
+        model = _build_model(device)
+        model.load_state_dict(state, strict=True)
+        model.checkpoint_updateformer = False
+        if fused_qkv:
+            for module in model.modules():
+                if type(module) is FlashAttention:
+                    module.__class__ = FusedFlashAttention
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=5e-5, weight_decay=1e-5
+        )
+        value = base_inputs.clone().requires_grad_(True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+        ):
+            if padded:
+                capacity = updateformer_track_capacity(value.shape[1])
+                padding = capacity - value.shape[1]
+                padded_value = F.pad(value, (0, 0, 0, 0, 0, padding))
+                padded_mask = F.pad(mask, (0, padding), value=False)
+                output = model._forward_impl(padded_value, padded_mask)[
+                    :, :value.shape[1]
+                ]
+            else:
+                output = model._forward_impl(value, mask)
+            valid = mask[:, :, None, None]
+            loss = ((((output.float() - target) * weights).square()) * valid).sum()
+            loss = loss / (valid.sum() * output.shape[2] * output.shape[3])
+        loss.backward()
+        result = {
+            "output": output.detach().cpu(),
+            "loss": loss.detach().cpu(),
+            "input_gradient": value.grad.detach().cpu(),
+            "parameter_gradients": {
+                name: parameter.grad.detach().cpu()
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            },
+        }
+        optimizer.step()
+        result["updated_parameters"] = {
+            name: parameter.detach().cpu()
+            for name, parameter in model.named_parameters()
+        }
+        return result
+
+    variants = {
+        "padding": run(padded=True, fused_qkv=False),
+        "qkv": run(padded=False, fused_qkv=True),
+        "padding_qkv": run(padded=True, fused_qkv=True),
+    }
+    eager = run(padded=False, fused_qkv=False)
+    summaries = {}
+    for name, value in variants.items():
+        records = [
+            _record(path, expected, actual)
+            for path, expected, actual in _pairs(eager, value)
+            if expected.is_floating_point()
+        ]
+        changed = [record for record in records if record["changed_elements"]]
+        summaries[name] = {
+            "changed_tensors": len(changed),
+            "maximum_absolute_error": max(
+                (record["maximum_absolute_error"] for record in changed),
+                default=0.0,
+            ),
+            "mean_absolute_error": sum(
+                record["mean_absolute_error"] * record["elements"]
+                for record in changed
+            ) / max(sum(record["elements"] for record in changed), 1),
+            "elements_over_one_ulp": sum(
+                record.get("elements_over_one_ulp", 0) for record in changed
+            ),
+            "largest": sorted(
+                changed,
+                key=lambda record: record["maximum_absolute_error"],
+                reverse=True,
+            )[:10],
+        }
+    return {"workload": workload.name, "variants": summaries}
     actual_losses = _run_loss_contract(device)
     records = [
         _record(path, expected, actual)

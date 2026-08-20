@@ -75,6 +75,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
         "cuda-graph-study",
         "partial-graph-study",
         "forward-graph-study",
+        "component-diagnose",
     }:
         raise ValueError(f"unsupported action: {action}")
     torch.set_float32_matmul_precision("high")
@@ -182,7 +183,7 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
             summary[f"partial_graph/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
-    else:
+    elif action == "forward-graph-study":
         from mvtracker.profiling.updateformer_diagnostics import (
             benchmark_forward_graph_checkpoint,
         )
@@ -197,6 +198,21 @@ def run_contract(action: str, warmup: int = 3, measured: int = 10) -> dict:
             summary[f"forward_graph/{name}/peak_allocated_gib"] = (
                 measurements["peak_allocated_bytes"] / 2**30
             )
+    else:
+        from mvtracker.profiling.updateformer_diagnostics import (
+            diagnose_fused_components,
+        )
+
+        verify_golden(CONTRACT_ROOT)
+        result = diagnose_fused_components(CONTRACT_ROOT)
+        summary = {}
+        for name, measurements in result["variants"].items():
+            summary[f"components/{name}/max_abs"] = measurements[
+                "maximum_absolute_error"
+            ]
+            summary[f"components/{name}/mean_abs"] = measurements[
+                "mean_absolute_error"
+            ]
     output_root = RUN_ROOT / "performance-results" / _source_commit()
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / f"{action}.json"
@@ -387,6 +403,11 @@ def partial_graph_study() -> None:
 @app.local_entrypoint(name="forward-graph-study")
 def forward_graph_study() -> None:
     _launch("forward-graph-study")
+
+
+@app.local_entrypoint(name="component-diagnose")
+def component_diagnose() -> None:
+    _launch("component-diagnose")
 
 
 @app.local_entrypoint(name="single-gpu-smoke")
