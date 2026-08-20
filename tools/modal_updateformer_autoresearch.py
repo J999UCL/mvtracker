@@ -51,6 +51,8 @@ image = _source_image(
         "python -m pip install --no-build-isolation "
         "'transformer-engine[pytorch]==2.6.0.post1'",
         env={
+            "CC": "gcc",
+            "CXX": "g++",
             "CUDA_HOME": "/opt/nvte-cuda",
             "NVTE_FRAMEWORK": "pytorch",
             "NVTE_CUDA_ARCHS": "90",
