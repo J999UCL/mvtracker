@@ -305,6 +305,9 @@ def run_single_gpu_smoke(run_name: str) -> dict:
     include_source=False,
 )
 def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
+    inductor_cache = RUN_ROOT / "torchinductor-cache" / "torch2.7.1-cu128-h100"
+    inductor_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor_cache)
     import torch
     import wandb
 
@@ -382,6 +385,9 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
     include_source=False,
 )
 def run_candidate_sweep() -> dict:
+    inductor_cache = RUN_ROOT / "torchinductor-cache" / "torch2.7.1-cu128-h100"
+    inductor_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(inductor_cache)
     import torch
     import wandb
 
@@ -391,6 +397,8 @@ def run_candidate_sweep() -> dict:
     candidates = (
         "bucketed",
         "bucketed_reduce",
+        "graphed",
+        "graphed_bucketed",
         "whole_graph",
         "whole_graph_qkv",
         "whole_graph_compiled",

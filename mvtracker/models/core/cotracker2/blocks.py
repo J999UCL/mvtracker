@@ -479,6 +479,7 @@ class EfficientUpdateFormer(nn.Module):
             "eager",
             "fused",
             "graphed",
+            "graphed_bucketed",
             "bucketed",
             "bucketed_reduce",
         }:
@@ -573,7 +574,7 @@ class EfficientUpdateFormer(nn.Module):
             self.vis_conf_head.apply(trunc_init)
 
     def forward(self, input_tensor, point_mask=None):
-        if self.execution_backend == "graphed":
+        if self.execution_backend in {"graphed", "graphed_bucketed"}:
             return self._forward_graphed(input_tensor, point_mask)
         if self.execution_backend in {"bucketed", "bucketed_reduce"}:
             return self._forward_bucketed(input_tensor, point_mask)
@@ -596,8 +597,12 @@ class EfficientUpdateFormer(nn.Module):
         return output
 
     def begin_graphed_sequence(self, window_counts, iterations, batch_size):
-        if self.execution_backend != "graphed":
+        if self.execution_backend not in {"graphed", "graphed_bucketed"}:
             return
+        if self.execution_backend == "graphed_bucketed":
+            window_counts = tuple(
+                updateformer_track_capacity(value) for value in window_counts
+            )
         signature = (
             int(batch_size),
             tuple(int(value) for value in window_counts),
@@ -613,7 +618,7 @@ class EfficientUpdateFormer(nn.Module):
         self._graphed_cursor = 0
 
     def end_graphed_sequence(self):
-        if self.execution_backend != "graphed":
+        if self.execution_backend not in {"graphed", "graphed_bucketed"}:
             return
         expected = len(self._graphed_window_counts) * self._graphed_iterations
         if self._graphed_cursor != expected:
@@ -685,14 +690,30 @@ class EfficientUpdateFormer(nn.Module):
         expected_tracks = self._graphed_window_counts[
             self._graphed_cursor // self._graphed_iterations
         ]
-        if input_tensor.shape[1] != expected_tracks:
+        actual_tracks = input_tensor.shape[1]
+        if actual_tracks > expected_tracks:
             raise RuntimeError(
-                f"graphed UpdateFormer slot expects {expected_tracks} tracks, "
-                f"got {input_tensor.shape[1]}"
+                f"graphed UpdateFormer slot holds {expected_tracks} tracks, "
+                f"got {actual_tracks}"
+            )
+        if actual_tracks < expected_tracks:
+            if self.execution_backend != "graphed_bucketed":
+                raise RuntimeError(
+                    f"graphed UpdateFormer slot expects {expected_tracks} tracks, "
+                    f"got {actual_tracks}"
+                )
+            input_tensor = F.pad(
+                input_tensor,
+                (0, 0, 0, 0, 0, expected_tracks - actual_tracks),
+            )
+            point_mask = F.pad(
+                point_mask,
+                (0, expected_tracks - actual_tracks),
+                value=False,
             )
         callable_ = self._graphed_callables[self._graphed_cursor]
         self._graphed_cursor += 1
-        return callable_(input_tensor, point_mask)
+        return callable_(input_tensor, point_mask)[:, :actual_tracks]
 
     def _forward_fused(self, input_tensor, point_mask=None):
         batch_size, track_count, _, _ = input_tensor.shape

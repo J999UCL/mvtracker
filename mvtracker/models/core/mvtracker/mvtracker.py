@@ -172,6 +172,7 @@ class MVTracker(nn.Module):
             "qkv",
             "fused",
             "graphed",
+            "graphed_bucketed",
             "compiled",
             "bucketed",
             "bucketed_reduce",
@@ -249,6 +250,8 @@ class MVTracker(nn.Module):
                 if updateformer_backend == "bucketed"
                 else "bucketed_reduce"
                 if updateformer_backend == "bucketed_reduce"
+                else "graphed_bucketed"
+                if updateformer_backend == "graphed_bucketed"
                 else updateformer_backend
                 if updateformer_backend in {"fused", "graphed"}
                 else "eager"
