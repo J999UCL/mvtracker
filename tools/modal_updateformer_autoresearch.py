@@ -393,10 +393,7 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
     include_source=False,
 )
 def run_candidate_sweep() -> dict:
-    import torch
     import wandb
-
-    from mvtracker.profiling.full_updateformer_candidate import compare_real_update
 
     commit = _source_commit()
     candidates = (
@@ -417,21 +414,62 @@ def run_candidate_sweep() -> dict:
             **TAGS,
         },
     )
-    torch.set_float32_matmul_precision("high")
     output_root = RUN_ROOT / "performance-results" / commit / "candidate-sweep"
     output_root.mkdir(parents=True, exist_ok=True)
     results = {}
     for candidate in candidates:
         print(f"AUTORESEARCH candidate={candidate} status=started", flush=True)
         output_path = output_root / f"{candidate}.json"
+        log_path = output_root / f"{candidate}.log"
         try:
-            result = compare_real_update(
-                data_root=DATA_ROOT / "datasets",
-                checkpoint=DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth",
-                batch_cache=CANDIDATE_BATCH,
-                output=output_path,
-                candidate_backend=candidate,
-            )
+            with log_path.open("w", encoding="utf-8") as log:
+                started = time.monotonic()
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "mvtracker.profiling.full_updateformer_candidate",
+                        "--data-root",
+                        str(DATA_ROOT / "datasets"),
+                        "--checkpoint",
+                        str(DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth"),
+                        "--batch-cache",
+                        str(CANDIDATE_BATCH),
+                        "--output",
+                        str(output_path),
+                        "--candidate-backend",
+                        candidate,
+                    ],
+                    cwd="/opt/mvtracker",
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+                while process.poll() is None:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= 8 * 60:
+                        process.kill()
+                        process.wait()
+                        raise TimeoutError(
+                            "candidate exceeded the eight-minute research budget"
+                        )
+                    print(
+                        f"AUTORESEARCH candidate={candidate} status=running "
+                        f"elapsed_seconds={elapsed:.0f}",
+                        flush=True,
+                    )
+                    time.sleep(15)
+            if process.returncode:
+                tail = log_path.read_text(encoding="utf-8")[-4000:]
+                raise RuntimeError(
+                    f"candidate process exited {process.returncode}: {tail}"
+                )
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+        except TimeoutError:
+            result = {
+                "passed": False,
+                "candidate_backend": candidate,
+                "error": "candidate exceeded the eight-minute research budget",
+            }
         except Exception as error:
             result = {
                 "passed": False,

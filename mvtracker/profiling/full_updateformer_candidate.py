@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -666,3 +667,38 @@ def compare_real_update(
             for backend, result in (("eager", eager), ("fused", fused))
         },
     }
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--batch-cache", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--candidate-backend", required=True)
+    arguments = parser.parse_args()
+    torch.set_float32_matmul_precision("high")
+    result = compare_real_update(
+        data_root=arguments.data_root,
+        checkpoint=arguments.checkpoint,
+        batch_cache=arguments.batch_cache,
+        output=arguments.output,
+        candidate_backend=arguments.candidate_backend,
+    )
+    arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    arguments.output.write_text(
+        json.dumps(result, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps({
+        "candidate": arguments.candidate_backend,
+        "passed": result["passed"],
+        "speedup": result["speedup"],
+        "amortized_speedup": result["amortized_speedup"],
+    }), flush=True)
+
+
+if __name__ == "__main__":
+    main()
