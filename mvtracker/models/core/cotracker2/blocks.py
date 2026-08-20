@@ -284,13 +284,10 @@ class _FusedQKVProjection(torch.autograd.Function):
         kv_weight_compute = kv_weight.to(compute_dtype)
         q_bias_compute = q_bias.to(compute_dtype)
         kv_bias_compute = kv_bias.to(compute_dtype)
-        ctx.input_dtype = x.dtype
-        ctx.q_weight_dtype = q_weight.dtype
-        ctx.q_bias_dtype = q_bias.dtype
-        ctx.kv_weight_dtype = kv_weight.dtype
-        ctx.kv_bias_dtype = kv_bias.dtype
+        ctx.autocast = autocast
+        ctx.compute_dtype = compute_dtype
         ctx.q_width = q_weight.shape[0]
-        ctx.save_for_backward(x_compute, q_weight_compute, kv_weight_compute)
+        ctx.save_for_backward(x, q_weight, q_bias, kv_weight, kv_bias)
         return F.linear(
             x_compute,
             torch.cat((q_weight_compute, kv_weight_compute), dim=0),
@@ -299,25 +296,33 @@ class _FusedQKVProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, q_weight, kv_weight = ctx.saved_tensors
+        x, q_weight, q_bias, kv_weight, kv_bias = ctx.saved_tensors
         q_grad, kv_grad = grad_output.split(
             (ctx.q_width, grad_output.shape[-1] - ctx.q_width), dim=-1
         )
-        x_flat = x.reshape(-1, x.shape[-1])
-        q_grad_flat = q_grad.reshape(-1, q_grad.shape[-1])
-        kv_grad_flat = kv_grad.reshape(-1, kv_grad.shape[-1])
-        input_grad = q_grad_flat @ q_weight
-        input_grad.add_(kv_grad_flat @ kv_weight)
-        q_weight_grad = q_grad_flat.transpose(0, 1) @ x_flat
-        kv_weight_grad = kv_grad_flat.transpose(0, 1) @ x_flat
-        q_bias_grad = q_grad_flat.sum(dim=0)
-        kv_bias_grad = kv_grad_flat.sum(dim=0)
-        return (
-            input_grad.reshape_as(x).to(ctx.input_dtype),
-            q_weight_grad.to(ctx.q_weight_dtype),
-            q_bias_grad.to(ctx.q_bias_dtype),
-            kv_weight_grad.to(ctx.kv_weight_dtype),
-            kv_bias_grad.to(ctx.kv_bias_dtype),
+        with torch.enable_grad(), torch.autocast(
+            device_type="cuda",
+            dtype=ctx.compute_dtype,
+            enabled=ctx.autocast,
+            cache_enabled=False,
+        ):
+            recompute_x = x.detach().requires_grad_(True)
+            recompute_q_weight = q_weight.detach().requires_grad_(True)
+            recompute_q_bias = q_bias.detach().requires_grad_(True)
+            recompute_kv_weight = kv_weight.detach().requires_grad_(True)
+            recompute_kv_bias = kv_bias.detach().requires_grad_(True)
+            q = F.linear(recompute_x, recompute_q_weight, recompute_q_bias)
+            kv = F.linear(recompute_x, recompute_kv_weight, recompute_kv_bias)
+        return torch.autograd.grad(
+            (q, kv),
+            (
+                recompute_x,
+                recompute_q_weight,
+                recompute_q_bias,
+                recompute_kv_weight,
+                recompute_kv_bias,
+            ),
+            (q_grad, kv_grad),
         )
 
 
