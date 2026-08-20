@@ -16,13 +16,13 @@ datasets:
     num_workers: 8
     physical_batching:
       enabled: true
-      capacity_name: h100-profile-20260816
+      capacity_name: h200-profile-20260816
       lookahead_steps: 4
       cpu_cache_gib_per_rank: 12
       decode_image_chunk_size: 64
       max_scenes: 2
-      pair_track_capacity_by_views: {1: 1024, 2: 1024, 3: 1280, 4: 1024}
-      singleton_only_views: [5, 6]
+      pair_track_capacity_by_views: {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 819, 6: 512}
+      singleton_only_views: []
       rank_local: true
     dali:
       num_threads: 4
@@ -130,7 +130,7 @@ logging:
   tags:
     - diegesis-mvkubric-50-50
     - gt-depth
-    - ddp2-h100
+    - ddp2-h200
     - full-model
     - continual-training
 

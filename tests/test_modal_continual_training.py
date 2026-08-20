@@ -21,7 +21,7 @@ contract = _load_launch_contract()
 
 class ModalContinualTrainingContractTests(unittest.TestCase):
     def test_exact_gpu_container_and_billing_contract(self):
-        self.assertEqual(contract.GPU_REQUEST, "H100!:2")
+        self.assertEqual(contract.GPU_REQUEST, "H200:2")
         self.assertEqual(contract.GPU_COUNT, 2)
         self.assertEqual(contract.MAX_CONTAINERS, 1)
         self.assertEqual(contract.EPHEMERAL_DISK_MIB, 512 * 1024)

@@ -93,7 +93,7 @@ and experiment billing tags.
 
 ## GT-depth DIEGESIS + 2,000-scene MV-Kubric continual training
 
-The launcher refuses a two-H100 submission unless the selected source SHA is
+The launcher refuses a two-H200 submission unless the selected source SHA is
 the pushed `origin/main` commit and at least two Prism container slots are free.
 It never stops another app. Data setup verifies the existing DIEGESIS and
 2,000-scene MV-Kubric pool, then materializes the pinned, checksummed
@@ -132,7 +132,7 @@ modal run --timestamps tools/modal_continual_training.py::smoke
 modal container list --json
 modal run --timestamps tools/modal_continual_training.py::smoke10
 
-# Two-update, two-H100 memory attribution profile. Update 0 warms the live
+# Two-update, two-H200 memory attribution profile. Update 0 warms the live
 # WIDS/DALI physical-batching path; update 1 records both ranks under
 # memory_profile/ and profiler/ in the run directory.
 modal container list --json
@@ -147,7 +147,7 @@ modal container list --json
 modal run --timestamps tools/modal_continual_training.py::train --confirm-main
 ```
 
-Both GPU modes request exactly `H100!:2`, set `max_containers=1`, and attach
+Both GPU modes request exactly `H200:2`, set `max_containers=1`, and attach
 `owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
 directory. Training entrypoints submit with Modal `Function.spawn()` and print a
@@ -246,9 +246,9 @@ export MVTRACKER_MODAL_COMMIT=<full-pushed-main-sha>
 modal run --timestamps tools/modal_dali_webdataset_cpu_smoke.py --shards 8
 ```
 
-## Production-parity two-H100 smoke
+## Production-parity two-H200 smoke
 
-This launcher requests exactly `H100!:2`, sets Modal retries to zero, and runs
+This launcher requests exactly `H200:2`, sets Modal retries to zero, and runs
 the production mixed DIEGESIS/MV-Kubric loader and training path for exactly ten
 optimizer steps. Smoke runs disable validation and visualization so they test
 only startup, data loading, forward/backward, and optimizer execution. W&B stays

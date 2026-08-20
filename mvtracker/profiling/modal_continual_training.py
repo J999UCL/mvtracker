@@ -1,4 +1,4 @@
-"""Launch invariants for the two-H100 continual-training experiment."""
+"""Launch invariants for the two-H200 continual-training experiment."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 
-GPU_REQUEST = "H100!:2"
+GPU_REQUEST = "H200:2"
 GPU_COUNT = 2
 MAX_CONTAINERS = 1
 EPHEMERAL_DISK_MIB = 512 * 1024

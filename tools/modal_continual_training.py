@@ -1,4 +1,4 @@
-"""Modal setup and two-H100 launcher for the continual-training experiment."""
+"""Modal setup and two-H200 launcher for the continual-training experiment."""
 
 from __future__ import annotations
 
@@ -358,7 +358,7 @@ def _default_run_name(mode: str, commit: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if mode == "production_smoke10":
         return f"gt-replay-prod-smoke10-{commit[:8]}-{timestamp}"
-    return f"gt-depth-replay-{mode}-ddp2-h100-{commit[:8]}-{timestamp}"
+    return f"gt-depth-replay-{mode}-ddp2-h200-{commit[:8]}-{timestamp}"
 
 
 def _prepare_launch(mode: str, run_name: str, confirm_main: bool) -> str:
@@ -368,7 +368,7 @@ def _prepare_launch(mode: str, run_name: str, confirm_main: bool) -> str:
     preflight_active_containers()
     selected = run_name or _default_run_name(mode, commit)
     validate_run_name(selected)
-    app.set_tags({**MODAL_TAGS, "experiment": selected, "gpu": "h100x2"})
+    app.set_tags({**MODAL_TAGS, "experiment": selected, "gpu": "h200x2"})
     return selected
 
 
@@ -447,7 +447,7 @@ def production_smoke10(
 def memory_profile(run_name: str = "", seed: int = 0) -> None:
     selected = _prepare_launch("memory_profile", run_name, confirm_main=False)
     app.set_tags(
-        {**PROFILE_TAGS, "experiment": selected, "gpu": "h100x2"}
+        {**PROFILE_TAGS, "experiment": selected, "gpu": "h200x2"}
     )
     _spawn_training("memory_profile", selected, seed=seed)
 
