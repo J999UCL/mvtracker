@@ -367,6 +367,124 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
     return {"result_path": str(output_path), **result}
 
 
+@app.function(
+    image=image,
+    secrets=[wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H100!",
+    cpu=8,
+    memory=65536,
+    timeout=6 * 60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def run_candidate_sweep() -> dict:
+    import torch
+    import wandb
+
+    from mvtracker.profiling.full_updateformer_candidate import compare_real_update
+
+    commit = _source_commit()
+    candidates = ("whole_graph", "whole_graph_qkv", "whole_graph_fused")
+    run = wandb.init(
+        entity="jeetucl-ucl",
+        project="mvtracker-modal-profiling",
+        group="updateformer-autoresearch-v2",
+        job_type="whole-update-candidate-sweep",
+        tags=["modal", "h100", "single-gpu", "autoresearch", "candidate-sweep"],
+        config={
+            "source_commit": commit,
+            "candidates": candidates,
+            **TAGS,
+        },
+    )
+    torch.set_float32_matmul_precision("high")
+    output_root = RUN_ROOT / "performance-results" / commit / "candidate-sweep"
+    output_root.mkdir(parents=True, exist_ok=True)
+    results = {}
+    for candidate in candidates:
+        print(f"AUTORESEARCH candidate={candidate} status=started", flush=True)
+        output_path = output_root / f"{candidate}.json"
+        try:
+            result = compare_real_update(
+                data_root=DATA_ROOT / "datasets",
+                checkpoint=DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth",
+                batch_cache=CANDIDATE_BATCH,
+                output=output_path,
+                candidate_backend=candidate,
+            )
+        except Exception as error:
+            result = {
+                "passed": False,
+                "candidate_backend": candidate,
+                "error": f"{type(error).__name__}: {error}",
+            }
+        output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        results[candidate] = result
+        summary = {
+            f"{candidate}/passed": int(result["passed"]),
+        }
+        if "speedup" in result:
+            summary.update({
+                f"{candidate}/behavior_passed": int(result["behavior_passed"]),
+                f"{candidate}/speedup": result["speedup"],
+                f"{candidate}/peak_allocated_gib": (
+                    result["memory"]["fused"]["peak_allocated_bytes"] / 2**30
+                ),
+            })
+        if "error" in result:
+            summary[f"{candidate}/error"] = result["error"]
+        run.log(summary)
+        print(
+            f"AUTORESEARCH candidate={candidate} status=finished "
+            f"passed={result['passed']} speedup={result.get('speedup')}",
+            flush=True,
+        )
+    accepted = [
+        result for result in results.values()
+        if result.get("passed")
+    ]
+    winner = (
+        max(accepted, key=lambda result: result["speedup"])["candidate_backend"]
+        if accepted else None
+    )
+    summary_path = output_root / "summary.json"
+    summary = {
+        "source_commit": commit,
+        "winner": winner,
+        "target_2x_reached": any(
+            result.get("target_2x_reached", False) for result in accepted
+        ),
+        "results": {
+            name: {
+                key: value for key, value in result.items()
+                if key in {
+                    "passed",
+                    "strict_passed",
+                    "behavior_passed",
+                    "performance_passed",
+                    "speedup",
+                    "target_2x_reached",
+                    "error",
+                }
+            }
+            for name, result in results.items()
+        },
+    }
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    run_volume.commit()
+    run.summary.update({
+        "winner": winner or "none",
+        "target_2x_reached": int(summary["target_2x_reached"]),
+        "result_path": str(summary_path),
+    })
+    run.finish()
+    return {"result_path": str(summary_path), **summary}
+
+
 def _launch(action: str, warmup: int = 3, measured: int = 10) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
@@ -460,3 +578,16 @@ def fused_candidate_gate(candidate_backend: str = "fused") -> None:
         }
     )
     print(json.dumps(run_fused_candidate_gate.remote(candidate_backend), indent=2))
+
+
+@app.local_entrypoint(name="candidate-sweep")
+def candidate_sweep() -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    app.set_tags({
+        **TAGS,
+        "experiment": f"updateformer-candidate-sweep-{commit[:8]}",
+        "gpu": "h100",
+    })
+    print(json.dumps(run_candidate_sweep.remote(), indent=2))

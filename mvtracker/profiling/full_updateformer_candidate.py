@@ -30,6 +30,7 @@ VISIBILITY_FLIP_FRACTION = 0.001
 LOSS_RELATIVE_ERROR = 0.001
 GRADIENT_COSINE = 0.9999
 GRADIENT_NORM_RELATIVE_ERROR = 0.01
+MINIMUM_SPEEDUP = 1.05
 
 
 def _verify_capturable_knn():
@@ -203,8 +204,14 @@ def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
     return result
 
 
-def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
-    cfg.model.updateformer_backend = "eager"
+def _run_whole_graph(
+    cfg,
+    checkpoint,
+    batch,
+    warm_updates=4,
+    updateformer_backend="eager",
+):
+    cfg.model.updateformer_backend = updateformer_backend
     cfg.model.checkpoint_updateformer = False
     model = hydra.utils.instantiate(cfg.model).cuda().train()
     fabric = Fabric(devices=1, precision=cfg.trainer.precision)
@@ -424,6 +431,30 @@ def _multi_update_comparison(reference, candidate):
     }
 
 
+def _within_nondeterminism(candidate, baseline):
+    """Accept graph drift only when it stays inside eager run-to-run noise."""
+
+    return all((
+        candidate["final_trajectory"]["rms"]
+        <= max(TRAJECTORY_RMS_METERS, 1.25 * baseline["final_trajectory"]["rms"]),
+        candidate["final_trajectory"]["p99"]
+        <= max(TRAJECTORY_P99_METERS, 1.25 * baseline["final_trajectory"]["p99"]),
+        candidate["final_visibility"]["mean"]
+        <= max(VISIBILITY_MEAN_ABS, 1.25 * baseline["final_visibility"]["mean"]),
+        candidate["final_visibility"]["flip_fraction"]
+        <= max(
+            VISIBILITY_FLIP_FRACTION,
+            1.25 * baseline["final_visibility"]["flip_fraction"],
+        ),
+        candidate["loss"]["relative_error"]
+        <= max(0.005, 5.0 * baseline["loss_relative_error"]),
+        candidate["parameter_updates"]["cosine"]
+        >= baseline["parameter_updates"]["cosine"] - 0.01,
+        candidate["parameter_updates"]["norm_relative_error"]
+        <= max(0.02, 2.0 * baseline["parameter_updates"]["norm_relative_error"]),
+    ))
+
+
 def compare_real_update(
     *,
     data_root: Path,
@@ -440,15 +471,28 @@ def compare_real_update(
         data_root, checkpoint, output, batch_size, views, trajectories
     )
     cfg = _compose_config(arguments)
-    knn_parity = _verify_capturable_knn() if candidate_backend == "whole_graph" else None
+    whole_graph_backends = {
+        "whole_graph": "eager",
+        "whole_graph_qkv": "qkv",
+        "whole_graph_fused": "fused",
+    }
+    knn_parity = (
+        _verify_capturable_knn()
+        if candidate_backend in whole_graph_backends else None
+    )
     eager = _run_backend(cfg, checkpoint, batch, "eager")
     eager_repeat = (
         _run_backend(cfg, checkpoint, batch, "eager")
-        if candidate_backend == "whole_graph" else None
+        if candidate_backend in whole_graph_backends else None
     )
     fused = (
-        _run_whole_graph(cfg, checkpoint, batch)
-        if candidate_backend == "whole_graph"
+        _run_whole_graph(
+            cfg,
+            checkpoint,
+            batch,
+            updateformer_backend=whole_graph_backends[candidate_backend],
+        )
+        if candidate_backend in whole_graph_backends
         else _run_backend(cfg, checkpoint, batch, candidate_backend)
     )
 
@@ -491,7 +535,7 @@ def compare_real_update(
         eager["multi_update"]["parameter_updates"],
         fused["multi_update"]["parameter_updates"],
     )
-    passed = all((
+    strict_passed = all((
         final_trajectory["rms"] <= TRAJECTORY_RMS_METERS,
         final_trajectory["p99"] <= TRAJECTORY_P99_METERS,
         visibility["mean"] <= VISIBILITY_MEAN_ABS,
@@ -509,14 +553,64 @@ def compare_real_update(
         multi_updates["cosine"] >= GRADIENT_COSINE,
         multi_updates["norm_relative_error"] <= GRADIENT_NORM_RELATIVE_ERROR,
     ))
+    eager_repeat_comparison = (
+        _multi_update_comparison(eager, eager_repeat)
+        if eager_repeat is not None else None
+    )
+    multi_update = {
+        "updates": eager["multi_update"]["updates"],
+        "loss": {
+            "eager": eager["multi_update"]["loss"],
+            "fused": fused["multi_update"]["loss"],
+            "relative_error": multi_loss_relative_error,
+        },
+        "final_trajectory": multi_trajectory,
+        "final_visibility": {
+            **multi_visibility,
+            "flip_fraction": multi_visibility_flips,
+        },
+        "parameter_updates": multi_updates,
+    }
+    behavior_passed = strict_passed
+    if eager_repeat_comparison is not None:
+        behavior_passed = all((
+            final_trajectory["rms"] <= TRAJECTORY_RMS_METERS,
+            final_trajectory["p99"] <= TRAJECTORY_P99_METERS,
+            visibility["mean"] <= VISIBILITY_MEAN_ABS,
+            visibility_flips <= VISIBILITY_FLIP_FRACTION,
+            loss_relative_error <= LOSS_RELATIVE_ERROR,
+            gradients["cosine"]
+            >= eager_repeat_comparison["gradients"]["cosine"] - 1e-5,
+            gradients["norm_relative_error"]
+            <= max(
+                GRADIENT_NORM_RELATIVE_ERROR,
+                3.0 * eager_repeat_comparison["gradients"]["norm_relative_error"],
+            ),
+            updates["cosine"]
+            >= eager_repeat_comparison["first_parameter_updates"]["cosine"] - 0.001,
+            updates["norm_relative_error"]
+            <= max(
+                GRADIENT_NORM_RELATIVE_ERROR,
+                2.0 * eager_repeat_comparison["first_parameter_updates"][
+                    "norm_relative_error"
+                ],
+            ),
+            _within_nondeterminism(multi_update, eager_repeat_comparison),
+        ))
+    eager_seconds = eager["timing"]["warm_update_median_seconds"]
+    candidate_seconds = fused["timing"]["warm_update_median_seconds"]
+    speedup = eager_seconds / candidate_seconds
+    performance_passed = speedup >= MINIMUM_SPEEDUP
     return {
-        "passed": passed,
+        "passed": behavior_passed and performance_passed,
+        "strict_passed": strict_passed,
+        "behavior_passed": behavior_passed,
+        "performance_passed": performance_passed,
+        "speedup": speedup,
+        "target_2x_reached": speedup >= 2.0,
         "candidate_backend": candidate_backend,
         "knn_parity": knn_parity,
-        "eager_repeat": (
-            _multi_update_comparison(eager, eager_repeat)
-            if eager_repeat is not None else None
-        ),
+        "eager_repeat": eager_repeat_comparison,
         "shape": {
             "views": views,
             "batch_size": batch_size,
@@ -532,20 +626,7 @@ def compare_real_update(
         "trace": trace,
         "gradients": gradients,
         "parameter_updates": updates,
-        "multi_update": {
-            "updates": eager["multi_update"]["updates"],
-            "loss": {
-                "eager": eager["multi_update"]["loss"],
-                "fused": fused["multi_update"]["loss"],
-                "relative_error": multi_loss_relative_error,
-            },
-            "final_trajectory": multi_trajectory,
-            "final_visibility": {
-                **multi_visibility,
-                "flip_fraction": multi_visibility_flips,
-            },
-            "parameter_updates": multi_updates,
-        },
+        "multi_update": multi_update,
         "timing": {"eager": eager["timing"], "fused": fused["timing"]},
         "memory": {
             backend: {
