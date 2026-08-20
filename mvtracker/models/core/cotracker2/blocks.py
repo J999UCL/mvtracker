@@ -475,7 +475,7 @@ class EfficientUpdateFormer(nn.Module):
         self._graphed_iterations = None
         self._graphed_callables = None
         self._graphed_cursor = 0
-        if execution_backend not in {"eager", "fused", "graphed"}:
+        if execution_backend not in {"eager", "fused", "graphed", "bucketed"}:
             raise ValueError(f"unknown UpdateFormer backend: {execution_backend}")
         if self.linear_layer_for_vis_conf:
             self.flow_head = nn.Sequential(
@@ -569,6 +569,8 @@ class EfficientUpdateFormer(nn.Module):
     def forward(self, input_tensor, point_mask=None):
         if self.execution_backend == "graphed":
             return self._forward_graphed(input_tensor, point_mask)
+        if self.execution_backend == "bucketed":
+            return self._forward_bucketed(input_tensor, point_mask)
         if self.execution_backend == "fused":
             return self._forward_fused(input_tensor, point_mask)
         if (
@@ -704,6 +706,29 @@ class EfficientUpdateFormer(nn.Module):
             )
         output = self._compiled_impl(input_tensor, point_mask)
         return output
+
+    def _forward_bucketed(self, input_tensor, point_mask=None):
+        batch_size, track_count, _, _ = input_tensor.shape
+        if point_mask is None:
+            point_mask = torch.ones(
+                batch_size,
+                track_count,
+                dtype=torch.bool,
+                device=input_tensor.device,
+            )
+        capacity = updateformer_track_capacity(track_count)
+        padding = capacity - track_count
+        if padding:
+            input_tensor = F.pad(input_tensor, (0, 0, 0, 0, 0, padding))
+            point_mask = F.pad(point_mask, (0, padding), value=False)
+        if self._compiled_impl is None:
+            self._compiled_impl = torch.compile(
+                self._forward_impl,
+                fullgraph=True,
+                dynamic=False,
+                mode="max-autotune",
+            )
+        return self._compiled_impl(input_tensor, point_mask)[:, :track_count]
 
     def _forward_impl(self, input_tensor, point_mask=None):
         tokens = self.input_transform(input_tensor)

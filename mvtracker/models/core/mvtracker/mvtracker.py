@@ -167,7 +167,14 @@ class MVTracker(nn.Module):
         self.corr_add_neighbor_xyz = corr_add_neighbor_xyz
         self.corr_filter_invalid_depth = corr_filter_invalid_depth
         self.updateformer_backend = updateformer_backend
-        if updateformer_backend not in {"eager", "qkv", "fused", "graphed"}:
+        if updateformer_backend not in {
+            "eager",
+            "qkv",
+            "fused",
+            "graphed",
+            "compiled",
+            "bucketed",
+        }:
             raise ValueError(f"unknown UpdateFormer backend: {updateformer_backend}")
         self.add_space_attn = add_space_attn
         self.updateformer_input_dim = (
@@ -237,6 +244,8 @@ class MVTracker(nn.Module):
             execution_backend=(
                 "fused"
                 if updateformer_backend == "compiled"
+                else "bucketed"
+                if updateformer_backend == "bucketed"
                 else updateformer_backend
                 if updateformer_backend in {"fused", "graphed"}
                 else "eager"

@@ -484,7 +484,7 @@ def compare_real_update(
     eager = _run_backend(cfg, checkpoint, batch, "eager")
     eager_repeat = (
         _run_backend(cfg, checkpoint, batch, "eager")
-        if candidate_backend in whole_graph_backends else None
+        if candidate_backend != "eager" else None
     )
     fused = (
         _run_whole_graph(

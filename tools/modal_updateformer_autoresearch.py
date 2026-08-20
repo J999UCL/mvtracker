@@ -389,6 +389,7 @@ def run_candidate_sweep() -> dict:
 
     commit = _source_commit()
     candidates = (
+        "bucketed",
         "whole_graph",
         "whole_graph_qkv",
         "whole_graph_compiled",
