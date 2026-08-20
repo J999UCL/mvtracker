@@ -24,6 +24,9 @@ SCENES_PER_SHARD = 4
 META_COMPONENT = "meta.npz"
 RGB_COMPONENT = "rgb.npz"
 DEPTH_COMPONENT = "depth.npz"
+RECORD_COMPONENTS = (META_COMPONENT, RGB_COMPONENT, DEPTH_COMPONENT)
+RECORD_LOCATOR = "record-locator.npz"
+RECORD_LOCATOR_FORMAT = "mvtracker-record-locator-v1"
 WIDS_INDEX = "shards.json"
 CATALOG = "catalog.json"
 INVENTORY_SUFFIX = ".inventory.json"
@@ -36,6 +39,135 @@ class SceneShard:
     name: str
     scene_ids: tuple[str, ...]
     index: int = 0
+
+
+@dataclass(frozen=True)
+class DaliIndexComponent:
+    extension: str
+    offset: int
+    size: int
+    name: str
+
+
+@dataclass(frozen=True)
+class DaliIndexRecord:
+    key: str
+    components: tuple[DaliIndexComponent, ...]
+
+
+def _split_webdataset_name(name: str) -> tuple[str, str]:
+    dot = name.find(".", name.rfind("/") + 1)
+    if dot < 0:
+        raise ValueError(f"WebDataset component has no extension: {name}")
+    return name[:dot], name[dot + 1 :]
+
+
+def parse_dali_index(path: Path) -> tuple[DaliIndexRecord, ...]:
+    """Parse one standard NVIDIA DALI WebDataset v1.2 index."""
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    if not lines:
+        raise ValueError(f"{path}: empty DALI index")
+    header = lines[0].split()
+    if len(header) != 2 or header[0] != "v1.2":
+        raise ValueError(f"{path}: expected a DALI v1.2 index")
+    expected = int(header[1])
+    records: list[DaliIndexRecord] = []
+    for line_number, line in enumerate(lines[1:], start=2):
+        fields = line.split()
+        if len(fields) % 4:
+            raise ValueError(f"{path}:{line_number}: malformed component quartet")
+        components: list[DaliIndexComponent] = []
+        record_key: str | None = None
+        for start in range(0, len(fields), 4):
+            extension, offset_text, size_text, name = fields[start : start + 4]
+            key, name_extension = _split_webdataset_name(name)
+            if extension != name_extension:
+                raise ValueError(f"{path}:{line_number}: extension does not match {name}")
+            if record_key is None:
+                record_key = key
+            elif record_key != key:
+                raise ValueError(f"{path}:{line_number}: components have different sample keys")
+            components.append(
+                DaliIndexComponent(
+                    extension=extension,
+                    offset=int(offset_text),
+                    size=int(size_text),
+                    name=name,
+                )
+            )
+        if record_key is None:
+            raise ValueError(f"{path}:{line_number}: empty sample record")
+        records.append(DaliIndexRecord(key=record_key, components=tuple(components)))
+    if len(records) != expected:
+        raise ValueError(f"{path}: header declares {expected} records, found {len(records)}")
+    return tuple(records)
+
+
+def build_record_locator(shards: Sequence[dict[str, object]], locator: Path) -> Path:
+    """Build a compact global-record locator from adjacent DALI indexes."""
+    if not shards:
+        raise ValueError("at least one indexed shard is required")
+    locator = Path(locator).resolve()
+    locator.parent.mkdir(parents=True, exist_ok=True)
+    shard_paths: list[str] = []
+    record_shards: list[int] = []
+    record_keys: list[str] = []
+    offsets: list[list[int]] = []
+    sizes: list[list[int]] = []
+    component_slots = {name: index for index, name in enumerate(RECORD_COMPONENTS)}
+    for shard_index, shard in enumerate(shards):
+        relative_tar = Path(str(shard["tar"]))
+        archive = relative_tar if relative_tar.is_absolute() else locator.parent / relative_tar
+        index_path = archive.with_suffix(".idx")
+        records = parse_dali_index(index_path)
+        if len(records) != int(shard["nsamples"]):
+            raise ValueError(
+                f"{index_path}: expected {shard['nsamples']} records, found {len(records)}"
+            )
+        shard_paths.append(str(relative_tar))
+        for record in records:
+            record_offsets = [-1] * len(RECORD_COMPONENTS)
+            record_sizes = [0] * len(RECORD_COMPONENTS)
+            for component in record.components:
+                try:
+                    slot = component_slots[component.extension]
+                except KeyError as error:
+                    raise ValueError(
+                        f"{index_path}: unsupported component {component.extension!r}"
+                    ) from error
+                record_offsets[slot] = component.offset
+                record_sizes[slot] = component.size
+            record_shards.append(shard_index)
+            record_keys.append(record.key)
+            offsets.append(record_offsets)
+            sizes.append(record_sizes)
+    temporary = locator.with_suffix(locator.suffix + ".partial")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            format=np.asarray(RECORD_LOCATOR_FORMAT),
+            shards=np.asarray(shard_paths),
+            keys=np.asarray(record_keys),
+            record_shards=np.asarray(record_shards, dtype=np.int32),
+            component_names=np.asarray(RECORD_COMPONENTS),
+            offsets=np.asarray(offsets, dtype=np.int64),
+            sizes=np.asarray(sizes, dtype=np.int64),
+        )
+    temporary.replace(locator)
+    return locator
+
+
+def publish_record_locator(split_root: Path) -> Path:
+    """Build and publish direct-record metadata for an existing split."""
+    split_root = Path(split_root).resolve()
+    manifest_path = split_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    locator = build_record_locator(manifest["shards"], split_root / RECORD_LOCATOR)
+    manifest["record_locator"] = locator.name
+    temporary = manifest_path.with_suffix(manifest_path.suffix + ".partial")
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(manifest_path)
+    return locator
 
 
 def discover_scene_ids(scene_root: Path, include: Iterable[str] | None = None) -> tuple[str, ...]:

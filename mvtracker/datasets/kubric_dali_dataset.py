@@ -1,8 +1,8 @@
-"""Indexed MV-Kubric WebDataset access.
+"""Direct indexed MV-Kubric WebDataset access.
 
 MV-Kubric samples are assembled from one scene metadata record and the
-selected scene/view media records.  WIDS provides random access to those
-records; the existing encoded-sample decoder still owns GPU decoding.
+selected scene/view media records.  The loader reads only those byte ranges
+from the mounted TARs; the existing encoded-sample decoder owns GPU decoding.
 """
 
 from __future__ import annotations
@@ -10,10 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -36,7 +37,8 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
 
 WEB_DATASET_FORMAT = "mvtracker-kubric-webdataset"
 SOURCE_VIEW_COUNT = 10
-WIDS_DESCRIPTOR_FIELD = "wids_descriptor"
+RECORD_LOCATOR_FIELD = "record_locator"
+RECORD_LOCATOR_FORMAT = "mvtracker-record-locator-v1"
 
 
 def _bytes_from_value(value: Any) -> bytes:
@@ -56,7 +58,7 @@ def _component(record: Mapping[str, Any], name: str) -> Any:
     try:
         return record[key]
     except KeyError as error:
-        raise KeyError(f"WIDS sample {record.get('__key__')!r} lacks {key}") from error
+        raise KeyError(f"indexed sample {record.get('__key__')!r} lacks {key}") from error
 
 
 def _npz_component(record: Mapping[str, Any], name: str) -> dict[str, np.ndarray]:
@@ -69,9 +71,9 @@ def _packed_frames(record: Mapping[str, Any], name: str) -> tuple[bytes, ...]:
     encoded = np.asarray(packed["bytes"], dtype=np.uint8).reshape(-1)
     offsets = np.asarray(packed["offsets"], dtype=np.int64).reshape(-1)
     if len(offsets) < 2 or offsets[0] != 0:
-        raise ValueError(f"WIDS component {name} has invalid frame offsets")
+        raise ValueError(f"indexed component {name} has invalid frame offsets")
     if offsets[-1] != encoded.size or np.any(offsets[1:] < offsets[:-1]):
-        raise ValueError(f"WIDS component {name} is truncated or unsorted")
+        raise ValueError(f"indexed component {name} is truncated or unsorted")
     return tuple(bytes(encoded[start:end]) for start, end in zip(offsets[:-1], offsets[1:]))
 
 
@@ -97,7 +99,7 @@ class KubricSceneMetadata:
 
 
 class KubricWebDatasetCatalog:
-    """Read the small catalog without opening any WIDS shard."""
+    """Read the small catalog without opening any data shard."""
 
     def __init__(self, manifest_path: str | Path):
         manifest_path = Path(manifest_path)
@@ -108,12 +110,12 @@ class KubricWebDatasetCatalog:
         scenes = manifest.get("scenes")
         if not isinstance(scenes, dict) or not scenes:
             raise ValueError(f"{manifest_path}: manifest has no scenes")
-        descriptor = manifest.get(WIDS_DESCRIPTOR_FIELD)
-        if not isinstance(descriptor, str) or not descriptor:
-            raise ValueError(f"{manifest_path}: missing {WIDS_DESCRIPTOR_FIELD}")
-        self.descriptor_path = (self.root / descriptor).resolve()
-        if not self.descriptor_path.is_file():
-            raise FileNotFoundError(f"WIDS descriptor is missing: {self.descriptor_path}")
+        locator = manifest.get(RECORD_LOCATOR_FIELD)
+        if not isinstance(locator, str) or not locator:
+            raise ValueError(f"{manifest_path}: missing {RECORD_LOCATOR_FIELD}")
+        self.record_locator_path = (self.root / locator).resolve()
+        if not self.record_locator_path.is_file():
+            raise FileNotFoundError(f"record locator is missing: {self.record_locator_path}")
         self.scenes = scenes
         self.source_fingerprint = str(manifest.get("source_fingerprint", "webdataset"))
 
@@ -136,30 +138,96 @@ class KubricWebDatasetCatalog:
         return entry, {}
 
 
-class _WidsRecordStore:
-    """One WIDS reader per materialization thread."""
+@dataclass(frozen=True)
+class IndexedReadStats:
+    requested_bytes: int
+    read_bytes: int
+    seconds: float
+    record_count: int
 
-    def __init__(self, descriptor_path: str | Path, *, reader_factory: Callable[[str], Any] | None = None):
-        self.descriptor_path = str(Path(descriptor_path).resolve())
-        self._reader_factory = reader_factory
-        self._local = threading.local()
 
-    def _reader(self):
-        reader = getattr(self._local, "reader", None)
-        if reader is None:
-            if self._reader_factory is None:
-                try:
-                    import wids
-                except ImportError as error:
-                    raise RuntimeError("MV-Kubric WebDataset loading requires the wids package") from error
-                reader = wids.ShardListDataset(self.descriptor_path, transformations=[])
-            else:
-                reader = self._reader_factory(self.descriptor_path)
-            self._local.reader = reader
-        return reader
+class _IndexedRecordStore:
+    """Read global WebDataset records directly from indexed TAR byte ranges."""
+
+    uses_local_cache = False
+    local_cache_bytes = 0
+
+    def __init__(self, locator_path: str | Path):
+        locator_path = Path(locator_path).resolve()
+        self.root = locator_path.parent
+        with np.load(locator_path, allow_pickle=False) as locator:
+            if str(locator["format"].item()) != RECORD_LOCATOR_FORMAT:
+                raise ValueError(f"{locator_path}: unsupported record locator format")
+            self.shard_paths = tuple(self.root / str(path) for path in locator["shards"])
+            self.keys = tuple(str(key) for key in locator["keys"])
+            self.record_shards = np.asarray(locator["record_shards"], dtype=np.int32).copy()
+            self.component_names = tuple(str(name) for name in locator["component_names"])
+            self.offsets = np.asarray(locator["offsets"], dtype=np.int64).copy()
+            self.sizes = np.asarray(locator["sizes"], dtype=np.int64).copy()
+        self._fds: dict[int, int] = {}
+        self._fd_lock = threading.Lock()
+        self._pid = os.getpid()
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+    def _fd(self, shard: int) -> int:
+        pid = os.getpid()
+        with self._fd_lock:
+            if pid != self._pid:
+                for fd in self._fds.values():
+                    os.close(fd)
+                self._fds.clear()
+                self._pid = pid
+            fd = self._fds.get(shard)
+            if fd is None:
+                fd = os.open(self.shard_paths[shard], os.O_RDONLY)
+                self._fds[shard] = fd
+            return fd
+
+    def read_many(
+        self, indices: tuple[int, ...] | list[int]
+    ) -> tuple[tuple[Mapping[str, Any], ...], IndexedReadStats]:
+        started = time.perf_counter()
+        requested = tuple(int(index) for index in indices)
+        records: list[dict[str, Any]] = []
+        reads: list[tuple[int, int, int, int, str]] = []
+        requested_bytes = 0
+        for position, index in enumerate(requested):
+            if not 0 <= index < len(self):
+                raise IndexError(f"record index {index} is outside [0, {len(self)})")
+            records.append({"__key__": self.keys[index]})
+            shard = int(self.record_shards[index])
+            for component, offset, size in zip(
+                self.component_names, self.offsets[index], self.sizes[index]
+            ):
+                if offset >= 0:
+                    reads.append((shard, int(offset), int(size), position, component))
+                    requested_bytes += int(size)
+        read_bytes = 0
+        for shard, offset, size, position, component in sorted(reads):
+            payload = os.pread(self._fd(shard), size, offset)
+            if len(payload) != size:
+                raise OSError(
+                    f"short indexed read from {self.shard_paths[shard]} at {offset}: "
+                    f"expected {size} bytes, read {len(payload)}"
+                )
+            records[position][f".{component}"] = payload
+            read_bytes += len(payload)
+        return tuple(records), IndexedReadStats(
+            requested_bytes=requested_bytes,
+            read_bytes=read_bytes,
+            seconds=time.perf_counter() - started,
+            record_count=len(requested),
+        )
+
+    def read(self, index: int) -> tuple[Mapping[str, Any], IndexedReadStats]:
+        records, stats = self.read_many((index,))
+        return records[0], stats
 
     def get(self, index: int) -> Mapping[str, Any]:
-        return self._reader()[int(index)]
+        record, _ = self.read(index)
+        return record
 
 
 def _scene_metadata(record: Mapping[str, Any], scene_name: str) -> KubricSceneMetadata:
@@ -197,18 +265,19 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         self.catalog = KubricWebDatasetCatalog(manifest_path)
         self.webdataset_root = str(webdataset_root)
         self.webdataset_split = webdataset_split
-        self._records = _WidsRecordStore(self.catalog.descriptor_path)
+        self._records = _IndexedRecordStore(self.catalog.record_locator_path)
         kwargs["data_root"] = str(Path(webdataset_root))
         kwargs["metadata_catalog"] = self.catalog
         kwargs["metadata_index_root"] = None
         super().__init__(*args, **kwargs)
 
-    def _scene(self, scene_name: str) -> KubricSceneMetadata:
+    def _scene(self, scene_name: str) -> tuple[KubricSceneMetadata, IndexedReadStats]:
         entry, _ = self.catalog.scene(scene_name)
         metadata_index = entry.get("metadata_index")
         if metadata_index is None:
             raise ValueError(f"scene {scene_name!r}: catalog has no metadata_index")
-        return _scene_metadata(self._records.get(int(metadata_index)), scene_name)
+        record, stats = self._records.read(int(metadata_index))
+        return _scene_metadata(record, scene_name), stats
 
     def _media_indices(self, scene_name: str, views: tuple[int, ...]) -> tuple[int, ...]:
         entry, _ = self.catalog.scene(scene_name)
@@ -226,7 +295,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         if not 0 <= scene_index < self.real_len:
             raise IndexError(f"scene index {scene_index} is outside [0, {self.real_len})")
         scene_name = self.seq_names[scene_index]
-        scene = self._scene(scene_name)
+        scene, metadata_read = self._scene(scene_name)
         if scene.frame_count != 24 or self.seq_len != 24:
             raise ValueError("MV-Kubric indexed loader requires exactly 24 frames (0..23)")
         if scene.invalid_frame_indices:
@@ -298,6 +367,11 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             "media_record_indices": list(media_indices),
             "depth_source": "gt",
             "gotit": True,
+            "indexed_metadata_requested_bytes": metadata_read.requested_bytes,
+            "indexed_metadata_read_bytes": metadata_read.read_bytes,
+            "indexed_metadata_read_seconds": metadata_read.seconds,
+            "indexed_local_cache_bytes": self._records.local_cache_bytes,
+            "record_store": "direct-pread",
             "apply_rgb_aug": apply_rgb_aug,
             "apply_depth_aug": apply_depth_aug,
             "motion_track_count": int(len(selected_global)),
@@ -325,8 +399,8 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             raise ValueError("SamplePlan media record count does not match selected views")
         rgb_sources: list[bytes] = []
         depth_sources: list[bytes] = []
-        for record_index in plan.media_record_indices:
-            record = self._records.get(record_index)
+        records, media_read = self._records.read_many(plan.media_record_indices)
+        for record_index, record in zip(plan.media_record_indices, records):
             rgb = _packed_frames(record, "rgb.npz")
             depth = _packed_frames(record, "depth.npz")
             if len(rgb) != 24 or len(depth) != 24:
@@ -337,8 +411,25 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         metadata["worker_prepare_seconds"] = time.perf_counter() - started
         metadata["media_record_count"] = len(plan.media_record_indices)
         metadata["encoded_bytes"] = sum(map(len, rgb_sources)) + sum(map(len, depth_sources))
+        metadata["indexed_media_requested_bytes"] = media_read.requested_bytes
+        metadata["indexed_media_read_bytes"] = media_read.read_bytes
+        metadata["indexed_media_read_seconds"] = media_read.seconds
+        metadata["indexed_requested_bytes"] = (
+            int(metadata["indexed_metadata_requested_bytes"]) + media_read.requested_bytes
+        )
+        metadata["indexed_read_bytes"] = (
+            int(metadata["indexed_metadata_read_bytes"]) + media_read.read_bytes
+        )
+        metadata["indexed_read_seconds"] = (
+            float(metadata["indexed_metadata_read_seconds"]) + media_read.seconds
+        )
         sample = EncodedTapVid3DSample(jpeg_bytes=tuple(rgb_sources), depth=None, theta=torch.from_numpy(plan.theta), intrs=torch.from_numpy(plan.intrinsics), extrs=torch.from_numpy(plan.extrinsics), trajectory=torch.from_numpy(plan.trajectory), trajectory_3d=torch.from_numpy(plan.trajectory_3d), visibility=torch.from_numpy(plan.visibility), valid=torch.ones((24, plan.track_count), dtype=torch.float32), query_points_3d=torch.from_numpy(plan.query_points_3d), seq_name=plan.sequence, metadata=metadata, output_size=plan.output_size, apply_rgb_aug=plan.apply_rgb_aug, rgb_augmentation=plan.rgb_augmentation, apply_depth_aug=plan.apply_depth_aug, augmentation_seed=plan.augmentation_seed, depth_scale=plan.depth_scale, track_upscaling_factor=1.0 / plan.depth_scale, max_depth=plan.max_depth, depth_patch_operations=plan.depth_patch_operations, image_codec=plan.image_codec, depth_bytes=tuple(depth_sources), depth_sensor_widths=plan.depth_sensor_widths, depth_focal_lengths=plan.depth_focal_lengths)
         return sample, True
 
 
-__all__ = ["DaliKubricMultiViewDataset", "KubricSceneMetadata", "KubricWebDatasetCatalog"]
+__all__ = [
+    "DaliKubricMultiViewDataset",
+    "IndexedReadStats",
+    "KubricSceneMetadata",
+    "KubricWebDatasetCatalog",
+]
