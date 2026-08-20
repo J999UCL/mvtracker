@@ -55,6 +55,41 @@ def _verify_capturable_knn():
     return {"indices_exact": True, "distances_exact": True}
 
 
+def _verify_tiled_knn():
+    from mvtracker.models.core.mvtracker.mvtracker import (
+        _knn_pointops,
+        _knn_tiled,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20260820)
+    cases = ((4, 257, 31, 1), (4, 257, 31, 16), (24, 12288, 599, 16))
+    for batch, references, queries, neighbors in cases:
+        reference = torch.randn(
+            batch, references, 3, device="cuda", generator=generator
+        )
+        query = torch.randn(
+            batch, queries, 3, device="cuda", generator=generator
+        )
+        expected_distance, expected_index = _knn_pointops(
+            neighbors, reference, query
+        )
+        actual_distance, actual_index = _knn_tiled(
+            neighbors, reference, query
+        )
+        torch.cuda.synchronize()
+        if not torch.equal(expected_index, actual_index):
+            raise RuntimeError(
+                f"tiled KNN indices differ for B={batch}, N={references}, "
+                f"M={queries}, K={neighbors}"
+            )
+        if not torch.equal(expected_distance, actual_distance):
+            raise RuntimeError(
+                f"tiled KNN distances differ for B={batch}, N={references}, "
+                f"M={queries}, K={neighbors}"
+            )
+    return {"indices_exact": True, "distances_exact": True}
+
+
 def _arguments(data_root, checkpoint, output, batch_size, views, trajectories):
     return SimpleNamespace(
         data_root=Path(data_root),
@@ -81,7 +116,10 @@ def _cpu(value):
 
 
 def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
-    cfg.model.updateformer_backend = backend
+    cfg.model.updateformer_backend = (
+        "eager" if backend == "tiled_knn" else backend
+    )
+    cfg.model.knn_backend = "tiled" if backend == "tiled_knn" else "serial"
     cfg.model.checkpoint_updateformer = False
     model = hydra.utils.instantiate(cfg.model).cuda().train()
     fabric = Fabric(devices=1, precision=cfg.trainer.precision)
@@ -608,10 +646,11 @@ def compare_real_update(
         "whole_graph_compiled": "compiled",
         "whole_graph_fused": "fused",
     }
-    knn_parity = (
-        _verify_capturable_knn()
-        if candidate_backend in whole_graph_backends else None
-    )
+    knn_parity = None
+    if candidate_backend in whole_graph_backends:
+        knn_parity = _verify_capturable_knn()
+    elif candidate_backend == "tiled_knn":
+        knn_parity = _verify_tiled_knn()
     eager = _run_backend(cfg, checkpoint, batch, "eager")
     eager_repeat = (
         _run_backend(cfg, checkpoint, batch, "eager")

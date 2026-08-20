@@ -2,6 +2,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
+#include <cub/block/block_radix_sort.cuh>
+
 namespace {
 
 template <typename T>
@@ -87,6 +89,109 @@ __global__ void knn_query_kernel(
   }
 }
 
+constexpr int kTiledThreads = 128;
+constexpr int kTiledItems = 4;
+constexpr int kTiledPoints = kTiledThreads * kTiledItems;
+constexpr int kTiledMaxNeighbors = 16;
+
+__global__ void tiled_knn_query_kernel(
+    int queries,
+    int neighbors,
+    const float* xyz,
+    const float* query,
+    const int* offsets,
+    const int* query_offsets,
+    int* indices,
+    float* squared_distances) {
+  using Sort = cub::BlockRadixSort<
+      float, kTiledThreads, kTiledItems, int>;
+  __shared__ typename Sort::TempStorage sort_storage;
+  __shared__ float tile_distances[kTiledMaxNeighbors];
+  __shared__ int tile_indices[kTiledMaxNeighbors];
+  __shared__ float best_distances[kTiledMaxNeighbors];
+  __shared__ int best_indices[kTiledMaxNeighbors];
+  __shared__ int begin;
+  __shared__ int end;
+
+  const int query_index = blockIdx.x;
+  if (query_index >= queries) {
+    return;
+  }
+  if (threadIdx.x == 0) {
+    const int batch = batch_index(query_index, query_offsets);
+    begin = batch == 0 ? 0 : offsets[batch - 1];
+    end = offsets[batch];
+    for (int rank = 0; rank < neighbors; ++rank) {
+      best_distances[rank] = 1e10f;
+      best_indices[rank] = -1;
+    }
+  }
+  __syncthreads();
+
+  const float qx = query[query_index * 3];
+  const float qy = query[query_index * 3 + 1];
+  const float qz = query[query_index * 3 + 2];
+  for (int tile = begin; tile < end; tile += kTiledPoints) {
+    float keys[kTiledItems];
+    int values[kTiledItems];
+#pragma unroll
+    for (int item = 0; item < kTiledItems; ++item) {
+      const int index = tile + threadIdx.x * kTiledItems + item;
+      if (index < end) {
+        const float dx = qx - xyz[index * 3];
+        const float dy = qy - xyz[index * 3 + 1];
+        const float dz = qz - xyz[index * 3 + 2];
+        keys[item] = dx * dx + dy * dy + dz * dz;
+        values[item] = index;
+      } else {
+        keys[item] = 1e10f;
+        values[item] = -1;
+      }
+    }
+    Sort(sort_storage).Sort(keys, values);
+#pragma unroll
+    for (int item = 0; item < kTiledItems; ++item) {
+      const int rank = threadIdx.x * kTiledItems + item;
+      if (rank < neighbors) {
+        tile_distances[rank] = keys[item];
+        tile_indices[rank] = values[item];
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float merged_distances[kTiledMaxNeighbors];
+      int merged_indices[kTiledMaxNeighbors];
+      int best_position = 0;
+      int tile_position = 0;
+      for (int rank = 0; rank < neighbors; ++rank) {
+        const bool take_best =
+            tile_position >= neighbors ||
+            (best_position < neighbors &&
+             best_distances[best_position] <= tile_distances[tile_position]);
+        if (take_best) {
+          merged_distances[rank] = best_distances[best_position];
+          merged_indices[rank] = best_indices[best_position];
+          ++best_position;
+        } else {
+          merged_distances[rank] = tile_distances[tile_position];
+          merged_indices[rank] = tile_indices[tile_position];
+          ++tile_position;
+        }
+      }
+      for (int rank = 0; rank < neighbors; ++rank) {
+        best_distances[rank] = merged_distances[rank];
+        best_indices[rank] = merged_indices[rank];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < neighbors) {
+    indices[query_index * neighbors + threadIdx.x] = best_indices[threadIdx.x];
+    squared_distances[query_index * neighbors + threadIdx.x] =
+        best_distances[threadIdx.x];
+  }
+}
+
 }  // namespace
 
 void capturable_knn_query_out_cuda(
@@ -108,6 +213,34 @@ void capturable_knn_query_out_cuda(
   const int blocks = (queries + threads - 1) / threads;
   const auto stream = at::cuda::getCurrentCUDAStream();
   knn_query_kernel<<<blocks, threads, 0, stream>>>(
+      queries,
+      static_cast<int>(neighbors),
+      xyz.data_ptr<float>(),
+      query.data_ptr<float>(),
+      offsets.data_ptr<int>(),
+      query_offsets.data_ptr<int>(),
+      indices.data_ptr<int>(),
+      squared_distances.data_ptr<float>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void tiled_knn_query_out_cuda(
+    int64_t neighbors,
+    const torch::Tensor& xyz,
+    const torch::Tensor& query,
+    const torch::Tensor& offsets,
+    const torch::Tensor& query_offsets,
+    torch::Tensor indices,
+    torch::Tensor squared_distances) {
+  TORCH_CHECK(neighbors > 0 && neighbors <= kTiledMaxNeighbors);
+  TORCH_CHECK(xyz.is_cuda() && query.is_cuda());
+  TORCH_CHECK(xyz.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(query.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(offsets.scalar_type() == torch::kInt32);
+  TORCH_CHECK(query_offsets.scalar_type() == torch::kInt32);
+  const int queries = query.size(0);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  tiled_knn_query_kernel<<<queries, kTiledThreads, 0, stream>>>(
       queries,
       static_cast<int>(neighbors),
       xyz.data_ptr<float>(),

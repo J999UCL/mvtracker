@@ -85,7 +85,12 @@ def _knn_torch(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
     return sorted_dists, indices
 
 
-def _knn_capturable(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
+def _knn_cuda_extension(
+    k: int,
+    xyz_ref: torch.Tensor,
+    xyz_query: torch.Tensor,
+    operation: str,
+):
     if not xyz_ref.is_cuda:
         return _knn_torch(k, xyz_ref, xyz_query)
     from mvtracker.models.core.mvtracker import mvtracker_capturable_knn_cuda
@@ -108,7 +113,7 @@ def _knn_capturable(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
     squared_distances = torch.empty(
         batch * query_count, k, dtype=torch.float32, device=xyz_ref.device
     )
-    mvtracker_capturable_knn_cuda.knn_query_out(
+    getattr(mvtracker_capturable_knn_cuda, operation)(
         k,
         reference,
         query,
@@ -123,6 +128,16 @@ def _knn_capturable(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
         * reference_count
     )
     return squared_distances.sqrt().view(batch, query_count, k).to(xyz_ref.dtype), indices
+
+
+def _knn_capturable(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
+    return _knn_cuda_extension(k, xyz_ref, xyz_query, "knn_query_out")
+
+
+def _knn_tiled(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
+    if k > 16:
+        raise ValueError("tiled KNN supports at most 16 neighbors")
+    return _knn_cuda_extension(k, xyz_ref, xyz_query, "tiled_knn_query_out")
 
 
 knn = _knn_capturable
@@ -148,6 +163,7 @@ class MVTracker(nn.Module):
             corr_add_neighbor_offset=True,
             corr_add_neighbor_xyz=False,
             corr_filter_invalid_depth=False,
+            knn_backend="serial",
             updateformer_backend="eager",
             checkpoint_updateformer=False,
     ):
@@ -166,6 +182,9 @@ class MVTracker(nn.Module):
         self.corr_add_neighbor_offset = corr_add_neighbor_offset
         self.corr_add_neighbor_xyz = corr_add_neighbor_xyz
         self.corr_filter_invalid_depth = corr_filter_invalid_depth
+        if knn_backend not in {"serial", "tiled"}:
+            raise ValueError(f"unknown KNN backend: {knn_backend}")
+        self.knn = _knn_tiled if knn_backend == "tiled" else _knn_capturable
         self.updateformer_backend = updateformer_backend
         if updateformer_backend not in {
             "eager",
@@ -417,6 +436,7 @@ class MVTracker(nn.Module):
                 corr_add_neighbor_offset=self.corr_add_neighbor_offset,
                 corr_add_neighbor_xyz=self.corr_add_neighbor_xyz,
                 rerun_fmap_coloring_fn=rerun_fmap_coloring_fn,
+                knn_fn=self.knn,
             )
 
         # Positional/time embeddings (keep shapes identical to before)
@@ -918,7 +938,7 @@ class MVTracker(nn.Module):
                             batch_idx, t - new_seq_t0
                         ].reshape(-1, self.latent_dim)
                         with torch.profiler.record_function("mvtracker/query_feature_knn"):
-                            _, neighbor_indices = knn(
+                            _, neighbor_indices = self.knn(
                                 1,
                                 rgbd_xyz_current[None],
                                 query_points_world[None],
@@ -1106,6 +1126,7 @@ class PointcloudCorrBlock:
             filter_invalid: bool = False,
             valid: Optional[torch.Tensor] = None,
             rerun_fmap_coloring_fn: Optional[Callable] = None,
+            knn_fn: Callable = _knn_capturable,
     ):
         self.B, self.N, self.C = fvec.shape
         assert xyz.shape == (self.B, self.N, 3)
@@ -1124,6 +1145,7 @@ class PointcloudCorrBlock:
         self.filter_invalid = filter_invalid
         self.valid = valid
         self.rerun_fmap_coloring_fn = rerun_fmap_coloring_fn
+        self.knn = knn_fn
 
     def corr_sample(
             self,
@@ -1141,13 +1163,17 @@ class PointcloudCorrBlock:
 
         # Find neighbors for each of the N target points
         if not self.filter_invalid:
-            neighbor_dists, neighbor_indices = knn(self.k, self.xyz, coords_world_xyz)
+            neighbor_dists, neighbor_indices = self.knn(
+                self.k, self.xyz, coords_world_xyz
+            )
         else:
             neighbor_dists = []
             neighbor_indices = []
             for xyz_i, valid_i, coords_world_xyz_i in zip(self.xyz, self.valid, coords_world_xyz):
                 xyz_i = xyz_i[valid_i]
-                neighbor_dists_i, neighbor_indices_i = knn(self.k, xyz_i[None], coords_world_xyz_i[None])
+                neighbor_dists_i, neighbor_indices_i = self.knn(
+                    self.k, xyz_i[None], coords_world_xyz_i[None]
+                )
                 neighbor_dists.append(neighbor_dists_i)
                 neighbor_indices.append(neighbor_indices_i)
             neighbor_dists = torch.cat(neighbor_dists)

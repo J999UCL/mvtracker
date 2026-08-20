@@ -23,6 +23,7 @@ model:
   corr_add_neighbor_offset: true
   corr_add_neighbor_xyz: false
   corr_filter_invalid_depth: false   # slower, but would make sure points with invalid depth are not considered in corr
+  knn_backend: serial
 
 evaluation:
   interp_shape: [ 384, 512 ]
