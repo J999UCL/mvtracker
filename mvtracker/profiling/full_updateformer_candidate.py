@@ -216,6 +216,7 @@ def compare_real_update(
     checkpoint: Path,
     batch_cache: Path,
     output: Path,
+    candidate_backend: str = "fused",
 ):
     batch = torch.load(batch_cache, map_location="cpu", weights_only=False)
     batch_size = int(batch.video.shape[0])
@@ -226,7 +227,7 @@ def compare_real_update(
     )
     cfg = _compose_config(arguments)
     eager = _run_backend(cfg, checkpoint, batch, "eager")
-    fused = _run_backend(cfg, checkpoint, batch, "fused")
+    fused = _run_backend(cfg, checkpoint, batch, candidate_backend)
 
     final_trajectory = _difference(
         eager["final_trajectories"], fused["final_trajectories"]
@@ -259,6 +260,7 @@ def compare_real_update(
     ))
     return {
         "passed": passed,
+        "candidate_backend": candidate_backend,
         "shape": {
             "views": views,
             "batch_size": batch_size,

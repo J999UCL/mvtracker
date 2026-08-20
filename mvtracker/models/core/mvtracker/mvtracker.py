@@ -134,6 +134,8 @@ class MVTracker(nn.Module):
         self.corr_add_neighbor_xyz = corr_add_neighbor_xyz
         self.corr_filter_invalid_depth = corr_filter_invalid_depth
         self.updateformer_backend = updateformer_backend
+        if updateformer_backend not in {"eager", "qkv", "fused"}:
+            raise ValueError(f"unknown UpdateFormer backend: {updateformer_backend}")
         self.add_space_attn = add_space_attn
         self.updateformer_input_dim = (
             # The positional encoding of the 3D flow from t=i to t=0
@@ -180,12 +182,14 @@ class MVTracker(nn.Module):
             num_virtual_tracks=num_virtual_tracks,
             attn_class=(
                 FusedFlashAttention
-                if updateformer_backend == "fused"
+                if updateformer_backend in {"qkv", "fused"}
                 else FlashAttention if use_flash_attention else Attention
             ),
             linear_layer_for_vis_conf=False,
             checkpoint_updateformer=checkpoint_updateformer,
-            execution_backend=updateformer_backend,
+            execution_backend=(
+                "fused" if updateformer_backend == "fused" else "eager"
+            ),
         )
 
         # Feature update + visibility

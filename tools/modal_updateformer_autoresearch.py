@@ -304,7 +304,7 @@ def run_single_gpu_smoke(run_name: str) -> dict:
     max_containers=1,
     include_source=False,
 )
-def run_fused_candidate_gate() -> dict:
+def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
     import torch
     import wandb
 
@@ -316,18 +316,23 @@ def run_fused_candidate_gate() -> dict:
         project="mvtracker-modal-profiling",
         group="updateformer-fused-backend",
         job_type="full-update-candidate-gate",
-        tags=["modal", "h100", "single-gpu", "updateformer", "fused-backend"],
-        config={"source_commit": commit, **TAGS},
+        tags=["modal", "h100", "single-gpu", "updateformer", candidate_backend],
+        config={
+            "source_commit": commit,
+            "candidate_backend": candidate_backend,
+            **TAGS,
+        },
     )
     torch.set_float32_matmul_precision("high")
     output_root = RUN_ROOT / "performance-results" / commit
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = output_root / "fused-candidate-gate.json"
+    output_path = output_root / f"{candidate_backend}-candidate-gate.json"
     result = compare_real_update(
         data_root=DATA_ROOT / "datasets",
         checkpoint=DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth",
         batch_cache=CANDIDATE_BATCH,
         output=output_path,
+        candidate_backend=candidate_backend,
     )
     output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     run_volume.commit()
@@ -429,15 +434,15 @@ def single_gpu_smoke(run_name: str = "") -> None:
 
 
 @app.local_entrypoint(name="fused-candidate-gate")
-def fused_candidate_gate() -> None:
+def fused_candidate_gate(candidate_backend: str = "fused") -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
     preflight_active_containers(required_free_slots=1)
     app.set_tags(
         {
             **TAGS,
-            "experiment": f"updateformer-fused-gate-{commit[:8]}",
+            "experiment": f"updateformer-{candidate_backend}-gate-{commit[:8]}",
             "gpu": "h100",
         }
     )
-    print(json.dumps(run_fused_candidate_gate.remote(), indent=2))
+    print(json.dumps(run_fused_candidate_gate.remote(candidate_backend), indent=2))
