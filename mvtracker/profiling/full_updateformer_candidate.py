@@ -6,6 +6,7 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 import time
+import statistics
 
 import hydra
 from lightning.fabric import Fabric
@@ -49,7 +50,7 @@ def _cpu(value):
     return value
 
 
-def _run_backend(cfg, checkpoint, batch, backend):
+def _run_backend(cfg, checkpoint, batch, backend, warm_updates=2):
     cfg.model.updateformer_backend = backend
     cfg.model.checkpoint_updateformer = False
     model = hydra.utils.instantiate(cfg.model).cuda().train()
@@ -123,6 +124,38 @@ def _run_backend(cfg, checkpoint, batch, backend):
         "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
         "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
     }
+    warm_timings = []
+    for _ in range(warm_updates):
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, cache_enabled=False
+        ):
+            warm_output = forward_batch_multi_view(
+                batch=batch,
+                model=model,
+                cfg=cfg,
+                step=2,
+                train_iters=cfg.trainer.train_iters,
+                gamma=cfg.trainer.gamma,
+                save_debug_logs=False,
+                debug_logs_path=None,
+                run_expensive_diagnostics=False,
+            )
+            warm_loss = (
+                warm_output["flow"]["loss"]
+                + warm_output["visibility"]["loss"]
+            )
+        warm_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.trainer.grad_clip)
+        optimizer.step()
+        torch.cuda.synchronize()
+        warm_timings.append(time.perf_counter() - started)
+    result["timing"]["warm_update_seconds"] = warm_timings
+    result["timing"]["warm_update_median_seconds"] = statistics.median(
+        warm_timings
+    )
     del model, optimizer, batch, output, loss
     torch.cuda.empty_cache()
     return result

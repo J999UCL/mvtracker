@@ -532,20 +532,15 @@ class EfficientUpdateFormer(nn.Module):
                 dtype=torch.bool,
                 device=input_tensor.device,
             )
-        capacity = updateformer_track_capacity(track_count)
-        padding = capacity - track_count
-        if padding:
-            input_tensor = F.pad(input_tensor, (0, 0, 0, 0, 0, padding))
-            point_mask = F.pad(point_mask, (0, padding), value=False)
         if self._compiled_impl is None:
             self._compiled_impl = torch.compile(
                 self._forward_impl,
                 fullgraph=True,
-                dynamic=False,
-                mode="max-autotune",
+                dynamic=True,
+                mode="max-autotune-no-cudagraphs",
             )
         output = self._compiled_impl(input_tensor, point_mask)
-        return output[:, :track_count]
+        return output
 
     def _forward_impl(self, input_tensor, point_mask=None):
         tokens = self.input_transform(input_tensor)

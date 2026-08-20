@@ -340,6 +340,8 @@ def run_fused_candidate_gate() -> dict:
         "gate/update_cosine": result["parameter_updates"]["cosine"],
         "timing/eager_forward_seconds": result["timing"]["eager"]["forward_seconds"],
         "timing/fused_forward_seconds": result["timing"]["fused"]["forward_seconds"],
+        "timing/eager_warm_update_seconds": result["timing"]["eager"]["warm_update_median_seconds"],
+        "timing/fused_warm_update_seconds": result["timing"]["fused"]["warm_update_median_seconds"],
         "result_path": str(output_path),
     })
     run.finish()
