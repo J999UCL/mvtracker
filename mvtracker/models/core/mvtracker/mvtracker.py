@@ -2,6 +2,7 @@ import logging
 import os
 from bisect import bisect_left
 from collections import defaultdict
+from functools import partial
 from typing import Optional, Callable
 
 import numpy as np
@@ -204,6 +205,7 @@ class MVTracker(nn.Module):
             "compiled",
             "bucketed",
             "bucketed_reduce",
+            "fa2",
         }:
             raise ValueError(f"unknown UpdateFormer backend: {updateformer_backend}")
         self.add_space_attn = add_space_attn
@@ -269,6 +271,8 @@ class MVTracker(nn.Module):
             attn_class=(
                 FusedFlashAttention
                 if updateformer_backend in {"qkv", "fused"}
+                else partial(FlashAttention, backend="fa2")
+                if updateformer_backend == "fa2"
                 else FlashAttention if use_flash_attention else Attention
             ),
             linear_layer_for_vis_conf=False,

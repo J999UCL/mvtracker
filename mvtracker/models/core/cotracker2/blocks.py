@@ -248,12 +248,21 @@ class Attention(nn.Module):
 
 
 class FlashAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, num_heads=8, dim_head=48, qkv_bias=False):
+    def __init__(
+            self,
+            query_dim,
+            context_dim=None,
+            num_heads=8,
+            dim_head=48,
+            qkv_bias=False,
+            backend="sdpa",
+    ):
         super().__init__()
         inner_dim = dim_head * num_heads
         context_dim = default(context_dim, query_dim)
         self.num_heads = num_heads
         self.dim_head = dim_head
+        self.backend = backend
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=qkv_bias)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=qkv_bias)
@@ -263,15 +272,25 @@ class FlashAttention(nn.Module):
         B, N1, _ = x.shape
         h = self.num_heads
 
-        q = self.to_q(x).reshape(B, N1, h, self.dim_head).transpose(1, 2)
+        q = self.to_q(x).reshape(B, N1, h, self.dim_head)
         context = default(context, x)
         k, v = self.to_kv(context).chunk(2, dim=-1)
         N2 = context.shape[1]
-        k = k.reshape(B, N2, h, self.dim_head).transpose(1, 2)
-        v = v.reshape(B, N2, h, self.dim_head).transpose(1, 2)
+        k = k.reshape(B, N2, h, self.dim_head)
+        v = v.reshape(B, N2, h, self.dim_head)
 
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        x = x.transpose(1, 2).reshape(B, N1, -1)
+        if self.backend == "fa2" and attn_mask is None:
+            from flash_attn import flash_attn_func
+
+            x = flash_attn_func(q, k, v)
+        else:
+            x = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                attn_mask=attn_mask,
+            ).transpose(1, 2)
+        x = x.reshape(B, N1, -1)
         return self.to_out(x)
 
 
