@@ -443,6 +443,7 @@ def run_candidate_sweep() -> dict:
 
     commit = _source_commit()
     candidates = (
+        "channels_last_cnn",
         "tiled_knn",
         "bucketed_reduce",
         "graphed",
@@ -550,6 +551,7 @@ def run_candidate_sweep() -> dict:
         if result.get("passed")
     ]
     live_candidates = {
+        "channels_last_cnn",
         "tiled_knn",
         "bucketed",
         "bucketed_reduce",

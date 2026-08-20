@@ -169,6 +169,7 @@ class MVTracker(nn.Module):
             corr_add_neighbor_xyz=False,
             corr_filter_invalid_depth=False,
             knn_backend="serial",
+            cnn_memory_format="contiguous",
             updateformer_backend="eager",
             checkpoint_updateformer=False,
     ):
@@ -190,6 +191,9 @@ class MVTracker(nn.Module):
         if knn_backend not in {"serial", "tiled"}:
             raise ValueError(f"unknown KNN backend: {knn_backend}")
         self.knn = _knn_tiled if knn_backend == "tiled" else _knn_capturable
+        if cnn_memory_format not in {"contiguous", "channels_last"}:
+            raise ValueError(f"unknown CNN memory format: {cnn_memory_format}")
+        self.cnn_memory_format = cnn_memory_format
         self.updateformer_backend = updateformer_backend
         if updateformer_backend not in {
             "eager",
@@ -247,6 +251,8 @@ class MVTracker(nn.Module):
             stride=self.stride,
             Embed3D=False,
         )
+        if self.cnn_memory_format == "channels_last":
+            self.fnet.to(memory_format=torch.channels_last)
 
         # Transformer for iterative updates
         self.updateformer_hidden_size = hidden_size
@@ -293,6 +299,10 @@ class MVTracker(nn.Module):
     def fnet_fwd(self, rgbs_normalized, image_features=None):
         b, v, t, _, h, w = rgbs_normalized.shape
         rgbs_normalized = rgbs_normalized.reshape(-1, 3, h, w)
+        if self.cnn_memory_format == "channels_last":
+            rgbs_normalized = rgbs_normalized.contiguous(
+                memory_format=torch.channels_last
+            )
         with torch.profiler.record_function("mvtracker/cnn_feature_encoder"):
             return self.fnet(rgbs_normalized)
 

@@ -117,9 +117,12 @@ def _cpu(value):
 
 def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
     cfg.model.updateformer_backend = (
-        "eager" if backend == "tiled_knn" else backend
+        "eager" if backend in {"tiled_knn", "channels_last_cnn"} else backend
     )
     cfg.model.knn_backend = "tiled" if backend == "tiled_knn" else "serial"
+    cfg.model.cnn_memory_format = (
+        "channels_last" if backend == "channels_last_cnn" else "contiguous"
+    )
     cfg.model.checkpoint_updateformer = False
     model = hydra.utils.instantiate(cfg.model).cuda().train()
     fabric = Fabric(devices=1, precision=cfg.trainer.precision)
