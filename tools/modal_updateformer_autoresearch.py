@@ -58,7 +58,7 @@ image = _source_image(
             "NVTE_CUDA_ARCHS": "90",
             "MAX_JOBS": "8",
         },
-    ).pip_install("numpy==1.24.3")
+    ).pip_install("numpy==1.24.3", "ml-dtypes==0.5.4")
 )
 
 
