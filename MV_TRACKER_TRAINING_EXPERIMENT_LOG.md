@@ -1255,3 +1255,25 @@ one metadata plus ten paired RGB/depth view-record grouping.
 - Source: `165d4c626f336618f83418d968a21a4a26e09dde`
 - Modal app: `ap-k5yiMFEKFRsDpoorbe4qK3`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/1v5bptbx
+
+## 20 August 2026: native DALI two-H100 training smoke
+
+The mixed DIEGESIS/MV-Kubric production path completed ten optimizer updates
+on two H100s with validation and visualization disabled. MV-Kubric TARs and
+indexes were read directly by `fn.readers.webdataset`; no WIDS, Python
+`pread`, TAR copying, or local staging remained in the live path. Complete
+four-scene groups are reused as `A,B,C,D,A,B,C,D`, with independent live
+view/track/augmentation sampling from each request.
+
+Each rank's DALI stream built over its shard partition in 61.9--65.7 seconds.
+The first optimizer step took 81.09 seconds, including 54.07 seconds of exposed
+first-use loading and decode setup. Steps 2--10 had a 7.26-second median and a
+0.25-second median exposed data wait. By steps 5 and 9, the next 1.4--1.5 GB
+scene groups were already prefetched and reported approximately 1 ms reader
+wait. Step 10 took 4.43 seconds with 0.24 seconds of data wait. Both final
+checkpoints were saved and both H100s were released.
+
+- Source: `5e02fdc298418de28252a05ac40a50b64139d2c0`
+- Run: `gt-replay-prod-smoke10-5e02fdc2-20260820T184325Z`
+- Modal worker: `ap-tUkVEprbY1lYixfRLGOXJh`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/7c737df3cd1f
