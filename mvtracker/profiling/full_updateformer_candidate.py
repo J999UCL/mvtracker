@@ -221,11 +221,7 @@ def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
         return output, loss
 
     optimizer.zero_grad(set_to_none=True)
-    warmup_stream = torch.cuda.Stream()
-    warmup_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup_stream):
-        forward_backward(False)
-    torch.cuda.current_stream().wait_stream(warmup_stream)
+    forward_backward(False)
     torch.cuda.synchronize()
     for parameter in parameters:
         parameter.grad.zero_()
