@@ -69,7 +69,6 @@ def _run_backend(cfg, checkpoint, batch, backend, warm_updates=4):
     }
     batch = copy.deepcopy(batch)
     dataclass_to_cuda_(batch)
-    camera_inverses = build_camera_inverses(batch)
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -198,6 +197,7 @@ def _run_whole_graph(cfg, checkpoint, batch, warm_updates=4):
     batch = copy.deepcopy(batch)
     execution_schedule = build_model_execution_schedule(batch)
     dataclass_to_cuda_(batch)
+    camera_inverses = build_camera_inverses(batch)
     parameters = tuple(model.parameters())
 
     def forward_backward(capture_trace):
