@@ -1107,3 +1107,27 @@ global scheduling still requires two ranks.
 - Partial-graph study: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/ywz00xip
 - Live single-H100 smoke: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/137699893d38
 - Live run directory: `single-gpu-performance/updateformer-single-h100-adebc37d`
+
+## 2026-08-20 — Matched full-model checkpoint throughput result
+
+Whole-UpdateFormer checkpointing was compared against the recorded eager H100
+baseline using the same full MVTracker profile path: deterministic cached
+MV-Kubric tensors, 24 frames, 384×512, 1,024 trajectories per scene, BF16,
+clean-depth checkpoint, forward/loss/backward/clipping/Adam, two warm-ups and
+three measured updates. Dataset loading and decoding were excluded from both.
+
+| Views | Eager best | Eager scenes/s | Checkpoint best | Checkpoint scenes/s | Ratio |
+|---:|---:|---:|---:|---:|---:|
+| 1 | B3 | 2.8742 | B8 | 2.7322 | 0.9506× |
+| 4 | B2 | 1.6556 | B4 | 1.6354 | 0.9878× |
+
+Checkpointing therefore increased safe physical capacity by 2.0--2.7× but did
+not improve full-model throughput: its best result was 4.9% slower for one view
+and 1.2% slower for four views. The recomputation cost almost completely
+amortizes in the four-view case but still slightly exceeds the batching gain.
+The optimization should be treated as a memory/capacity lever, not a standalone
+speed optimization. It remains useful if another optimization exploits the
+headroom or if an otherwise required shape OOMs.
+
+- Checkpointed H100 sweep: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/96kk758r
+- Results: `checkpoint-net-throughput-8fa3abc8/summary.json` on `jeet-mvtracker-runs-v2`
