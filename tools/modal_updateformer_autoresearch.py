@@ -392,7 +392,7 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
     max_containers=1,
     include_source=False,
 )
-def run_real_update_profile() -> dict:
+def run_real_update_profile(knn_backend: str = "serial") -> dict:
     import wandb
 
     from mvtracker.profiling.full_updateformer_candidate import profile_real_update
@@ -404,16 +404,17 @@ def run_real_update_profile() -> dict:
         group="updateformer-autoresearch-v2",
         job_type="real-update-operator-profile",
         tags=["modal", "h100", "single-gpu", "autoresearch", "operator-profile"],
-        config={"source_commit": commit, **TAGS},
+        config={"source_commit": commit, "knn_backend": knn_backend, **TAGS},
     )
     result = profile_real_update(
         data_root=DATA_ROOT / "datasets",
         checkpoint=DATA_ROOT / "checkpoints/mvtracker_200000_june2025.pth",
         batch_cache=CANDIDATE_BATCH,
+        knn_backend=knn_backend,
     )
     output_root = RUN_ROOT / "performance-results" / commit
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = output_root / "real-update-operator-profile.json"
+    output_path = output_root / f"real-update-{knn_backend}-operator-profile.json"
     output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     run_volume.commit()
     for name, row in result["regions"].items():
@@ -708,7 +709,7 @@ def fused_candidate_gate(candidate_backend: str = "fused") -> None:
 
 
 @app.local_entrypoint(name="real-update-profile")
-def real_update_profile() -> None:
+def real_update_profile(knn_backend: str = "serial") -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
     preflight_active_containers(required_free_slots=1)
@@ -717,7 +718,7 @@ def real_update_profile() -> None:
         "experiment": f"real-update-profile-{commit[:8]}",
         "gpu": "h100",
     })
-    print(json.dumps(run_real_update_profile.remote(), indent=2))
+    print(json.dumps(run_real_update_profile.remote(knn_backend), indent=2))
 
 
 @app.local_entrypoint(name="candidate-sweep")

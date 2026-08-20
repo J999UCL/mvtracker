@@ -250,6 +250,7 @@ def profile_real_update(
     data_root: Path,
     checkpoint: Path,
     batch_cache: Path,
+    knn_backend: str = "serial",
 ):
     batch = torch.load(batch_cache, map_location="cpu", weights_only=False)
     arguments = _arguments(
@@ -263,6 +264,7 @@ def profile_real_update(
     cfg = _compose_config(arguments)
     cfg.model.updateformer_backend = "eager"
     cfg.model.checkpoint_updateformer = False
+    cfg.model.knn_backend = knn_backend
     model = hydra.utils.instantiate(cfg.model).cuda().train()
     Fabric(devices=1, precision=cfg.trainer.precision).load_raw(
         str(checkpoint), model
@@ -350,6 +352,7 @@ def profile_real_update(
             "views": int(batch.video.shape[1]),
             "tracks": int(batch.query_points_3d.shape[1]),
         },
+        "knn_backend": knn_backend,
         "regions": regions,
         "top_self_device_time": rows[:100],
         "table": profiler.key_averages().table(
