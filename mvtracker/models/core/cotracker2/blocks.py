@@ -670,11 +670,30 @@ class EfficientUpdateFormer(nn.Module):
             cache_enabled=False,
         ):
             with CUDA_CAPTURE_LOCK:
-                callables = torch.cuda.make_graphed_callables(
-                    tuple(slots),
-                    tuple(sample_args),
-                    num_warmup_iters=3,
-                )
+                default_graph_context = torch.cuda.graph
+
+                def thread_local_graph_context(
+                    cuda_graph,
+                    pool=None,
+                    stream=None,
+                    capture_error_mode="global",
+                ):
+                    return default_graph_context(
+                        cuda_graph,
+                        pool=pool,
+                        stream=stream,
+                        capture_error_mode="thread_local",
+                    )
+
+                torch.cuda.graph = thread_local_graph_context
+                try:
+                    callables = torch.cuda.make_graphed_callables(
+                        tuple(slots),
+                        tuple(sample_args),
+                        num_warmup_iters=3,
+                    )
+                finally:
+                    torch.cuda.graph = default_graph_context
         for parameter in self.parameters():
             parameter.grad = None
         object.__setattr__(self, "_graphed_callables", callables)
