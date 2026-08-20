@@ -642,6 +642,20 @@ def _latest_checkpoint_path(experiment_path):
     return checkpoint_path
 
 
+def _checkpoint_source_cursors(checkpoint_path):
+    if checkpoint_path is None:
+        return {}
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    return {
+        source: int(cursor)
+        for source, cursor in checkpoint.get("source_cursors", {}).items()
+    }
+
+
 def _write_latest_checkpoint_manifest(experiment_path, checkpoint_path, completed_steps):
     manifest_path = Path(experiment_path) / LATEST_CHECKPOINT_MANIFEST
     temporary_path = manifest_path.with_suffix(".tmp")
@@ -786,7 +800,14 @@ def _assert_matching_step_fingerprint(fabric, fingerprint):
         raise RuntimeError("planned physical step differs between DDP ranks")
 
 
-def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=None):
+def _build_training_dataset(
+    dataset_name,
+    dataset_root,
+    cfg,
+    fabric,
+    source_cfg=None,
+    start_request_cursor=0,
+):
     include_scene_ids = (
         source_cfg.get("include_scene_ids") if source_cfg is not None else None
     )
@@ -801,6 +822,7 @@ def _build_training_dataset(dataset_name, dataset_root, cfg, fabric, source_cfg=
             fabric,
             include_scene_ids=include_scene_ids,
             exclude_scene_ids=exclude_scene_ids,
+            dali_stream_start_request_cursor=int(start_request_cursor),
         )
         return dataset
     if dataset_name.startswith("pointodyssey-multiview-"):
@@ -1788,6 +1810,9 @@ def main(cfg: DictConfig):
 
     torch.Tensor.numpy = patched_numpy
 
+    latest_checkpoint = _latest_checkpoint_path(cfg.experiment_path)
+    resume_source_cursors = _checkpoint_source_cursors(latest_checkpoint)
+
     eval_dataloaders = []
     for dataset_name in cfg.datasets.eval.names:
         if _mixed_source_name(cfg) and dataset_name == "tapvid3d-multiview-validation":
@@ -2049,6 +2074,7 @@ def main(cfg: DictConfig):
                 cfg,
                 fabric,
                 source_cfg,
+                start_request_cursor=resume_source_cursors.get(source, 0),
             )
             for source, source_cfg in cfg.datasets.train.sources.items()
         }
@@ -2232,7 +2258,6 @@ def main(cfg: DictConfig):
     if expensive_diagnostics_interval < 1:
         raise ValueError("trainer.expensive_diagnostics_interval must be at least 1")
 
-    latest_checkpoint = _latest_checkpoint_path(cfg.experiment_path)
     if latest_checkpoint is not None:
         state = AttributeDict(
             model=model,

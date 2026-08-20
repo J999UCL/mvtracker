@@ -117,6 +117,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
     _scene_reuse_passes = 2
     _fixed_views = None
     _seed_by_scene = False
+    _stream_start_offset = 0
 
     def __init__(
         self,
@@ -134,6 +135,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         scene_reuse_passes: int = 2,
         fixed_views: tuple[int, ...] | None = None,
         seed_by_scene: bool = False,
+        stream_start_request_cursor: int = 0,
         **kwargs,
     ):
         manifest_path = Path(webdataset_root) / webdataset_split / "manifest.json"
@@ -143,6 +145,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         kwargs["metadata_index_root"] = None
         super().__init__(*args, **kwargs)
         resolved_stream_seed = self.seed if stream_seed is None else stream_seed
+        requests_per_group = int(stream_scenes_per_batch) * int(scene_reuse_passes)
         self.stream = KubricDaliSceneStream(
             manifest_path,
             rank=stream_rank,
@@ -153,10 +156,12 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             shuffle_shards=stream_shuffle_shards,
             include_scene_ids=stream_include_scene_ids,
             allow_empty=stream_allow_empty,
+            start_group_index=int(stream_start_request_cursor) // requests_per_group,
         )
         self._scene_reuse_passes = int(scene_reuse_passes)
         self._fixed_views = fixed_views
         self._seed_by_scene = bool(seed_by_scene)
+        self._stream_start_offset = int(stream_start_request_cursor) % requests_per_group
         self._streamed_scenes: deque[
             tuple[KubricDaliSceneBundle, KubricDaliSceneGroup, int, int]
         ] = deque()
@@ -169,6 +174,9 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
                     (scene, group, position, reuse_pass)
                     for position, scene in enumerate(group.scenes)
                 )
+            while self._stream_start_offset:
+                self._streamed_scenes.popleft()
+                self._stream_start_offset -= 1
         return self._streamed_scenes.popleft()
 
     def plan_sample(self, index) -> SamplePlan | None:

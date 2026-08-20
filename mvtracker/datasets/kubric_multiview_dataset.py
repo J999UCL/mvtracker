@@ -100,6 +100,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             subset: str = "test",
             include_scene_ids=None,
             exclude_scene_ids=(),
+            dali_stream_start_request_cursor: int = 0,
     ):
         """
         Examples of evaluation datasets supported by this factory method:
@@ -318,6 +319,9 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             kubric_kwargs["stream_rank"] = int(fabric.global_rank)
             kubric_kwargs["stream_world_size"] = int(fabric.world_size)
             kubric_kwargs["stream_seed"] = int(training_args.reproducibility.seed)
+            kubric_kwargs["stream_start_request_cursor"] = int(
+                dali_stream_start_request_cursor
+            )
             return DaliKubricMultiViewDataset(**kubric_kwargs)
         if training and mvkubric_storage not in {"native", "dali_stream"}:
             raise ValueError(f"unsupported mvkubric_storage={mvkubric_storage!r}")

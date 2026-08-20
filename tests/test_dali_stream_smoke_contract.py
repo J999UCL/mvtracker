@@ -255,6 +255,76 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         ]
         self.assertEqual(assigned_scene_counts, [8, 8])
 
+    def test_resume_rotates_to_the_next_unconsumed_scene_group(self):
+        reader_calls = []
+
+        def webdataset(**kwargs):
+            reader_calls.append(tuple(kwargs["paths"]))
+            return (object(), object(), object())
+
+        def pipeline_def(function):
+            def build_pipeline(**_kwargs):
+                return types.SimpleNamespace(
+                    outputs=function(), build=lambda: None
+                )
+
+            return build_pipeline
+
+        nvidia = types.ModuleType("nvidia")
+        dali = types.ModuleType("nvidia.dali")
+        dali.pipeline_def = pipeline_def
+        fn = types.ModuleType("nvidia.dali.fn")
+        fn.readers = types.SimpleNamespace(webdataset=webdataset)
+        nvidia.dali = dali
+        dali.fn = fn
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "shards": [
+                            {
+                                "tar": f"shard-{index}.tar",
+                                "nsamples": 44,
+                                "scene_ids": [
+                                    f"scene-{index}-{scene}"
+                                    for scene in range(4)
+                                ],
+                            }
+                            for index in range(3)
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                sys.modules,
+                {
+                    "nvidia": nvidia,
+                    "nvidia.dali": dali,
+                    "nvidia.dali.fn": fn,
+                },
+            ):
+                stream = KubricDaliSceneStream(
+                    manifest_path,
+                    rank=0,
+                    world_size=1,
+                    seed=72,
+                    shuffle_shards=False,
+                    start_group_index=1,
+                )
+
+        self.assertEqual(
+            reader_calls[0],
+            tuple(
+                str(root / f"shard-{index}.tar")
+                for index in (1, 2, 0)
+            ),
+        )
+        self.assertTrue(stream.local_scene_names[0].startswith("scene-1-"))
+
     def test_one_scene_group_is_consumed_in_two_ordered_passes(self):
         scenes = tuple(
             KubricDaliSceneBundle(name, b"meta", (b"rgb",) * 10, (b"depth",) * 10)
@@ -282,6 +352,22 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         for start in range(0, 8, 2):
             pair = [consumed[index][0].scene_name for index in (start, start + 1)]
             self.assertEqual(len(set(pair)), 2)
+
+    def test_resume_offset_continues_inside_the_reused_group(self):
+        scenes = tuple(
+            KubricDaliSceneBundle(name, b"meta", (b"rgb",) * 10, (b"depth",) * 10)
+            for name in ("a", "b", "c", "d")
+        )
+        group = KubricDaliSceneGroup(scenes, 1, 0.1, 1)
+        dataset = DaliKubricMultiViewDataset.__new__(DaliKubricMultiViewDataset)
+        dataset.stream = types.SimpleNamespace(next_scene_group=lambda: group)
+        dataset._streamed_scenes = deque()
+        dataset._scene_reuse_passes = 2
+        dataset._stream_start_offset = 5
+
+        consumed = [dataset._next_scene()[0].scene_name for _ in range(3)]
+
+        self.assertEqual(consumed, ["b", "c", "d"])
 
     def test_reused_scene_uses_each_requests_independent_virtual_index(self):
         bundle = _training_bundle("scene-a")

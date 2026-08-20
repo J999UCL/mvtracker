@@ -67,11 +67,14 @@ class KubricDaliSceneStream:
         shuffle_shards: bool = True,
         include_scene_ids: tuple[str, ...] | None = None,
         allow_empty: bool = False,
+        start_group_index: int = 0,
     ):
         if scenes_per_batch < 1:
             raise ValueError("scenes_per_batch must be positive")
         if not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
+        if start_group_index < 0:
+            raise ValueError("start_group_index must be non-negative")
 
         manifest_path = Path(manifest_path)
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -111,6 +114,21 @@ class KubricDaliSceneStream:
         assigned = tuple(partitions[int(rank)])
         if not assigned and not allow_empty:
             raise ValueError(f"rank {rank} was assigned no WebDataset shards")
+        local_scene_count = int(scene_counts[int(rank)])
+        if assigned and start_group_index:
+            scene_offset = (
+                int(start_group_index) * int(scenes_per_batch)
+            ) % local_scene_count
+            start_shard = 0
+            while scene_offset:
+                shard_scene_count = len(assigned[start_shard][2])
+                if scene_offset < shard_scene_count:
+                    raise ValueError(
+                        "DALI resume position must align to a TAR boundary"
+                    )
+                scene_offset -= shard_scene_count
+                start_shard += 1
+            assigned = assigned[start_shard:] + assigned[:start_shard]
 
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -129,7 +147,7 @@ class KubricDaliSceneStream:
             for _, _, _, selected_names in assigned
             for scene_name in selected_names
         )
-        self.local_scene_count = int(scene_counts[int(rank)])
+        self.local_scene_count = local_scene_count
         self._scene_cursor = 0
         self._batch_index = 0
 

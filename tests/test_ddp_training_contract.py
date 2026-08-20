@@ -157,6 +157,24 @@ class DDPTrainingContractTests(unittest.TestCase):
             )
             self.assertEqual(manifest["completed_steps"], 250)
 
+    def test_checkpoint_source_cursors_are_available_before_loader_creation(self):
+        (read_cursors,) = _load_functions(
+            "_checkpoint_source_cursors",
+            namespace={"torch": torch},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "model.pth"
+            torch.save(
+                {"source_cursors": {"diegesis": 1001, "mvkubric": 1000}},
+                checkpoint,
+            )
+            self.assertEqual(
+                read_cursors(checkpoint),
+                {"diegesis": 1001, "mvkubric": 1000},
+            )
+        source = ast.unparse(_function_node("main"))
+        self.assertIn("start_request_cursor=resume_source_cursors.get(source, 0)", source)
+
     def test_distributed_eval_gathers_metrics_and_writes_once(self):
         source = ast.unparse(_function_node("_run_eval"))
         self.assertEqual(source.count("fabric.barrier()"), 2)
