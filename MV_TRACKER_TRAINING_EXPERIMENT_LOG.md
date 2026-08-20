@@ -960,6 +960,30 @@ steps 250 and 500:
 The step-0 27-scene MV-Kubric aggregate is not used in that trend because the
 later scheduled validations contain only scenes 101--102.
 
+### Step-500 continuation after the mmap fix
+
+The same run resumed from canonical `model_000500.pth` on source
+`34ceaabf956c038df628b5f306e6dc0192dfbe83`. Model, optimizer, OneCycle
+scheduler, completed step, master seed, W&B identity and source schedule state
+were restored; telemetry-only steps 501--526 from the stopped process were not
+loaded. MV-Kubric DALI streaming resumed at saved cursor 1005 (group 125,
+offset 5) rather than replaying from the first shard. Initial step-500
+validation was skipped because its metrics already existed.
+
+Update 501 completed in 41.61 seconds cold: 20.76 seconds data, 15.58 forward
+and 5.11 backward. Rank RSS was approximately 45.3 and 44.3 GiB; system
+anonymous pages were 47.6 GiB and cached/mapped data approximately 24.2 GiB,
+well below the new 128 GiB hard limit.
+
+The legacy step-500 checkpoint stores rank-0 source cursors only. Reconstructing
+the logs showed rank 1's DIEGESIS cursor was 1067 versus rank 0's 1053, so the
+resume rewinds 14 rank-1 DIEGESIS attempts. Both ranks' MV-Kubric cursor was
+1005, so the large replay dataset continues at the correct position.
+
+- Resume app: `ap-e5wPL69oknXFAWO8jaRlVQ`
+- Function call: `fc-01M0GGB3NMHSJJ962CC4RHZVKM`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/8dd8bd8df50a
+
 ## 2026-08-19 — Direct Modal Volume v2 dataset experiment
 
 The abandoned 2,000-scene dataset-image build was stopped and its six
