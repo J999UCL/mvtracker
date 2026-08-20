@@ -41,7 +41,9 @@ TAGS = {
 }
 
 app = modal.App(APP_NAME, tags={**TAGS, "experiment": "unclassified", "gpu": "h100"})
-image = _source_image(_dependency_image())
+image = _source_image(
+    _dependency_image().pip_install("transformer-engine[pytorch]==2.18.0")
+)
 
 
 @app.function(
@@ -397,6 +399,7 @@ def run_candidate_sweep() -> dict:
 
     commit = _source_commit()
     candidates = (
+        "te_mlp",
         "bucketed_reduce",
         "graphed",
         "graphed_bucketed",
@@ -503,6 +506,7 @@ def run_candidate_sweep() -> dict:
         if result.get("passed")
     ]
     live_candidates = {
+        "te_mlp",
         "bucketed",
         "bucketed_reduce",
         "graphed",

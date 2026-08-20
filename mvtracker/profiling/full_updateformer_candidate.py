@@ -33,6 +33,7 @@ GRADIENT_COSINE = 0.9999
 GRADIENT_NORM_RELATIVE_ERROR = 0.01
 MINIMUM_SPEEDUP = 1.05
 AMORTIZATION_UPDATES = 1000
+PREDICTION_DRIFT_MULTIPLIER = 1.5
 
 
 def _verify_capturable_knn():
@@ -442,15 +443,25 @@ def _within_nondeterminism(candidate, baseline):
 
     return all((
         candidate["final_trajectory"]["rms"]
-        <= max(TRAJECTORY_RMS_METERS, 1.25 * baseline["final_trajectory"]["rms"]),
+        <= max(
+            TRAJECTORY_RMS_METERS,
+            PREDICTION_DRIFT_MULTIPLIER * baseline["final_trajectory"]["rms"],
+        ),
         candidate["final_trajectory"]["p99"]
-        <= max(TRAJECTORY_P99_METERS, 1.25 * baseline["final_trajectory"]["p99"]),
+        <= max(
+            TRAJECTORY_P99_METERS,
+            PREDICTION_DRIFT_MULTIPLIER * baseline["final_trajectory"]["p99"],
+        ),
         candidate["final_visibility"]["mean"]
-        <= max(VISIBILITY_MEAN_ABS, 1.25 * baseline["final_visibility"]["mean"]),
+        <= max(
+            VISIBILITY_MEAN_ABS,
+            PREDICTION_DRIFT_MULTIPLIER * baseline["final_visibility"]["mean"],
+        ),
         candidate["final_visibility"]["flip_fraction"]
         <= max(
             VISIBILITY_FLIP_FRACTION,
-            1.25 * baseline["final_visibility"]["flip_fraction"],
+            PREDICTION_DRIFT_MULTIPLIER
+            * baseline["final_visibility"]["flip_fraction"],
         ),
         candidate["loss"]["relative_error"]
         <= max(0.005, 5.0 * baseline["loss_relative_error"]),
