@@ -324,6 +324,38 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
             ),
         )
         self.assertTrue(stream.local_scene_names[0].startswith("scene-1-"))
+        self.assertTrue(stream._resume_wrap_pending)
+        self.assertTrue(stream._original_expected_scenes[0].startswith("scene-0-"))
+        self.assertTrue(stream._expected_scenes[0].startswith("scene-1-"))
+
+    def test_resumed_stream_wraps_to_the_original_epoch_order(self):
+        original_names = ("a", "b", "c", "d")
+        stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
+        stream.rank = 0
+        stream.repeat = True
+        stream.heartbeat_seconds = 60.0
+        stream.records_per_batch = 44
+        stream.scenes_per_batch = 4
+        stream._batch_index = 0
+        stream._scene_cursor = 0
+        stream._resume_wrap_pending = True
+        stream._original_assigned = ("original",)
+        stream._original_expected_scenes = original_names
+        stream._expected_scenes = ("e", "f", "g", "h")
+        stream._pipeline = types.SimpleNamespace(
+            run=lambda: (_ for _ in ()).throw(StopIteration)
+        )
+        replacement = _Pipeline(_scene_outputs(original_names))
+        stream._build_pipeline = lambda assigned: (
+            replacement if assigned == ("original",) else None
+        )
+
+        group = stream.next_scene_group()
+
+        self.assertEqual(
+            tuple(scene.scene_name for scene in group.scenes), original_names
+        )
+        self.assertFalse(stream._resume_wrap_pending)
 
     def test_one_scene_group_is_consumed_in_two_ordered_passes(self):
         scenes = tuple(

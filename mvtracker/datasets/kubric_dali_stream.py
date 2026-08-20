@@ -51,6 +51,7 @@ class KubricDaliSceneStream:
     scenes_per_batch = SCENES_PER_BATCH
     records_per_batch = RECORDS_PER_BATCH
     _selected_scene_ids = None
+    _resume_wrap_pending = False
 
     def __init__(
         self,
@@ -115,6 +116,7 @@ class KubricDaliSceneStream:
         if not assigned and not allow_empty:
             raise ValueError(f"rank {rank} was assigned no WebDataset shards")
         local_scene_count = int(scene_counts[int(rank)])
+        original_assigned = assigned
         if assigned and start_group_index:
             scene_offset = (
                 int(start_group_index) * int(scenes_per_batch)
@@ -138,6 +140,11 @@ class KubricDaliSceneStream:
         self.scenes_per_batch = int(scenes_per_batch)
         self.records_per_batch = self.scenes_per_batch * RECORDS_PER_SCENE
         self.assigned_shards = tuple(str(archive) for archive, _, _, _ in assigned)
+        self._original_expected_scenes = tuple(
+            scene_name
+            for _, _, scene_names, _ in original_assigned
+            for scene_name in scene_names
+        )
         self._expected_scenes = tuple(
             scene_name for _, _, scene_names, _ in assigned for scene_name in scene_names
         )
@@ -150,6 +157,7 @@ class KubricDaliSceneStream:
         self.local_scene_count = local_scene_count
         self._scene_cursor = 0
         self._batch_index = 0
+        self._resume_wrap_pending = assigned != original_assigned
 
         if not assigned:
             self.build_seconds = 0.0
@@ -159,32 +167,37 @@ class KubricDaliSceneStream:
         import nvidia.dali.fn as fn
         from nvidia.dali import pipeline_def
 
-        paths = [str(archive) for archive, _, _, _ in assigned]
-        index_paths = [str(index) for _, index, _, _ in assigned]
+        def build_pipeline(shards):
+            paths = [str(archive) for archive, _, _, _ in shards]
+            index_paths = [str(index) for _, index, _, _ in shards]
 
-        @pipeline_def
-        def scene_pipeline():
-            return tuple(
-                fn.readers.webdataset(
-                    paths=paths,
-                    index_paths=index_paths,
-                    ext=["meta.npz", "rgb.npz", "depth.npz"],
-                    dont_use_mmap=True,
-                    missing_component_behavior="empty",
-                    random_shuffle=False,
-                    prefetch_queue_depth=int(prefetch_queue_depth),
-                    name="MVKubricReader",
+            @pipeline_def
+            def scene_pipeline():
+                return tuple(
+                    fn.readers.webdataset(
+                        paths=paths,
+                        index_paths=index_paths,
+                        ext=["meta.npz", "rgb.npz", "depth.npz"],
+                        dont_use_mmap=True,
+                        missing_component_behavior="empty",
+                        random_shuffle=False,
+                        prefetch_queue_depth=int(prefetch_queue_depth),
+                        name="MVKubricReader",
+                    )
                 )
+            pipeline = scene_pipeline(
+                batch_size=self.records_per_batch,
+                num_threads=int(num_threads),
+                device_id=None,
+                prefetch_queue_depth=int(prefetch_queue_depth),
             )
+            pipeline.build()
+            return pipeline
 
+        self._build_pipeline = build_pipeline
+        self._original_assigned = original_assigned
         build_started = time.perf_counter()
-        self._pipeline = scene_pipeline(
-            batch_size=self.records_per_batch,
-            num_threads=int(num_threads),
-            device_id=None,
-            prefetch_queue_depth=int(prefetch_queue_depth),
-        )
-        self._pipeline.build()
+        self._pipeline = build_pipeline(assigned)
         self.build_seconds = time.perf_counter() - build_started
 
     def _heartbeat(self, stop: threading.Event, batch_index: int, started: float) -> None:
@@ -230,11 +243,23 @@ class KubricDaliSceneStream:
             except StopIteration:
                 if not self.repeat:
                     raise
-                self._pipeline.reset()
-                print(
-                    f"DALI_STREAM event=epoch_reset rank={self.rank}",
-                    flush=True,
-                )
+                if self._resume_wrap_pending:
+                    self._pipeline = self._build_pipeline(
+                        self._original_assigned
+                    )
+                    self._expected_scenes = self._original_expected_scenes
+                    self._scene_cursor = 0
+                    self._resume_wrap_pending = False
+                    print(
+                        f"DALI_STREAM event=resume_wrap rank={self.rank}",
+                        flush=True,
+                    )
+                else:
+                    self._pipeline.reset()
+                    print(
+                        f"DALI_STREAM event=epoch_reset rank={self.rank}",
+                        flush=True,
+                    )
                 outputs = self._pipeline.run()
         finally:
             stop.set()
