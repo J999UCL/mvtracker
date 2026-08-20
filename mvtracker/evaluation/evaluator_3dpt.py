@@ -292,11 +292,7 @@ class Evaluator:
             gt_trajectories_3d_worldspace = datapoint.trajectory_3d
             valid_tracks_per_frame = datapoint.valid
             track_upscaling_factor = datapoint.track_upscaling_factor
-            if torch.is_tensor(track_upscaling_factor):
-                if track_upscaling_factor.numel() != 1:
-                    raise ValueError("evaluation requires one track scale for its single-scene batch")
-                track_upscaling_factor = track_upscaling_factor.item()
-            seq_name = datapoint.seq_name[0]
+            track_padding_mask = datapoint.track_padding_mask
 
             # Novel view data
             novel_rgbs = datapoint.novel_video
@@ -304,6 +300,43 @@ class Evaluator:
             novel_extrs = datapoint.novel_extrs
 
             batch_size, num_views, num_frames, _, height, width = rgbs.shape
+            seq_names = list(datapoint.seq_name)
+            if len(seq_names) != batch_size:
+                raise ValueError(
+                    f"expected {batch_size} sequence names, got {len(seq_names)}"
+                )
+            if torch.is_tensor(track_upscaling_factor):
+                track_upscaling_factors = track_upscaling_factor.reshape(-1)
+                if track_upscaling_factors.numel() != batch_size:
+                    raise ValueError(
+                        f"expected {batch_size} track scales, got "
+                        f"{track_upscaling_factors.numel()}"
+                    )
+            else:
+                track_upscaling_factors = torch.full(
+                    (batch_size,), float(track_upscaling_factor), device=device
+                )
+            if track_padding_mask is None:
+                if gt_trajectories_3d_worldspace is not None:
+                    track_padding_mask = torch.zeros(
+                        batch_size,
+                        gt_trajectories_3d_worldspace.shape[-2],
+                        dtype=torch.bool,
+                        device=device,
+                    )
+            else:
+                track_padding_mask = track_padding_mask.to(device=device, dtype=torch.bool)
+
+            if batch_size > 1 and (
+                self.rerun_viz_indices
+                or self.forward_pass_log_indices
+                or self.mp4_track_viz_indices
+            ):
+                raise ValueError(
+                    "batched evaluation requires rerun, forward-pass, and MP4 "
+                    "logging to be disabled"
+                )
+            seq_name = seq_names[0]
 
             # For generic datasets without labels, we will try sampling queries from depthmap points and around origin
             no_tracking_labels = False
@@ -423,6 +456,9 @@ class Evaluator:
                 d = query_points_3d.device
                 gt_visibilities_per_view = torch.ones((batch_size, num_views, num_frames, num_points), dtype=bool).to(d)
                 valid_tracks_per_frame = torch.ones((batch_size, num_frames, num_points), dtype=bool).to(d)
+                track_padding_mask = torch.zeros(
+                    batch_size, num_points, dtype=torch.bool, device=d
+                )
 
             if no_tracking_labels and not any([should_save_mp4_viz,
                                                should_save_rerun_viz,
@@ -445,6 +481,7 @@ class Evaluator:
             assert query_points_3d.shape == (batch_size, num_points, 4)
             assert gt_trajectories_3d_worldspace.shape == (batch_size, num_frames, num_points, 3)
             assert valid_tracks_per_frame.shape == (batch_size, num_frames, num_points)
+            assert track_padding_mask.shape == (batch_size, num_points)
 
             # Dump the RGBs and depths to disk
             if should_save_rerun_viz:
@@ -499,6 +536,7 @@ class Evaluator:
                 "query_points_3d": query_points_3d,
                 "intrs": intrs,
                 "extrs": extrs,
+                "track_padding_mask": track_padding_mask,
                 "save_debug_logs": should_save_forward_pass_logs,
                 "debug_logs_path": os.path.join(
                     log_dir, f"forward_pass__eval_{dataset_name}_step-{step}_seq-{datapoint_idx}",
@@ -517,6 +555,8 @@ class Evaluator:
 
             start_time = time.time()
             if "shape_of_motion" in log_dir or "dynamic_3dgs" in log_dir:
+                if batch_size != 1:
+                    raise ValueError("cached evaluation output only supports batch_size=1")
                 if "dynamic_3dgs" in log_dir:
                     cached_output_path = os.path.join(log_dir, f"step-0_seq-{seq_name}_tracks.npz")
                 else:
@@ -541,9 +581,12 @@ class Evaluator:
             frames_processed = batch_size * num_frames
             elapsed = end_time - start_time
             fps = frames_processed / elapsed
-            logging.info(f"[Datapoint {datapoint_idx}] FPS: {fps:.1f}")
-            total_fps += fps
-            count += 1
+            scene_result_indices = list(range(count, count + batch_size))
+            logging.info(
+                f"[Batch {datapoint_idx}; scenes {scene_result_indices}] FPS: {fps:.1f}"
+            )
+            total_fps += fps * batch_size
+            count += batch_size
 
             pred_trajectories = results["traj_e"]
             pred_visibilities = results["vis_e"]
@@ -565,47 +608,74 @@ class Evaluator:
 
             # Project the predictions to pixel space for visualization
             pred_trajectories_pixel_xy_camera_z_per_view = torch.stack([
-                torch.cat(world_space_to_pixel_xy_and_camera_z(
-                    world_xyz=pred_trajectories[0],
-                    intrs=intrs[0, view_idx],
-                    extrs=extrs[0, view_idx],
-                ), dim=-1)
-                for view_idx in range(num_views)
+                torch.stack([
+                    torch.cat(world_space_to_pixel_xy_and_camera_z(
+                        world_xyz=pred_trajectories[scene_index],
+                        intrs=intrs[scene_index, view_idx],
+                        extrs=extrs[scene_index, view_idx],
+                    ), dim=-1)
+                    for view_idx in range(num_views)
+                ], dim=0)
+                for scene_index in range(batch_size)
             ], dim=0)
-            for view_idx in range(num_views):
-                pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
-                    pixel_xy=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, :2],
-                    camera_z=pred_trajectories_pixel_xy_camera_z_per_view[view_idx, :, :, 2:],
-                    intrs_inv=intrs_inv[0, view_idx],
-                    extrs_inv=extrs_inv[0, view_idx],
-                )
-                if not torch.allclose(pred_trajectories_reproduced, pred_trajectories, atol=1):
-                    warnings.warn(f"Reprojection of the predicted trajectories failed: "
-                                  f"view_idx={view_idx}, "
-                                  f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - pred_trajectories))}")
-            pred_trajectories_pixel_xy_camera_z_per_view = pred_trajectories_pixel_xy_camera_z_per_view[None]
+            for scene_index in range(batch_size):
+                real_track_mask = ~track_padding_mask[scene_index]
+                for view_idx in range(num_views):
+                    projected = pred_trajectories_pixel_xy_camera_z_per_view[
+                        scene_index, view_idx, :, real_track_mask
+                    ]
+                    pred_trajectories_reproduced = pixel_xy_and_camera_z_to_world_space(
+                        pixel_xy=projected[..., :2],
+                        camera_z=projected[..., 2:],
+                        intrs_inv=intrs_inv[scene_index, view_idx],
+                        extrs_inv=extrs_inv[scene_index, view_idx],
+                    )
+                    expected = pred_trajectories[scene_index, :, real_track_mask]
+                    if not torch.allclose(pred_trajectories_reproduced, expected, atol=1):
+                        warnings.warn(
+                            "Reprojection of the predicted trajectories failed: "
+                            f"scene_index={scene_index}, view_idx={view_idx}, "
+                            f"max_diff={torch.max(torch.abs(pred_trajectories_reproduced - expected))}"
+                        )
 
             # Compute 3D metrics
             gt_visibilities_any_view = gt_visibilities_per_view.any(dim=1)
-            assert gt_visibilities_any_view.any(dim=1).all(), "All points should be visible in at least one view."
+            for scene_index in range(batch_size):
+                real_track_mask = ~track_padding_mask[scene_index]
+                assert gt_visibilities_any_view[
+                    scene_index, :, real_track_mask
+                ].any(dim=0).all(), "All points should be visible in at least one view."
             per_track_results = None
             if evaluation_setting in ["kubric-multiview", "panoptic-multiview", "dexycb-multiview"]:
-                eval_3dpt_results_dict = evaluate_3dpt(
-                    gt_tracks=gt_trajectories_3d_worldspace[0].cpu().numpy(),
-                    gt_visibilities=gt_visibilities_any_view[0].cpu().numpy(),
-                    query_points=query_points_3d[0].cpu().numpy(),
-                    pred_tracks=pred_trajectories[0].cpu().numpy(),
-                    pred_visibilities=pred_visibilities[0].cpu().numpy(),
-                    evaluation_setting=evaluation_setting,
-                    track_upscaling_factor=track_upscaling_factor,
-                    prefix=f"eval_{dataset_name}",
-                    add_per_track_results=should_save_rerun_viz,
-                    verbose=False,
-                )
-                if should_save_rerun_viz:
-                    per_track_results = eval_3dpt_results_dict[f'eval_{dataset_name}/model__per_track_results']
-                    del eval_3dpt_results_dict[f'eval_{dataset_name}/model__per_track_results']
-                metrics[datapoint_idx] = eval_3dpt_results_dict
+                for scene_index, result_index in enumerate(scene_result_indices):
+                    real_track_mask = ~track_padding_mask[scene_index]
+                    eval_3dpt_results_dict = evaluate_3dpt(
+                        gt_tracks=gt_trajectories_3d_worldspace[
+                            scene_index, :, real_track_mask
+                        ].cpu().numpy(),
+                        gt_visibilities=gt_visibilities_any_view[
+                            scene_index, :, real_track_mask
+                        ].cpu().numpy(),
+                        query_points=query_points_3d[
+                            scene_index, real_track_mask
+                        ].cpu().numpy(),
+                        pred_tracks=pred_trajectories[
+                            scene_index, :, real_track_mask
+                        ].cpu().numpy(),
+                        pred_visibilities=pred_visibilities[
+                            scene_index, :, real_track_mask
+                        ].cpu().numpy(),
+                        evaluation_setting=evaluation_setting,
+                        track_upscaling_factor=float(track_upscaling_factors[scene_index]),
+                        prefix=f"eval_{dataset_name}",
+                        add_per_track_results=should_save_rerun_viz,
+                        verbose=False,
+                    )
+                    if should_save_rerun_viz:
+                        per_track_results = eval_3dpt_results_dict.pop(
+                            f'eval_{dataset_name}/model__per_track_results'
+                        )
+                    metrics[result_index] = eval_3dpt_results_dict
 
                 if "2dpt" in dataset_name:
                     assert batch_size == 1
@@ -668,15 +738,16 @@ class Evaluator:
                             if k in _metrics[view_idx]
                         ]).round(2)
 
-                    metrics[datapoint_idx].update(_metrics_avg)
+                    metrics[scene_result_indices[0]].update(_metrics_avg)
                     for view_idx in _metrics:
-                        metrics[datapoint_idx].update({
+                        metrics[scene_result_indices[0]].update({
                             f"{k}__view-{view_idx}": v
                             for k, v in _metrics[view_idx].items()
                         })
 
             # Compute 2D metrics
             elif evaluation_setting in ["tapvid2d"]:
+                assert batch_size == 1
                 assert num_views == 1
                 if pred_trajectories_2d is None:
                     pred_trajectories_2d = pred_trajectories_pixel_xy_camera_z_per_view[:, :, :, :, :2]
@@ -687,7 +758,7 @@ class Evaluator:
                     pred_tracks=pred_trajectories_2d[0, 0].cpu().numpy(),
                     pred_visibilities=pred_visibilities[0].cpu().numpy(),
                     evaluation_setting=evaluation_setting,
-                    track_upscaling_factor=track_upscaling_factor,
+                    track_upscaling_factor=float(track_upscaling_factors[0]),
                     prefix=f"eval_{dataset_name}",
                     add_per_track_results=should_save_rerun_viz,
                     verbose=False,
@@ -695,7 +766,7 @@ class Evaluator:
                 if should_save_rerun_viz:
                     per_track_results = eval_2dpt_results_dict[f'eval_{dataset_name}/model__per_track_results']
                     del eval_2dpt_results_dict[f'eval_{dataset_name}/model__per_track_results']
-                metrics[datapoint_idx] = eval_2dpt_results_dict
+                metrics[scene_result_indices[0]] = eval_2dpt_results_dict
 
                 tapvid2d_original_metrics = compute_tapvid_metrics_original(
                     query_points_2d[0].cpu().numpy(),
@@ -710,24 +781,49 @@ class Evaluator:
                     f"eval_{dataset_name}/model__tapvid2d_{k}": (tapvid2d_original_metrics[k] * 100).round(2).item()
                     for k in sorted(tapvid2d_original_metrics)
                 }
-                metrics[datapoint_idx].update(tapvid2d_original_metrics)
+                metrics[scene_result_indices[0]].update(tapvid2d_original_metrics)
 
             elif evaluation_setting in ["no-tracking-labels"]:
-                metrics[datapoint_idx] = {}
+                assert batch_size == 1
+                metrics[scene_result_indices[0]] = {}
 
-            np.savez(
-                os.path.join(log_dir, f"step-{step}_seq-{seq_name}_tracks.npz"),
-                gt_trajectories_2d=gt_trajectories_2d_pixelspace_w_z_cameraspace.cpu().numpy(),
-                gt_trajectories_3d=gt_trajectories_3d_worldspace.cpu().numpy(),
-                gt_visibilities_per_view=gt_visibilities_per_view.cpu().numpy(),
-                gt_visibilities_any_view=gt_visibilities_any_view.cpu().numpy(),
-                pred_trajectories_2d=pred_trajectories_pixel_xy_camera_z_per_view.cpu().numpy(),
-                pred_trajectories_3d=pred_trajectories.cpu().numpy(),
-                pred_visibilities_any_view=pred_visibilities.cpu().numpy(),
-                query_points_2d=query_points_2d.cpu().numpy() if query_points_2d is not None else None,
-                query_points_3d=query_points_3d.cpu().numpy(),
-                track_upscaling_factor=track_upscaling_factor,
-            )
+            for scene_index in range(batch_size):
+                real_track_mask = ~track_padding_mask[scene_index]
+                np.savez(
+                    os.path.join(
+                        log_dir, f"step-{step}_seq-{seq_names[scene_index]}_tracks.npz"
+                    ),
+                    gt_trajectories_2d=gt_trajectories_2d_pixelspace_w_z_cameraspace[
+                        scene_index:scene_index + 1, :, :, real_track_mask
+                    ].cpu().numpy(),
+                    gt_trajectories_3d=gt_trajectories_3d_worldspace[
+                        scene_index:scene_index + 1, :, real_track_mask
+                    ].cpu().numpy(),
+                    gt_visibilities_per_view=gt_visibilities_per_view[
+                        scene_index:scene_index + 1, :, :, real_track_mask
+                    ].cpu().numpy(),
+                    gt_visibilities_any_view=gt_visibilities_any_view[
+                        scene_index:scene_index + 1, :, real_track_mask
+                    ].cpu().numpy(),
+                    pred_trajectories_2d=pred_trajectories_pixel_xy_camera_z_per_view[
+                        scene_index:scene_index + 1, :, :, real_track_mask
+                    ].cpu().numpy(),
+                    pred_trajectories_3d=pred_trajectories[
+                        scene_index:scene_index + 1, :, real_track_mask
+                    ].cpu().numpy(),
+                    pred_visibilities_any_view=pred_visibilities[
+                        scene_index:scene_index + 1, :, real_track_mask
+                    ].cpu().numpy(),
+                    query_points_2d=(
+                        query_points_2d[scene_index:scene_index + 1, real_track_mask]
+                        .cpu().numpy()
+                        if query_points_2d is not None else None
+                    ),
+                    query_points_3d=query_points_3d[
+                        scene_index:scene_index + 1, real_track_mask
+                    ].cpu().numpy(),
+                    track_upscaling_factor=float(track_upscaling_factors[scene_index]),
+                )
 
             # Visualize the results with rerun.io
             viz_fps = 30
@@ -910,15 +1006,17 @@ class Evaluator:
                         max_individual_tracks_to_visualize=0,
                     )
 
-            metrics[datapoint_idx]["fps"] = fps
+            for result_index in scene_result_indices:
+                metrics[result_index]["fps"] = fps
 
             try:
                 params_total = sum(p.numel() for p in model.parameters())
                 params_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 params_non_trainable = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-                metrics[datapoint_idx]["params_total"] = params_total
-                metrics[datapoint_idx]["params_trainable"] = params_trainable
-                metrics[datapoint_idx]["params_non_trainable"] = params_non_trainable
+                for result_index in scene_result_indices:
+                    metrics[result_index]["params_total"] = params_total
+                    metrics[result_index]["params_trainable"] = params_trainable
+                    metrics[result_index]["params_non_trainable"] = params_non_trainable
             except Exception as e:
                 logging.info(f"Error calculating model parameters: {e}")
 
