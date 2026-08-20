@@ -114,6 +114,9 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
 
     collate_fn = staticmethod(collate_encoded_tapvid3d)
     requires_cuda_prefetch = True
+    _scene_reuse_passes = 2
+    _fixed_views = None
+    _seed_by_scene = False
 
     def __init__(
         self,
@@ -123,6 +126,14 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         stream_rank: int = 0,
         stream_world_size: int = 1,
         stream_seed: int | None = None,
+        stream_scenes_per_batch: int = 4,
+        stream_repeat: bool = True,
+        stream_shuffle_shards: bool = True,
+        stream_include_scene_ids: tuple[str, ...] | None = None,
+        stream_allow_empty: bool = False,
+        scene_reuse_passes: int = 2,
+        fixed_views: tuple[int, ...] | None = None,
+        seed_by_scene: bool = False,
         **kwargs,
     ):
         manifest_path = Path(webdataset_root) / webdataset_split / "manifest.json"
@@ -137,7 +148,15 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             rank=stream_rank,
             world_size=stream_world_size,
             seed=int(0 if resolved_stream_seed is None else resolved_stream_seed),
+            scenes_per_batch=stream_scenes_per_batch,
+            repeat=stream_repeat,
+            shuffle_shards=stream_shuffle_shards,
+            include_scene_ids=stream_include_scene_ids,
+            allow_empty=stream_allow_empty,
         )
+        self._scene_reuse_passes = int(scene_reuse_passes)
+        self._fixed_views = fixed_views
+        self._seed_by_scene = bool(seed_by_scene)
         self._streamed_scenes: deque[
             tuple[KubricDaliSceneBundle, KubricDaliSceneGroup, int, int]
         ] = deque()
@@ -145,7 +164,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
     def _next_scene(self):
         if not self._streamed_scenes:
             group = self.stream.next_scene_group()
-            for reuse_pass in range(2):
+            for reuse_pass in range(self._scene_reuse_passes):
                 self._streamed_scenes.extend(
                     (scene, group, position, reuse_pass)
                     for position, scene in enumerate(group.scenes)
@@ -160,10 +179,14 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         if scene.invalid_frame_indices:
             return None
         scene_index = self.seq_names.index(scene.name)
-        seed = int(self.seed + virtual_index) if self.seed is not None else None
+        seed_index = scene_index if self._seed_by_scene else virtual_index
+        seed = int(self.seed + seed_index) if self.seed is not None else None
         rng = np.random.RandomState(seed)
 
-        if self.enable_variable_num_views_augs:
+        if self._fixed_views is not None:
+            views = self._fixed_views
+            view_count = len(views)
+        elif self.enable_variable_num_views_augs:
             probabilities = np.asarray(
                 tuple(
                     self.enable_variable_num_views_augs__n_views_probability.get(i, 0.0)
@@ -177,9 +200,12 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
                 if request is not None and request.view_count is not None
                 else int(rng.choice(np.arange(1, scene.view_count + 1), p=probabilities))
             )
+            views = tuple(
+                sorted(rng.choice(scene.view_count, view_count, replace=False).tolist())
+            )
         else:
             view_count = scene.view_count if self.num_views == -1 else int(self.num_views)
-        views = tuple(sorted(rng.choice(scene.view_count, view_count, replace=False).tolist()))
+            views = tuple(sorted(rng.choice(scene.view_count, view_count, replace=False).tolist()))
 
         frame_indices = np.arange(24, dtype=np.int64)
         tracks_all = scene.tracks_3d
@@ -393,4 +419,72 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         return sample, True
 
 
-__all__ = ["DaliKubricMultiViewDataset", "KubricSceneMetadata", "KubricWebDatasetCatalog"]
+class DaliKubricValidationDataset(DaliKubricMultiViewDataset):
+    """Finite, unaugmented MV-Kubric validation stream for CUDA decoding."""
+
+    dali_loader_num_workers = 0
+
+    def __init__(
+        self,
+        *args,
+        webdataset_root: str,
+        include_scene_ids: tuple[str, ...] | list[str] | None = None,
+        views: tuple[int, ...] = (0, 1, 2, 3),
+        stream_rank: int = 0,
+        stream_world_size: int = 1,
+        stream_seed: int = 72,
+        **kwargs,
+    ):
+        selected_scenes = (
+            None if include_scene_ids is None else tuple(map(str, include_scene_ids))
+        )
+        fixed_views = tuple(map(int, views))
+        kwargs.update(
+            include_scene_ids=selected_scenes,
+            views_to_return=list(fixed_views),
+            num_views=-1,
+            augmentation_probability=0.0,
+            enable_rgb_augs=False,
+            enable_depth_augs=False,
+            enable_cropping_augs=False,
+            enable_variable_trajpersample_augs=False,
+            enable_scene_transform_augs=False,
+            enable_camera_params_noise_augs=False,
+            enable_variable_depth_type_augs=False,
+            enable_variable_num_views_augs=False,
+            normalize_scene_following_vggt=False,
+            enable_variable_vggt_crop_size_augs=False,
+        )
+        super().__init__(
+            *args,
+            webdataset_root=webdataset_root,
+            webdataset_split="validation",
+            stream_rank=stream_rank,
+            stream_world_size=stream_world_size,
+            stream_seed=stream_seed,
+            stream_scenes_per_batch=1,
+            stream_repeat=False,
+            stream_shuffle_shards=False,
+            stream_include_scene_ids=selected_scenes,
+            stream_allow_empty=True,
+            scene_reuse_passes=1,
+            fixed_views=fixed_views,
+            seed_by_scene=True,
+            **kwargs,
+        )
+        self.virtual_len = self.stream.local_scene_count
+        self.local_scene_names = self.stream.local_scene_names
+
+    def __getitem__(self, index):
+        plan = self.plan_sample(int(index))
+        if plan is None:
+            raise RuntimeError("MV-Kubric validation scene did not produce a sample")
+        return self.materialize_sample(plan)
+
+
+__all__ = [
+    "DaliKubricMultiViewDataset",
+    "DaliKubricValidationDataset",
+    "KubricSceneMetadata",
+    "KubricWebDatasetCatalog",
+]

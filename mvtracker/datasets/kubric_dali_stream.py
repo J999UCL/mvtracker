@@ -1,4 +1,4 @@
-"""Native DALI streaming for four-scene MV-Kubric WebDataset shards."""
+"""Native DALI streaming for MV-Kubric WebDataset shards."""
 
 from __future__ import annotations
 
@@ -47,6 +47,11 @@ def _scene_name(metadata_npz: bytes) -> str:
 class KubricDaliSceneStream:
     """Stream complete four-scene shards directly through DALI WebDataset."""
 
+    repeat = True
+    scenes_per_batch = SCENES_PER_BATCH
+    records_per_batch = RECORDS_PER_BATCH
+    _selected_scene_ids = None
+
     def __init__(
         self,
         manifest_path: str | Path,
@@ -58,14 +63,21 @@ class KubricDaliSceneStream:
         num_threads: int = 8,
         prefetch_queue_depth: int = 2,
         heartbeat_seconds: float = 10.0,
+        repeat: bool = True,
+        shuffle_shards: bool = True,
+        include_scene_ids: tuple[str, ...] | None = None,
+        allow_empty: bool = False,
     ):
-        if scenes_per_batch != SCENES_PER_BATCH:
-            raise ValueError(f"MV-Kubric shards contain exactly {SCENES_PER_BATCH} scenes")
+        if scenes_per_batch < 1:
+            raise ValueError("scenes_per_batch must be positive")
         if not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
 
         manifest_path = Path(manifest_path)
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        selected_scene_ids = (
+            None if include_scene_ids is None else frozenset(map(str, include_scene_ids))
+        )
         shard_pairs = []
         for shard in manifest["shards"]:
             scene_names = tuple(map(str, shard["scene_ids"]))
@@ -74,39 +86,63 @@ class KubricDaliSceneStream:
                     f"{shard['tar']}: record count does not match its scenes"
                 )
             archive = manifest_path.parent / str(shard["tar"])
-            shard_pairs.append(
-                (archive, archive.with_suffix(".idx"), scene_names)
+            selected_names = (
+                scene_names
+                if selected_scene_ids is None
+                else tuple(name for name in scene_names if name in selected_scene_ids)
             )
-        random.Random(int(seed)).shuffle(shard_pairs)
-        shard_pairs.sort(key=lambda pair: len(pair[2]), reverse=True)
-        partitions: list[list[tuple[Path, Path, tuple[str, ...]]]] = [
+            if selected_names:
+                shard_pairs.append(
+                    (archive, archive.with_suffix(".idx"), scene_names, selected_names)
+                )
+        if shuffle_shards:
+            random.Random(int(seed)).shuffle(shard_pairs)
+        shard_pairs.sort(key=lambda pair: len(pair[3]), reverse=True)
+        partitions: list[
+            list[tuple[Path, Path, tuple[str, ...], tuple[str, ...]]]
+        ] = [
             [] for _ in range(world_size)
         ]
         scene_counts = [0] * world_size
         for pair in shard_pairs:
             destination = min(range(world_size), key=lambda value: scene_counts[value])
             partitions[destination].append(pair)
-            scene_counts[destination] += len(pair[2])
+            scene_counts[destination] += len(pair[3])
         assigned = tuple(partitions[int(rank)])
-        if not assigned:
+        if not assigned and not allow_empty:
             raise ValueError(f"rank {rank} was assigned no WebDataset shards")
 
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.seed = int(seed)
         self.heartbeat_seconds = float(heartbeat_seconds)
-        self.assigned_shards = tuple(str(archive) for archive, _, _ in assigned)
+        self.repeat = bool(repeat)
+        self.scenes_per_batch = int(scenes_per_batch)
+        self.records_per_batch = self.scenes_per_batch * RECORDS_PER_SCENE
+        self.assigned_shards = tuple(str(archive) for archive, _, _, _ in assigned)
         self._expected_scenes = tuple(
-            scene_name for _, _, scene_names in assigned for scene_name in scene_names
+            scene_name for _, _, scene_names, _ in assigned for scene_name in scene_names
         )
+        self._selected_scene_ids = selected_scene_ids
+        self.local_scene_names = tuple(
+            scene_name
+            for _, _, _, selected_names in assigned
+            for scene_name in selected_names
+        )
+        self.local_scene_count = int(scene_counts[int(rank)])
         self._scene_cursor = 0
         self._batch_index = 0
+
+        if not assigned:
+            self.build_seconds = 0.0
+            self._pipeline = None
+            return
 
         import nvidia.dali.fn as fn
         from nvidia.dali import pipeline_def
 
-        paths = [str(archive) for archive, _, _ in assigned]
-        index_paths = [str(index) for _, index, _ in assigned]
+        paths = [str(archive) for archive, _, _, _ in assigned]
+        index_paths = [str(index) for _, index, _, _ in assigned]
 
         @pipeline_def
         def scene_pipeline():
@@ -124,7 +160,7 @@ class KubricDaliSceneStream:
 
         build_started = time.perf_counter()
         self._pipeline = scene_pipeline(
-            batch_size=RECORDS_PER_BATCH,
+            batch_size=self.records_per_batch,
             num_threads=int(num_threads),
             device_id=None,
             prefetch_queue_depth=int(prefetch_queue_depth),
@@ -142,6 +178,24 @@ class KubricDaliSceneStream:
             )
 
     def next_scene_group(self) -> KubricDaliSceneGroup:
+        if self._pipeline is None:
+            raise StopIteration
+        while True:
+            group = self._next_scene_group()
+            if self._selected_scene_ids is None:
+                return group
+            selected = tuple(
+                scene for scene in group.scenes if scene.scene_name in self._selected_scene_ids
+            )
+            if selected:
+                return KubricDaliSceneGroup(
+                    scenes=selected,
+                    batch_index=group.batch_index,
+                    read_seconds=group.read_seconds,
+                    payload_bytes=group.payload_bytes,
+                )
+
+    def _next_scene_group(self) -> KubricDaliSceneGroup:
         self._batch_index += 1
         started = time.perf_counter()
         stop = threading.Event()
@@ -155,6 +209,8 @@ class KubricDaliSceneStream:
             try:
                 outputs = self._pipeline.run()
             except StopIteration:
+                if not self.repeat:
+                    raise
                 self._pipeline.reset()
                 print(
                     f"DALI_STREAM event=epoch_reset rank={self.rank}",
@@ -166,16 +222,19 @@ class KubricDaliSceneStream:
             watcher.join()
         read_seconds = time.perf_counter() - started
 
-        if len(outputs) != 3 or len(outputs[0]) != RECORDS_PER_BATCH:
+        if len(outputs) != 3 or len(outputs[0]) != self.records_per_batch:
             raise RuntimeError("DALI WebDataset reader did not return one complete shard")
         components = [
-            tuple(_tensor_bytes(output.at(position)) for position in range(RECORDS_PER_BATCH))
+            tuple(
+                _tensor_bytes(output.at(position))
+                for position in range(self.records_per_batch)
+            )
             for output in outputs
         ]
         metadata, rgb, depth = components
         scenes = []
         payload_bytes = 0
-        for scene_position in range(SCENES_PER_BATCH):
+        for scene_position in range(self.scenes_per_batch):
             start = scene_position * RECORDS_PER_SCENE
             if not metadata[start] or rgb[start] or depth[start]:
                 raise RuntimeError(f"record {start} is not an MV-Kubric metadata record")
