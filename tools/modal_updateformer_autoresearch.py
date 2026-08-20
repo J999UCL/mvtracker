@@ -388,7 +388,12 @@ def run_candidate_sweep() -> dict:
     from mvtracker.profiling.full_updateformer_candidate import compare_real_update
 
     commit = _source_commit()
-    candidates = ("whole_graph", "whole_graph_qkv", "whole_graph_fused")
+    candidates = (
+        "whole_graph",
+        "whole_graph_qkv",
+        "whole_graph_compiled",
+        "whole_graph_fused",
+    )
     run = wandb.init(
         entity="jeetucl-ucl",
         project="mvtracker-modal-profiling",

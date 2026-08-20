@@ -235,7 +235,9 @@ class MVTracker(nn.Module):
             linear_layer_for_vis_conf=False,
             checkpoint_updateformer=checkpoint_updateformer,
             execution_backend=(
-                updateformer_backend
+                "fused"
+                if updateformer_backend == "compiled"
+                else updateformer_backend
                 if updateformer_backend in {"fused", "graphed"}
                 else "eager"
             ),
