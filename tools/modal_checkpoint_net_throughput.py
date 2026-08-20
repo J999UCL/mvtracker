@@ -1,4 +1,4 @@
-"""Matched full-model H100 throughput comparison for UpdateFormer checkpointing."""
+"""Matched full-model H200 throughput comparison for UpdateFormer checkpointing."""
 
 from __future__ import annotations
 
@@ -25,14 +25,16 @@ from mvtracker.profiling.modal_continual_training import (
 )
 
 
-APP_NAME = "jeet-mvtracker-checkpoint-throughput"
-CACHE_ROOT = DATA_ROOT / "checkpoint-throughput-batches"
+APP_NAME = "jeet-mvtracker-checkpoint-throughput-h200"
+CACHE_ROOT = DATA_ROOT / "checkpoint-throughput-h200-batches"
 TAGS = {"owner": "jeet", "project": "mvtracker", "purpose": "profiling"}
 VIEWS = (1, 4)
 TRAJECTORIES = 1024
+GPU_LANE = "H200"
+CACHE_BATCH_SIZE = 16
 BASELINE = {
-    1: {"batch_size": 3, "scenes_per_second": 2.874249495013758},
-    4: {"batch_size": 2, "scenes_per_second": 1.6556496592605954},
+    1: {"batch_size": 5, "scenes_per_second": 3.300549786440229},
+    4: {"batch_size": 3, "scenes_per_second": 1.9327912147330826},
 }
 
 app = modal.App(APP_NAME, tags={**TAGS, "experiment": "checkpoint-net-throughput"})
@@ -40,7 +42,7 @@ image = _source_image(_dependency_image())
 
 
 def _cache_path(views: int) -> Path:
-    return CACHE_ROOT / f"views{views}-traj{TRAJECTORIES}-batch8.pt"
+    return CACHE_ROOT / f"views{views}-traj{TRAJECTORIES}-batch{CACHE_BATCH_SIZE}.pt"
 
 
 @app.function(
@@ -68,12 +70,16 @@ def prepare_batches_remote() -> dict:
     )
     results = []
     for views in VIEWS:
-        print(f"preparing {views}-view/{TRAJECTORIES}-track B8 cache", flush=True)
+        print(
+            f"preparing {views}-view/{TRAJECTORIES}-track "
+            f"B{CACHE_BATCH_SIZE} cache",
+            flush=True,
+        )
         result = prepare_profile_batch(
             data_root=DATA_ROOT / "datasets",
             output=_cache_path(views),
             views=views,
-            batch_size=8,
+            batch_size=CACHE_BATCH_SIZE,
             trajectories=TRAJECTORIES,
         )
         results.append(result)
@@ -91,7 +97,7 @@ def prepare_batches_remote() -> dict:
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
-    gpu="H100!",
+    gpu=GPU_LANE,
     cpu=8,
     memory=32768,
     timeout=45 * 60,
@@ -108,17 +114,18 @@ def sweep_remote(run_name: str) -> dict:
         project="mvtracker-modal-profiling",
         group="updateformer-autoresearch-v3",
         job_type="checkpoint-net-throughput",
-        tags=["modal", "h100", "single-gpu", "full-model", "checkpoint"],
+        tags=["modal", "h200", "single-gpu", "full-model", "checkpoint"],
         config={
             "source_commit": _source_commit(),
             "views": list(VIEWS),
             "trajectories": TRAJECTORIES,
+            "gpu_lane": GPU_LANE,
             **TAGS,
         },
     )
     trials = []
     for views in VIEWS:
-        for batch_size in range(1, 9):
+        for batch_size in range(1, CACHE_BATCH_SIZE + 1):
             output = output_root / f"views{views}-batch{batch_size}.json"
             command = [
                 sys.executable,
@@ -147,7 +154,7 @@ def sweep_remote(run_name: str) -> dict:
                 "--workers",
                 "0",
                 "--gpu-lane",
-                "H100!",
+                GPU_LANE,
             ]
             completed = subprocess.run(command, cwd="/opt/mvtracker", check=False)
             if completed.returncode != 0:
@@ -214,6 +221,6 @@ def sweep(run_name: str = "") -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
     preflight_active_containers(required_free_slots=1)
-    selected = run_name or f"checkpoint-net-throughput-{commit[:8]}"
-    app.set_tags({**TAGS, "experiment": selected, "gpu": "h100"})
+    selected = run_name or f"checkpoint-net-throughput-h200-{commit[:8]}"
+    app.set_tags({**TAGS, "experiment": selected, "gpu": "h200"})
     print(json.dumps(sweep_remote.remote(selected), indent=2))
