@@ -354,6 +354,15 @@ def run_fused_candidate_gate(candidate_backend: str = "fused") -> dict:
         "timing/fused_warm_update_seconds": result["timing"]["fused"]["warm_update_median_seconds"],
         "result_path": str(output_path),
     })
+    if result["eager_repeat"] is not None:
+        run.summary.update({
+            "baseline/five_update_trajectory_rms_m": result["eager_repeat"][
+                "final_trajectory"
+            ]["rms"],
+            "baseline/five_update_update_cosine": result["eager_repeat"][
+                "parameter_updates"
+            ]["cosine"],
+        })
     run.finish()
     return {"result_path": str(output_path), **result}
 

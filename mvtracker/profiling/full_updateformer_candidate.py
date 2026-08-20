@@ -388,6 +388,42 @@ def _trace_difference(eager, fused):
     return result
 
 
+def _multi_update_comparison(reference, candidate):
+    trajectory = _difference(
+        reference["multi_update"]["final_trajectories"],
+        candidate["multi_update"]["final_trajectories"],
+    )
+    visibility = _difference(
+        reference["multi_update"]["final_visibility"],
+        candidate["multi_update"]["final_visibility"],
+    )
+    visibility["flip_fraction"] = float(
+        (
+            (reference["multi_update"]["final_visibility"] >= 0.5)
+            != (candidate["multi_update"]["final_visibility"] >= 0.5)
+        ).float().mean()
+    )
+    loss_relative_error = abs(
+        candidate["multi_update"]["loss"]
+        - reference["multi_update"]["loss"]
+    ) / max(abs(reference["multi_update"]["loss"]), 1e-12)
+    return {
+        "loss_relative_error": loss_relative_error,
+        "final_trajectory": trajectory,
+        "final_visibility": visibility,
+        "gradients": _vector_agreement(
+            reference["gradients"], candidate["gradients"]
+        ),
+        "first_parameter_updates": _vector_agreement(
+            reference["parameter_updates"], candidate["parameter_updates"]
+        ),
+        "parameter_updates": _vector_agreement(
+            reference["multi_update"]["parameter_updates"],
+            candidate["multi_update"]["parameter_updates"],
+        ),
+    }
+
+
 def compare_real_update(
     *,
     data_root: Path,
@@ -406,6 +442,10 @@ def compare_real_update(
     cfg = _compose_config(arguments)
     knn_parity = _verify_capturable_knn() if candidate_backend == "whole_graph" else None
     eager = _run_backend(cfg, checkpoint, batch, "eager")
+    eager_repeat = (
+        _run_backend(cfg, checkpoint, batch, "eager")
+        if candidate_backend == "whole_graph" else None
+    )
     fused = (
         _run_whole_graph(cfg, checkpoint, batch)
         if candidate_backend == "whole_graph"
@@ -473,6 +513,10 @@ def compare_real_update(
         "passed": passed,
         "candidate_backend": candidate_backend,
         "knn_parity": knn_parity,
+        "eager_repeat": (
+            _multi_update_comparison(eager, eager_repeat)
+            if eager_repeat is not None else None
+        ),
         "shape": {
             "views": views,
             "batch_size": batch_size,
