@@ -6,7 +6,10 @@ These commands use one H100 and the billing tags `owner=jeet`,
 `project=mvtracker`, `purpose=profiling`. Capture creates the immutable v3
 golden contract once. Every candidate must stay within one BF16 ULP and pass
 the tight FP32 output, input-gradient, parameter-gradient, Adam-update, and
-loss checks before its fixed B1/B2/B4 benchmark runs.
+loss checks before its fixed B1/B2/B4 benchmark runs. The end-to-end command
+also compares whole-update and reusable live backends against eager run-to-run
+nondeterminism, selects the fastest valid live backend, then confirms it for ten
+real changing optimizer steps. Inductor kernels persist on the run Volume.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
@@ -17,8 +20,13 @@ modal run --timestamps tools/modal_updateformer_autoresearch.py::verify
 modal run --timestamps tools/modal_updateformer_autoresearch.py::run_benchmark \
   --warmup 3 --measured 10
 
-# Three-update live training smoke on one H100; no DDP.
-modal run --timestamps tools/modal_updateformer_autoresearch.py::single_gpu_smoke
+# Candidate search followed by a ten-update live confirmation; no DDP.
+modal run --timestamps tools/modal_updateformer_autoresearch.py::autoresearch \
+  --steps 10
+
+# Explicit live candidate confirmation when rerunning one backend.
+modal run --timestamps tools/modal_updateformer_autoresearch.py::single_gpu_smoke \
+  --backend graphed_bucketed --steps 10
 
 # Matched full-model eager-versus-checkpoint H200 throughput comparison.
 modal run --timestamps tools/modal_checkpoint_net_throughput.py::prepare
