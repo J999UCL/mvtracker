@@ -445,12 +445,6 @@ def run_candidate_sweep() -> dict:
     candidates = (
         "compiled_default",
         "whole_graph_compiled_default",
-        "fa2",
-        "channels_last_cnn",
-        "tiled_knn",
-        "bucketed_reduce",
-        "graphed",
-        "graphed_bucketed",
         "whole_graph",
     )
     run = wandb.init(
@@ -555,13 +549,6 @@ def run_candidate_sweep() -> dict:
     ]
     live_candidates = {
         "compiled_default",
-        "fa2",
-        "channels_last_cnn",
-        "tiled_knn",
-        "bucketed",
-        "bucketed_reduce",
-        "graphed",
-        "graphed_bucketed",
     }
     live_accepted = [
         result for result in accepted

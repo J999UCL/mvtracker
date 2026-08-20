@@ -1232,3 +1232,9 @@ Key W&B runs:
 
 The current production default remains eager UpdateFormer, contiguous CNN and
 the original serial capture-safe KNN. No rejected candidate was promoted.
+
+The final static upper-bound candidate combined default dynamic Inductor with
+the whole-update graph. It reached 2.08x steady-state (0.807 s to 0.389 s) and
+1.51x over a 1,000-update horizon after its 154-second setup. It was rejected
+for production because it is static-shape-only and its first Adam update cosine
+was 0.548. W&B: `jj3wr5c3` (combined) and `o1im1wxb` (Inductor only).

@@ -579,3 +579,21 @@ and LayerNorm while leaving GEMM/attention ordering controlled. Default-mode
 dynamic Inductor, alone and wrapped by the static whole-update graph, is the
 next active candidate. CUDA graphs alone, generic fused libraries, memory
 format changes and a replacement attention implementation are not sufficient.
+
+The combined upper-bound experiment subsequently reached the target on the
+repeated static workload. Default dynamic Inductor reduced the warm update from
+0.633 s to 0.500 s (1.27x), with a 114-second compile. Wrapping those compiled
+kernels in the complete forward/backward graph reduced the update from 0.807 s
+to 0.389 s: 2.08x steady-state and 1.51x after amortizing its 154-second setup
+over 1,000 updates. Peak allocated memory also fell slightly, from 29.8 GiB to
+29.4 GiB.
+
+This is an upper bound, not a production backend. It requires one repeated
+static shape, and Inductor changed the first trajectory prediction by 30.1 mm
+RMS, the first gradient cosine to 0.985, and the first clipped Adam update
+cosine to 0.548. The result proves that 2x is available by jointly eliminating
+launch overhead and fusing the pointwise/reduction graph. It also proves that a
+promotable implementation must reproduce those fusions in dynamic custom
+kernels while explicitly controlling the arithmetic order.
+
+W&B: dynamic Inductor `o1im1wxb`; compiled whole-update graph `jj3wr5c3`.
