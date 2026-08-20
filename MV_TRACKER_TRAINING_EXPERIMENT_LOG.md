@@ -925,6 +925,41 @@ point was 5.80 seconds.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/8dd8bd8df50a
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+### Stopped-run audit and mmap correction
+
+The H200 run was stopped by request after 526 completed updates. The durable
+resume point is `model_000500.pth`; steps 501--526 exist only in telemetry.
+Container RAM grew monotonically from 69.23 GiB at step 1 to 454.96 GiB at
+step 500 and 470.28 GiB at step 520. The DALI WebDataset reader had retained
+its default mmap behavior on the mounted network Volume. Source `2b4109c`
+switches it to plain file I/O and changes the Modal training allocation to a
+64 GiB request with a hard 128 GiB limit.
+
+Trailing 50-update means changed as follows from steps 1--50 to 477--526:
+
+| Source | Total loss | Trajectory loss | Visibility loss |
+|---|---:|---:|---:|
+| Combined | 0.25637 → 0.22589 | 0.05878 → 0.05162 | 0.19758 → 0.17427 |
+| DIEGESIS | 0.34045 → 0.26618 | 0.05748 → 0.03704 | 0.28297 → 0.22914 |
+| MV-Kubric | 0.17228 → 0.18560 | 0.06008 → 0.06620 | 0.11220 → 0.11939 |
+
+DIEGESIS validation improved from step 0 to 500: AJ 66.84→71.76,
+average points within threshold 88.84→93.30, ATE 5.30→3.93, and occlusion
+accuracy 78.08→80.06. Most of the gain was already present at step 250.
+
+For a strict MV-Kubric comparison, scenes 101--102 were recovered from the
+step-0 full-validation per-scene rows and compared with the same subset at
+steps 250 and 500:
+
+| Step | AJ | Average points within threshold | ATE | Occlusion accuracy |
+|---:|---:|---:|---:|---:|
+| 0 | 71.78 | 82.02 | 7.86 | 91.62 |
+| 250 | 69.33 | 80.19 | 8.84 | 91.13 |
+| 500 | 68.46 | 79.58 | 9.03 | 90.59 |
+
+The step-0 27-scene MV-Kubric aggregate is not used in that trend because the
+later scheduled validations contain only scenes 101--102.
+
 ## 2026-08-19 — Direct Modal Volume v2 dataset experiment
 
 The abandoned 2,000-scene dataset-image build was stopped and its six
