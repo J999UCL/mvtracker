@@ -51,6 +51,25 @@ def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
     return emb.view(B, S, N, embed_dim)
 
 
+def get_3d_sincos_pos_embed_from_grid_cuda(embed_dim, grid):
+    assert embed_dim % 3 == 0
+    axis_dim = embed_dim // 3
+    assert axis_dim % 2 == 0
+    omega = torch.arange(
+        axis_dim // 2,
+        dtype=torch.float64,
+        device=grid.device,
+    )
+    omega = 1.0 / 10000 ** (omega / (axis_dim / 2.0))
+    values = []
+    flat = grid.reshape(-1, 3).double()
+    for axis in range(3):
+        phase = flat[:, axis:axis + 1] * omega[None]
+        values.extend((torch.sin(phase), torch.cos(phase)))
+    embedding = torch.cat(values, dim=1)
+    return embedding.view(*grid.shape[:-1], embed_dim)
+
+
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """
     grid_size: int of the grid height and width

@@ -1245,6 +1245,7 @@ def forward_batch_multi_view(
         execution_schedule=execution_schedule,
         camera_inverses=camera_inverses,
         pointcloud_grids=pointcloud_grids,
+        capture_safe=graph_capture,
     )
     pred_trajectories = results["traj_e"]
     pred_visibilities = results["vis_e"]

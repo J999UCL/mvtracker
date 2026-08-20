@@ -19,6 +19,7 @@ from mvtracker.models.core.cotracker2.blocks import (
 from mvtracker.models.core.embeddings import (
     get_3d_sincos_pos_embed_from_grid,
     get_1d_sincos_pos_embed_from_grid,
+    get_3d_sincos_pos_embed_from_grid_cuda,
     get_3d_embedding,
 )
 from mvtracker.models.core.model_utils import smart_cat, init_pointcloud_from_rgbd, save_pointcloud_to_ply
@@ -289,6 +290,7 @@ class MVTracker(nn.Module):
             intrs_inv=None,
             extrs_inv=None,
             pointcloud_grids=None,
+            capture_safe=False,
             iters=4,
             feat_init=None,
             save_debug_logs=False,
@@ -369,7 +371,11 @@ class MVTracker(nn.Module):
         embed_dim = self.updateformer_input_dim
         if embed_dim % 6 != 0:
             embed_dim += 6 - (embed_dim % 6)
-        pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, coords[:, 0:1]).float()[:, 0].permute(0, 2, 1)
+        pos_embed_fn = (
+            get_3d_sincos_pos_embed_from_grid_cuda
+            if capture_safe else get_3d_sincos_pos_embed_from_grid
+        )
+        pos_embed = pos_embed_fn(embed_dim, coords[:, 0:1]).float()[:, 0].permute(0, 2, 1)
         if embed_dim > self.updateformer_input_dim:
             pos_embed = pos_embed[:, :self.updateformer_input_dim, :]
         pos_embed = rearrange(pos_embed, "b e n -> (b n) e").unsqueeze(1)
@@ -467,6 +473,7 @@ class MVTracker(nn.Module):
             execution_schedule=None,
             camera_inverses=None,
             pointcloud_grids=None,
+            capture_safe=False,
             **kwargs,
     ):
         device = extrs.device
@@ -544,6 +551,7 @@ class MVTracker(nn.Module):
                         camera_inverses[1].index_select(0, index),
                     ) if camera_inverses is not None else None,
                     pointcloud_grids=pointcloud_grids,
+                    capture_safe=capture_safe,
                 )
                 for local_index, scene_index in enumerate(scene_indices):
                     grouped_results[scene_index] = {
@@ -921,6 +929,7 @@ class MVTracker(nn.Module):
                 intrs_inv=intrs_inv_seq,
                 extrs_inv=extrs_inv_seq,
                 pointcloud_grids=pointcloud_grids,
+                capture_safe=capture_safe,
                 iters=iters,
                 save_debug_logs=save_debug_logs,
                 debug_logs_path=debug_logs_path,
