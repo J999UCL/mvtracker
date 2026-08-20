@@ -984,6 +984,49 @@ resume rewinds 14 rank-1 DIEGESIS attempts. Both ranks' MV-Kubric cursor was
 - Function call: `fc-01M0GGB3NMHSJJ962CC4RHZVKM`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/8dd8bd8df50a
 
+### Final 1,000-step result
+
+The resumed run completed all 1,000 optimizer updates. Canonical
+`latest_checkpoint.json` points to `model_final.pth` at step 1000; periodic
+`model_001000.pth` is also present. Median optimizer-step time was 5.29
+seconds. After mmap was disabled, container RAM stabilized near 85.5 GiB
+through steps 930--990 and ended at 82.5 GiB.
+
+Trailing 50-update training means changed from steps 1--50 to 951--1000:
+
+| Source | Total loss | Trajectory loss | Visibility loss |
+|---|---:|---:|---:|
+| Combined | 0.25637 → 0.21949 | 0.05878 → 0.05172 | 0.19758 → 0.16777 |
+| DIEGESIS | 0.34045 → 0.26190 | 0.05748 → 0.03666 | 0.28297 → 0.22523 |
+| MV-Kubric | 0.17228 → 0.17709 | 0.06008 → 0.06678 | 0.11220 → 0.11032 |
+
+DIEGESIS held-out validation:
+
+| Step | AJ | Average points within threshold | ATE | Occlusion accuracy |
+|---:|---:|---:|---:|---:|
+| 0 | 66.84 | 88.84 | 5.30 | 78.08 |
+| 250 | 71.48 | 93.11 | 3.92 | 79.62 |
+| 500 | 71.76 | 93.30 | 3.93 | 80.06 |
+| 750 | 72.70 | 94.14 | 3.50 | 80.27 |
+| 1000 | 72.66 | 94.04 | 3.47 | 80.33 |
+
+Strictly matched MV-Kubric scenes 101--102:
+
+| Step | AJ | Average points within threshold | ATE | Occlusion accuracy |
+|---:|---:|---:|---:|---:|
+| 0 | 71.78 | 82.02 | 7.86 | 91.62 |
+| 250 | 69.33 | 80.19 | 8.84 | 91.13 |
+| 500 | 68.46 | 79.58 | 9.03 | 90.59 |
+| 750 | 69.14 | 79.74 | 8.99 | 91.35 |
+| 1000 | 70.39 | 80.63 | 9.34 | 91.21 |
+
+The 27-scene MV-Kubric aggregate also remained below baseline at step 1000:
+AJ 73.79→72.00, average points 84.46→83.15, ATE 7.42→8.16, and
+occlusion accuracy 91.66→91.14. There was genuine late AJ recovery on the
+matched subset after step 500, but not a complete return to the initial model.
+The equal-source matched AJ `(DIEGESIS + MV-Kubric) / 2` improved from 69.31
+at step 0 to 71.53 at step 1000.
+
 ## 2026-08-19 — Direct Modal Volume v2 dataset experiment
 
 The abandoned 2,000-scene dataset-image build was stopped and its six
