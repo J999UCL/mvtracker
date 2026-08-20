@@ -650,6 +650,7 @@ def compare_real_update(
         "whole_graph": "eager",
         "whole_graph_qkv": "qkv",
         "whole_graph_compiled": "compiled",
+        "whole_graph_compiled_default": "compiled_default",
         "whole_graph_fused": "fused",
     }
     knn_parity = None

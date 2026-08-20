@@ -203,6 +203,7 @@ class MVTracker(nn.Module):
             "graphed",
             "graphed_bucketed",
             "compiled",
+            "compiled_default",
             "bucketed",
             "bucketed_reduce",
             "fa2",
@@ -280,6 +281,8 @@ class MVTracker(nn.Module):
             execution_backend=(
                 "fused"
                 if updateformer_backend == "compiled"
+                else "compiled_default"
+                if updateformer_backend == "compiled_default"
                 else "bucketed"
                 if updateformer_backend == "bucketed"
                 else "bucketed_reduce"

@@ -499,6 +499,7 @@ class EfficientUpdateFormer(nn.Module):
         if execution_backend not in {
             "eager",
             "fused",
+            "compiled_default",
             "graphed",
             "graphed_bucketed",
             "bucketed",
@@ -599,7 +600,7 @@ class EfficientUpdateFormer(nn.Module):
             return self._forward_graphed(input_tensor, point_mask)
         if self.execution_backend in {"bucketed", "bucketed_reduce"}:
             return self._forward_bucketed(input_tensor, point_mask)
-        if self.execution_backend == "fused":
+        if self.execution_backend in {"fused", "compiled_default"}:
             return self._forward_fused(input_tensor, point_mask)
         if (
             self.checkpoint_updateformer
@@ -766,11 +767,12 @@ class EfficientUpdateFormer(nn.Module):
                 device=input_tensor.device,
             )
         if self._compiled_impl is None:
+            compile_arguments = {"fullgraph": True, "dynamic": True}
+            if self.execution_backend == "fused":
+                compile_arguments["mode"] = "max-autotune-no-cudagraphs"
             self._compiled_impl = torch.compile(
                 self._forward_impl,
-                fullgraph=True,
-                dynamic=True,
-                mode="max-autotune-no-cudagraphs",
+                **compile_arguments,
             )
         output = self._compiled_impl(input_tensor, point_mask)
         return output
