@@ -475,14 +475,31 @@ def run_candidate_sweep() -> dict:
         result for result in results.values()
         if result.get("passed")
     ]
+    live_candidates = {
+        "bucketed",
+        "bucketed_reduce",
+        "graphed",
+        "graphed_bucketed",
+    }
+    live_accepted = [
+        result for result in accepted
+        if result["candidate_backend"] in live_candidates
+    ]
     winner = (
         max(accepted, key=lambda result: result["speedup"])["candidate_backend"]
         if accepted else None
+    )
+    live_winner = (
+        max(live_accepted, key=lambda result: result["speedup"])[
+            "candidate_backend"
+        ]
+        if live_accepted else None
     )
     summary_path = output_root / "summary.json"
     summary = {
         "source_commit": commit,
         "winner": winner,
+        "live_winner": live_winner,
         "target_2x_reached": any(
             result.get("target_2x_reached", False) for result in accepted
         ),
@@ -506,6 +523,7 @@ def run_candidate_sweep() -> dict:
     run_volume.commit()
     run.summary.update({
         "winner": winner or "none",
+        "live_winner": live_winner or "none",
         "target_2x_reached": int(summary["target_2x_reached"]),
         "result_path": str(summary_path),
     })
@@ -625,3 +643,26 @@ def candidate_sweep() -> None:
         "gpu": "h100",
     })
     print(json.dumps(run_candidate_sweep.remote(), indent=2))
+
+
+@app.local_entrypoint(name="autoresearch")
+def autoresearch(steps: int = 10) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    app.set_tags({
+        **TAGS,
+        "experiment": f"updateformer-autoresearch-{commit[:8]}",
+        "gpu": "h100",
+    })
+    sweep = run_candidate_sweep.remote()
+    live_winner = sweep["live_winner"]
+    result = {"sweep": sweep, "live_confirmation": None}
+    if live_winner is not None:
+        run_name = f"updateformer-{live_winner}-live-{commit[:8]}"
+        result["live_confirmation"] = run_single_gpu_smoke.remote(
+            run_name,
+            live_winner,
+            steps,
+        )
+    print(json.dumps(result, indent=2))
