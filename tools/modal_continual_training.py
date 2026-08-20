@@ -260,17 +260,31 @@ def train_remote(
     confirmation: str = "",
     materialize_whole_step: bool = False,
     seed_override: int = 0,
+    resume_existing: bool = False,
 ) -> dict:
     if mode not in EXPERIMENT_PHASES:
         raise ValueError("unsupported training mode")
     require_remote_main_confirmation(mode, confirmation)
     validate_run_name(run_name)
     commit = _source_commit()
-    derived_seed, wandb_run_id = _run_identity(run_name, commit)
-    seed = seed_override or derived_seed
     run_dir = RUN_ROOT / CONTINUAL_RUN_SUBDIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "modal-run-manifest.json"
+    existing_manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_file()
+        else None
+    )
+    if resume_existing:
+        if existing_manifest is None:
+            raise RuntimeError("resume requires an existing run manifest")
+        seed = int(existing_manifest["master_seed"])
+        wandb_run_id = str(existing_manifest["wandb_run_id"])
+        if seed_override and int(seed_override) != seed:
+            raise RuntimeError("resume seed does not match the existing run")
+    else:
+        derived_seed, wandb_run_id = _run_identity(run_name, commit)
+        seed = seed_override or derived_seed
     data_inventory = json.loads(
         (Path(DATA_VOLUME_ROOT) / "direct-volume-data-manifest.json").read_text()
     )
@@ -297,9 +311,36 @@ def train_remote(
         "materialize_whole_step": materialize_whole_step,
         "modal_tags": modal_tags,
     }
-    if manifest_path.is_file():
-        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if existing != manifest:
+    if existing_manifest is not None:
+        if resume_existing:
+            ignored = {"source_commit", "resume_source_commits"}
+            existing_contract = {
+                key: value
+                for key, value in existing_manifest.items()
+                if key not in ignored
+            }
+            current_contract = {
+                key: value for key, value in manifest.items() if key not in ignored
+            }
+            if existing_contract != current_contract:
+                raise RuntimeError(
+                    "existing run contract does not match this resume"
+                )
+            source_commits = list(
+                existing_manifest.get(
+                    "resume_source_commits",
+                    [existing_manifest["source_commit"]],
+                )
+            )
+            if commit not in source_commits:
+                source_commits.append(commit)
+            existing_manifest["resume_source_commits"] = source_commits
+            manifest = existing_manifest
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            run_volume.commit()
+        elif existing_manifest != manifest:
             raise RuntimeError("existing run manifest does not match this launch")
     else:
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -339,6 +380,8 @@ def train_remote(
                 f"+experiment={phase['config']}",
                 f"datasets.train.materialize_whole_step={str(materialize_whole_step).lower()}",
             ]
+            if resume_existing:
+                command.append("modes.validate_at_start=false")
             completed = subprocess.run(
                 command,
                 cwd=SOURCE_ROOT,
@@ -380,6 +423,7 @@ def _spawn_training(
     confirmation: str = "",
     materialize_whole_step: bool = False,
     seed: int = 0,
+    resume_existing: bool = False,
 ) -> None:
     deployed_training = modal.Function.from_name(APP_NAME, "train_remote")
     call = deployed_training.spawn(
@@ -388,6 +432,7 @@ def _spawn_training(
         confirmation,
         materialize_whole_step,
         seed,
+        resume_existing,
     )
     print(
         json.dumps(
@@ -455,6 +500,17 @@ def memory_profile(run_name: str = "", seed: int = 0) -> None:
 
 
 @app.local_entrypoint(name="train")
-def train(run_name: str = "", confirm_main: bool = False) -> None:
+def train(
+    run_name: str = "",
+    confirm_main: bool = False,
+    resume_existing: bool = False,
+) -> None:
+    if resume_existing and not run_name:
+        raise RuntimeError("--resume-existing requires --run-name")
     selected = _prepare_launch("main", run_name, confirm_main)
-    _spawn_training("main", selected, MAIN_CONFIRMATION)
+    _spawn_training(
+        "main",
+        selected,
+        MAIN_CONFIRMATION,
+        resume_existing=resume_existing,
+    )

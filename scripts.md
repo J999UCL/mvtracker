@@ -147,6 +147,14 @@ modal container list --json
 modal run --timestamps tools/modal_continual_training.py::train --confirm-main
 ```
 
+Resume an existing run from its canonical `latest_checkpoint.json` while
+preserving optimizer, scheduler, source cursors, seed, and W&B identity:
+
+```bash
+modal run --timestamps tools/modal_continual_training.py::train \
+  --run-name <existing-run-name> --confirm-main --resume-existing
+```
+
 Both GPU modes request exactly `H200:2`, set `max_containers=1`, and attach
 `owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint

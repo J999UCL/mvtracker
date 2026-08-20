@@ -144,6 +144,16 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertIn('"function_call_id": call.object_id', source)
         self.assertNotIn("train_remote.remote(", entrypoints)
 
+    def test_resume_preserves_existing_identity_and_skips_duplicate_eval(self):
+        source = (ROOT / "tools/modal_continual_training.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('seed = int(existing_manifest["master_seed"])', source)
+        self.assertIn('wandb_run_id = str(existing_manifest["wandb_run_id"])', source)
+        self.assertIn('command.append("modes.validate_at_start=false")', source)
+        self.assertIn('"resume_source_commits"', source)
+        self.assertIn("--resume-existing requires --run-name", source)
+
 
 if __name__ == "__main__":
     unittest.main()
