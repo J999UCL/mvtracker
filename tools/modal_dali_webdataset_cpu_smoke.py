@@ -83,7 +83,7 @@ def benchmark(shards: int = 8) -> dict[str, object]:
 
     @pipeline_def
     def reader_pipeline():
-        return fn.readers.webdataset(
+        outputs = fn.readers.webdataset(
             paths=paths,
             index_paths=index_paths,
             ext=["meta.npz", "rgb.npz", "depth.npz"],
@@ -92,6 +92,7 @@ def benchmark(shards: int = 8) -> dict[str, object]:
             prefetch_queue_depth=2,
             name="Reader",
         )
+        return tuple(outputs)
 
     run = wandb.init(
         entity="jeetucl-ucl",
