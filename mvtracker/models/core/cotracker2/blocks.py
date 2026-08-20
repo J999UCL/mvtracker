@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import collections
+import gc
 from itertools import repeat
 from typing import Callable
 
@@ -469,7 +470,12 @@ class EfficientUpdateFormer(nn.Module):
         self.checkpoint_updateformer = checkpoint_updateformer
         self.execution_backend = execution_backend
         self._compiled_impl = None
-        if execution_backend not in {"eager", "fused"}:
+        self._graphed_signature = None
+        self._graphed_window_counts = None
+        self._graphed_iterations = None
+        self._graphed_callables = None
+        self._graphed_cursor = 0
+        if execution_backend not in {"eager", "fused", "graphed"}:
             raise ValueError(f"unknown UpdateFormer backend: {execution_backend}")
         if self.linear_layer_for_vis_conf:
             self.flow_head = nn.Sequential(
@@ -561,6 +567,8 @@ class EfficientUpdateFormer(nn.Module):
             self.vis_conf_head.apply(trunc_init)
 
     def forward(self, input_tensor, point_mask=None):
+        if self.execution_backend == "graphed":
+            return self._forward_graphed(input_tensor, point_mask)
         if self.execution_backend == "fused":
             return self._forward_fused(input_tensor, point_mask)
         if (
@@ -578,6 +586,105 @@ class EfficientUpdateFormer(nn.Module):
         else:
             output = self._forward_impl(input_tensor, point_mask)
         return output
+
+    def begin_graphed_sequence(self, window_counts, iterations, batch_size):
+        if self.execution_backend != "graphed":
+            return
+        signature = (
+            int(batch_size),
+            tuple(int(value) for value in window_counts),
+            int(iterations),
+        )
+        if self._graphed_signature != signature:
+            self._graphed_signature = signature
+            self._graphed_window_counts = signature[1]
+            self._graphed_iterations = signature[2]
+            self._graphed_callables = None
+            gc.collect()
+            torch.cuda.empty_cache()
+        self._graphed_cursor = 0
+
+    def end_graphed_sequence(self):
+        if self.execution_backend != "graphed":
+            return
+        expected = len(self._graphed_window_counts) * self._graphed_iterations
+        if self._graphed_cursor != expected:
+            raise RuntimeError(
+                f"graphed UpdateFormer consumed {self._graphed_cursor}/{expected} slots"
+            )
+
+    def _capture_graphed_sequence(self, input_tensor, point_mask):
+        if self._graphed_signature is None:
+            raise RuntimeError("begin_graphed_sequence must run before UpdateFormer")
+
+        class Slot(nn.Module):
+            def __init__(self, core):
+                super().__init__()
+                self.core = core
+
+            def forward(self, value, mask):
+                return self.core._forward_impl(value, mask)
+
+        batch_size = self._graphed_signature[0]
+        slots = []
+        sample_args = []
+        for track_count in self._graphed_window_counts:
+            for _ in range(self._graphed_iterations):
+                slots.append(Slot(self))
+                value = torch.zeros(
+                    batch_size,
+                    track_count,
+                    input_tensor.shape[2],
+                    input_tensor.shape[3],
+                    dtype=input_tensor.dtype,
+                    device=input_tensor.device,
+                    requires_grad=input_tensor.requires_grad,
+                )
+                mask = torch.ones(
+                    batch_size,
+                    track_count,
+                    dtype=torch.bool,
+                    device=input_tensor.device,
+                )
+                sample_args.append((value, mask))
+        autocast_enabled = torch.is_autocast_enabled("cuda")
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.get_autocast_dtype("cuda"),
+            enabled=autocast_enabled,
+            cache_enabled=False,
+        ):
+            callables = torch.cuda.make_graphed_callables(
+                tuple(slots),
+                tuple(sample_args),
+                num_warmup_iters=3,
+            )
+        for parameter in self.parameters():
+            parameter.grad = None
+        object.__setattr__(self, "_graphed_callables", callables)
+
+    def _forward_graphed(self, input_tensor, point_mask=None):
+        if point_mask is None:
+            point_mask = torch.ones(
+                input_tensor.shape[:2],
+                dtype=torch.bool,
+                device=input_tensor.device,
+            )
+        if self._graphed_callables is None:
+            self._capture_graphed_sequence(input_tensor, point_mask)
+        if self._graphed_cursor >= len(self._graphed_callables):
+            raise RuntimeError("graphed UpdateFormer sequence exhausted")
+        expected_tracks = self._graphed_window_counts[
+            self._graphed_cursor // self._graphed_iterations
+        ]
+        if input_tensor.shape[1] != expected_tracks:
+            raise RuntimeError(
+                f"graphed UpdateFormer slot expects {expected_tracks} tracks, "
+                f"got {input_tensor.shape[1]}"
+            )
+        callable_ = self._graphed_callables[self._graphed_cursor]
+        self._graphed_cursor += 1
+        return callable_(input_tensor, point_mask)
 
     def _forward_fused(self, input_tensor, point_mask=None):
         batch_size, track_count, _, _ = input_tensor.shape

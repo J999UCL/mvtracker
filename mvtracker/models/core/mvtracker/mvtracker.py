@@ -134,7 +134,7 @@ class MVTracker(nn.Module):
         self.corr_add_neighbor_xyz = corr_add_neighbor_xyz
         self.corr_filter_invalid_depth = corr_filter_invalid_depth
         self.updateformer_backend = updateformer_backend
-        if updateformer_backend not in {"eager", "qkv", "fused"}:
+        if updateformer_backend not in {"eager", "qkv", "fused", "graphed"}:
             raise ValueError(f"unknown UpdateFormer backend: {updateformer_backend}")
         self.add_space_attn = add_space_attn
         self.updateformer_input_dim = (
@@ -188,7 +188,9 @@ class MVTracker(nn.Module):
             linear_layer_for_vis_conf=False,
             checkpoint_updateformer=checkpoint_updateformer,
             execution_backend=(
-                "fused" if updateformer_backend == "fused" else "eager"
+                updateformer_backend
+                if updateformer_backend in {"fused", "graphed"}
+                else "eager"
             ),
         )
 
@@ -657,6 +659,19 @@ class MVTracker(nn.Module):
             for index in range(batch_size)
         ]
         fmaps_seq, depths_seq, feat_init, rerun_fmap_coloring_fn = None, None, None, None
+        graph_window_counts = []
+        graph_window_start = w_idx_start
+        while graph_window_start < num_frames - self.S // 2:
+            graph_window_counts.append(max(
+                bisect_left(times, graph_window_start + self.S)
+                for times in query_times
+            ))
+            graph_window_start += self.S // 2
+        self.updateformer.begin_graphed_sequence(
+            graph_window_counts,
+            iters,
+            batch_size,
+        )
         while w_idx_start < num_frames - self.S // 2:
             p_idx_ends = [
                 bisect_left(times, w_idx_start + self.S)
@@ -874,6 +889,8 @@ class MVTracker(nn.Module):
                 ] = 0.0
             w_idx_start = w_idx_start + self.S // 2
             p_idx_starts = p_idx_ends
+
+        self.updateformer.end_graphed_sequence()
 
         if save_debug_logs:
             import gpustat
