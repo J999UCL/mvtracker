@@ -102,6 +102,7 @@ def _t4_image() -> modal.Image:
             "opencv-python-headless==4.11.0.86", "pandas==2.2.3",
             "scipy==1.15.2", "matplotlib==3.10.1", "Pillow==11.1.0", "imageio==2.37.0",
             "pypng==0.20220715.0", "kornia==0.7.3",
+            "mediapy==1.2.0", "rerun-sdk==0.21.0",
             "tqdm==4.67.1", "pause==0.3", "jupyterlab==4.3.6",
         )
         .run_commands(
