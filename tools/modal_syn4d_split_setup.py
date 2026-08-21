@@ -133,18 +133,34 @@ def _blender_image() -> modal.Image:
 
 
 def _t4_image() -> modal.Image:
-    return _clone_source(
+    base = (
         modal.Image.from_registry(
             "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.10"
         )
         .apt_install("ca-certificates", "curl", "ffmpeg", "git", "libgl1", "libglib2.0-0", "libopenexr-dev", "openexr", "zstd")
         .pip_install("torch==2.7.1", "torchvision==0.22.1", "torchaudio==2.7.1", index_url="https://download.pytorch.org/whl/cu128")
         .pip_install(
-            "OpenEXR==3.3.5", "wandb==0.19.9", "opencv-python-headless==4.11.0.86",
-            "scipy==1.15.2", "Pillow==11.1.0", "imageio==2.37.0", "mediapy==1.2.0",
+            "hf-xet==1.1.8", "huggingface-hub==0.30.2", "nvidia-dali-cuda120==1.53.0",
+            "OpenEXR==3.3.5", "safetensors==0.5.3", "wandb==0.19.9",
+            "opencv-python-headless==4.11.0.86", "pandas==2.2.3", "scipy==1.15.2",
+            "matplotlib==3.10.1", "Pillow==11.1.0", "imageio==2.37.0", "pypng==0.20220715.0",
+            "kornia==0.7.3", "mediapy==1.2.0", "rerun-sdk==0.21.0", "tqdm==4.67.1", "pause==0.3",
         )
-        .env({"DALI_DISABLE_NVML": "1"})
+        .run_commands(
+            f"mkdir -p {shlex.quote(str(VISUALIZER_ROOT))}",
+            *(
+                "curl -fsSL "
+                + shlex.quote(
+                    "https://huggingface.co/datasets/Syn4D/Syn4D/resolve/"
+                    f"{SYN4D_REVISION}/code/visualizer/{filename}"
+                )
+                + " -o " + shlex.quote(str(VISUALIZER_ROOT / filename))
+                for filename in ("syn4d_track.py", "base_dataset.py", "utils.py")
+            ),
+        )
+        .env({"DALI_DISABLE_NVML": "1", "HF_HOME": "/tmp/huggingface", "HF_XET_CACHE": "/tmp/huggingface/xet"})
     )
+    return _clone_source(base)
 
 
 app = modal.App(APP_NAME, tags=T4_TAGS)
@@ -232,7 +248,7 @@ def stage_dependencies_remote() -> dict[str, object]:
 
     def refresh_archive(archive: str, members: list[str]) -> None:
         destination = DATA_ROOT / CLOTHING_ROOT / f"{archive}.tar"
-        if destination.is_file() and set(archive_map.get(archive, [])) == set(members):
+        if destination.is_file() and set(local_archive_map.get(archive, [])) == set(members):
             return
         stale = destination.with_name(f".{destination.name}.stale")
         if destination.is_file():
@@ -273,8 +289,10 @@ def stage_dependencies_remote() -> dict[str, object]:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
     (DATA_ROOT / CLOTHING_ROOT).mkdir(parents=True, exist_ok=True)
+    updated_archive_map = dict(local_archive_map)
+    updated_archive_map.update(required_members)
     (DATA_ROOT / CLOTHING_ROOT / "archive_map.json").write_text(
-        json.dumps({archive: sorted(members) for archive, members in sorted(required_members.items())}, indent=2, sort_keys=True) + "\n"
+        json.dumps(updated_archive_map, indent=2, sort_keys=True) + "\n"
     )
     manifest = {
         "format": "mvtracker-syn4d-fixed-split",
@@ -314,7 +332,7 @@ def convert_body_remote() -> dict[str, object]:
     motions = sorted({item["dependencies"].body_motion for item in plans})
     output_root = DATA_ROOT / CONVERTED_BODY_ROOT
     output_root.mkdir(parents=True, exist_ok=True)
-    missing = [motion for motion in motions if not (output_root / f"{motion}.npz").is_file()]
+    missing = [motion for motion in motions if not tuple(output_root.rglob(f"{motion}.npz"))]
     if not missing:
         return {"motion_count": 0, "vertex_cache_count": 0, "skipped": True}
     run = _wandb_run(
@@ -393,21 +411,26 @@ def _convert_jobs(environment_names: tuple[str, ...], shard: str) -> dict[str, o
         work.mkdir(parents=True)
         archive = work / f"{job.environment}.tar.zst"
         try:
-            legacy = DATA_ROOT / LEGACY_ARCHIVES[job.environment]
-            if legacy.is_file():
+            legacy_relative = LEGACY_ARCHIVES.get(job.environment)
+            legacy = DATA_ROOT / legacy_relative if legacy_relative is not None else None
+            if legacy is not None and legacy.is_file():
                 if legacy.stat().st_size != job.archive_bytes:
                     raise RuntimeError(f"legacy archive size mismatch: {legacy}")
                 shutil.copyfile(legacy, archive)
             else:
+                hf_work = work / "hf"
+                hf_work.mkdir()
+                os.environ["HF_HOME"] = str(work / "hf-home")
+                os.environ["HF_XET_CACHE"] = str(work / "hf-xet")
                 source = hf_hub_download(
                     repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
                     filename=f"{SYN4D_SUBSET}/{job.environment}.tar.zst",
-                    token=os.environ["HF_TOKEN"], local_dir=str(work),
+                    token=os.environ["HF_TOKEN"], local_dir=str(hf_work),
+                    cache_dir=str(work / "hf-cache"),
                 )
                 if Path(source).stat().st_size != job.archive_bytes:
                     raise RuntimeError(f"downloaded archive size mismatch: {source}")
-                if Path(source) != archive:
-                    shutil.copyfile(source, archive)
+                archive = Path(source)
             extracted = work / "extracted"
             extracted.mkdir()
             subprocess.run(["tar", "-I", "zstd -T0", "-xf", str(archive), "-C", str(extracted)], check=True)
@@ -468,13 +491,17 @@ def convert_bedlam() -> None:
     print(json.dumps(convert_body_remote.remote(), indent=2, sort_keys=True))
 
 
-@app.local_entrypoint(name="convert")
-def convert() -> None:
-    _preflight(T4_TAGS, free_slots=2)
-    shard_a = convert_shard_a_remote.spawn()
-    shard_b = convert_shard_b_remote.spawn()
-    print(json.dumps({"shard_a": shard_a.get(), "shard_b": shard_b.get()}, indent=2, sort_keys=True))
+@app.local_entrypoint(name="convert-shard-a")
+def convert_shard_a() -> None:
+    _preflight(T4_TAGS)
+    print(json.dumps(convert_shard_a_remote.remote(), indent=2, sort_keys=True))
+
+
+@app.local_entrypoint(name="convert-shard-b")
+def convert_shard_b() -> None:
+    _preflight(T4_TAGS)
+    print(json.dumps(convert_shard_b_remote.remote(), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
-    print("Use: modal run tools/modal_syn4d_split_setup.py::<download|convert-bedlam|convert>")
+    print("Use: modal run tools/modal_syn4d_split_setup.py::<download|convert-bedlam|convert-shard-a|convert-shard-b>")

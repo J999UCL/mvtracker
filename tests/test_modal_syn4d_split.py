@@ -14,6 +14,7 @@ from mvtracker.profiling.modal_syn4d_split import (
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = (ROOT / "tools/modal_syn4d_split_setup.py").read_text(encoding="utf-8")
+PROFILE = (ROOT / "mvtracker/profiling/modal_syn4d_split.py").read_text(encoding="utf-8")
 
 
 class ModalSyn4DSplitTests(unittest.TestCase):
@@ -45,16 +46,25 @@ class ModalSyn4DSplitTests(unittest.TestCase):
         self.assertIn("_inputs", LAUNCHER)
         self.assertIn("download_body_motions", LAUNCHER)
         self.assertIn("download_sparse_clothing_tar", LAUNCHER)
+        self.assertIn("datasets/syn4d/temple_group/private/smplx_addon_parts", PROFILE)
+        for package in ("nvidia-dali-cuda120", "safetensors", "pandas", "matplotlib", "pypng", "kornia", "rerun-sdk", "tqdm", "pause"):
+            self.assertIn(package, LAUNCHER)
+        for filename in ("syn4d_track.py", "base_dataset.py", "utils.py"):
+            self.assertIn(filename, LAUNCHER)
         self.assertIn("local_archive_map", LAUNCHER)
         self.assertIn("stale", LAUNCHER)
         self.assertIn("set(local_archive_map.get(archive, [])) | set(members)", LAUNCHER)
         self.assertEqual(LAUNCHER.count('gpu="T4"'), 2)
-        self.assertIn("convert_shard_a_remote.spawn()", LAUNCHER)
-        self.assertIn("convert_shard_b_remote.spawn()", LAUNCHER)
-        self.assertIn("shard_a.get()", LAUNCHER)
-        self.assertIn("shard_b.get()", LAUNCHER)
+        self.assertIn('name="convert-shard-a"', LAUNCHER)
+        self.assertIn('name="convert-shard-b"', LAUNCHER)
+        self.assertNotIn(".spawn()", LAUNCHER)
+        self.assertNotIn(".get()", LAUNCHER)
         self.assertIn("data_volume.commit()", LAUNCHER)
         self.assertIn("shutil.rmtree(work, ignore_errors=True)", LAUNCHER)
+        self.assertIn("LEGACY_ARCHIVES.get(job.environment)", LAUNCHER)
+        self.assertIn("archive = Path(source)", LAUNCHER)
+        self.assertIn("HF_XET_CACHE", LAUNCHER)
+        self.assertIn("rglob(f\"{motion}.npz\")", LAUNCHER)
         self.assertNotIn("range(1, 10)", LAUNCHER)
         self.assertNotIn("range(10, 20)", LAUNCHER)
 

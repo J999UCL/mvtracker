@@ -426,7 +426,8 @@ modal run --detach --timestamps tools/modal_syn4d_split_setup.py::download
 # Detached CPU-only Blender body conversion into the selected metadata root.
 modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert-bedlam
 
-# The entrypoint spawns exactly two T4 workers and waits for both results.
+# Launch exactly two detached T4 shard functions directly; they are disjoint.
 modal container list --json
-modal run --timestamps tools/modal_syn4d_split_setup.py::convert
+modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert-shard-a
+modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert-shard-b
 ```

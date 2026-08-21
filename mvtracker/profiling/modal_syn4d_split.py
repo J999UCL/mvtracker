@@ -73,7 +73,7 @@ SHARED_METADATA_ROOT = Path("datasets/syn4d/v1-stride1-12train-4validation/metad
 BODY_ROOT = SHARED_METADATA_ROOT / "b2_motions_npz_training/motions_npz_training"
 CLOTHING_ROOT = SHARED_METADATA_ROOT / "b2_assetdata_download/clothing/npz"
 OBJECT_ROOT = SHARED_METADATA_ROOT / "new_weight_bone"
-SMPLX_ADDON_PARTS = Path("datasets/syn4d/private/smplx_addon_parts")
+SMPLX_ADDON_PARTS = Path("datasets/syn4d/temple_group/private/smplx_addon_parts")
 LEGACY_ARCHIVES = {
     "lab_bald": ARCHIVE_ROOT / "lab_bald/source/lab_bald.tar.zst",
     "temple_group": ARCHIVE_ROOT / "temple_group/source/temple_group.tar.zst",
