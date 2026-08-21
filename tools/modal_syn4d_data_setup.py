@@ -279,7 +279,7 @@ def download_dependencies_remote() -> dict[str, object]:
 @app.function(
     image=blender_image, secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
-    cpu=64, memory=128 * 1024, ephemeral_disk=T4_EPHEMERAL_DISK_MIB,
+    cpu=8, memory=32 * 1024, ephemeral_disk=512 * 1024,
     timeout=24 * 60 * 60, retries=0, max_containers=MAX_CONTAINERS,
     include_source=False,
 )
