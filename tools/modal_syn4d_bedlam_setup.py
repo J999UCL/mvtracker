@@ -31,22 +31,7 @@ MODAL_TAGS = {
 }
 WANDB_PROJECT = "mvtracker-modal-profiling"
 WANDB_GROUP = "syn4d-stride1-12train-4validation"
-
-
-def _bedlam_credentials() -> dict[str, str]:
-    env_path = Path(__file__).resolve().parents[2] / ".env"
-    values: dict[str, str] = {}
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line.startswith("export "):
-            line = line[7:]
-        key, separator, value = line.partition("=")
-        if separator and key in {"BEDLAM_EMAIL", "BEDLAM_PASSWORD"}:
-            values[key] = value.strip().strip("\"'")
-    missing = {"BEDLAM_EMAIL", "BEDLAM_PASSWORD"}.difference(values)
-    if missing:
-        raise RuntimeError(f"missing BEDLAM variables in {env_path}: {sorted(missing)}")
-    return values
+BEDLAM_SECRET_NAME = "jeet-mvtracker-bedlam"
 
 
 def _image() -> modal.Image:
@@ -85,7 +70,9 @@ hf_secret = modal.Secret.from_name(HF_SECRET_NAME, required_keys=["HF_TOKEN"])
 wandb_secret = modal.Secret.from_name(
     WANDB_SECRET_NAME, required_keys=["WANDB_API_KEY"]
 )
-bedlam_secret = modal.Secret.from_dict(_bedlam_credentials())
+bedlam_secret = modal.Secret.from_name(
+    BEDLAM_SECRET_NAME, required_keys=["BEDLAM_EMAIL", "BEDLAM_PASSWORD"]
+)
 
 
 def _inputs() -> tuple[str, dict[str, list[str]], str]:

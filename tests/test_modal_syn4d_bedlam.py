@@ -63,10 +63,10 @@ class ModalSyn4DBedlamTests(unittest.TestCase):
         self.assertEqual(parsed.data_offset, 512)
         self.assertEqual(parsed.size, len(payload))
 
-    def test_modal_job_is_cpu_tagged_and_uses_ephemeral_secret(self):
+    def test_modal_job_is_cpu_tagged_and_uses_named_secret(self):
         self.assertIn('"owner": "jeet"', (ROOT / "tools/modal_training_profile.py").read_text())
         self.assertIn('"experiment": "syn4d-bedlam-selective-dependencies"', LAUNCHER)
-        self.assertIn("modal.Secret.from_dict(_bedlam_credentials())", LAUNCHER)
+        self.assertIn('BEDLAM_SECRET_NAME = "jeet-mvtracker-bedlam"', LAUNCHER)
         self.assertIn("cpu=8", LAUNCHER)
         self.assertNotIn("gpu=", LAUNCHER)
         self.assertNotIn("BEDLAM_EMAIL=", LAUNCHER)
