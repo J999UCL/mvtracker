@@ -405,3 +405,28 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::loader_smoke
 ```
+
+## Convert the fixed Syn4D environment split on Modal
+
+This separate generic app uses the immutable 20-row manifest: 16 train and 4
+validation environments, one sequence per environment. Dependency staging
+reuses verified historical BEDLAM/object data and fetches only missing exact
+body, clothing, and object dependencies. The body conversion is CPU-only
+(8 CPUs, 32 GiB). Two T4 workers use byte-balanced disjoint environment sets;
+each downloads one archive to ephemeral SSD, extracts it once, converts one
+sequence, commits the derived split cache, and removes raw data.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+
+# Detached setup stages the fixed manifest's missing dependencies.
+modal run --detach --timestamps tools/modal_syn4d_split_setup.py::download
+
+# Detached CPU-only Blender body conversion into the selected metadata root.
+modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert-bedlam
+
+# The entrypoint spawns exactly two T4 workers and waits for both results.
+modal container list --json
+modal run --timestamps tools/modal_syn4d_split_setup.py::convert
+```
