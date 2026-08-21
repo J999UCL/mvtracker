@@ -105,24 +105,27 @@ def _preselect_tracks(
     maximum: int | None,
 ) -> np.ndarray:
     candidates = np.flatnonzero(eligible)
-    if maximum is not None and len(candidates) > maximum:
-        target = int(maximum)
-    else:
-        target = len(candidates)
     static = candidates[movement[candidates] < 0.01]
     very_dynamic = candidates[movement[candidates] > 2.0]
-    dynamic = candidates[(movement[candidates] > 0.1) & (movement[candidates] <= 2.0)]
-    desired = (
-        target - int(target * ratio_dynamic) - int(target * ratio_very_dynamic),
-        int(target * ratio_dynamic),
-        int(target * ratio_very_dynamic),
+    dynamic = candidates[movement[candidates] > 0.1]
+    ratio_static = 1.0 - ratio_dynamic - ratio_very_dynamic
+    target = min(
+        len(candidates),
+        int(len(dynamic) / ratio_dynamic) if ratio_dynamic else len(candidates),
+        int(len(very_dynamic) / ratio_very_dynamic)
+        if ratio_very_dynamic
+        else len(candidates),
+        int(len(static) / ratio_static) if ratio_static else len(candidates),
     )
-    buckets = (static, dynamic, very_dynamic)
-    if any(len(bucket) < count for bucket, count in zip(buckets, desired)):
-        return np.empty(0, dtype=np.int64)
+    if maximum is not None:
+        target = min(target, int(maximum))
+    dynamic_count = int(target * ratio_dynamic)
+    very_dynamic_count = int(target * ratio_very_dynamic)
+    static_count = target - dynamic_count - very_dynamic_count
     selected = [
-        rng.choice(bucket, count, replace=False)
-        for bucket, count in zip(buckets, desired)
+        rng.choice(dynamic, dynamic_count, replace=False),
+        rng.choice(very_dynamic, very_dynamic_count, replace=False),
+        rng.choice(static, static_count, replace=False),
     ]
     result = np.concatenate(selected) if selected else np.empty(0, dtype=np.int64)
     rng.shuffle(result)
