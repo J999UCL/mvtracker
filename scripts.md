@@ -380,7 +380,7 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::convert_bedlam
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::remaining
+  modal run --detach --timestamps tools/modal_syn4d_data_setup.py::remaining
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::loader_smoke
