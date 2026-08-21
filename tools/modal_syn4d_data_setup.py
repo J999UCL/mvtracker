@@ -172,8 +172,7 @@ def _wandb_run(*, job_type: str, name: str, tags: list[str], config: dict):
     image=t4_image,
     secrets=[hf_secret, wandb_secret],
     volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
-    gpu="T4",
-    cpu=T4_CPU, memory=T4_MEMORY_MIB, ephemeral_disk=T4_EPHEMERAL_DISK_MIB,
+    cpu=8, memory=16 * 1024, ephemeral_disk=256 * 1024,
     timeout=24 * 60 * 60, retries=1, max_containers=MAX_CONTAINERS,
     include_source=False,
 )
@@ -192,7 +191,7 @@ def download_dependencies_remote() -> dict[str, object]:
 
     run = _wandb_run(
         job_type="temple-group-download", name="temple-group-selective-download",
-        tags=["download", "t4"], config={"source_revision": SYN4D_REVISION, **MODAL_TAGS},
+        tags=["download", "cpu"], config={"source_revision": SYN4D_REVISION, **CPU_TAGS},
     )
     started = time.perf_counter()
     root = DATA_ROOT / TEMPLE_GROUP_ROOT
@@ -433,7 +432,7 @@ def _preflight(tags: dict[str, str] = MODAL_TAGS) -> None:
 
 @app.local_entrypoint(name="download")
 def download() -> None:
-    _preflight()
+    _preflight(CPU_TAGS)
     print(json.dumps(download_dependencies_remote.remote(), indent=2, sort_keys=True))
 
 
