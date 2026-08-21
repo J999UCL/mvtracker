@@ -27,6 +27,9 @@ EXPECTED_MVKUBRIC_TRAIN_SCENES = set(TRAIN_SCENES)
 EXPECTED_MVKUBRIC_POOL_SCENES = set(TRAIN_SCENES) | set(VALIDATION_SCENES)
 EXPECTED_MVKUBRIC_SCENES = set(TRAIN_SCENES)
 MVKUBRIC_INDEX_RELATIVE = Path("datasets/kubric-multiview/train/MVTracker_index")
+SYN4D_LAB_BALD_SEQUENCES = tuple(
+    f"lab_bald__seq_{index:06d}" for index in range(20)
+)
 
 
 class _DeterministicRequestSampler:
@@ -230,8 +233,9 @@ def profile_encoded_loader(
     production CUDA prefetch wrapper, while the CPU lane iterates samples
     directly to isolate encoded-cache and host-side work.
     """
-    if source not in {"diegesis", "mvkubric"}:
-        raise ValueError("source must be diegesis or mvkubric")
+    supported_sources = {"diegesis", "mvkubric", "syn4d"}
+    if source not in supported_sources:
+        raise ValueError("source must be diegesis, mvkubric, or syn4d")
     if warmup < 0 or measured <= 0 or workers < 0:
         raise ValueError("warmup must be non-negative, measured and workers must be positive")
     if use_cuda and workers < 1:
@@ -244,8 +248,8 @@ def profile_encoded_loader(
         source_schedule = (source,)
     else:
         source_schedule = tuple(source_schedule)
-        if not source_schedule or any(item not in {"diegesis", "mvkubric"} for item in source_schedule):
-            raise ValueError("source_schedule must contain diegesis or mvkubric")
+        if not source_schedule or any(item not in supported_sources for item in source_schedule):
+            raise ValueError("source_schedule contains an unsupported source")
     if source_schedule != (source,) and not use_cuda:
         raise ValueError("source_schedule requires the CUDA production loader")
     import itertools
@@ -257,6 +261,7 @@ def profile_encoded_loader(
         CudaPrefetchLoader,
         TapVid3DMultiViewDataset,
     )
+    from mvtracker.datasets.syn4d_multiview_dataset import Syn4DMultiViewDataset
 
     repo_root = Path(__file__).resolve().parents[2]
     config = OmegaConf.merge(
@@ -283,6 +288,14 @@ def profile_encoded_loader(
                     "kitchen02", "kitchen03", "kitchen04", "livingroom01", "livingroom03",
                     "livingroom04", "livingroom05",
                 )),
+            )
+        if dataset_source == "syn4d":
+            return Syn4DMultiViewDataset.from_name(
+                "syn4d-multiview-training",
+                str(datasets_root / "syn4d-mvtracker"),
+                training_args=config,
+                fabric=SimpleNamespace(world_size=1),
+                include_scene_ids=list(SYN4D_LAB_BALD_SEQUENCES),
             )
         from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
 

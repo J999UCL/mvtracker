@@ -82,6 +82,8 @@ def profile_t4_loader_remote(
     *,
     warmup: int = 4,
     measured: int = 16,
+    source: str = "matrix",
+    view_count: int = 4,
 ) -> dict:
     import wandb
     from mvtracker.profiling.modal_continual_data import profile_encoded_loader
@@ -90,6 +92,10 @@ def profile_t4_loader_remote(
         raise ValueError("run name contains unsupported characters")
     if warmup < 0 or measured <= 0:
         raise ValueError("warmup must be non-negative and measured must be positive")
+    if source not in {"matrix", "syn4d"}:
+        raise ValueError("source must be matrix or syn4d")
+    if not 1 <= view_count <= 6:
+        raise ValueError("view_count must be between one and six")
 
     container_monitor = ContainerHardwareMonitor()
     gpu_monitor = GpuHardwareMonitor()
@@ -102,6 +108,8 @@ def profile_t4_loader_remote(
             "source_commit": _source_commit(),
             "gpu": T4_GPU_REQUEST,
             "workers": T4_WORKERS,
+            "source": source,
+            "view_count": view_count,
             "simulated_compute_seconds": SIMULATED_COMPUTE_SECONDS,
             **MODAL_TAGS,
         },
@@ -136,13 +144,15 @@ def profile_t4_loader_remote(
             Path(DATA_VOLUME_ROOT),
         )
 
+        case_total = 1 if source == "syn4d" else 4
+
         def report_progress(event, case_name, result):
             progress["current_case"] = case_name if event == "started" else None
             if result is not None:
                 progress["completed"][case_name] = result
             print(
                 f"PROFILE_PROGRESS event={event} case={case_name} "
-                f"completed={len(progress['completed'])}/4",
+                f"completed={len(progress['completed'])}/{case_total}",
                 flush=True,
             )
             metrics = {
@@ -154,15 +164,31 @@ def profile_t4_loader_remote(
             run.log(metrics)
             write_progress()
 
-        profiles = run_case_matrix(
-            profile_loader,
-            warmup=warmup,
-            measured=measured,
-            workers=T4_WORKERS,
-            simulated_compute_seconds=SIMULATED_COMPUTE_SECONDS,
-            hardware_sampler=sample_hardware,
-            progress_callback=report_progress,
-        )
+        if source == "syn4d":
+            case_name = f"syn4d-views{view_count}"
+            report_progress("started", case_name, None)
+            result = profile_loader(
+                source="syn4d",
+                view_count=view_count,
+                warmup=warmup,
+                measured=measured,
+                workers=T4_WORKERS,
+                use_cuda=True,
+                simulated_compute_seconds=0.0,
+                hardware_sampler=sample_hardware,
+            )
+            report_progress("completed", case_name, result)
+            profiles = {"case": case_name, "profile": result}
+        else:
+            profiles = run_case_matrix(
+                profile_loader,
+                warmup=warmup,
+                measured=measured,
+                workers=T4_WORKERS,
+                simulated_compute_seconds=SIMULATED_COMPUTE_SECONDS,
+                hardware_sampler=sample_hardware,
+                progress_callback=report_progress,
+            )
         hardware = {
             "cpu_ram": container_monitor.sample(),
             "gpu": gpu_monitor.sample(),
@@ -201,3 +227,26 @@ def profile(run_name: str = "", warmup: int = 4, measured: int = 16) -> None:
         raise ValueError("run name contains unsupported characters")
     app.set_tags({**MODAL_TAGS, "experiment": selected, "gpu": "t4"})
     print(json.dumps(profile_t4_loader_remote.remote(selected, warmup=warmup, measured=measured), indent=2))
+
+
+@app.local_entrypoint(name="syn4d")
+def profile_syn4d(
+    run_name: str = "",
+    warmup: int = 1,
+    measured: int = 5,
+    view_count: int = 4,
+) -> None:
+    commit = _source_commit()
+    preflight_active_containers(required_free_slots=1)
+    selected = run_name or _default_run_name(commit)
+    if _RUN_NAME.fullmatch(selected) is None:
+        raise ValueError("run name contains unsupported characters")
+    app.set_tags({**MODAL_TAGS, "experiment": selected, "gpu": "t4", "source": "syn4d"})
+    result = profile_t4_loader_remote.remote(
+        selected,
+        warmup=warmup,
+        measured=measured,
+        source="syn4d",
+        view_count=view_count,
+    )
+    print(json.dumps(result, indent=2))

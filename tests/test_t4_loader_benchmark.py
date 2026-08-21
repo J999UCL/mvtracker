@@ -83,6 +83,9 @@ class T4LoaderBenchmarkTests(unittest.TestCase):
         self.assertIn("run_volume.commit()", source)
         self.assertIn("wandb.init", source)
         self.assertIn("PROFILE_PROGRESS", source)
+        self.assertIn('@app.local_entrypoint(name="syn4d")', source)
+        self.assertIn('source="syn4d"', source)
+        self.assertIn('"source": "syn4d"', source)
 
     def test_profile_waits_only_for_the_current_cuda_stream(self):
         source = (
