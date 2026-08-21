@@ -470,70 +470,100 @@ def _convert_sequence(
     _write_memmap(writer.array("queries_xytv"), queries)
     _write_memmap(writer.array("motion_path_length"), path_length)
 
-    exr_workers = min(16, os.cpu_count() or 1)
-    for view in range(VIEW_COUNT):
-        rows = rows_by_view[view]
-        depths_cm = _read_view_depths_cm(
-            _depth_paths(scene_root, sequence_base, view, rows),
+    cpu_stage_workers = max(1, min(3, (os.cpu_count() or 1) // 2))
+
+    def read_depth_view(view: int) -> np.ndarray:
+        return _read_view_depths_cm(
+            _depth_paths(scene_root, sequence_base, view, rows_by_view[view]),
             official_module=official_module,
-            workers=exr_workers,
+            workers=cpu_stage_workers,
         )
-        if depths_cm.shape != (frame_count, source_height, source_width):
-            raise ValueError(
-                f"view {view} EXR shape {depths_cm.shape} disagrees with MP4 "
-                f"{(frame_count, source_height, source_width)}"
-            )
-        native_depths_m = depth_centimetres_to_metres(depths_cm)
-        del depths_cm
-        native_intrinsics = np.empty((frame_count, 3, 3), dtype=np.float32)
-        extrinsics = np.empty((frame_count, 4, 4), dtype=np.float32)
-        for frame, row in enumerate(rows):
-            native_intrinsics[frame], extrinsics[frame] = camera_from_syn4d_row(
-                row, source_width=source_width, source_height=source_height
-            )
-        visibility = compute_depth_visibility(
-            tracks,
-            track_valid,
-            native_depths_m[None],
-            native_intrinsics[None],
-            extrinsics[None],
-            device=device,
-        )[0]
-        _write_memmap(writer.view_array(view, "visibility"), visibility)
-        _write_memmap(
-            writer.view_array(view, "intrinsics"),
-            resize_intrinsics(
-                native_intrinsics,
-                source_width=source_width,
-                source_height=source_height,
-            ),
-        )
-        _write_memmap(writer.view_array(view, "extrinsics_w2c"), extrinsics)
 
-        depth_output = writer.view_array(view, "depth")
-        for start in range(0, frame_count, 16):
-            stop = min(start + 16, frame_count)
-            depth_output[start:stop] = resize_depth_validity_weighted(
-                native_depths_m[start:stop], device=device
+    # The T4 stages remain serial. CPU work rolls around them: one future holds
+    # the next native-depth view and one writes the preceding view's JPEGs.
+    with (
+        ThreadPoolExecutor(max_workers=1) as depth_prefetch,
+        ThreadPoolExecutor(max_workers=1) as jpeg_writer,
+    ):
+        depth_future = depth_prefetch.submit(read_depth_view, 0)
+        jpeg_future = None
+        jpeg_view = None
+        for view in range(VIEW_COUNT):
+            rows = rows_by_view[view]
+            depths_cm = depth_future.result()
+            if view + 1 < VIEW_COUNT:
+                depth_future = depth_prefetch.submit(read_depth_view, view + 1)
+            if depths_cm.shape != (frame_count, source_height, source_width):
+                raise ValueError(
+                    f"view {view} EXR shape {depths_cm.shape} disagrees with MP4 "
+                    f"{(frame_count, source_height, source_width)}"
+                )
+            native_depths_m = depth_centimetres_to_metres(depths_cm)
+            del depths_cm
+            native_intrinsics = np.empty((frame_count, 3, 3), dtype=np.float32)
+            extrinsics = np.empty((frame_count, 4, 4), dtype=np.float32)
+            for frame, row in enumerate(rows):
+                native_intrinsics[frame], extrinsics[frame] = camera_from_syn4d_row(
+                    row, source_width=source_width, source_height=source_height
+                )
+            visibility = compute_depth_visibility(
+                tracks,
+                track_valid,
+                native_depths_m[None],
+                native_intrinsics[None],
+                extrinsics[None],
+                device=device,
+            )[0]
+            _write_memmap(writer.view_array(view, "visibility"), visibility)
+            _write_memmap(
+                writer.view_array(view, "intrinsics"),
+                resize_intrinsics(
+                    native_intrinsics,
+                    source_width=source_width,
+                    source_height=source_height,
+                ),
             )
-        depth_output.flush()
-        del depth_output, native_depths_m, visibility
+            _write_memmap(writer.view_array(view, "extrinsics_w2c"), extrinsics)
 
-        rgb = _decode_rgb_video_dali(
-            videos[view], frame_count=frame_count, device=device
-        )
-        _write_jpeg_store(
-            rgb,
-            destination / f"view_{view}",
-            workers=min(16, os.cpu_count() or 1),
-        )
-        _emit(
-            progress,
-            stage="view_ready",
-            sequence=sequence_base,
-            view=view,
-            frames=frame_count,
-        )
+            depth_output = writer.view_array(view, "depth")
+            for start in range(0, frame_count, 16):
+                stop = min(start + 16, frame_count)
+                depth_output[start:stop] = resize_depth_validity_weighted(
+                    native_depths_m[start:stop], device=device
+                )
+            depth_output.flush()
+            del depth_output, native_depths_m, visibility
+
+            # Do not decode another raw RGB view until the previous one has
+            # been encoded and released.
+            if jpeg_future is not None:
+                jpeg_future.result()
+                _emit(
+                    progress,
+                    stage="view_ready",
+                    sequence=sequence_base,
+                    view=jpeg_view,
+                    frames=frame_count,
+                )
+            rgb = _decode_rgb_video_dali(
+                videos[view], frame_count=frame_count, device=device
+            )
+            jpeg_future = jpeg_writer.submit(
+                _write_jpeg_store,
+                rgb,
+                destination / f"view_{view}",
+                workers=cpu_stage_workers,
+            )
+            jpeg_view = view
+        if jpeg_future is not None:
+            jpeg_future.result()
+            _emit(
+                progress,
+                stage="view_ready",
+                sequence=sequence_base,
+                view=jpeg_view,
+                frames=frame_count,
+            )
 
     manifest = finalize_sequence_cache(
         writer,

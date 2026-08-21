@@ -1,6 +1,7 @@
 import csv
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,9 +140,11 @@ class Syn4DConversionTests(unittest.TestCase):
             progress = []
             depth_calls = []
             rgb_calls = []
+            jpeg_threads = []
+            write_jpeg_store = syn4d_conversion._write_jpeg_store
 
             def fake_depth(paths, *, official_module, workers):
-                depth_calls.append((tuple(paths), workers))
+                depth_calls.append((tuple(paths), workers, threading.get_ident()))
                 return np.full((1, 4, 6), 200.0, dtype=np.float32)
 
             def fake_rgb(path, *, frame_count, device):
@@ -156,6 +159,10 @@ class Syn4DConversionTests(unittest.TestCase):
                 return np.broadcast_to(
                     depths[:, :1, :1], (len(depths), 384, 683)
                 ).copy()
+
+            def observed_jpeg_store(frames, destination, *, workers):
+                jpeg_threads.append((workers, threading.get_ident()))
+                write_jpeg_store(frames, destination, workers=workers)
 
             with (
                 patch.object(
@@ -186,6 +193,11 @@ class Syn4DConversionTests(unittest.TestCase):
                     syn4d_conversion,
                     "resize_depth_validity_weighted",
                     side_effect=fake_resize,
+                ),
+                patch.object(
+                    syn4d_conversion,
+                    "_write_jpeg_store",
+                    side_effect=observed_jpeg_store,
                 ),
             ):
                 result = syn4d_conversion.convert_syn4d_sequence(
@@ -227,6 +239,11 @@ class Syn4DConversionTests(unittest.TestCase):
             self.assertFalse((destination / "0" / "rgb.npy").exists())
             self.assertEqual(len(depth_calls), 8)
             self.assertEqual(len(rgb_calls), 8)
+            self.assertTrue(all(workers <= 3 for _, workers, _ in depth_calls))
+            self.assertTrue(all(workers <= 3 for workers, _ in jpeg_threads))
+            main_thread = threading.get_ident()
+            self.assertTrue(all(thread != main_thread for _, _, thread in depth_calls))
+            self.assertTrue(all(thread != main_thread for _, thread in jpeg_threads))
             self.assertEqual(
                 [event["stage"] for event in progress],
                 [
