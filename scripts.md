@@ -382,8 +382,8 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::convert
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::loader-smoke
+  modal run --timestamps tools/modal_syn4d_data_setup.py::loader_smoke
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::lab-bald
+  modal run --timestamps tools/modal_syn4d_data_setup.py::lab_bald
 ```
