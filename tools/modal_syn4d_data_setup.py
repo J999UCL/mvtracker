@@ -172,7 +172,7 @@ def _wandb_run(*, job_type: str, name: str, tags: list[str], config: dict):
     image=t4_image,
     secrets=[hf_secret, wandb_secret],
     volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
-    cpu=8, memory=16 * 1024, ephemeral_disk=256 * 1024,
+    cpu=8, memory=16 * 1024, ephemeral_disk=512 * 1024,
     timeout=24 * 60 * 60, retries=1, max_containers=MAX_CONTAINERS,
     include_source=False,
 )
