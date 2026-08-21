@@ -179,6 +179,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         just_return_kwargs=False,
         include_scene_ids=None,
         exclude_scene_ids=(),
+        storage_split=None,
     ):
         if not dataset_name.startswith(_DATASET_PREFIX):
             raise ValueError(f"Unsupported Syn4D dataset name: {dataset_name}")
@@ -197,12 +198,16 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         datasets_cfg = getattr(training_args, "datasets", {}) if training_args else {}
         kwargs.pop("raw_root")
         kwargs.update(
-            data_root=os.path.join(dataset_root, _SPLITS[requested]),
+            data_root=os.path.join(
+                dataset_root,
+                storage_split or _SPLITS[requested],
+            ),
             num_views=int(datasets_cfg.get("syn4d_num_views", 6)),
             view_count_probabilities=tuple(
                 datasets_cfg.get("syn4d_view_count_probabilities", (1 / 6,) * 6)
             ),
             mmap_cache_sequences=int(datasets_cfg.get("syn4d_mmap_cache_sequences", 4)),
+            max_depth=float(datasets_cfg.get("syn4d_max_depth", 300.0)),
             enable_variable_depth_type_augs=False,
             estimated_depth_root=None,
             estimated_depth_provider=None,

@@ -291,7 +291,7 @@ class MixedTrainingIntegrationTests(unittest.TestCase):
     def test_main_encodes_mixed_retry_resume_metrics_and_single_eval_contract(self):
         source = ast.unparse(_node("main"))
         loader_source = ast.unparse(_node("_load_mixed_step"))
-        self.assertIn("('diegesis', 'mvkubric', 'diegesis', 'mvkubric')", source)
+        self.assertIn("set(source_pattern) != set(cfg.datasets.train.sources)", source)
         self.assertIn("_load_mixed_step", source)
         self.assertIn("source_cursors[source] += 1", loader_source)
         self.assertIn("_all_ranks_succeeded", loader_source)

@@ -83,10 +83,14 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         contract.require_main_confirmation("smoke", False)
         contract.require_main_confirmation("memory_profile", False)
         contract.require_main_confirmation("main", True)
+        contract.require_main_confirmation("syn4d_main", True)
         with self.assertRaisesRegex(RuntimeError, "--confirm-main"):
             contract.require_main_confirmation("main", False)
         contract.require_remote_main_confirmation("main", contract.MAIN_CONFIRMATION)
-        with self.assertRaisesRegex(RuntimeError, "1000-step confirmation"):
+        contract.require_remote_main_confirmation(
+            "syn4d_main", contract.SYN4D_MAIN_CONFIRMATION
+        )
+        with self.assertRaisesRegex(RuntimeError, "explicit confirmation"):
             contract.require_remote_main_confirmation("main", "")
 
     def test_preflight_refuses_to_interrupt_active_apps(self):

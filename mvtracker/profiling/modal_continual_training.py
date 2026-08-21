@@ -34,6 +34,7 @@ WANDB_ENTITY = "jeetucl-ucl"
 WANDB_PROJECT = "mvtracker-continual-training"
 WANDB_GROUP = "gt-depth-replay-v1"
 MAIN_CONFIRMATION = "RUN_MAIN_1000_STEPS"
+SYN4D_MAIN_CONFIRMATION = "RUN_SYN4D_MAIN_2000_STEPS"
 
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -121,12 +122,24 @@ def require_pushed_main_commit(
 
 
 def require_main_confirmation(mode: str, confirm_main: bool) -> None:
-    if mode not in {"smoke", "smoke10", "production_smoke10", "memory_profile", "main"}:
+    if mode not in {
+        "smoke",
+        "smoke10",
+        "production_smoke10",
+        "memory_profile",
+        "main",
+        "syn4d_smoke1",
+        "syn4d_main",
+    }:
         raise ValueError("unsupported continual-training mode")
-    if mode == "main" and not confirm_main:
+    if mode in {"main", "syn4d_main"} and not confirm_main:
         raise RuntimeError("main training requires --confirm-main")
 
 
 def require_remote_main_confirmation(mode: str, confirmation: str) -> None:
-    if mode == "main" and confirmation != MAIN_CONFIRMATION:
-        raise RuntimeError("main training requires explicit 1000-step confirmation")
+    expected = {
+        "main": MAIN_CONFIRMATION,
+        "syn4d_main": SYN4D_MAIN_CONFIRMATION,
+    }.get(mode)
+    if expected is not None and confirmation != expected:
+        raise RuntimeError(f"{mode} requires explicit confirmation")

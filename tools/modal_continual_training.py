@@ -37,6 +37,7 @@ from mvtracker.profiling.modal_continual_training import (
     WANDB_ENTITY,
     WANDB_GROUP,
     WANDB_PROJECT,
+    SYN4D_MAIN_CONFIRMATION,
     preflight_active_containers,
     require_main_confirmation,
     require_pushed_main_commit,
@@ -88,6 +89,20 @@ EXPERIMENT_PHASES = {
             "name": "main",
             "config": "diegesis_mvkubric_gt_ddp",
             "target_completed_steps": 1000,
+        },
+    ),
+    "syn4d_smoke1": (
+        {
+            "name": "syn4d_smoke1",
+            "config": "diegesis_syn4d_mvkubric_gt_ddp_smoke1",
+            "target_completed_steps": 1,
+        },
+    ),
+    "syn4d_main": (
+        {
+            "name": "syn4d_main",
+            "config": "diegesis_syn4d_mvkubric_gt_ddp",
+            "target_completed_steps": 2000,
         },
     ),
 }
@@ -288,6 +303,30 @@ def train_remote(
     data_inventory = json.loads(
         (Path(DATA_VOLUME_ROOT) / "direct-volume-data-manifest.json").read_text()
     )
+    syn4d_sequences = None
+    if mode.startswith("syn4d_"):
+        syn4d_root = (
+            Path(DATA_VOLUME_ROOT) / "datasets/syn4d-mvtracker/train"
+        )
+        syn4d_sequences = sorted(
+            path.name for path in syn4d_root.iterdir() if path.is_dir()
+        )
+        if len(syn4d_sequences) != 20:
+            raise RuntimeError(
+                f"Syn4D training cache has {len(syn4d_sequences)} sequences; expected 20"
+            )
+    wandb_group = (
+        "gt-depth-replay-syn4d-v1"
+        if mode.startswith("syn4d_")
+        else WANDB_GROUP
+    )
+    run_data_inventory = {
+        "train_scene_count": data_inventory["train_scene_count"],
+        "validation_scene_count": data_inventory["validation_scene_count"],
+        "validation_scene_ids": data_inventory["validation_scene_ids"],
+    }
+    if syn4d_sequences is not None:
+        run_data_inventory["syn4d_sequences"] = syn4d_sequences
     modal_tags = PROFILE_TAGS if mode == "memory_profile" else MODAL_TAGS
     manifest = {
         "mode": mode,
@@ -295,18 +334,14 @@ def train_remote(
         "source_commit": commit,
         "data_volume": "jeet-mvtracker-data-v2",
         "data_layout_version": DATA_LAYOUT_VERSION,
-        "data_inventory": {
-            "train_scene_count": data_inventory["train_scene_count"],
-            "validation_scene_count": data_inventory["validation_scene_count"],
-            "validation_scene_ids": data_inventory["validation_scene_ids"],
-        },
+        "data_inventory": run_data_inventory,
         "phases": [dict(phase) for phase in EXPERIMENT_PHASES[mode]],
         "gpu": GPU_REQUEST,
         "max_containers": MAX_CONTAINERS,
         "master_seed": seed,
         "wandb_entity": WANDB_ENTITY,
         "wandb_project": WANDB_PROJECT,
-        "wandb_group": WANDB_GROUP,
+        "wandb_group": wandb_group,
         "wandb_run_id": wandb_run_id,
         "materialize_whole_step": materialize_whole_step,
         "modal_tags": modal_tags,
@@ -363,7 +398,7 @@ def train_remote(
             "MVTRACKER_WANDB_RUN_ID": wandb_run_id,
             "WANDB_ENTITY": WANDB_ENTITY,
             "WANDB_PROJECT": WANDB_PROJECT,
-            "WANDB_RUN_GROUP": WANDB_GROUP,
+            "WANDB_RUN_GROUP": wandb_group,
             "WANDB_RUN_ID": wandb_run_id,
             "WANDB_RESUME": "allow",
         }
@@ -403,6 +438,8 @@ def _default_run_name(mode: str, commit: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if mode == "production_smoke10":
         return f"gt-replay-prod-smoke10-{commit[:8]}-{timestamp}"
+    if mode.startswith("syn4d_"):
+        return f"gt-replay-syn4d-{mode}-ddp2-h200-{commit[:8]}-{timestamp}"
     return f"gt-depth-replay-{mode}-ddp2-h200-{commit[:8]}-{timestamp}"
 
 
@@ -513,4 +550,20 @@ def train(
         selected,
         MAIN_CONFIRMATION,
         resume_existing=resume_existing,
+    )
+
+
+@app.local_entrypoint(name="syn4d-smoke1")
+def syn4d_smoke1(run_name: str = "", seed: int = 0) -> None:
+    selected = _prepare_launch("syn4d_smoke1", run_name, confirm_main=False)
+    _spawn_training("syn4d_smoke1", selected, seed=seed)
+
+
+@app.local_entrypoint(name="syn4d-train")
+def syn4d_train(run_name: str = "", confirm_main: bool = False) -> None:
+    selected = _prepare_launch("syn4d_main", run_name, confirm_main)
+    _spawn_training(
+        "syn4d_main",
+        selected,
+        SYN4D_MAIN_CONFIRMATION,
     )

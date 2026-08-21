@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - diegesis_syn4d_mvkubric_gt_ddp
+  - _self_
+
+datasets:
+  eval:
+    names: []
+
+trainer:
+  num_steps: 1
+  eval_freq: 10000
+  viz_freq: 10000
+  save_ckpt_freq: 1
+
+modes:
+  validate_at_start: false
+
+logging:
+  tags:
+    - diegesis-syn4d-mvkubric-25-25-50
+    - gt-depth
+    - ddp2-h200
+    - full-model
+    - continual-training
+    - smoke1

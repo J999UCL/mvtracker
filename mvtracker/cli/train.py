@@ -746,7 +746,10 @@ class _ScheduledSourceSampler(torch.utils.data.Sampler):
 
 
 def _mixed_source_name(cfg):
-    return cfg.datasets.train.name == "mixed-diegesis-mvkubric-training"
+    return cfg.datasets.train.name in {
+        "mixed-diegesis-mvkubric-training",
+        "mixed-diegesis-syn4d-mvkubric-training",
+    }
 
 
 def _eval_dataset_names_for_step(cfg, step):
@@ -854,6 +857,11 @@ def _build_training_dataset(
             just_return_kwargs=True,
             include_scene_ids=include_scene_ids,
             exclude_scene_ids=exclude_scene_ids,
+            storage_split=(
+                source_cfg.get("storage_split")
+                if source_cfg is not None
+                else None
+            ),
         )
         if source_cfg is not None and "view_count_probabilities" in source_cfg:
             kwargs["view_count_probabilities"] = tuple(
@@ -1886,6 +1894,20 @@ def main(cfg: DictConfig):
                 stream_world_size=stream_world_size,
                 stream_seed=int(cfg.reproducibility.seed),
             )
+        elif _mixed_source_name(cfg) and dataset_name == "syn4d-multiview-validation":
+            source_cfg = cfg.datasets.eval.sources.syn4d
+            include_scene_ids = list(source_cfg.include_scene_ids)
+            if fabric.world_size > 1:
+                include_scene_ids = include_scene_ids[
+                    fabric.global_rank::fabric.world_size
+                ]
+            eval_dataset = Syn4DMultiViewDataset.from_name(
+                dataset_name,
+                source_cfg.root,
+                cfg,
+                include_scene_ids=include_scene_ids,
+                storage_split=source_cfg.get("storage_split"),
+            )
         elif dataset_name.startswith("tapvid2d-davis-"):
             eval_dataset = TapVidDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("kubric-multiview-v3-25views"):
@@ -2081,8 +2103,12 @@ def main(cfg: DictConfig):
         train_dataset = None
     elif mixed_training:
         source_pattern = tuple(cfg.datasets.train.source_schedule)
-        if source_pattern != ("diegesis", "mvkubric", "diegesis", "mvkubric"):
-            raise ValueError("mixed training requires source_schedule D/K/D/K")
+        if not source_pattern or set(source_pattern) != set(
+            cfg.datasets.train.sources
+        ):
+            raise ValueError(
+                "mixed source schedule must contain every configured source"
+            )
         if gradient_accumulation_steps != len(source_pattern):
             raise ValueError(
                 "gradient accumulation must match the mixed source schedule length"

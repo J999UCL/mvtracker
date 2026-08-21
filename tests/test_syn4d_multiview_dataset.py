@@ -151,6 +151,7 @@ class Syn4DLoaderTests(unittest.TestCase):
             datasets={
                 "syn4d_num_views": 6,
                 "syn4d_mmap_cache_sequences": 2,
+                "syn4d_max_depth": 321.0,
             }
         )
         kwargs = Syn4DMultiViewDataset.from_name(
@@ -158,13 +159,15 @@ class Syn4DLoaderTests(unittest.TestCase):
             "/datasets/syn4d-mvtracker",
             training_args=config,
             just_return_kwargs=True,
+            storage_split="shared",
         )
         self.assertEqual(
             kwargs["data_root"],
-            "/datasets/syn4d-mvtracker/validation",
+            "/datasets/syn4d-mvtracker/shared",
         )
         self.assertEqual(kwargs["num_views"], 6)
         self.assertEqual(kwargs["mmap_cache_sequences"], 2)
+        self.assertEqual(kwargs["max_depth"], 321.0)
         self.assertFalse(kwargs["enable_variable_depth_type_augs"])
 
     def test_plans_window_views_tracks_and_materializes_indexed_jpegs(self):

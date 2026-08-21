@@ -1,0 +1,176 @@
+# @package _global_
+
+experiment_path: ${oc.env:MVTRACKER_TRAINING_RUN_DIR}
+restore_ckpt_path: ${oc.env:MVTRACKER_TRAINING_CHECKPOINT}
+
+datasets:
+  root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
+  syn4d_num_views: 4
+  syn4d_max_depth: 300.0
+  train:
+    name: mixed-diegesis-syn4d-mvkubric-training
+    batch_size: 1
+    sequence_len: 24
+    traj_per_sample: 2048
+    mvkubric_storage: dali_stream
+    mvkubric_webdataset_root: ${oc.env:MVTRACKER_MVKUBRIC_WEBDATASET_ROOT,${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/kubric-multiview-webdataset}
+    kubric_max_depth: 24
+    num_workers: 8
+    physical_batching:
+      enabled: true
+      capacity_name: h200-profile-20260816
+      lookahead_steps: 4
+      cpu_cache_gib_per_rank: 12
+      decode_image_chunk_size: 64
+      max_scenes: 2
+      pair_track_capacity_by_views: {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 819, 6: 512}
+      singleton_only_views: []
+      rank_local: true
+    dali:
+      num_threads: 4
+      prefetch_queue_depth: 2
+    source_schedule: [diegesis, mvkubric, syn4d, mvkubric]
+    sources:
+      diegesis:
+        name: tapvid3d-multiview-training
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/diegesis-mvtracker
+        include_scene_ids:
+          - bathroom01
+          - bathroom02
+          - bathroom03
+          - bedroom02
+          - bedroom03
+          - bedroom04
+          - diningroom01
+          - diningroom03
+          - diningroom04
+          - kitchen01
+          - kitchen02
+          - kitchen03
+          - kitchen04
+          - livingroom01
+          - livingroom03
+          - livingroom04
+          - livingroom05
+        view_count_probabilities: [0.25, 0.25, 0.25, 0.25]
+      syn4d:
+        name: syn4d-multiview-training
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/syn4d-mvtracker
+        include_scene_ids:
+          - lab_bald__seq_000000
+          - lab_bald__seq_000001
+          - lab_bald__seq_000002
+          - lab_bald__seq_000003
+          - lab_bald__seq_000004
+          - lab_bald__seq_000005
+          - lab_bald__seq_000006
+          - lab_bald__seq_000007
+          - lab_bald__seq_000008
+          - lab_bald__seq_000009
+          - lab_bald__seq_000010
+          - lab_bald__seq_000011
+          - lab_bald__seq_000012
+          - lab_bald__seq_000013
+          - lab_bald__seq_000014
+          - lab_bald__seq_000015
+        view_count_probabilities: [0.20, 0.10, 0.10, 0.25, 0.10, 0.25]
+      mvkubric:
+        name: kubric-multiview-v3-training
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
+        view_count_probabilities: [0.20, 0.10, 0.10, 0.25, 0.10, 0.25]
+        trajectory_caps_by_view: {5: 819, 6: 512}
+  eval:
+    names:
+      - tapvid3d-multiview-validation
+      - syn4d-multiview-validation
+      - kubric-multiview-v3-validation-subset
+      - kubric-multiview-v3-validation-full
+    schedule:
+      - steps: [0, 1000, 2000]
+        names:
+          - tapvid3d-multiview-validation
+          - syn4d-multiview-validation
+          - kubric-multiview-v3-validation-full
+      - steps: [500, 1500]
+        names:
+          - tapvid3d-multiview-validation
+          - syn4d-multiview-validation
+          - kubric-multiview-v3-validation-subset
+    num_workers: 4
+    sources:
+      diegesis:
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/diegesis-mvtracker
+        include_scene_ids: [bedroom01, diningroom02]
+        views: [0, 1, 2, 3]
+      syn4d:
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/syn4d-mvtracker
+        storage_split: train
+        include_scene_ids:
+          - lab_bald__seq_000016
+          - lab_bald__seq_000017
+          - lab_bald__seq_000018
+          - lab_bald__seq_000019
+      mvkubric:
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
+        subset_scene_ids: ["101", "102"]
+        full_scene_ids: ["101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "111", "112", "113", "114", "115", "116", "117", "118", "119", "120", "121", "122", "123", "124", "125", "126", "127"]
+        views: [0, 1, 2, 3]
+
+trainer:
+  num_steps: 2000
+  lr_schedule_steps: 2000
+  eval_freq: 500
+  viz_freq: 10000
+  save_ckpt_freq: 250
+  lr: 0.00005
+  wdecay: 0.00001
+  anneal_strategy: linear
+  grad_clip: 1.0
+  gradient_accumulation_steps: 4
+  expensive_diagnostics_interval: 50
+  hardware_metrics_interval: 10
+  precision: bf16-mixed
+  visibility_loss_weight: 0.1
+
+modes:
+  validate_at_start: true
+
+reproducibility:
+  seed: ${oc.env:MVTRACKER_TRAINING_SEED}
+  deterministic: false
+
+augmentations:
+  probability: 0.8
+  rgb: true
+  depth: true
+  variable_depth_type: false
+  variable_num_views: true
+  cropping: true
+  cropping_size: [384, 512]
+  variable_vggt_crop_size: false
+  keep_principal_point_centered: false
+  variable_trajpersample: true
+  scene_transform: true
+  camera_params_noise: true
+  normalize_scene_following_vggt: false
+
+logging:
+  log_wandb: true
+  wandb_entity: jeetucl-ucl
+  wandb_project: mvtracker-continual-training
+  wandb_group: gt-depth-replay-syn4d-v1
+  wandb_run_name: ${oc.env:MVTRACKER_WANDB_RUN_NAME}
+  wandb_run_id: ${oc.env:MVTRACKER_WANDB_RUN_ID}
+  tags:
+    - diegesis-syn4d-mvkubric-25-25-50
+    - gt-depth
+    - ddp2-h200
+    - full-model
+    - continual-training
+    - 2000-steps
+
+evaluation:
+  evaluator:
+    rerun_viz_indices: null
+    forward_pass_log_indices: null
+    mp4_track_viz_indices: null
