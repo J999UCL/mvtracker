@@ -1066,6 +1066,10 @@ INDEX_HTML = r"""<!doctype html>
       <input id="raw-opacity" type="range" min="0" max="1" step="0.05" value="0.35">
       <output id="raw-opacity-value" for="raw-opacity">35%</output>
     </label>
+    <label class="opacity-control" for="loss-smoothing">Loss smoothing
+      <input id="loss-smoothing" type="range" min="0" max="0.99" step="0.01" value="0.9">
+      <output id="loss-smoothing-value" for="loss-smoothing">90%</output>
+    </label>
   </div>
 
   <section>
@@ -1076,7 +1080,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="chart-panel"><h3>Syn4D</h3><div class="chart-wrap loss-large"><canvas id="loss-syn4d"></canvas></div></div>
       <div class="chart-panel"><h3>MV-Kubric</h3><div class="chart-wrap loss-large"><canvas id="loss-mvkubric"></canvas></div></div>
     </div>
-    <div class="chart-note">Faint points are raw updates; solid lines are trailing 50-sample means. Each panel shows total, visibility, and 3D trajectory loss.</div>
+    <div class="chart-note">Faint points are raw updates; solid lines are debiased exponential moving averages. Each panel shows total, visibility, and 3D trajectory loss.</div>
   </section>
 
   <section>
@@ -1159,8 +1163,9 @@ const alphaColor=(hex,alpha)=>{
   return match?`rgba(${parseInt(match[1],16)},${parseInt(match[2],16)},${parseInt(match[3],16)},${alpha})`:hex;
 };
 const meanLine=(label,stroke,extra={})=>line(`${label} · 50-sample mean`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
+const emaLine=(label,stroke,extra={})=>line(`${label} · EMA`,stroke,{borderWidth:2.5,pointRadius:0,pointHoverRadius:3,tension:.18,...extra});
 const rawPoints=(label,stroke,extra={})=>line(`${label} · raw`,alphaColor(stroke,.35),{showInLegend:false,showLine:false,borderWidth:0,pointRadius:1,pointHoverRadius:4,tension:0,isRawPoints:true,rawStroke:stroke,...extra});
-const lossLines=()=>[rawPoints('Total',palette.s1,{seriesKey:'total'}),meanLine('Total',palette.s1,{seriesKey:'total'}),rawPoints('Visibility',palette.s2,{seriesKey:'visibility'}),meanLine('Visibility',palette.s2,{borderDash:[6,4],seriesKey:'visibility'}),rawPoints('Trajectory',palette.s3,{seriesKey:'trajectory'}),meanLine('Trajectory',palette.s3,{seriesKey:'trajectory'})];
+const lossLines=()=>[rawPoints('Total',palette.s1,{seriesKey:'total'}),emaLine('Total',palette.s1,{seriesKey:'total'}),rawPoints('Visibility',palette.s2,{seriesKey:'visibility'}),emaLine('Visibility',palette.s2,{borderDash:[6,4],seriesKey:'visibility'}),rawPoints('Trajectory',palette.s3,{seriesKey:'trajectory'}),emaLine('Trajectory',palette.s3,{seriesKey:'trajectory'})];
 const compactNumber=value=>{
   const number=Number(value), magnitude=Math.abs(number);
   if(!Number.isFinite(number)) return value;
@@ -1201,6 +1206,10 @@ const charts={
 };
 const rawOpacity=document.getElementById('raw-opacity');
 const rawOpacityValue=document.getElementById('raw-opacity-value');
+const lossSmoothing=document.getElementById('loss-smoothing');
+const lossSmoothingValue=document.getElementById('loss-smoothing-value');
+let lossSmoothingWeight=Number(lossSmoothing.value);
+let currentLosses={};
 function setRawOpacity(value){
   const opacity=Math.max(0,Math.min(1,Number(value)));
   rawOpacityValue.value=`${Math.round(opacity*100)}%`;
@@ -1223,6 +1232,27 @@ const movingAverageXY=(input,windowSize=50)=>{
   return input.map(point=>{window.push(point.y);sum+=point.y;if(window.length>windowSize)sum-=window.shift();return{x:point.x,y:sum/window.length};});
 };
 const movingAveragePoints=(series,windowSize=50)=>movingAverageXY(points(series),windowSize);
+const debiasedEmaXY=(input,weight=lossSmoothingWeight)=>{
+  let weightedSum=0, weightSum=0;
+  return input.map(point=>{
+    weightedSum=weight*weightedSum+(1-weight)*point.y;
+    weightSum=weight*weightSum+(1-weight);
+    return{x:point.x,y:weightedSum/weightSum};
+  });
+};
+const debiasedEmaPoints=series=>debiasedEmaXY(points(series));
+function renderLossCharts(){
+  const lossData=source=>[points(source.total),debiasedEmaPoints(source.total),points(source.visibility),debiasedEmaPoints(source.visibility),points(source.flow),debiasedEmaPoints(source.flow)];
+  update(charts.combined,lossData(currentLosses.combined||{}));
+  update(charts.diegesis,lossData(currentLosses.diegesis||{}));
+  update(charts.syn4d,lossData(currentLosses.syn4d||{}));
+  update(charts.mvkubric,lossData(currentLosses.mvkubric||{}));
+}
+lossSmoothing.addEventListener('input',event=>{
+  lossSmoothingWeight=Number(event.target.value);
+  lossSmoothingValue.value=`${Math.round(lossSmoothingWeight*100)}%`;
+  renderLossCharts();
+});
 const parityPoints=series=>points(series).map(point=>({x:point.x,y:1}));
 const pipePoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.step),y:Number(point[key])}));
 const gpuPoints=(series,key,gpuIndex=null)=>(series||[]).filter(point=>point[key]!=null&&(gpuIndex==null||Number(point.gpu_index)===gpuIndex)).map(point=>({x:Number(point.elapsed_seconds)/60,y:Number(point[key])}));
@@ -1245,9 +1275,9 @@ function render(state){
   const errors=document.getElementById('errors'), entries=Object.entries(state.errors||{}); errors.className=entries.length?'error visible':'error'; errors.textContent=entries.map(([key,value])=>`${key}: ${value}`).join('\n');
   text('latest-message',state.latest_log_message||'Waiting for training log…');
 
-  const losses=state.series?.losses||{}, combinedLosses=losses.combined||{}, diegesisLosses=losses.diegesis||{}, syn4dLosses=losses.syn4d||{}, mvkubricLosses=losses.mvkubric||{};
-  const lossData=source=>[points(source.total),movingAveragePoints(source.total),points(source.visibility),movingAveragePoints(source.visibility),points(source.flow),movingAveragePoints(source.flow)];
-  update(charts.combined,lossData(combinedLosses)); update(charts.diegesis,lossData(diegesisLosses)); update(charts.syn4d,lossData(syn4dLosses)); update(charts.mvkubric,lossData(mvkubricLosses));
+  currentLosses=state.series?.losses||{};
+  renderLossCharts();
+  const combinedLosses=currentLosses.combined||{};
   const baseline=state.series?.baseline||{};
   update(charts.stationary,[points(combinedLosses.flow),movingAveragePoints(combinedLosses.flow),points(baseline.stationary),movingAveragePoints(baseline.stationary)]);
   update(charts.stationaryRatio,[points(baseline.model_ratio),movingAveragePoints(baseline.model_ratio),parityPoints(baseline.model_ratio)]);
