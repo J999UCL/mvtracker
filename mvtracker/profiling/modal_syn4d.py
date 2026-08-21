@@ -1,4 +1,4 @@
-"""Small, scene-scoped staging helpers for the Syn4D temple_group profile."""
+"""Scene-scoped staging contracts for the Syn4D lab_bald pilot."""
 
 from __future__ import annotations
 
@@ -6,128 +6,166 @@ import csv
 import io
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 
 SYN4D_REPO_ID = "Syn4D/Syn4D"
 SYN4D_REVISION = "181c6a2da735b216826ab9411b08e0d1d225aced"
-TEMPLE_GROUP_SCENE = "temple_group"
-TEMPLE_GROUP_HF_MAPPING = "data/syn4d_v1_stride_1/sequence_to_asset_mapping.csv"
-TEMPLE_GROUP_HF_SOURCE = "data/syn4d_v1_stride_1/temple_group.tar.zst"
-TEMPLE_GROUP_OBJECT_ROOT = "data/metadata/new_weight_bone"
-TEMPLE_GROUP_SOURCE_BYTES = 13_287_559_476
-TEMPLE_GROUP_ROOT = Path("datasets/syn4d/temple_group")
-TEMPLE_GROUP_SOURCE_ROOT = TEMPLE_GROUP_ROOT / "source"
-TEMPLE_GROUP_METADATA_ROOT = TEMPLE_GROUP_ROOT / "metadata"
-TEMPLE_GROUP_OBJECT_ROOT_LOCAL = TEMPLE_GROUP_METADATA_ROOT / "new_weight_bone"
-TEMPLE_GROUP_MAPPING = TEMPLE_GROUP_ROOT / "sequence_to_asset_mapping.csv"
-TEMPLE_GROUP_BODY_ROOT = TEMPLE_GROUP_METADATA_ROOT / "bedlam2_smpl_npz"
-TEMPLE_GROUP_CACHE_ROOT = Path("datasets/syn4d-mvtracker/v1/train")
+SYN4D_SCENE = "lab_bald"
+SYN4D_SEQUENCE = "seq_000000"
+SYN4D_HF_MAPPING = "data/syn4d_v1_stride_1/sequence_to_asset_mapping.csv"
+SYN4D_HF_SOURCE = "data/syn4d_v1_stride_1/lab_bald.tar.zst"
+SYN4D_SOURCE_BYTES = 16_004_849_235
+SYN4D_OBJECT_ROOT = "data/metadata/new_weight_bone"
+SYN4D_ROOT = Path("datasets/syn4d/lab_bald")
+SYN4D_SOURCE_ROOT = SYN4D_ROOT / "source"
+SYN4D_METADATA_ROOT = SYN4D_ROOT / "metadata"
+SYN4D_OBJECT_ROOT_LOCAL = SYN4D_METADATA_ROOT / "new_weight_bone"
+SYN4D_MAPPING = SYN4D_ROOT / "sequence_to_asset_mapping.csv"
+SYN4D_BODY_ROOT = SYN4D_METADATA_ROOT / "bedlam2_smpl_npz"
+SYN4D_CACHE_ROOT = Path("datasets/syn4d-mvtracker/train")
 SELECTIVE_BEDLAM_ROOT = Path(
     "datasets/syn4d/v1-stride1-12train-4validation/metadata"
 )
-TEMPLE_GROUP_OBJECT_VERTEX_FILENAME = "vertices_sequence.npz"
-MANIFEST_NAME = "temple_group_manifest.json"
+SYN4D_OBJECT_VERTEX_FILENAME = "vertices_sequence.npz"
+MANIFEST_NAME = "lab_bald_manifest.json"
 
 
-def temple_group_object_paths(mapping_csv: Path) -> tuple[Path, ...]:
-    """Return the 60 public HF vertex files referenced by temple_group."""
+def _mapping_text(mapping_csv: str | Path) -> str:
+    if isinstance(mapping_csv, Path):
+        return mapping_csv.read_text(encoding="utf-8-sig")
+    return mapping_csv
 
-    from mvtracker.preprocessing.syn4d import temple_group_dependencies
 
-    plan = temple_group_dependencies(Path(mapping_csv))
+def sequence_dependencies(mapping_csv: str | Path) -> dict[str, Any]:
+    """Resolve exactly lab_bald/seq_000000 and its shared assets."""
+
+    views: set[int] = set()
+    bodies: set[str] = set()
+    objects: set[tuple[str, str]] = set()
+    pattern = re.compile(r"(seq_\d{6})_([0-7])$")
+    for row in csv.DictReader(io.StringIO(_mapping_text(mapping_csv))):
+        if row.get("scene") != SYN4D_SCENE:
+            continue
+        match = pattern.fullmatch(str(row.get("sequence_name", "")))
+        if match is None or match.group(1) != SYN4D_SEQUENCE:
+            continue
+        views.add(int(match.group(2)))
+        asset_type = row.get("asset_type")
+        asset = str(row.get("asset", ""))
+        if asset_type == "bedlam2_body":
+            bodies.add(asset)
+        elif asset_type == "objaverse_object":
+            parts = asset.rsplit("_", 1)
+            if len(parts) != 2:
+                raise ValueError(f"invalid Syn4D object asset {asset!r}")
+            objects.add((parts[0], parts[1]))
+
+    if views != set(range(8)):
+        raise ValueError(
+            f"{SYN4D_SCENE}/{SYN4D_SEQUENCE} must cover views 0 through 7; "
+            f"got {sorted(views)}"
+        )
+    if len(bodies) != 1:
+        raise ValueError(
+            f"{SYN4D_SCENE}/{SYN4D_SEQUENCE} must resolve to one BEDLAM2 body"
+        )
+    if not objects:
+        raise ValueError(
+            f"{SYN4D_SCENE}/{SYN4D_SEQUENCE} has no referenced objects"
+        )
+    body_motion = next(iter(bodies))
+    subject, animation = body_motion.rsplit("_", 1)
+    clothing_member = f"{subject}/{animation}/{animation}.npz"
+    return {
+        "scene": SYN4D_SCENE,
+        "sequence": SYN4D_SEQUENCE,
+        "views": sorted(views),
+        "body_motion": body_motion,
+        "motions": [body_motion],
+        "clothing_member": clothing_member,
+        "objects": sorted(objects),
+        "body_count": 1,
+        "clothing_count": 1,
+        "object_count": len(objects),
+    }
+
+
+def sequence_object_paths(mapping_csv: str | Path) -> tuple[Path, ...]:
+    """Return only public vertex files referenced by the pilot sequence."""
+
+    plan = sequence_dependencies(mapping_csv)
     return tuple(
-        Path(TEMPLE_GROUP_OBJECT_ROOT)
+        Path(SYN4D_OBJECT_ROOT)
         / group
         / object_id
-        / TEMPLE_GROUP_OBJECT_VERTEX_FILENAME
-        for group, object_id in plan.objects
+        / SYN4D_OBJECT_VERTEX_FILENAME
+        for group, object_id in plan["objects"]
     )
 
 
-def temple_group_bedlam_plan(
-    mapping_csv: str, archive_map: dict[str, list[str]],
+def sequence_bedlam_plan(
+    mapping_csv: str, archive_map: dict[str, list[str]]
 ) -> dict[str, Any]:
-    """Join the one-scene mapping to private BEDLAM clothing archives."""
+    """Join the pilot mapping to one cached BEDLAM clothing archive."""
 
-    motions: set[str] = set()
-    sequence_names: set[str] = set()
-    for row in csv.DictReader(io.StringIO(mapping_csv)):
-        if row.get("scene") != TEMPLE_GROUP_SCENE:
-            continue
-        sequence_names.add(str(row["sequence_name"]).rsplit("_", 1)[0])
-        if row.get("asset_type") == "bedlam2_body":
-            motions.add(str(row["asset"]))
-    if len(sequence_names) != 20 or len(motions) != 20:
-        raise RuntimeError(
-            "unexpected temple_group BEDLAM plan: "
-            f"sequences={len(sequence_names)} motions={len(motions)}"
-        )
+    plan = sequence_dependencies(mapping_csv)
     member_to_archive = {
         member: archive for archive, members in archive_map.items() for member in members
     }
-    required_members: dict[str, list[str]] = {}
-    for motion in sorted(motions):
-        subject, animation = motion.rsplit("_", 1)
-        member = f"{subject}/{animation}/{animation}.npz"
-        archive = member_to_archive.get(member)
-        if archive is None:
-            raise RuntimeError(f"BEDLAM archive map has no clothing member {member}")
-        required_members.setdefault(archive, []).append(member)
-    return {
-        "scene": TEMPLE_GROUP_SCENE,
-        "sequence_count": len(sequence_names),
-        "motions": sorted(motions),
-        "required_members": {
-            archive: sorted(members)
-            for archive, members in sorted(required_members.items())
-        },
-        "body_count": len(motions),
-        "clothing_count": len(motions),
-    }
+    archive = member_to_archive.get(plan["clothing_member"])
+    if archive is None:
+        raise RuntimeError(
+            f"BEDLAM archive map has no clothing member {plan['clothing_member']}"
+        )
+    return {**plan, "required_members": {archive: [plan["clothing_member"]]}}
 
 
-def write_temple_group_manifest(
-    destination: Path, *, source_archive: Path, mapping: Path,
-    object_files: tuple[Path, ...], bedlam: dict[str, Any], bedlam_root: Path,
+def write_sequence_manifest(
+    destination: Path,
+    *,
+    source_archive: Path,
+    mapping: Path,
+    object_files: tuple[Path, ...],
+    bedlam: dict[str, Any],
+    bedlam_root: Path,
 ) -> Path:
-    """Write the completion marker last, after selective dependencies exist."""
+    """Publish the completion marker only after every pilot dependency exists."""
 
-    from mvtracker.preprocessing.syn4d import temple_group_dependencies
-
-    dependencies = temple_group_dependencies(mapping)
-    expected = len(dependencies.objects)
+    dependencies = sequence_dependencies(mapping)
+    expected = len(dependencies["objects"])
     if len(object_files) != expected:
         raise RuntimeError(f"expected {expected} object vertices, got {len(object_files)}")
-    if not source_archive.is_file() or source_archive.stat().st_size != TEMPLE_GROUP_SOURCE_BYTES:
-        raise RuntimeError(f"incomplete temple_group source archive: {source_archive}")
+    if not source_archive.is_file() or source_archive.stat().st_size != SYN4D_SOURCE_BYTES:
+        raise RuntimeError(f"incomplete {SYN4D_SCENE} source archive: {source_archive}")
     missing = [str(path) for path in object_files if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"missing object vertices: {missing[:3]}")
     body_source = Path(bedlam_root) / "b2_motions_npz_training/motions_npz_training"
     clothing_source = Path(bedlam_root) / "b2_assetdata_download/clothing/npz"
-    missing_bodies = [
-        motion for motion in bedlam["motions"]
+    missing_body = [
+        motion for motion in dependencies["motions"]
         if not (body_source / f"{motion}.npz").is_file()
     ]
     missing_clothing = [
         archive for archive in bedlam["required_members"]
         if not (clothing_source / f"{archive}.tar").is_file()
     ]
-    if missing_bodies or missing_clothing:
+    if missing_body or missing_clothing:
         raise FileNotFoundError(
-            "verified BEDLAM2 cache is incomplete for temple_group: "
-            f"bodies={missing_bodies[:3]} clothing={missing_clothing[:3]}"
+            f"verified BEDLAM2 cache is incomplete for {SYN4D_SCENE}: "
+            f"bodies={missing_body} clothing={missing_clothing}"
         )
     manifest = {
-        "format": "mvtracker-syn4d-temple-group",
-        "scene": TEMPLE_GROUP_SCENE,
+        "format": "mvtracker-syn4d-lab-bald",
+        "scene": SYN4D_SCENE,
+        "sequence": SYN4D_SEQUENCE,
         "source_revision": SYN4D_REVISION,
         "source_archive": str(source_archive),
         "mapping": str(mapping),
-        "sequence_count": len(dependencies.sequences),
-        "body_count": len(dependencies.body_motions),
-        "clothing_count": len(dependencies.clothing_members),
+        "body_count": 1,
+        "clothing_count": 1,
         "object_count": expected,
         "bedlam_root": str(bedlam_root),
         "bedlam": bedlam,
@@ -141,11 +179,10 @@ def write_temple_group_manifest(
 
 
 __all__ = [
-    "MANIFEST_NAME", "SELECTIVE_BEDLAM_ROOT", "SYN4D_REPO_ID", "SYN4D_REVISION",
-    "TEMPLE_GROUP_BODY_ROOT", "TEMPLE_GROUP_CACHE_ROOT", "TEMPLE_GROUP_HF_MAPPING", "TEMPLE_GROUP_HF_SOURCE",
-    "TEMPLE_GROUP_METADATA_ROOT",
-    "TEMPLE_GROUP_MAPPING", "TEMPLE_GROUP_OBJECT_ROOT", "TEMPLE_GROUP_OBJECT_ROOT_LOCAL",
-    "TEMPLE_GROUP_ROOT", "TEMPLE_GROUP_SCENE", "TEMPLE_GROUP_SOURCE_BYTES",
-    "TEMPLE_GROUP_SOURCE_ROOT", "temple_group_bedlam_plan",
-    "temple_group_object_paths", "write_temple_group_manifest",
+    "MANIFEST_NAME", "SELECTIVE_BEDLAM_ROOT", "SYN4D_BODY_ROOT", "SYN4D_CACHE_ROOT",
+    "SYN4D_HF_MAPPING", "SYN4D_HF_SOURCE", "SYN4D_MAPPING", "SYN4D_METADATA_ROOT",
+    "SYN4D_OBJECT_ROOT", "SYN4D_OBJECT_ROOT_LOCAL", "SYN4D_REPO_ID", "SYN4D_REVISION",
+    "SYN4D_ROOT", "SYN4D_SCENE", "SYN4D_SEQUENCE", "SYN4D_SOURCE_BYTES",
+    "SYN4D_SOURCE_ROOT", "sequence_bedlam_plan", "sequence_dependencies",
+    "sequence_object_paths", "write_sequence_manifest",
 ]
