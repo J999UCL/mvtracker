@@ -9,6 +9,7 @@ import numpy as np
 from mvtracker.datasets.syn4d_multiview_dataset import (
     Syn4DMultiViewDataset,
     _SequenceMmapCache,
+    _preselect_tracks,
 )
 
 
@@ -109,6 +110,18 @@ def _dataset(root: Path):
 
 
 class Syn4DLoaderTests(unittest.TestCase):
+    def test_motion_preselection_does_not_substitute_missing_pools(self):
+        movement = np.array([0.0] * 8 + [0.5] * 16, dtype=np.float32)
+        selected = _preselect_tracks(
+            movement,
+            np.ones_like(movement, dtype=bool),
+            np.random.RandomState(3),
+            ratio_dynamic=0.5,
+            ratio_very_dynamic=0.25,
+            maximum=24,
+        )
+        self.assertEqual(selected.size, 0)
+
     def test_factory_maps_the_direct_sequence_cache(self):
         config = SimpleNamespace(
             datasets={

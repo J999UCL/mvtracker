@@ -1596,12 +1596,20 @@ class _CudaPrefetchIterator:
                 if sample.depth is not None
                 else len(sample.depth_sensor_widths)
             )
-            if views < 1 or len(sample.jpeg_bytes) % views:
-                raise ValueError("encoded sample has an invalid view/frame layout")
+            if sample.image_codec == "raw":
+                if sample.raw_rgb is None or sample.raw_rgb.ndim != 5:
+                    raise ValueError("raw sample has an invalid view/frame layout")
+                if int(sample.raw_rgb.shape[0]) != views:
+                    raise ValueError("raw RGB and depth view counts differ")
+                frames = int(sample.raw_rgb.shape[1])
+            else:
+                if views < 1 or len(sample.jpeg_bytes) % views:
+                    raise ValueError("encoded sample has an invalid view/frame layout")
+                frames = len(sample.jpeg_bytes) // views
             keys.append((
                 sample.image_codec,
                 views,
-                len(sample.jpeg_bytes) // views,
+                frames,
                 sample.output_size,
             ))
         if len(set(keys)) != 1:

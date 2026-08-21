@@ -358,3 +358,32 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run tools/modal_updateformer_autoresearch.py::fused_candidate_gate \
     --candidate-backend qkv
 ```
+
+## Convert the Syn4D `temple_group` scene on Modal
+
+Upload the licensed SMPL-X add-on once, deploy the tagged CPU/T4 conversion app,
+stage only `temple_group` and its selective dependencies, convert its 20 BEDLAM2
+bodies, then run one-sequence or whole-scene conversion. The source archive and
+final unquantized TAPVid-MV cache live on `jeet-mvtracker-data-v2`.
+
+```bash
+modal volume put jeet-mvtracker-data-v2 \
+  /Users/jeetthakwani/Downloads/smplx_blender_addon-1.0.3-20260511.zip \
+  datasets/syn4d/temple_group/private/
+
+MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
+  modal deploy tools/modal_syn4d_data_setup.py
+
+MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
+  modal run --timestamps tools/modal_syn4d_data_setup.py::download
+
+MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
+  modal run --timestamps tools/modal_syn4d_data_setup.py::convert-bedlam
+
+MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
+  modal run --timestamps tools/modal_syn4d_data_setup.py::convert \
+    --sequence seq_000000
+
+MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
+  modal run --timestamps tools/modal_syn4d_data_setup.py::temple-group
+```

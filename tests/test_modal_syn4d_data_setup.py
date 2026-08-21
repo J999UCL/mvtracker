@@ -73,6 +73,7 @@ class ModalSyn4DDataSetupTests(unittest.TestCase):
                 write_temple_group_manifest(
                     root / "manifest.json", source_archive=source,
                     mapping=mapping, object_files=objects, bedlam={},
+                    bedlam_root=root / "bedlam",
                 )
             self.assertFalse((root / "manifest.json").exists())
 
@@ -86,6 +87,9 @@ class ModalSyn4DDataSetupTests(unittest.TestCase):
         self.assertIn("require_pushed_main_commit", LAUNCHER)
         self.assertNotIn("flash_attn", LAUNCHER)
         self.assertNotIn("pointops", LAUNCHER)
+        self.assertIn("SELECTIVE_BEDLAM_ROOT", LAUNCHER)
+        self.assertNotIn("download_body_motions", LAUNCHER)
+        self.assertIn("@modal.web_server(8000", LAUNCHER)
 
 
 if __name__ == "__main__":

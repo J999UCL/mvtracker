@@ -6,7 +6,6 @@ import csv
 import io
 import json
 from pathlib import Path
-import shutil
 from typing import Any
 
 
@@ -19,10 +18,14 @@ TEMPLE_GROUP_OBJECT_ROOT = "data/metadata/new_weight_bone"
 TEMPLE_GROUP_SOURCE_BYTES = 13_287_559_476
 TEMPLE_GROUP_ROOT = Path("datasets/syn4d/temple_group")
 TEMPLE_GROUP_SOURCE_ROOT = TEMPLE_GROUP_ROOT / "source"
-TEMPLE_GROUP_OBJECT_ROOT_LOCAL = TEMPLE_GROUP_ROOT / "objects"
+TEMPLE_GROUP_METADATA_ROOT = TEMPLE_GROUP_ROOT / "metadata"
+TEMPLE_GROUP_OBJECT_ROOT_LOCAL = TEMPLE_GROUP_METADATA_ROOT / "new_weight_bone"
 TEMPLE_GROUP_MAPPING = TEMPLE_GROUP_ROOT / "sequence_to_asset_mapping.csv"
-TEMPLE_GROUP_BEDLAM_ROOT = TEMPLE_GROUP_ROOT / "bedlam2"
-TEMPLE_GROUP_CACHE_ROOT = TEMPLE_GROUP_ROOT / "cache"
+TEMPLE_GROUP_BODY_ROOT = TEMPLE_GROUP_METADATA_ROOT / "bedlam2_smpl_npz"
+TEMPLE_GROUP_CACHE_ROOT = Path("datasets/syn4d-mvtracker/v1/train")
+SELECTIVE_BEDLAM_ROOT = Path(
+    "datasets/syn4d/v1-stride1-12train-4validation/metadata"
+)
 TEMPLE_GROUP_OBJECT_VERTEX_FILENAME = "vertices_sequence.npz"
 MANIFEST_NAME = "temple_group_manifest.json"
 
@@ -40,24 +43,6 @@ def temple_group_object_paths(mapping_csv: Path) -> tuple[Path, ...]:
         / TEMPLE_GROUP_OBJECT_VERTEX_FILENAME
         for group, object_id in plan.objects
     )
-
-
-def stage_hf_file(
-    *, repo_id: str, revision: str, filename: str, token: str,
-    destination: Path, local_dir: Path = Path("/tmp/syn4d-hf"),
-) -> Path:
-    """Copy one pinned HF file into the Volume, without a second full hash pass."""
-
-    from huggingface_hub import hf_hub_download
-
-    source = Path(hf_hub_download(
-        repo_id=repo_id, repo_type="dataset", revision=revision,
-        filename=filename, token=token, local_dir=str(local_dir),
-    ))
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
-    return destination
 
 
 def temple_group_bedlam_plan(
@@ -104,7 +89,7 @@ def temple_group_bedlam_plan(
 
 def write_temple_group_manifest(
     destination: Path, *, source_archive: Path, mapping: Path,
-    object_files: tuple[Path, ...], bedlam: dict[str, Any],
+    object_files: tuple[Path, ...], bedlam: dict[str, Any], bedlam_root: Path,
 ) -> Path:
     """Write the completion marker last, after selective dependencies exist."""
 
@@ -119,6 +104,21 @@ def write_temple_group_manifest(
     missing = [str(path) for path in object_files if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"missing object vertices: {missing[:3]}")
+    body_source = Path(bedlam_root) / "b2_motions_npz_training/motions_npz_training"
+    clothing_source = Path(bedlam_root) / "b2_assetdata_download/clothing/npz"
+    missing_bodies = [
+        motion for motion in bedlam["motions"]
+        if not (body_source / f"{motion}.npz").is_file()
+    ]
+    missing_clothing = [
+        archive for archive in bedlam["required_members"]
+        if not (clothing_source / f"{archive}.tar").is_file()
+    ]
+    if missing_bodies or missing_clothing:
+        raise FileNotFoundError(
+            "verified BEDLAM2 cache is incomplete for temple_group: "
+            f"bodies={missing_bodies[:3]} clothing={missing_clothing[:3]}"
+        )
     manifest = {
         "format": "mvtracker-syn4d-temple-group",
         "scene": TEMPLE_GROUP_SCENE,
@@ -129,6 +129,7 @@ def write_temple_group_manifest(
         "body_count": len(dependencies.body_motions),
         "clothing_count": len(dependencies.clothing_members),
         "object_count": expected,
+        "bedlam_root": str(bedlam_root),
         "bedlam": bedlam,
     }
     destination = Path(destination)
@@ -140,10 +141,11 @@ def write_temple_group_manifest(
 
 
 __all__ = [
-    "MANIFEST_NAME", "SYN4D_REPO_ID", "SYN4D_REVISION", "TEMPLE_GROUP_BEDLAM_ROOT",
-    "TEMPLE_GROUP_CACHE_ROOT", "TEMPLE_GROUP_HF_MAPPING", "TEMPLE_GROUP_HF_SOURCE",
+    "MANIFEST_NAME", "SELECTIVE_BEDLAM_ROOT", "SYN4D_REPO_ID", "SYN4D_REVISION",
+    "TEMPLE_GROUP_BODY_ROOT", "TEMPLE_GROUP_CACHE_ROOT", "TEMPLE_GROUP_HF_MAPPING", "TEMPLE_GROUP_HF_SOURCE",
+    "TEMPLE_GROUP_METADATA_ROOT",
     "TEMPLE_GROUP_MAPPING", "TEMPLE_GROUP_OBJECT_ROOT", "TEMPLE_GROUP_OBJECT_ROOT_LOCAL",
     "TEMPLE_GROUP_ROOT", "TEMPLE_GROUP_SCENE", "TEMPLE_GROUP_SOURCE_BYTES",
-    "TEMPLE_GROUP_SOURCE_ROOT", "stage_hf_file", "temple_group_bedlam_plan",
+    "TEMPLE_GROUP_SOURCE_ROOT", "temple_group_bedlam_plan",
     "temple_group_object_paths", "write_temple_group_manifest",
 ]

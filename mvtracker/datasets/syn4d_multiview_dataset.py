@@ -117,16 +117,14 @@ def _preselect_tracks(
         int(target * ratio_dynamic),
         int(target * ratio_very_dynamic),
     )
+    buckets = (static, dynamic, very_dynamic)
+    if any(len(bucket) < count for bucket, count in zip(buckets, desired)):
+        return np.empty(0, dtype=np.int64)
     selected = [
-        rng.choice(bucket, min(count, len(bucket)), replace=False)
-        for bucket, count in zip((static, dynamic, very_dynamic), desired)
+        rng.choice(bucket, count, replace=False)
+        for bucket, count in zip(buckets, desired)
     ]
     result = np.concatenate(selected) if selected else np.empty(0, dtype=np.int64)
-    if len(result) < target:
-        remaining = np.setdiff1d(candidates, result, assume_unique=False)
-        result = np.concatenate(
-            (result, rng.choice(remaining, target - len(result), replace=False))
-        )
     rng.shuffle(result)
     return result.astype(np.int64, copy=False)
 

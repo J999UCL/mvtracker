@@ -1002,13 +1002,42 @@ def finalize_sequence_cache(
         "coordinate_frame": "syn4d_world_metres",
         "depth": "float32_optical_z_metres_zero_invalid",
         "rgb": "uint8_rgb_chw",
-        "queries": "source_pixel_xytv",
+        "queries": "cache_pixel_xytv",
     }
     temporary = writer.destination / ".manifest.json.partial"
     temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     manifest_path = writer.destination / "manifest.json"
     temporary.replace(manifest_path)
     return manifest_path
+
+
+def convert_temple_group(
+    scene_root: Path,
+    primary_metadata_root: Path,
+    fallback_metadata_root: Path,
+    output_root: Path,
+    *,
+    official_visualizer_root: Path,
+    sequence: str | None = None,
+    device: str = "cuda",
+    progress=None,
+):
+    """Lazy public entry point for the real one-scene converter."""
+
+    from mvtracker.preprocessing.syn4d_conversion import (
+        convert_temple_group as run_conversion,
+    )
+
+    return run_conversion(
+        scene_root,
+        primary_metadata_root,
+        fallback_metadata_root,
+        output_root,
+        official_visualizer_root=official_visualizer_root,
+        sequence=sequence,
+        device=device,
+        progress=progress,
+    )
 
 
 __all__ = [
@@ -1030,6 +1059,7 @@ __all__ = [
     "camera_from_syn4d_row",
     "compact_surface_candidates",
     "compute_depth_visibility",
+    "convert_temple_group",
     "create_sequence_cache",
     "depth_centimetres_to_metres",
     "discover_temple_group_sequences",

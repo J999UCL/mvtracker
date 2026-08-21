@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import time
 
@@ -45,8 +46,12 @@ BLENDER_ARCHIVE = f"blender-{BLENDER_VERSION}-linux-x64.tar.xz"
 BLENDER_URL = f"https://download.blender.org/release/Blender4.5/{BLENDER_ARCHIVE}"
 BLENDER_ROOT = Path(f"/opt/blender-{BLENDER_VERSION}-linux-x64")
 BLENDER_BIN = BLENDER_ROOT / "blender"
-SMPLX_ADDON_ZIP = DATA_ROOT / "bedlam2" / "smplx_blender_addon.zip"
+SMPLX_ADDON_ZIP = (
+    DATA_ROOT
+    / "datasets/syn4d/temple_group/private/smplx_blender_addon-1.0.3-20260511.zip"
+)
 BEDLAM_SCRIPTS_ROOT = Path("/opt/syn4d-bedlam2")
+SYN4D_VISUALIZER_ROOT = Path("/opt/syn4d-visualizer")
 BEDLAM_README_URL = (
     "https://huggingface.co/datasets/Syn4D/Syn4D/resolve/"
     "181c6a2da735b216826ab9411b08e0d1d225aced/code/bedlam2/"
@@ -58,9 +63,6 @@ data_volume = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True, v
 run_volume = modal.Volume.from_name(RUN_VOLUME_NAME, create_if_missing=True, version=2)
 hf_secret = modal.Secret.from_name(HF_SECRET_NAME, required_keys=["HF_TOKEN"])
 wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME, required_keys=["WANDB_API_KEY"])
-bedlam_secret = modal.Secret.from_name(
-    "jeet-mvtracker-bedlam", required_keys=["BEDLAM_EMAIL", "BEDLAM_PASSWORD"]
-)
 
 
 def _clone_source(image: modal.Image) -> modal.Image:
@@ -85,7 +87,7 @@ def _t4_image() -> modal.Image:
             "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.10"
         )
         .apt_install(
-            "ca-certificates", "ffmpeg", "git", "libgl1", "libglib2.0-0",
+            "ca-certificates", "curl", "ffmpeg", "git", "libgl1", "libglib2.0-0",
             "libopenexr-dev", "openexr", "zstd",
         )
         .pip_install(
@@ -95,9 +97,24 @@ def _t4_image() -> modal.Image:
         .pip_install(
             "hf-xet==1.1.8", "huggingface-hub==0.30.2",
             "nvidia-dali-cuda120==1.53.0",
-            "nvidia-nvimgcodec-cu12[nvtiff]==0.7.0.11",
-            "nvidia-libnvcomp-cu12==5.1.0.21", "OpenEXR==3.3.5",
-            "safetensors==0.5.3", "wandb==0.19.9",
+            "OpenEXR==3.3.5", "safetensors==0.5.3", "wandb==0.19.9",
+            "opencv-python-headless==4.11.0.86", "pandas==2.2.3",
+            "scipy==1.15.2", "Pillow==11.1.0", "imageio==2.37.0",
+            "tqdm==4.67.1", "pause==0.3", "jupyterlab==4.3.6",
+        )
+        .run_commands(
+            f"mkdir -p {shlex.quote(str(SYN4D_VISUALIZER_ROOT))}",
+            *(
+                "curl -fsSL "
+                + shlex.quote(
+                    "https://huggingface.co/datasets/Syn4D/Syn4D/resolve/"
+                    "181c6a2da735b216826ab9411b08e0d1d225aced/code/visualizer/"
+                    + filename
+                )
+                + " -o "
+                + shlex.quote(str(SYN4D_VISUALIZER_ROOT / filename))
+                for filename in ("syn4d_track.py", "base_dataset.py", "utils.py")
+            ),
         )
     )
     return _clone_source(base).env(
@@ -118,10 +135,10 @@ def _blender_image() -> modal.Image:
         + shlex.quote(str(BEDLAM_SCRIPTS_ROOT / name))
         for name in script_names
     )
-    return (
+    base = (
         modal.Image.debian_slim(python_version="3.11")
         .apt_install(
-            "ca-certificates", "curl", "libgl1", "libglib2.0-0", "libopenexr-dev",
+            "ca-certificates", "curl", "git", "libgl1", "libglib2.0-0", "libopenexr-dev",
             "libxi6", "libxrender1", "libxxf86vm1", "openexr", "xz-utils",
         )
         .pip_install("numpy==2.2.4", "wandb==0.19.9")
@@ -132,6 +149,7 @@ def _blender_image() -> modal.Image:
         )
         .env({"BLENDER_BIN": str(BLENDER_BIN)})
     )
+    return _clone_source(base)
 
 
 app = modal.App(APP_NAME, tags=MODAL_TAGS)
@@ -152,8 +170,9 @@ def _wandb_run(*, job_type: str, name: str, tags: list[str], config: dict):
 
 @app.function(
     image=t4_image,
-    secrets=[hf_secret, wandb_secret, bedlam_secret],
+    secrets=[hf_secret, wandb_secret],
     volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
+    gpu="T4",
     cpu=T4_CPU, memory=T4_MEMORY_MIB, ephemeral_disk=T4_EPHEMERAL_DISK_MIB,
     timeout=24 * 60 * 60, retries=1, max_containers=MAX_CONTAINERS,
     include_source=False,
@@ -162,19 +181,13 @@ def download_dependencies_remote() -> dict[str, object]:
     """Stage exactly one source scene and its 20 bodies/20 clothing/60 objects."""
 
     from huggingface_hub import hf_hub_download
-    import requests
-
     from mvtracker.profiling.modal_syn4d import (
-        SYN4D_REPO_ID, SYN4D_REVISION, TEMPLE_GROUP_HF_MAPPING,
+        SELECTIVE_BEDLAM_ROOT, SYN4D_REPO_ID, SYN4D_REVISION, TEMPLE_GROUP_HF_MAPPING,
         TEMPLE_GROUP_HF_SOURCE, TEMPLE_GROUP_MAPPING,
         TEMPLE_GROUP_OBJECT_ROOT_LOCAL, TEMPLE_GROUP_ROOT,
         TEMPLE_GROUP_SOURCE_BYTES, TEMPLE_GROUP_SOURCE_ROOT,
         temple_group_bedlam_plan, temple_group_object_paths,
         write_temple_group_manifest,
-    )
-    from mvtracker.profiling.modal_syn4d_bedlam import (
-        CLOTHING_SOURCE_ROOT, download_body_motions,
-        download_sparse_clothing_tar, download_text,
     )
 
     run = _wandb_run(
@@ -201,45 +214,34 @@ def download_dependencies_remote() -> dict[str, object]:
     ))
     if source_path.stat().st_size != TEMPLE_GROUP_SOURCE_BYTES:
         raise RuntimeError("temple_group source archive size does not match pin")
-    source_destination.write_bytes(source_path.read_bytes())
+    shutil.copyfile(source_path, source_destination)
 
-    object_files = []
-    for remote_path in temple_group_object_paths(mapping_destination):
+    def stage_object(remote_path: Path) -> Path:
         local_path = Path(hf_hub_download(
             repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
             filename=remote_path.as_posix(), token=os.environ["HF_TOKEN"],
-            local_dir="/tmp/syn4d-object",
+            local_dir=f"/tmp/syn4d-object-{remote_path.parent.name}",
         ))
         relative = Path(remote_path).relative_to(Path("data/metadata/new_weight_bone"))
         destination = DATA_ROOT / TEMPLE_GROUP_OBJECT_ROOT_LOCAL / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(local_path.read_bytes())
-        object_files.append(destination)
+        shutil.copyfile(local_path, destination)
+        return destination
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        object_files = list(
+            pool.map(stage_object, temple_group_object_paths(mapping_destination))
+        )
     run.log({"download/object_vertices": len(object_files)})
 
-    with requests.Session() as session:
-        archive_map = json.loads(download_text(
-            session, f"{CLOTHING_SOURCE_ROOT}/archive_map.json",
-            os.environ["BEDLAM_EMAIL"], os.environ["BEDLAM_PASSWORD"],
-        ))
-        checksums = download_text(
-            session, f"{CLOTHING_SOURCE_ROOT}/checksum.xxh128",
-            os.environ["BEDLAM_EMAIL"], os.environ["BEDLAM_PASSWORD"],
-        )
+    bedlam_root = DATA_ROOT / SELECTIVE_BEDLAM_ROOT
+    archive_map = json.loads(
+        (bedlam_root / "b2_assetdata_download/clothing/npz/archive_map.json").read_text()
+    )
     bedlam_plan = temple_group_bedlam_plan(
         mapping_destination.read_text(encoding="utf-8-sig"), archive_map
-    )
-    download_body_motions(
-        DATA_ROOT / TEMPLE_GROUP_ROOT / "bedlam2", bedlam_plan["motions"],
-        os.environ["BEDLAM_EMAIL"], os.environ["BEDLAM_PASSWORD"],
-    )
-    for archive, members in bedlam_plan["required_members"].items():
-        download_sparse_clothing_tar(
-            DATA_ROOT / TEMPLE_GROUP_ROOT / "bedlam2", archive, members,
-            os.environ["BEDLAM_EMAIL"], os.environ["BEDLAM_PASSWORD"],
-        )
-    (DATA_ROOT / TEMPLE_GROUP_ROOT / "bedlam2" / "source_archives.xxh128").write_text(
-        checksums, encoding="utf-8"
     )
     write_temple_group_manifest(
         DATA_ROOT / TEMPLE_GROUP_ROOT / "manifest.json",
@@ -247,6 +249,7 @@ def download_dependencies_remote() -> dict[str, object]:
         mapping=mapping_destination,
         object_files=tuple(object_files),
         bedlam=bedlam_plan,
+        bedlam_root=bedlam_root,
     )
     data_volume.commit()
     result = {
@@ -270,7 +273,12 @@ def download_dependencies_remote() -> dict[str, object]:
 def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str, object]:
     """Run the official Blender 4.5 Alembic -> vertex NPZ pipeline."""
 
-    from mvtracker.profiling.modal_syn4d import TEMPLE_GROUP_ROOT
+    from mvtracker.preprocessing.syn4d import temple_group_dependencies
+    from mvtracker.profiling.modal_syn4d import (
+        SELECTIVE_BEDLAM_ROOT,
+        TEMPLE_GROUP_BODY_ROOT,
+        TEMPLE_GROUP_MAPPING,
+    )
 
     if processes <= 0:
         raise ValueError("processes must be positive")
@@ -282,10 +290,20 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
     addon = Path(SMPLX_ADDON_ZIP)
     if not addon.is_file():
         raise FileNotFoundError(f"private SMPL-X add-on is required on the Volume: {addon}")
-    metadata_root = DATA_ROOT / TEMPLE_GROUP_ROOT / "bedlam2"
-    motions_root = metadata_root / "datasets/syn4d/v1-stride1-12train-4validation/metadata/b2_motions_npz_training/motions_npz_training"
-    abc_root = metadata_root / "bedlam2_smpl_abc"
-    vertices_root = metadata_root / "bedlam2_smpl_npz"
+    dependencies = temple_group_dependencies(DATA_ROOT / TEMPLE_GROUP_MAPPING)
+    source_motions = (
+        DATA_ROOT
+        / SELECTIVE_BEDLAM_ROOT
+        / "b2_motions_npz_training/motions_npz_training"
+    )
+    work_root = Path("/tmp/temple-group-bedlam")
+    motions_root = work_root / "motions"
+    abc_root = work_root / "abc"
+    vertices_root = work_root / "vertices"
+    shutil.rmtree(work_root, ignore_errors=True)
+    motions_root.mkdir(parents=True)
+    for motion in dependencies.body_motions:
+        shutil.copyfile(source_motions / f"{motion}.npz", motions_root / f"{motion}.npz")
     install = (
         f"{shlex.quote(str(BLENDER_BIN))} --background --python-expr "
         + shlex.quote(
@@ -310,10 +328,15 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
     subprocess.run(stage2, check=True)
     stage2_seconds = time.perf_counter() - stage2_started
     run.log({"bedlam/stage2_seconds": stage2_seconds, "bedlam/stage2": 1})
-    run_volume.commit()
+    published_root = DATA_ROOT / TEMPLE_GROUP_BODY_ROOT
+    for source in vertices_root.rglob("*.npz"):
+        destination = published_root / source.relative_to(vertices_root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    data_volume.commit()
     result = {"stage1_seconds": stage1_seconds, "stage2_seconds": stage2_seconds,
               "motion_count": len(tuple(motions_root.rglob("*.npz"))),
-              "vertex_cache_count": len(tuple(vertices_root.rglob("*.npz")))}
+              "vertex_cache_count": len(tuple(published_root.rglob("*.npz")))}
     run.summary.update(result)
     run.finish()
     return result
@@ -330,7 +353,12 @@ def convert_temple_group_remote(sequence: str | None = None) -> dict[str, object
     """Convert the whole scene or one sequence through the shared core."""
 
     from mvtracker.preprocessing.syn4d import convert_temple_group
-    from mvtracker.profiling.modal_syn4d import TEMPLE_GROUP_ROOT
+    from mvtracker.profiling.modal_syn4d import (
+        SELECTIVE_BEDLAM_ROOT,
+        TEMPLE_GROUP_CACHE_ROOT,
+        TEMPLE_GROUP_METADATA_ROOT,
+        TEMPLE_GROUP_ROOT,
+    )
 
     requested = sequence or "whole-scene"
     run = _wandb_run(
@@ -338,20 +366,34 @@ def convert_temple_group_remote(sequence: str | None = None) -> dict[str, object
         tags=["converter", "t4"], config={"sequence": requested, **MODAL_TAGS},
     )
     started = time.perf_counter()
-    source_root = DATA_ROOT / TEMPLE_GROUP_ROOT / "source"
-    source_archive = source_root / "temple_group.tar.zst"
-    extracted_marker = source_root / ".extracted"
-    if not extracted_marker.is_file():
-        subprocess.run(
-            ["tar", "-I", "zstd", "-xf", str(source_archive), "-C", str(source_root)],
-            check=True,
-        )
-        extracted_marker.write_text("complete\n", encoding="utf-8")
-        run.log({"conversion/source_extract": 1})
+    source_archive = DATA_ROOT / TEMPLE_GROUP_ROOT / "source/temple_group.tar.zst"
+    extracted_root = Path("/tmp/syn4d-temple-group")
+    shutil.rmtree(extracted_root, ignore_errors=True)
+    extracted_root.mkdir(parents=True)
+    subprocess.run(
+        ["tar", "-I", "zstd -T0", "-xf", str(source_archive), "-C", str(extracted_root)],
+        check=True,
+    )
+    run.log({"conversion/source_extract": 1})
+
+    def progress(payload: dict[str, object]) -> None:
+        metrics = {
+            f"conversion/{key}": value
+            for key, value in payload.items()
+            if isinstance(value, (int, float))
+        }
+        if metrics:
+            run.log(metrics)
+
     result = convert_temple_group(
-        DATA_ROOT / TEMPLE_GROUP_ROOT, DATA_ROOT / TEMPLE_GROUP_ROOT / "cache",
-        sequence=sequence, device="cuda",
-        progress=lambda payload: run.log({f"conversion/{key}": value for key, value in payload.items()}),
+        extracted_root / "temple_group",
+        DATA_ROOT / TEMPLE_GROUP_METADATA_ROOT,
+        DATA_ROOT / SELECTIVE_BEDLAM_ROOT,
+        DATA_ROOT / TEMPLE_GROUP_CACHE_ROOT,
+        sequence=sequence,
+        device="cuda",
+        official_visualizer_root=SYN4D_VISUALIZER_ROOT,
+        progress=progress,
     )
     result = {**result, "elapsed_seconds": time.perf_counter() - started}
     run.summary.update(result)
@@ -359,6 +401,27 @@ def convert_temple_group_remote(sequence: str | None = None) -> dict[str, object
     data_volume.commit()
     run_volume.commit()
     return result
+
+
+@app.function(
+    image=t4_image,
+    secrets=[hf_secret, wandb_secret],
+    volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
+    gpu="T4", cpu=T4_CPU, memory=T4_MEMORY_MIB,
+    ephemeral_disk=T4_EPHEMERAL_DISK_MIB,
+    timeout=8 * 60 * 60, max_containers=1, include_source=False,
+)
+@modal.web_server(8000, startup_timeout=120)
+def notebook() -> None:
+    """Tagged T4 JupyterLab for inspecting and timing committed converter code."""
+
+    subprocess.Popen(
+        [
+            "jupyter", "lab", "--ip=0.0.0.0", "--port=8000", "--no-browser",
+            "--allow-root", "--ServerApp.token=", "--ServerApp.password=",
+            "--ServerApp.root_dir=/opt/mvtracker",
+        ]
+    )
 
 
 def _preflight(tags: dict[str, str] = MODAL_TAGS) -> None:
