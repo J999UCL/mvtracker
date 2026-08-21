@@ -199,7 +199,8 @@ def download_dependencies_remote() -> dict[str, object]:
     from huggingface_hub import hf_hub_download
     from mvtracker.profiling.modal_syn4d import (
         SELECTIVE_BEDLAM_ROOT, SYN4D_HF_MAPPING, SYN4D_HF_SOURCE, SYN4D_MAPPING,
-        SYN4D_OBJECT_ROOT_LOCAL, SYN4D_REPO_ID, SYN4D_REVISION, SYN4D_ROOT,
+        SYN4D_METADATA_ROOT, SYN4D_OBJECT_ROOT_LOCAL, SYN4D_REPO_ID,
+        SYN4D_REVISION, SYN4D_ROOT,
         SYN4D_SOURCE_BYTES, SYN4D_SOURCE_ROOT, sequence_bedlam_plan,
         sequence_object_paths, write_sequence_manifest,
     )
