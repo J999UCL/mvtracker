@@ -46,10 +46,11 @@ BLENDER_ARCHIVE = f"blender-{BLENDER_VERSION}-linux-x64.tar.xz"
 BLENDER_URL = f"https://download.blender.org/release/Blender4.5/{BLENDER_ARCHIVE}"
 BLENDER_ROOT = Path(f"/opt/blender-{BLENDER_VERSION}-linux-x64")
 BLENDER_BIN = BLENDER_ROOT / "blender"
-SMPLX_ADDON_ZIP = (
+SMPLX_ADDON_PARTS = (
     DATA_ROOT
-    / "datasets/syn4d/temple_group/private/smplx_blender_addon-1.0.3-20260511.zip"
+    / "datasets/syn4d/temple_group/private/smplx_addon_parts"
 )
+SMPLX_ADDON_BYTES = 387_473_505
 BEDLAM_SCRIPTS_ROOT = Path("/opt/syn4d-bedlam2")
 SYN4D_VISUALIZER_ROOT = Path("/opt/syn4d-visualizer")
 BEDLAM_README_URL = (
@@ -286,9 +287,21 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
         tags=["bedlam2", "blender-4.5", "cpu"],
         config={"blender_version": BLENDER_VERSION, "processes": processes, **CPU_TAGS},
     )
-    addon = Path(SMPLX_ADDON_ZIP)
-    if not addon.is_file():
-        raise FileNotFoundError(f"private SMPL-X add-on is required on the Volume: {addon}")
+    addon_parts = sorted(Path(SMPLX_ADDON_PARTS).glob("part-*"))
+    if not addon_parts:
+        raise FileNotFoundError(
+            f"private SMPL-X add-on parts are required on the Volume: {SMPLX_ADDON_PARTS}"
+        )
+    addon = Path("/tmp/smplx_blender_addon-1.0.3-20260511.zip")
+    with addon.open("wb") as output:
+        for part in addon_parts:
+            with part.open("rb") as source:
+                shutil.copyfileobj(source, output, 8 << 20)
+    if addon.stat().st_size != SMPLX_ADDON_BYTES:
+        raise RuntimeError(
+            f"SMPL-X add-on parts total {addon.stat().st_size} bytes; "
+            f"expected {SMPLX_ADDON_BYTES}"
+        )
     dependencies = temple_group_dependencies(DATA_ROOT / TEMPLE_GROUP_MAPPING)
     source_motions = (
         DATA_ROOT

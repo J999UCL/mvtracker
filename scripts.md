@@ -367,9 +367,13 @@ bodies, then run one-sequence or whole-scene conversion. The source archive and
 final unquantized TAPVid-MV cache live on `jeet-mvtracker-data-v2`.
 
 ```bash
-modal volume put jeet-mvtracker-data-v2 \
+SMPLX_PARTS="$(mktemp -d)"
+split -b 25m \
   /Users/jeetthakwani/Downloads/smplx_blender_addon-1.0.3-20260511.zip \
-  datasets/syn4d/temple_group/private/
+  "$SMPLX_PARTS/part-"
+find "$SMPLX_PARTS" -type f -name 'part-*' -print0 | \
+  xargs -0 -P 8 -I {} modal volume put jeet-mvtracker-data-v2 {} \
+    datasets/syn4d/temple_group/private/smplx_addon_parts/
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal deploy tools/modal_syn4d_data_setup.py
