@@ -1503,3 +1503,22 @@ The likely bounded contributors are the four-step encoded lookahead plus
 Syn4D's mapped sequence cache, but the available two memory samples do not
 prove that the process had stabilized. W&B:
 https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/a96efc42247a
+
+### 256-GiB relaunch
+
+Source `d44c73db12b999b8f6257b89689b0675c229cd00` retained the 64-GiB RAM
+request and raised only the hard limit to 256 GiB. The fresh two-H200 run
+completed all three initial validation datasets and remained healthy beyond
+100 optimizer updates. The first cold update took 147.7 seconds, but the warm
+median remained around 6--7 seconds with roughly 0.6 seconds median exposed
+data wait.
+
+Container RAM followed a decelerating cache-fill curve: 105.5 GiB at step 10,
+125.7 at step 20, 133.4 at step 30, 135.9 at step 50, 140.2 at step 90, and
+142.1 at step 100. The process therefore still crept upward, but had 114 GiB
+headroom and no longer resembled the earlier linear mmap leak. The run remains
+active and monitored.
+
+- Run: `gt-replay-syn4d-main-ddp2-h200-256g-d44c73d-20260821T231000Z`
+- Function call: `fc-01M0K63D2YX68PJ3TVCDKPHJ06`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/b7f6de8d6ff6
