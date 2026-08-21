@@ -100,7 +100,7 @@ def _t4_image() -> modal.Image:
             "nvidia-dali-cuda120==1.53.0",
             "OpenEXR==3.3.5", "safetensors==0.5.3", "wandb==0.19.9",
             "opencv-python-headless==4.11.0.86", "pandas==2.2.3",
-            "scipy==1.15.2", "Pillow==11.1.0", "imageio==2.37.0",
+            "scipy==1.15.2", "matplotlib==3.10.1", "Pillow==11.1.0", "imageio==2.37.0",
             "tqdm==4.67.1", "pause==0.3", "jupyterlab==4.3.6",
         )
         .run_commands(
