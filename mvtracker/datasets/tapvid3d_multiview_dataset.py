@@ -243,6 +243,7 @@ class EncodedTapVid3DSample:
     depth_bytes: tuple[bytes, ...] = ()
     depth_sensor_widths: tuple[float, ...] = ()
     depth_focal_lengths: tuple[float, ...] = ()
+    raw_rgb: torch.Tensor | None = None
 
 
 @dataclass
@@ -286,6 +287,7 @@ class SamplePlan:
     # Indexed MV-Kubric media records selected by the live metadata planner.
     # Other datasets leave this empty and continue using rgb_sources/depth_sources.
     media_record_indices: tuple[int, ...] = ()
+    track_validity: np.ndarray | None = None
 
 
 @dataclass
@@ -300,7 +302,7 @@ class EncodedTapVid3DBatch:
             )
             for name in (
                 "depth", "theta", "intrs", "extrs", "trajectory",
-                "trajectory_3d", "visibility", "valid", "query_points_3d",
+                "trajectory_3d", "visibility", "valid", "query_points_3d", "raw_rgb",
             ):
                 value = getattr(sample, name)
                 if value is not None:
@@ -1415,6 +1417,10 @@ def decode_tapvid3d_batch(
             flat_encoded,
             [encoded for sample in batch.samples for encoded in sample.depth_bytes],
         )
+    elif codec == "raw":
+        if any(sample.raw_rgb is None for sample in batch.samples):
+            raise ValueError("raw RGB batches require decoded uint8 tensors")
+        decoded_all = []
     else:
         raise ValueError(f"unsupported encoded image codec: {codec}")
     if timing_events is not None:
@@ -1434,7 +1440,9 @@ def decode_tapvid3d_batch(
             frames = len(sample.depth_bytes) // views
             source_h, source_w = decoded[0].shape[:2]
         output_h, output_w = sample.output_size
-        if codec == "jpeg":
+        if codec == "raw":
+            rgb = sample.raw_rgb.to(device, non_blocking=True).float()
+        elif codec == "jpeg":
             rgb = torch.stack(decoded).float()
         else:
             rgb = torch.stack([

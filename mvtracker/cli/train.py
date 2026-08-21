@@ -37,6 +37,7 @@ import signal, sys
 from mvtracker.datasets import (
     KubricMultiViewDataset,
     PointOdysseyMultiViewDataset,
+    Syn4DMultiViewDataset,
     TapVid3DMultiViewDataset,
 )
 from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
@@ -844,6 +845,21 @@ def _build_training_dataset(
                 source_cfg.view_count_probabilities
             )
         return TapVid3DMultiViewDataset(**kwargs)
+    if dataset_name.startswith("syn4d-multiview-"):
+        kwargs = Syn4DMultiViewDataset.from_name(
+            dataset_name,
+            dataset_root,
+            cfg,
+            fabric,
+            just_return_kwargs=True,
+            include_scene_ids=include_scene_ids,
+            exclude_scene_ids=exclude_scene_ids,
+        )
+        if source_cfg is not None and "view_count_probabilities" in source_cfg:
+            kwargs["view_count_probabilities"] = tuple(
+                source_cfg.view_count_probabilities
+            )
+        return Syn4DMultiViewDataset(**kwargs)
     raise ValueError(f"Dataset {dataset_name} not supported for training")
 
 
@@ -1900,6 +1916,10 @@ def main(cfg: DictConfig):
             eval_dataset = TapVid3DMultiViewDataset.from_name(
                 dataset_name, cfg.datasets.root, cfg
             )
+        elif dataset_name.startswith("syn4d-multiview-"):
+            eval_dataset = Syn4DMultiViewDataset.from_name(
+                dataset_name, cfg.datasets.root, cfg
+            )
         elif dataset_name.startswith("panoptic-multiview"):
             eval_dataset = PanopticStudioMultiViewDataset.from_name(dataset_name, cfg.datasets.root)
         elif dataset_name.startswith("dex-ycb-multiview"):
@@ -2192,8 +2212,12 @@ def main(cfg: DictConfig):
                 world_size=fabric.world_size,
                 rank=fabric.global_rank,
                 seed=int(cfg.reproducibility.seed),
-                view_count_probabilities=cfg.datasets.get(
-                    "tapvid3d_view_count_probabilities", (0.25,) * 4
+                view_count_probabilities=getattr(
+                    train_dataset,
+                    "view_count_probabilities",
+                    cfg.datasets.get(
+                        "tapvid3d_view_count_probabilities", (0.25,) * 4
+                    ),
                 ),
             )
             train_loader = loader_type(

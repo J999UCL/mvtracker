@@ -552,7 +552,8 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             else:
                 view_folders = [
                     d for d in os.listdir(scene_path)
-                    if os.path.isdir(os.path.join(scene_path, d)) and d.startswith('view_')
+                    if os.path.isdir(os.path.join(scene_path, d))
+                    and (d.startswith('view_') or d.isdigit())
                 ]
             if len(view_folders) == 0:
                 logging.warning(f"Skipping {scene_path} because it has no views.")
