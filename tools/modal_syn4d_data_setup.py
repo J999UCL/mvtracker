@@ -140,7 +140,8 @@ def _blender_image() -> modal.Image:
         modal.Image.debian_slim(python_version="3.11")
         .apt_install(
             "ca-certificates", "curl", "git", "libgl1", "libglib2.0-0", "libopenexr-dev",
-            "libxi6", "libxrender1", "libxxf86vm1", "openexr", "xz-utils",
+            "libice6", "libsm6", "libx11-6", "libxfixes3", "libxi6",
+            "libxkbcommon0", "libxrender1", "libxxf86vm1", "openexr", "xz-utils",
         )
         .pip_install("numpy==2.2.4", "wandb==0.19.9")
         .run_commands(
