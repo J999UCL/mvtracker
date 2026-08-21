@@ -25,6 +25,7 @@ class PointOdysseyValidationTests(unittest.TestCase):
     def test_existing_dataset_mappings_are_unchanged(self):
         expected = {
             "kubric-multiview-v3": "kubric-multiview",
+            "syn4d-multiview-validation": "kubric-multiview",
             "panoptic-multiview": "panoptic-multiview",
             "dex-ycb-multiview": "dexycb-multiview",
             "tapvid2d-davis-first": "tapvid2d",

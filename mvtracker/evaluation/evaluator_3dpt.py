@@ -44,6 +44,7 @@ def _evaluation_setting_for_dataset(dataset_name: str, no_tracking_labels: bool)
         "kubric" in dataset_name
         or dataset_name.startswith("pointodyssey-multiview-")
         or dataset_name.startswith("tapvid3d-multiview-")
+        or dataset_name.startswith("syn4d-multiview-")
     ):
         return "kubric-multiview"
     if "panoptic-multiview" in dataset_name:
