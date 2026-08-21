@@ -22,6 +22,7 @@ from mvtracker.preprocessing.syn4d import (
     resize_depth_validity_weighted,
     resize_intrinsics,
     sample_candidate_quarter,
+    sequence_dependencies,
     syn4d_actor_world_vertices,
     syn4d_moving_object_world_vertices,
     syn4d_static_object_world_vertices,
@@ -31,6 +32,29 @@ from mvtracker.preprocessing.syn4d import (
 
 
 class Syn4DPreprocessingTests(unittest.TestCase):
+    def test_single_sequence_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mapping = Path(directory) / "sequence_to_asset_mapping.csv"
+            with mapping.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=("scene", "sequence_name", "asset_type", "asset"),
+                )
+                writer.writeheader()
+                for view in range(8):
+                    common = {"scene": "lab_bald", "sequence_name": f"seq_000000_{view}"}
+                    writer.writerow(common | {"asset_type": "bedlam2_body", "asset": "subject_M_1234"})
+                    for index in range(3):
+                        writer.writerow(common | {"asset_type": "objaverse_object", "asset": f"group{index}_object{index}"})
+
+            dependencies = sequence_dependencies(
+                mapping, scene="lab_bald", sequence_base="seq_000000"
+            )
+
+        self.assertEqual(dependencies.body_motion, "subject_M_1234")
+        self.assertEqual(dependencies.clothing_member, "subject_M/1234/1234.npz")
+        self.assertEqual(len(dependencies.objects), 3)
+
     def test_temple_group_dependency_plan_is_exact(self):
         with tempfile.TemporaryDirectory() as directory:
             mapping = Path(directory) / "sequence_to_asset_mapping.csv"
@@ -300,6 +324,12 @@ class Syn4DPreprocessingTests(unittest.TestCase):
             )
             writer.array("tracks_xyz")[:] = 1.0
             writer.view_array(1, "depth")[:] = 2.0
+            for view in range(2):
+                (writer.destination / f"view_{view}" / "jpeg_bytes.bin").write_bytes(b"ab")
+                np.save(
+                    writer.destination / f"view_{view}" / "jpeg_offsets.npy",
+                    np.array([0, 1, 2], dtype=np.int64),
+                )
             manifest_path = finalize_sequence_cache(
                 writer, fps=24.0, source_width=10, source_height=8
             )
@@ -308,6 +338,8 @@ class Syn4DPreprocessingTests(unittest.TestCase):
         self.assertEqual(manifest["format"], "syn4d-tapvid-mv")
         self.assertEqual(manifest["cache_resolution"], [4, 5])
         self.assertEqual(manifest["depth"], "float32_optical_z_metres_zero_invalid")
+        self.assertEqual(manifest["rgb"], "jpeg_quality_95_rgb")
+        self.assertNotIn("version", manifest)
         self.assertEqual(manifest["views"], 2)
 
     def test_candidate_quarter_is_exact_without_replacement(self):

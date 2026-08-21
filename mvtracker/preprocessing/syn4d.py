@@ -1,4 +1,4 @@
-"""Core helpers for converting Syn4D into an expanded TAPVid-MV cache.
+"""Core helpers for converting Syn4D into a TAPVid-MV cache.
 
 The module deliberately contains no download, Modal, video, or OpenEXR
 orchestration.  It operates on decoded arrays and official Syn4D metadata so
@@ -18,13 +18,12 @@ import numpy as np
 
 
 CACHE_FORMAT = "syn4d-tapvid-mv"
-CACHE_VERSION = 1
 TEMPLE_GROUP_SCENE = "temple_group"
 TEMPLE_GROUP_SEQUENCE_BASES = tuple(f"seq_{index:06d}" for index in range(20))
 VIEW_COUNT = 8
 TRACK_COUNT = 65_536
-CACHE_HEIGHT = 494
-CACHE_WIDTH = 878
+CACHE_HEIGHT = 384
+CACHE_WIDTH = 683
 
 
 @dataclass(frozen=True)
@@ -51,6 +50,43 @@ def _clothing_member(body_motion: str) -> str:
 def _object_asset(asset: str) -> tuple[str, str]:
     group, object_id = asset.rsplit("_", 1)
     return group, object_id
+
+
+def sequence_dependencies(
+    mapping_csv: Path, *, scene: str, sequence_base: str
+) -> SequenceDependencies:
+    """Resolve the body, clothing, and objects for one Syn4D sequence."""
+
+    views: set[int] = set()
+    bodies: set[str] = set()
+    objects: set[tuple[str, str]] = set()
+    with Path(mapping_csv).open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("scene") != scene:
+                continue
+            match = re.fullmatch(rf"{re.escape(sequence_base)}_([0-7])", str(row.get("sequence_name", "")))
+            if match is None:
+                continue
+            views.add(int(match.group(1)))
+            asset_type = row.get("asset_type")
+            asset = str(row.get("asset", ""))
+            if asset_type == "bedlam2_body":
+                bodies.add(asset)
+            elif asset_type == "objaverse_object":
+                objects.add(_object_asset(asset))
+    if views != set(range(VIEW_COUNT)):
+        raise ValueError(f"{scene}/{sequence_base} does not cover all eight cameras")
+    if len(bodies) != 1 or len(objects) != 3:
+        raise ValueError(
+            f"{scene}/{sequence_base} must resolve to one body and three objects"
+        )
+    body_motion = next(iter(bodies))
+    return SequenceDependencies(
+        sequence_base=sequence_base,
+        body_motion=body_motion,
+        clothing_member=_clothing_member(body_motion),
+        objects=tuple(sorted(objects)),
+    )
 
 
 def temple_group_dependencies(mapping_csv: Path) -> TempleGroupDependencies:
@@ -927,7 +963,7 @@ def create_sequence_cache(
     width: int = CACHE_WIDTH,
     view_count: int = VIEW_COUNT,
 ) -> SequenceCacheWriter:
-    """Preallocate a direct, uncompressed sequence cache for staged filling."""
+    """Preallocate one DIEGESIS-style Syn4D sequence cache."""
 
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
@@ -938,11 +974,11 @@ def create_sequence_cache(
     for view in range(view_count):
         view_root = destination / str(view)
         view_root.mkdir()
-        _preallocate(view_root / "rgb.npy", dtype=np.uint8, shape=(frame_count, 3, height, width))
         _preallocate(view_root / "depth.npy", dtype=np.float32, shape=(frame_count, height, width))
         _preallocate(view_root / "intrinsics.npy", dtype=np.float32, shape=(frame_count, 3, 3))
         _preallocate(view_root / "extrinsics_w2c.npy", dtype=np.float32, shape=(frame_count, 4, 4))
         _preallocate(view_root / "visibility.npy", dtype=bool, shape=(frame_count, track_count))
+        (destination / f"view_{view}").mkdir()
     return SequenceCacheWriter(
         destination=destination,
         scene=scene,
@@ -971,7 +1007,6 @@ def finalize_sequence_cache(
         "queries_xytv": (np.dtype("float32"), (writer.track_count, 4)),
     }
     view_specs = {
-        "rgb": (np.dtype("uint8"), (writer.frame_count, 3, writer.height, writer.width)),
         "depth": (np.dtype("float32"), (writer.frame_count, writer.height, writer.width)),
         "intrinsics": (np.dtype("float32"), (writer.frame_count, 3, 3)),
         "extrinsics_w2c": (np.dtype("float32"), (writer.frame_count, 4, 4)),
@@ -986,11 +1021,21 @@ def finalize_sequence_cache(
             array = np.load(writer.destination / str(view) / f"{name}.npy", mmap_mode="r")
             if array.dtype != dtype or array.shape != shape:
                 raise ValueError(f"invalid cache array contract for view {view}/{name}")
+        jpeg_root = writer.destination / f"view_{view}"
+        offsets = np.load(jpeg_root / "jpeg_offsets.npy", allow_pickle=False)
+        byte_count = (jpeg_root / "jpeg_bytes.bin").stat().st_size
+        if (
+            offsets.dtype != np.int64
+            or offsets.shape != (writer.frame_count + 1,)
+            or offsets[0] != 0
+            or offsets[-1] != byte_count
+            or np.any(offsets[1:] <= offsets[:-1])
+        ):
+            raise ValueError(f"invalid JPEG store contract for view {view}")
     if not np.isfinite(fps) or fps <= 0.0:
         raise ValueError("fps must be positive and finite")
     manifest = {
         "format": CACHE_FORMAT,
-        "version": CACHE_VERSION,
         "scene": writer.scene,
         "sequence_base": writer.sequence_base,
         "frames": writer.frame_count,
@@ -1001,7 +1046,7 @@ def finalize_sequence_cache(
         "fps": float(fps),
         "coordinate_frame": "syn4d_world_metres",
         "depth": "float32_optical_z_metres_zero_invalid",
-        "rgb": "uint8_rgb_chw",
+        "rgb": "jpeg_quality_95_rgb",
         "queries": "cache_pixel_xytv",
     }
     temporary = writer.destination / ".manifest.json.partial"
@@ -1011,21 +1056,21 @@ def finalize_sequence_cache(
     return manifest_path
 
 
-def convert_temple_group(
+def convert_syn4d_sequence(
     scene_root: Path,
     primary_metadata_root: Path,
     fallback_metadata_root: Path,
     output_root: Path,
     *,
     official_visualizer_root: Path,
-    sequence: str | None = None,
+    sequence: str,
     device: str = "cuda",
     progress=None,
 ):
-    """Lazy public entry point for the real one-scene converter."""
+    """Lazy public entry point for the single-sequence converter."""
 
     from mvtracker.preprocessing.syn4d_conversion import (
-        convert_temple_group as run_conversion,
+        convert_syn4d_sequence as run_conversion,
     )
 
     return run_conversion(
@@ -1059,7 +1104,7 @@ __all__ = [
     "camera_from_syn4d_row",
     "compact_surface_candidates",
     "compute_depth_visibility",
-    "convert_temple_group",
+    "convert_syn4d_sequence",
     "create_sequence_cache",
     "depth_centimetres_to_metres",
     "discover_temple_group_sequences",
@@ -1071,6 +1116,7 @@ __all__ = [
     "resize_depth_validity_weighted",
     "resize_intrinsics",
     "sample_candidate_quarter",
+    "sequence_dependencies",
     "syn4d_actor_rotation",
     "syn4d_actor_world_vertices",
     "syn4d_moving_object_world_vertices",

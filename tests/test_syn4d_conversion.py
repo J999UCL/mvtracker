@@ -12,7 +12,7 @@ from mvtracker.preprocessing import syn4d_conversion
 
 
 def _write_one_frame_scene(root: Path) -> Path:
-    scene_root = root / "temple_group"
+    scene_root = root / "lab_bald"
     (scene_root / "mp4").mkdir(parents=True)
     camera_root = scene_root / "ground_truth" / "meta_exr_csv"
     camera_root.mkdir(parents=True)
@@ -76,7 +76,7 @@ class Syn4DConversionTests(unittest.TestCase):
         module = SimpleNamespace(Syn4D_Track=construct)
         result = syn4d_conversion._official_sequence_items(
             module,
-            scene_root=Path("/data/temple_group"),
+            scene_root=Path("/data/lab_bald"),
             primary_metadata_root=Path("/metadata/primary"),
             fallback_metadata_root=Path("/metadata/clothing"),
             sequence_base="seq_000000",
@@ -89,7 +89,7 @@ class Syn4DConversionTests(unittest.TestCase):
         self.assertEqual(kwargs["dataset_root"], "/data")
         self.assertEqual(kwargs["metadata_root"], "/metadata/primary")
         self.assertEqual(kwargs["fallback_metadata_root"], "/metadata/clothing")
-        self.assertEqual(kwargs["scene_name_list"], ["temple_group"])
+        self.assertEqual(kwargs["scene_name_list"], ["lab_bald"])
         self.assertEqual(kwargs["track_query_idx"], 0)
         self.assertEqual(kwargs["S"], 1)
         self.assertEqual(kwargs["N"], 65_536)
@@ -147,7 +147,7 @@ class Syn4DConversionTests(unittest.TestCase):
 
             def fake_rgb(path, *, frame_count, device):
                 rgb_calls.append((path, frame_count, device))
-                return np.zeros((1, 494, 878, 3), dtype=np.uint8)
+                return np.zeros((1, 384, 683, 3), dtype=np.uint8)
 
             def fake_visibility(tracks, valid, depths, intrinsics, extrinsics, **kwargs):
                 self.assertEqual(depths.shape, (1, 1, 4, 6))
@@ -155,7 +155,7 @@ class Syn4DConversionTests(unittest.TestCase):
 
             def fake_resize(depths, **kwargs):
                 return np.broadcast_to(
-                    depths[:, :1, :1], (len(depths), 494, 878)
+                    depths[:, :1, :1], (len(depths), 384, 683)
                 ).copy()
 
             with (
@@ -189,7 +189,7 @@ class Syn4DConversionTests(unittest.TestCase):
                     side_effect=fake_resize,
                 ),
             ):
-                result = syn4d_conversion.convert_temple_group(
+                result = syn4d_conversion.convert_syn4d_sequence(
                     scene_root,
                     primary,
                     clothing,
@@ -200,9 +200,9 @@ class Syn4DConversionTests(unittest.TestCase):
                     progress=progress.append,
                 )
 
-            self.assertEqual(result["sequence_count"], 1)
-            self.assertEqual(result["sequences"], ["seq_000000"])
-            destination = Path(result["output_paths"][0])
+            self.assertEqual(result["scene"], "lab_bald")
+            self.assertEqual(result["sequence"], "seq_000000")
+            destination = Path(result["output_path"])
             manifest = json.loads((destination / "manifest.json").read_text())
             tracks = np.load(destination / "tracks_xyz.npy", mmap_mode="r")
             valid = np.load(destination / "track_valid.npy", mmap_mode="r")
@@ -210,6 +210,7 @@ class Syn4DConversionTests(unittest.TestCase):
             path_length = np.load(destination / "motion_path_length.npy", mmap_mode="r")
             depth = np.load(destination / "0" / "depth.npy", mmap_mode="r")
             visibility = np.load(destination / "7" / "visibility.npy", mmap_mode="r")
+            jpeg_offsets = np.load(destination / "view_0" / "jpeg_offsets.npy")
 
             self.assertEqual(manifest["queries"], "cache_pixel_xytv")
             self.assertEqual(manifest["tracks"], 65_536)
@@ -221,7 +222,11 @@ class Syn4DConversionTests(unittest.TestCase):
             self.assertTrue(np.all(queries[:, 2:] == 0.0))
             self.assertTrue(np.all(path_length == 0.0))
             self.assertEqual(depth.dtype, np.float32)
+            self.assertEqual(depth.shape, (1, 384, 683))
             np.testing.assert_allclose(depth[0, 0, 0], 2.0)
+            np.testing.assert_array_equal(jpeg_offsets.shape, (2,))
+            self.assertGreater((destination / "view_0" / "jpeg_bytes.bin").stat().st_size, 0)
+            self.assertFalse((destination / "0" / "rgb.npy").exists())
             self.assertEqual(len(depth_calls), 8)
             self.assertEqual(len(rgb_calls), 8)
             self.assertEqual(

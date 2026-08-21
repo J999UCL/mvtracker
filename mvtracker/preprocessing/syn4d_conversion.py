@@ -1,4 +1,4 @@
-"""End-to-end conversion of Syn4D ``temple_group`` into TAPVid-MV arrays."""
+"""Convert one Syn4D sequence into the DIEGESIS-style training cache."""
 
 from __future__ import annotations
 
@@ -19,15 +19,12 @@ import numpy as np
 from mvtracker.preprocessing.syn4d import (
     CACHE_HEIGHT,
     CACHE_WIDTH,
-    TEMPLE_GROUP_SCENE,
-    TEMPLE_GROUP_SEQUENCE_BASES,
     TRACK_COUNT,
     VIEW_COUNT,
     camera_from_syn4d_row,
     compute_depth_visibility,
     create_sequence_cache,
     depth_centimetres_to_metres,
-    discover_temple_group_sequences,
     finalize_sequence_cache,
     motion_path_length,
     resize_depth_validity_weighted,
@@ -36,6 +33,9 @@ from mvtracker.preprocessing.syn4d import (
 
 
 ProgressCallback = Callable[[dict[str, object]], None]
+TRACK_SOURCE_HEIGHT = 494
+TRACK_SOURCE_WIDTH = 878
+JPEG_QUALITY = 95
 
 
 def _emit(progress: ProgressCallback | None, **event: object) -> None:
@@ -198,7 +198,7 @@ def _official_sequence_items(
         max_interval=1,
         rgb_source="mp4",
         tracking_format="safetensor",
-        resolution=((CACHE_WIDTH, CACHE_HEIGHT), frame_count),
+        resolution=((TRACK_SOURCE_WIDTH, TRACK_SOURCE_HEIGHT), frame_count),
         seed=int(sequence_base.removeprefix("seq_")),
         allow_repeat=False,
     )
@@ -254,12 +254,12 @@ def _explicit_world_tracks(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     first_track = np.asarray(items[0]["track"], dtype=np.float32)
     first_valid = np.asarray(items[0]["track_valid_mask"], dtype=bool)
-    if first_track.shape != (CACHE_HEIGHT, CACHE_WIDTH, 3):
+    if first_track.shape != (TRACK_SOURCE_HEIGHT, TRACK_SOURCE_WIDTH, 3):
         raise ValueError(
             f"official query track has shape {first_track.shape}; "
-            f"expected {(CACHE_HEIGHT, CACHE_WIDTH, 3)}"
+            f"expected {(TRACK_SOURCE_HEIGHT, TRACK_SOURCE_WIDTH, 3)}"
         )
-    if first_valid.shape != (CACHE_HEIGHT, CACHE_WIDTH):
+    if first_valid.shape != (TRACK_SOURCE_HEIGHT, TRACK_SOURCE_WIDTH):
         raise ValueError("official query validity mask has wrong resolution")
     selected, xs, ys, quarter_count = _quarter_query_pixels(
         first_valid,
@@ -337,6 +337,35 @@ def _decode_rgb_video_dali(
     return np.ascontiguousarray(output[0], dtype=np.uint8)
 
 
+def _write_jpeg_store(frames_rgb: np.ndarray, destination: Path, *, workers: int) -> None:
+    """Encode RGB frames concurrently and write the DIEGESIS byte-range layout."""
+
+    import cv2
+
+    frames = np.asarray(frames_rgb, dtype=np.uint8)
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError("RGB frames must have shape [F,H,W,3]")
+
+    def encode(frame: np.ndarray) -> bytes:
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            np.ascontiguousarray(frame[..., ::-1]),
+            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+        )
+        if not ok:
+            raise RuntimeError("JPEG encoding failed")
+        return encoded.tobytes()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        encoded_frames = executor.map(encode, frames)
+        offsets = np.zeros(len(frames) + 1, dtype=np.int64)
+        with (destination / "jpeg_bytes.bin").open("wb") as handle:
+            for index, encoded in enumerate(encoded_frames):
+                handle.write(encoded)
+                offsets[index + 1] = offsets[index] + len(encoded)
+    np.save(destination / "jpeg_offsets.npy", offsets)
+
+
 def _depth_paths(
     scene_root: Path,
     sequence_base: str,
@@ -392,7 +421,8 @@ def _convert_sequence(
     progress: ProgressCallback | None,
 ) -> Path:
     _emit(progress, stage="sequence_started", sequence=sequence_base)
-    destination = output_root / f"{TEMPLE_GROUP_SCENE}__{sequence_base}"
+    scene = scene_root.name
+    destination = output_root / f"{scene}__{sequence_base}"
     if (destination / "manifest.json").is_file():
         _emit(progress, stage="sequence_reused", sequence=sequence_base)
         return destination
@@ -419,6 +449,8 @@ def _convert_sequence(
     tracks, track_valid, queries, quarter_count = _explicit_world_tracks(
         items, sequence_base=sequence_base
     )
+    queries[:, 0] *= np.float32(CACHE_WIDTH / TRACK_SOURCE_WIDTH)
+    queries[:, 1] *= np.float32(CACHE_HEIGHT / TRACK_SOURCE_HEIGHT)
     del items
     path_length = motion_path_length(tracks, track_valid)
     _emit(
@@ -432,7 +464,7 @@ def _convert_sequence(
 
     writer = create_sequence_cache(
         destination,
-        scene=TEMPLE_GROUP_SCENE,
+        scene=scene,
         sequence_base=sequence_base,
         frame_count=frame_count,
     )
@@ -493,7 +525,11 @@ def _convert_sequence(
         rgb = _decode_rgb_video_dali(
             videos[view], frame_count=frame_count, device=device
         )
-        _write_memmap(writer.view_array(view, "rgb"), rgb.transpose(0, 3, 1, 2))
+        _write_jpeg_store(
+            rgb,
+            destination / f"view_{view}",
+            workers=min(16, os.cpu_count() or 1),
+        )
         _emit(
             progress,
             stage="view_ready",
@@ -512,56 +548,46 @@ def _convert_sequence(
     return destination
 
 
-def convert_temple_group(
+def convert_syn4d_sequence(
     scene_root: Path,
     primary_metadata_root: Path,
     fallback_metadata_root: Path,
     output_root: Path,
     *,
     official_visualizer_root: Path,
-    sequence: str | None = None,
+    sequence: str,
     device: str = "cuda",
     progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
-    """Convert one or all 20 ``temple_group`` sequences and stop.
+    """Convert exactly one sequence from the scene at ``scene_root``.
 
     A sequence is complete only when ``manifest.json`` exists.  The function
     has no decoder, metadata, or storage fallbacks.
     """
 
     scene_root = Path(scene_root).resolve()
-    if scene_root.name != TEMPLE_GROUP_SCENE:
-        raise ValueError(f"scene_root must point to {TEMPLE_GROUP_SCENE!r}")
     primary_metadata_root = Path(primary_metadata_root).resolve()
     fallback_metadata_root = Path(fallback_metadata_root).resolve()
     output_root = Path(output_root).resolve()
-    if sequence is None:
-        sequences = discover_temple_group_sequences(scene_root)
-    else:
-        if sequence not in TEMPLE_GROUP_SEQUENCE_BASES:
-            raise ValueError(f"invalid temple_group sequence {sequence!r}")
-        sequences = (sequence,)
+    if re.fullmatch(r"seq_\d{6}", sequence) is None:
+        raise ValueError(f"invalid Syn4D sequence {sequence!r}")
     output_root.mkdir(parents=True, exist_ok=True)
     official_module = _import_official_syn4d(official_visualizer_root)
-    destinations = tuple(
-        _convert_sequence(
-            official_module=official_module,
-            scene_root=scene_root,
-            primary_metadata_root=primary_metadata_root,
-            fallback_metadata_root=fallback_metadata_root,
-            output_root=output_root,
-            sequence_base=sequence_base,
-            device=device,
-            progress=progress,
-        )
-        for sequence_base in sequences
+    destination = _convert_sequence(
+        official_module=official_module,
+        scene_root=scene_root,
+        primary_metadata_root=primary_metadata_root,
+        fallback_metadata_root=fallback_metadata_root,
+        output_root=output_root,
+        sequence_base=sequence,
+        device=device,
+        progress=progress,
     )
     return {
-        "scene": TEMPLE_GROUP_SCENE,
-        "sequence_count": len(destinations),
-        "sequences": list(sequences),
-        "output_paths": [str(path) for path in destinations],
+        "scene": scene_root.name,
+        "sequence": sequence,
+        "output_path": str(destination),
     }
 
 
-__all__ = ["convert_temple_group"]
+__all__ = ["convert_syn4d_sequence"]
