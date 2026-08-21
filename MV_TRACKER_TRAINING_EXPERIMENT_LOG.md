@@ -1516,8 +1516,18 @@ data wait.
 Container RAM followed a decelerating cache-fill curve: 105.5 GiB at step 10,
 125.7 at step 20, 133.4 at step 30, 135.9 at step 50, 140.2 at step 90, and
 142.1 at step 100. The process therefore still crept upward, but had 114 GiB
-headroom and no longer resembled the earlier linear mmap leak. The run remains
-active and monitored.
+headroom and no longer resembled the earlier linear mmap leak.
+
+The run was deliberately stopped on 22 August after step-500 validation. The
+container reached telemetry step 540; the durable resume point remains
+`model_000500.pth`. DIEGESIS improved from AJ 66.84 to 70.03 and Syn4D from
+83.52 to 85.76, but MV-Kubric scenes 101--102 fell from the matched step-zero
+AJ 71.78 to 68.18 and ATE worsened from 7.86 to 9.96. The Syn4D split was also
+found to contain only separate `lab_bald` sequences rather than distinct
+environments, so its held-out improvement was weak evidence of generalization.
+Continuing the remaining 1,500 updates was not justified. Modal app
+`ap-Y7ejZV9iii9kR5k3ekoWuL` reached zero tasks and released both H200s; the
+step-250 and step-500 checkpoints remain on the run Volume.
 
 - Run: `gt-replay-syn4d-main-ddp2-h200-256g-d44c73d-20260821T231000Z`
 - Function call: `fc-01M0K63D2YX68PJ3TVCDKPHJ06`
