@@ -40,6 +40,7 @@ from mvtracker.profiling.modal_syn4d_split import (
     SHARED_METADATA_ROOT,
     SPLIT_MANIFEST,
     SPLIT_ROOTS,
+    SPLIT_SEED,
     SMPLX_ADDON_PARTS,
     SYN4D_REPO_ID,
     SYN4D_REVISION,
@@ -278,9 +279,10 @@ def stage_dependencies_remote() -> dict[str, object]:
             relative = Path(group) / object_id / "vertices_sequence.npz"
             destination = DATA_ROOT / OBJECT_ROOT / relative
             object_paths.add((relative, destination))
-    for relative, destination in sorted(object_paths):
+    def stage_object(item: tuple[Path, Path]) -> None:
+        relative, destination = item
         if destination.is_file():
-            continue
+            return
         source = hf_hub_download(
             repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
             filename=f"data/metadata/new_weight_bone/{relative.as_posix()}",
@@ -288,6 +290,8 @@ def stage_dependencies_remote() -> dict[str, object]:
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(stage_object, sorted(object_paths)))
     (DATA_ROOT / CLOTHING_ROOT).mkdir(parents=True, exist_ok=True)
     updated_archive_map = dict(local_archive_map)
     updated_archive_map.update(required_members)
@@ -296,6 +300,7 @@ def stage_dependencies_remote() -> dict[str, object]:
     )
     manifest = {
         "format": "mvtracker-syn4d-fixed-split",
+        "split_seed": SPLIT_SEED,
         "source_revision": SYN4D_REVISION,
         "output_roots": {split: str(root) for split, root in SPLIT_ROOTS.items()},
         "rows": [

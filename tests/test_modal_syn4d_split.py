@@ -7,6 +7,7 @@ from mvtracker.profiling.modal_syn4d_split import (
     SHARD_B_ENVIRONMENTS,
     SPLIT_MANIFEST,
     SPLIT_ROOTS,
+    SPLIT_SEED,
     jobs,
     jobs_for,
 )
@@ -23,6 +24,7 @@ class ModalSyn4DSplitTests(unittest.TestCase):
         self.assertEqual(sum(row["split"] == "train" for row in SPLIT_MANIFEST), 16)
         self.assertEqual(sum(row["split"] == "validation" for row in SPLIT_MANIFEST), 4)
         self.assertEqual(len({row["environment"] for row in SPLIT_MANIFEST}), 20)
+        self.assertEqual(SPLIT_SEED, 72)
         self.assertTrue(all(row["sequence"].startswith("seq_") for row in SPLIT_MANIFEST))
 
     def test_archive_sizes_and_workers_are_balanced(self):
