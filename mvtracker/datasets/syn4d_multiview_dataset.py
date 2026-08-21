@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,7 +15,6 @@ import torch
 
 from mvtracker.datasets.kubric_multiview_dataset import _legal_contiguous_window_starts
 from mvtracker.datasets.tapvid3d_multiview_dataset import (
-    EncodedTapVid3DSample,
     SamplePlan,
     TapVid3DMultiViewDataset,
     _project,
@@ -31,10 +29,6 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
 
 _DATASET_PREFIX = "syn4d-multiview-"
 _SPLITS = {"training": "train", "validation": "validation", "test": "test"}
-_CACHE_FORMAT = "syn4d-tapvid-mv"
-_CACHE_VERSION = 1
-
-
 class _MappedSequence:
     def __init__(self, root: Path):
         self.root = root
@@ -133,7 +127,7 @@ def _preselect_tracks(
 
 
 class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
-    """Sample explicit Syn4D world tracks and decoded RGB sequence arrays."""
+    """Sample explicit Syn4D world tracks and indexed JPEG media."""
 
     def __init__(
         self,
@@ -158,11 +152,6 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
     def _load_manifest(self, sequence: str) -> dict[str, Any]:
         root = Path(self.data_root) / sequence
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-        if (
-            manifest.get("format") != _CACHE_FORMAT
-            or manifest.get("version") != _CACHE_VERSION
-        ):
-            raise ValueError(f"{root}: unsupported Syn4D cache manifest")
         manifest["frame_count"] = int(manifest["frames"])
         manifest["point_count"] = int(manifest["tracks"])
         manifest["views"] = list(range(int(manifest["views"])))
@@ -194,10 +183,9 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             exclude_scene_ids=exclude_scene_ids,
         )
         datasets_cfg = getattr(training_args, "datasets", {}) if training_args else {}
-        version = datasets_cfg.get("syn4d_cache_version", "v1")
         kwargs.pop("raw_root")
         kwargs.update(
-            data_root=os.path.join(dataset_root, version, _SPLITS[requested]),
+            data_root=os.path.join(dataset_root, _SPLITS[requested]),
             num_views=int(datasets_cfg.get("syn4d_num_views", 6)),
             view_count_probabilities=tuple(
                 datasets_cfg.get("syn4d_view_count_probabilities", (1 / 6,) * 6)
@@ -420,9 +408,15 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             theta=theta,
             source_size=source_size,
             output_size=output_size,
-            image_codec="raw",
+            image_codec="jpeg",
             depth_source="gt",
-            rgb_sources=tuple(root / str(view) / "rgb.npy" for view in views),
+            rgb_sources=tuple(
+                (
+                    root / f"view_{view}" / "jpeg_bytes.bin",
+                    root / f"view_{view}" / "jpeg_offsets.npy",
+                )
+                for view in views
+            ),
             depth_sources=tuple(root / str(view) / "depth.npy" for view in views),
             apply_rgb_aug=apply_rgb_aug,
             rgb_augmentation=rgb_augmentation,
@@ -438,39 +432,4 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         )
 
     def materialize_sample(self, plan: SamplePlan):
-        started = time.perf_counter()
-        with self._sequence_cache.use(plan.sequence) as store:
-            rgb = np.stack(
-                [store.read(f"{view}/rgb.npy", plan.frame_indices) for view in plan.views]
-            )
-            depth = np.stack(
-                [store.read(f"{view}/depth.npy", plan.frame_indices) for view in plan.views]
-            )
-        metadata = dict(plan.metadata)
-        metadata["worker_prepare_seconds"] = time.perf_counter() - started
-        sample = EncodedTapVid3DSample(
-            jpeg_bytes=(),
-            depth=torch.from_numpy(depth[:, :, None]),
-            theta=torch.from_numpy(plan.theta),
-            intrs=torch.from_numpy(plan.intrinsics),
-            extrs=torch.from_numpy(plan.extrinsics),
-            trajectory=torch.from_numpy(plan.trajectory),
-            trajectory_3d=torch.from_numpy(plan.trajectory_3d),
-            visibility=torch.from_numpy(plan.visibility),
-            valid=torch.from_numpy(plan.track_validity.astype(np.float32)),
-            query_points_3d=torch.from_numpy(plan.query_points_3d),
-            seq_name=plan.sequence,
-            metadata=metadata,
-            output_size=plan.output_size,
-            apply_rgb_aug=plan.apply_rgb_aug,
-            rgb_augmentation=plan.rgb_augmentation,
-            apply_depth_aug=plan.apply_depth_aug,
-            augmentation_seed=plan.augmentation_seed,
-            depth_scale=plan.depth_scale,
-            track_upscaling_factor=1.0 / plan.depth_scale,
-            max_depth=plan.max_depth,
-            depth_patch_operations=plan.depth_patch_operations,
-            image_codec="raw",
-            raw_rgb=torch.from_numpy(rgb),
-        )
-        return sample, True
+        return super().materialize_sample(plan)

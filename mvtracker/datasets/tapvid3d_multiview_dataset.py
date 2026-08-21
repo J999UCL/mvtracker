@@ -243,7 +243,6 @@ class EncodedTapVid3DSample:
     depth_bytes: tuple[bytes, ...] = ()
     depth_sensor_widths: tuple[float, ...] = ()
     depth_focal_lengths: tuple[float, ...] = ()
-    raw_rgb: torch.Tensor | None = None
 
 
 @dataclass
@@ -302,7 +301,7 @@ class EncodedTapVid3DBatch:
             )
             for name in (
                 "depth", "theta", "intrs", "extrs", "trajectory",
-                "trajectory_3d", "visibility", "valid", "query_points_3d", "raw_rgb",
+                "trajectory_3d", "visibility", "valid", "query_points_3d",
             ):
                 value = getattr(sample, name)
                 if value is not None:
@@ -1312,7 +1311,9 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             trajectory=torch.from_numpy(plan.trajectory),
             trajectory_3d=torch.from_numpy(plan.trajectory_3d),
             visibility=torch.from_numpy(plan.visibility),
-            valid=torch.ones((self.seq_len, plan.track_count), dtype=torch.float32),
+            valid=torch.from_numpy(plan.track_validity.astype(np.float32))
+            if plan.track_validity is not None
+            else torch.ones((self.seq_len, plan.track_count), dtype=torch.float32),
             query_points_3d=torch.from_numpy(plan.query_points_3d),
             seq_name=plan.sequence,
             metadata=metadata,
@@ -1417,10 +1418,6 @@ def decode_tapvid3d_batch(
             flat_encoded,
             [encoded for sample in batch.samples for encoded in sample.depth_bytes],
         )
-    elif codec == "raw":
-        if any(sample.raw_rgb is None for sample in batch.samples):
-            raise ValueError("raw RGB batches require decoded uint8 tensors")
-        decoded_all = []
     else:
         raise ValueError(f"unsupported encoded image codec: {codec}")
     if timing_events is not None:
@@ -1440,9 +1437,7 @@ def decode_tapvid3d_batch(
             frames = len(sample.depth_bytes) // views
             source_h, source_w = decoded[0].shape[:2]
         output_h, output_w = sample.output_size
-        if codec == "raw":
-            rgb = sample.raw_rgb.to(device, non_blocking=True).float()
-        elif codec == "jpeg":
+        if codec == "jpeg":
             rgb = torch.stack(decoded).float()
         else:
             rgb = torch.stack([
@@ -1596,16 +1591,9 @@ class _CudaPrefetchIterator:
                 if sample.depth is not None
                 else len(sample.depth_sensor_widths)
             )
-            if sample.image_codec == "raw":
-                if sample.raw_rgb is None or sample.raw_rgb.ndim != 5:
-                    raise ValueError("raw sample has an invalid view/frame layout")
-                if int(sample.raw_rgb.shape[0]) != views:
-                    raise ValueError("raw RGB and depth view counts differ")
-                frames = int(sample.raw_rgb.shape[1])
-            else:
-                if views < 1 or len(sample.jpeg_bytes) % views:
-                    raise ValueError("encoded sample has an invalid view/frame layout")
-                frames = len(sample.jpeg_bytes) // views
+            if views < 1 or len(sample.jpeg_bytes) % views:
+                raise ValueError("encoded sample has an invalid view/frame layout")
+            frames = len(sample.jpeg_bytes) // views
             keys.append((
                 sample.image_codec,
                 views,

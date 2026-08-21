@@ -39,10 +39,6 @@ def _write_sequence(root: Path, name="temple_group__seq_000000"):
         view_root = sequence / str(view)
         view_root.mkdir()
         np.save(
-            view_root / "rgb.npy",
-            np.full((frames, 3, height, width), 10 + view, dtype=np.uint8),
-        )
-        np.save(
             view_root / "depth.npy",
             np.full((frames, height, width), 2.0, dtype=np.float32),
         )
@@ -58,11 +54,18 @@ def _write_sequence(root: Path, name="temple_group__seq_000000"):
             view_root / "visibility.npy",
             np.ones((frames, points), dtype=np.bool_),
         )
+        jpeg_root = sequence / f"view_{view}"
+        jpeg_root.mkdir()
+        payloads = [bytes([0xFF, 0xD8, view, frame, 0xFF, 0xD9]) for frame in range(frames)]
+        offsets = np.zeros(frames + 1, dtype=np.int64)
+        with (jpeg_root / "jpeg_bytes.bin").open("wb") as handle:
+            for frame, payload in enumerate(payloads):
+                handle.write(payload)
+                offsets[frame + 1] = offsets[frame] + len(payload)
+        np.save(jpeg_root / "jpeg_offsets.npy", offsets)
     (sequence / "manifest.json").write_text(
         json.dumps(
             {
-                "format": "syn4d-tapvid-mv",
-                "version": 1,
                 "frames": frames,
                 "tracks": points,
                 "views": 8,
@@ -137,7 +140,6 @@ class Syn4DLoaderTests(unittest.TestCase):
     def test_factory_maps_the_direct_sequence_cache(self):
         config = SimpleNamespace(
             datasets={
-                "syn4d_cache_version": "v1",
                 "syn4d_num_views": 6,
                 "syn4d_mmap_cache_sequences": 2,
             }
@@ -150,20 +152,20 @@ class Syn4DLoaderTests(unittest.TestCase):
         )
         self.assertEqual(
             kwargs["data_root"],
-            "/datasets/syn4d-mvtracker/v1/validation",
+            "/datasets/syn4d-mvtracker/validation",
         )
         self.assertEqual(kwargs["num_views"], 6)
         self.assertEqual(kwargs["mmap_cache_sequences"], 2)
         self.assertFalse(kwargs["enable_variable_depth_type_augs"])
 
-    def test_plans_window_views_tracks_and_materializes_raw_arrays(self):
+    def test_plans_window_views_tracks_and_materializes_indexed_jpegs(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = _dataset(Path(directory))
             request = SimpleNamespace(virtual_index=0, scene_index=0, view_count=6)
 
             plan = dataset.plan_sample(request)
             self.assertIsNotNone(plan)
-            self.assertEqual(plan.image_codec, "raw")
+            self.assertEqual(plan.image_codec, "jpeg")
             self.assertEqual(len(plan.views), 6)
             self.assertEqual(plan.frame_indices.shape, (3,))
             self.assertLessEqual(plan.track_count, 8)
@@ -172,8 +174,9 @@ class Syn4DLoaderTests(unittest.TestCase):
 
             sample, gotit = dataset.materialize_sample(plan)
             self.assertTrue(gotit)
-            self.assertEqual(sample.raw_rgb.shape, (6, 3, 3, 8, 10))
-            self.assertEqual(str(sample.raw_rgb.dtype), "torch.uint8")
+            self.assertEqual(sample.image_codec, "jpeg")
+            self.assertEqual(len(sample.jpeg_bytes), 6 * 3)
+            self.assertTrue(all(str(encoded.dtype) == "torch.uint8" for encoded in sample.jpeg_bytes))
             self.assertEqual(sample.depth.shape, (6, 3, 1, 8, 10))
             self.assertEqual(sample.valid.shape, (3, plan.track_count))
             self.assertTrue((~sample.valid.bool()).any())
