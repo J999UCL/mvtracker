@@ -389,5 +389,9 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
     --sequence seq_000000
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
+  modal run --timestamps tools/modal_syn4d_data_setup.py::loader_smoke \
+    --iterations 5 --view-count 4
+
+MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::temple_group
 ```

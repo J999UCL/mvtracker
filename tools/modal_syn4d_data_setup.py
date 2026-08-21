@@ -451,6 +451,143 @@ def notebook() -> None:
     )
 
 
+@app.function(
+    image=t4_image,
+    secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
+    gpu="T4", cpu=T4_CPU, memory=T4_MEMORY_MIB,
+    ephemeral_disk=512 * 1024,
+    timeout=60 * 60, max_containers=1, include_source=False,
+)
+def loader_smoke_remote(iterations: int = 5, view_count: int = 4) -> dict[str, object]:
+    """Measure the real direct-Volume Syn4D plan/materialize/decode path."""
+
+    from types import SimpleNamespace
+
+    import numpy as np
+    import torch
+
+    from mvtracker.datasets.syn4d_multiview_dataset import (
+        Syn4DMultiViewDataset,
+        _SequenceMmapCache,
+    )
+    from mvtracker.datasets.tapvid3d_multiview_dataset import (
+        EncodedTapVid3DBatch,
+        decode_tapvid3d_batch,
+    )
+    from mvtracker.profiling.modal_syn4d import TEMPLE_GROUP_CACHE_ROOT
+
+    if iterations < 1 or not 1 <= view_count <= 6:
+        raise ValueError("iterations must be positive and view_count must be in [1,6]")
+    root = DATA_ROOT / TEMPLE_GROUP_CACHE_ROOT
+    sequence = "temple_group__seq_000000"
+    dataset = Syn4DMultiViewDataset.__new__(Syn4DMultiViewDataset)
+    dataset.data_root = str(root)
+    dataset.seq_names = [sequence]
+    dataset.real_len = 1
+    dataset.seq_len = 24
+    dataset.num_views = None
+    dataset.view_count_probabilities = (1 / 6,) * 6
+    dataset.traj_per_sample = 2_048
+    dataset.seed = 72
+    dataset.add_index_to_seed = True
+    dataset.crop_size = (384, 512)
+    dataset.enable_cropping_augs = True
+    dataset.enable_rgb_augs = False
+    dataset.enable_depth_augs = False
+    dataset.enable_variable_trajpersample_augs = False
+    dataset.enable_variable_num_views_augs = True
+    dataset.enable_scene_transform_augs = False
+    dataset.enable_camera_params_noise_augs = False
+    dataset.augmentation_probability = 0.0
+    dataset.ratio_dynamic = 0.5
+    dataset.ratio_very_dynamic = 0.25
+    dataset.max_tracks_to_preload = 18_000
+    dataset.max_depth = 1_000.0
+    dataset.eraser_aug_prob = 0.5
+    dataset.eraser_max = 10
+    dataset.eraser_bounds = [2, 100]
+    dataset.replace_aug_prob = 0.5
+    dataset.replace_max = 10
+    dataset.replace_bounds = [2, 100]
+    dataset._manifests = {sequence: dataset._load_manifest(sequence)}
+    dataset._sequence_cache = _SequenceMmapCache(root, maximum=1)
+
+    device = torch.device("cuda")
+    rgb_stream = torch.cuda.Stream(device=device)
+    depth_stream = torch.cuda.Stream(device=device)
+    prepare_stream = torch.cuda.Stream(device=device)
+    run = _wandb_run(
+        job_type="syn4d-loader-smoke",
+        name="temple-group-seq000000-loader-smoke",
+        tags=["loader", "t4"],
+        config={"iterations": iterations, "view_count": view_count, **MODAL_TAGS},
+    )
+    rows = []
+    for index in range(iterations):
+        request = SimpleNamespace(
+            virtual_index=index, scene_index=0, view_count=view_count
+        )
+        started = time.perf_counter()
+        plan = dataset.plan_sample(request)
+        planning_seconds = time.perf_counter() - started
+        if plan is None:
+            raise RuntimeError(f"Syn4D planner rejected deterministic sample {index}")
+        materialize_started = time.perf_counter()
+        sample, gotit = dataset.materialize_sample(plan)
+        materialize_seconds = time.perf_counter() - materialize_started
+        if not gotit:
+            raise RuntimeError(f"Syn4D materializer rejected sample {index}")
+        decode_started = time.perf_counter()
+        datapoint = decode_tapvid3d_batch(
+            EncodedTapVid3DBatch([sample]),
+            device,
+            rgb_stream=rgb_stream,
+            depth_stream=depth_stream,
+            prepare_stream=prepare_stream,
+        )
+        torch.cuda.synchronize(device)
+        decode_seconds = time.perf_counter() - decode_started
+        expected_video = (1, view_count, 24, 3, 384, 512)
+        expected_depth = (1, view_count, 24, 1, 384, 512)
+        if tuple(datapoint.video.shape) != expected_video:
+            raise RuntimeError(f"video shape {tuple(datapoint.video.shape)} != {expected_video}")
+        if tuple(datapoint.videodepth.shape) != expected_depth:
+            raise RuntimeError(
+                f"depth shape {tuple(datapoint.videodepth.shape)} != {expected_depth}"
+            )
+        rows.append(
+            {
+                "planning_seconds": planning_seconds,
+                "materialize_seconds": materialize_seconds,
+                "decode_seconds": decode_seconds,
+                "track_count": int(plan.track_count),
+                "window_start": int(plan.frame_indices[0]),
+            }
+        )
+
+    warm = rows[1:] if len(rows) > 1 else rows
+    result = {
+        "iterations": iterations,
+        "view_count": view_count,
+        "cold_materialize_seconds": rows[0]["materialize_seconds"],
+        "warm_materialize_median_seconds": float(
+            np.median([row["materialize_seconds"] for row in warm])
+        ),
+        "warm_decode_median_seconds": float(
+            np.median([row["decode_seconds"] for row in warm])
+        ),
+        "track_count_min": min(row["track_count"] for row in rows),
+        "track_count_max": max(row["track_count"] for row in rows),
+        "rows": rows,
+    }
+    for step, row in enumerate(rows):
+        run.log({f"loader/{key}": value for key, value in row.items()}, step=step)
+    run.summary.update({key: value for key, value in result.items() if key != "rows"})
+    run.finish()
+    return result
+
+
 def _preflight(tags: dict[str, str] = MODAL_TAGS) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
@@ -482,6 +619,18 @@ def temple_group(processes: int = CPU_CONVERSION_PROCESSES) -> None:
     download_dependencies_remote.remote()
     convert_bedlam_remote.remote(processes)
     print(json.dumps(convert_temple_group_remote.remote(), indent=2, sort_keys=True))
+
+
+@app.local_entrypoint(name="loader-smoke")
+def loader_smoke(iterations: int = 5, view_count: int = 4) -> None:
+    _preflight()
+    print(
+        json.dumps(
+            loader_smoke_remote.remote(iterations, view_count),
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
