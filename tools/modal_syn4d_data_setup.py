@@ -47,7 +47,9 @@ BLENDER_ARCHIVE = f"blender-{BLENDER_VERSION}-linux-x64.tar.xz"
 BLENDER_URL = f"https://download.blender.org/release/Blender4.5/{BLENDER_ARCHIVE}"
 BLENDER_ROOT = Path(f"/opt/blender-{BLENDER_VERSION}-linux-x64")
 BLENDER_BIN = BLENDER_ROOT / "blender"
-SMPLX_ADDON_PARTS = DATA_ROOT / "datasets/syn4d/private/smplx_addon_parts"
+SMPLX_ADDON_PARTS = (
+    DATA_ROOT / "datasets/syn4d/temple_group/private/smplx_addon_parts"
+)
 SMPLX_ADDON_BYTES = 387_473_505
 BEDLAM_SCRIPTS_ROOT = Path("/opt/syn4d-bedlam2")
 SYN4D_VISUALIZER_ROOT = Path("/opt/syn4d-visualizer")
