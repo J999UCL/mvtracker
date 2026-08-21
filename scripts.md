@@ -382,12 +382,12 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::download
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::convert-bedlam
+  modal run --timestamps tools/modal_syn4d_data_setup.py::convert_bedlam
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::convert \
     --sequence seq_000000
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::temple-group
+  modal run --timestamps tools/modal_syn4d_data_setup.py::temple_group
 ```
