@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
-from dataclasses import dataclass
 import hashlib
 import io
 import json
@@ -62,15 +61,6 @@ EXCLUDED_SEQUENCES = frozenset(
 )
 
 
-@dataclass(frozen=True)
-class RemoteTarMember:
-    name: str
-    data_offset: int
-    size: int
-    mode: int
-    mtime: int
-
-
 def build_dependency_plan(
     mapping_csv: str, archive_map: dict[str, list[str]]
 ) -> dict[str, object]:
@@ -122,32 +112,16 @@ def _request(
     sfile: str,
     email: str,
     password: str,
-    *,
-    byte_range: tuple[int, int] | None = None,
 ):
-    headers = {"Accept-Encoding": "identity"}
-    if byte_range is not None:
-        headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
     response = session.post(
         BEDLAM_URL,
         params={"domain": "bedlam2", "resume": "1", "sfile": sfile},
         data={"username": email, "password": password},
-        headers=headers,
+        headers={"Accept-Encoding": "identity"},
         stream=True,
         timeout=(30, 300),
     )
     response.raise_for_status()
-    if byte_range is not None:
-        start, end = byte_range
-        if response.status_code != 206:
-            response.close()
-            raise RuntimeError(
-                f"BEDLAM did not honor byte range {start}-{end} for {sfile}"
-            )
-        expected = f"bytes {start}-{end}/"
-        if not response.headers.get("Content-Range", "").startswith(expected):
-            response.close()
-            raise RuntimeError(f"invalid BEDLAM Content-Range for {sfile}")
     return response
 
 
@@ -162,50 +136,29 @@ def download_text(session, sfile: str, email: str, password: str) -> str:
     return payload.decode("utf-8")
 
 
-def _parse_octal(field: bytes) -> int:
-    stripped = field.rstrip(b"\0 ").lstrip(b" ")
-    return int(stripped or b"0", 8)
+def copy_selected_tar_members(
+    source_stream, destination: Path, required_members: Iterable[str]
+) -> dict[str, int]:
+    """Stream one source TAR and retain only the requested NPZ members."""
 
-
-def parse_tar_header(block: bytes, offset: int) -> RemoteTarMember | None:
-    if len(block) != 512:
-        raise RuntimeError("short remote TAR header")
-    if block == bytes(512):
-        return None
-    stored_checksum = _parse_octal(block[148:156])
-    observed_checksum = sum(block[:148]) + 8 * ord(" ") + sum(block[156:])
-    if stored_checksum != observed_checksum:
-        raise RuntimeError(f"invalid remote TAR header checksum at offset {offset}")
-    name = block[:100].split(b"\0", 1)[0].decode("utf-8")
-    prefix = block[345:500].split(b"\0", 1)[0].decode("utf-8")
-    if prefix:
-        name = f"{prefix}/{name}"
-    return RemoteTarMember(
-        name=name,
-        data_offset=offset + 512,
-        size=_parse_octal(block[124:136]),
-        mode=_parse_octal(block[100:108]),
-        mtime=_parse_octal(block[136:148]),
-    )
-
-
-def scan_remote_tar(session, sfile: str, email: str, password: str) -> dict[str, RemoteTarMember]:
-    members: dict[str, RemoteTarMember] = {}
-    offset = 0
-    for _ in range(20_000):
-        response = _request(
-            session, sfile, email, password, byte_range=(offset, offset + 511)
-        )
-        try:
-            block = response.raw.read(512)
-        finally:
-            response.close()
-        member = parse_tar_header(block, offset)
-        if member is None:
-            return members
-        members[member.name] = member
-        offset = member.data_offset + ((member.size + 511) // 512) * 512
-    raise RuntimeError(f"remote TAR index exceeded limit: {sfile}")
+    required = set(required_members)
+    copied: dict[str, int] = {}
+    with tarfile.open(fileobj=source_stream, mode="r|") as source, tarfile.open(
+        destination, "w"
+    ) as output:
+        for member in source:
+            if not member.isfile() or member.name not in required:
+                continue
+            member_stream = source.extractfile(member)
+            if member_stream is None:
+                raise RuntimeError(f"cannot read clothing member {member.name}")
+            with member_stream:
+                output.addfile(member, member_stream)
+            copied[member.name] = member.size
+    missing = sorted(required.difference(copied))
+    if missing:
+        raise RuntimeError(f"source clothing TAR lacks required members: {missing}")
+    return copied
 
 
 def _validate_sparse_tar(path: Path, expected: Iterable[str]) -> dict[str, int]:
@@ -243,34 +196,17 @@ def download_sparse_clothing_tar(
 
     sfile = f"{CLOTHING_SOURCE_ROOT}/{archive_name}.tar"
     with requests.Session() as session:
-        remote_members = scan_remote_tar(session, sfile, email, password)
-        missing = sorted(set(required_members).difference(remote_members))
-        if missing:
-            raise RuntimeError(f"{archive_name} lacks required members: {missing}")
-        selected = [remote_members[name] for name in sorted(required_members)]
-
+        response = _request(session, sfile, email, password)
+        source_size = int(response.headers.get("Content-Length", 0))
+        if response.headers.get("Content-Type") != "application/octet-stream":
+            response.close()
+            raise RuntimeError(f"BEDLAM did not return clothing TAR {archive_name}")
         with tempfile.TemporaryDirectory(prefix=f"{archive_name}-") as directory:
             local_tar = Path(directory) / f"{archive_name}.tar"
-            with tarfile.open(local_tar, "w") as output:
-                for member in selected:
-                    response = _request(
-                        session,
-                        sfile,
-                        email,
-                        password,
-                        byte_range=(
-                            member.data_offset,
-                            member.data_offset + member.size - 1,
-                        ),
-                    )
-                    try:
-                        info = tarfile.TarInfo(member.name)
-                        info.size = member.size
-                        info.mode = member.mode
-                        info.mtime = member.mtime
-                        output.addfile(info, response.raw)
-                    finally:
-                        response.close()
+            try:
+                copy_selected_tar_members(response.raw, local_tar, required_members)
+            finally:
+                response.close()
             sizes = _validate_sparse_tar(local_tar, required_members)
             partial = destination.with_name(f".{destination.name}.partial")
             shutil.copyfile(local_tar, partial)
@@ -280,6 +216,7 @@ def download_sparse_clothing_tar(
         "archive": archive_name,
         "status": "downloaded",
         "size_bytes": destination.stat().st_size,
+        "source_size_bytes": source_size,
         "member_sizes": sizes,
     }
 
@@ -363,6 +300,9 @@ def materialize_dependencies(
     started = time.perf_counter()
     results: list[dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
+        body_future = pool.submit(
+            download_body_motions, data_root, motions, email, password
+        )
         futures = {
             pool.submit(
                 download_sparse_clothing_tar,
@@ -374,9 +314,6 @@ def materialize_dependencies(
             ): archive
             for archive, members in required_members.items()
         }
-        body_future = pool.submit(
-            download_body_motions, data_root, motions, email, password
-        )
         for future in as_completed([*futures, body_future]):
             result = future.result()
             results.append(result)
@@ -434,30 +371,32 @@ def probe_dependencies(
     plan = build_dependency_plan(mapping_csv, archive_map)
     required = plan["required_members"]
     assert isinstance(required, dict)
-    archive_name = "b2_clothing_npz_000"
-    with requests.Session() as session:
-        clothing_index = scan_remote_tar(
-            session,
-            f"{CLOTHING_SOURCE_ROOT}/{archive_name}.tar",
-            email,
-            password,
-        )
-        body_header = _request(
-            session, BODY_SOURCE, email, password, byte_range=(0, 511)
-        )
-        try:
-            parse_tar_header(body_header.raw.read(512), 0)
-        finally:
-            body_header.close()
-    needed = required[archive_name]
+
+    def source_size(archive_name: str) -> int:
+        with requests.Session() as session:
+            response = _request(
+                session,
+                f"{CLOTHING_SOURCE_ROOT}/{archive_name}.tar",
+                email,
+                password,
+            )
+            try:
+                if response.headers.get("Content-Type") != "application/octet-stream":
+                    raise RuntimeError(f"BEDLAM did not return {archive_name}")
+                return int(response.headers["Content-Length"])
+            finally:
+                response.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        source_sizes = dict(zip(required, pool.map(source_size, required)))
     return {
         "sequence_count": plan["sequence_count"],
         "motion_count": len(plan["motions"]),
         "clothing_archive_count": len(required),
         "clothing_member_count": sum(len(v) for v in required.values()),
-        "probe_archive": archive_name,
-        "probe_archive_members": len(clothing_index),
-        "probe_required_members": len(needed),
-        "probe_required_bytes": sum(clothing_index[name].size for name in needed),
-        "range_requests_supported": True,
+        "source_clothing_bytes": sum(source_sizes.values()),
+        "smallest_source_archive_bytes": min(source_sizes.values()),
+        "largest_source_archive_bytes": max(source_sizes.values()),
+        "range_requests_supported": False,
+        "streaming_sparse_extraction": True,
     }

@@ -9,7 +9,7 @@ from pathlib import Path
 from mvtracker.profiling.modal_syn4d_bedlam import (
     CLOTHING_ROOT,
     build_dependency_plan,
-    parse_tar_header,
+    copy_selected_tar_members,
 )
 
 
@@ -49,19 +49,27 @@ class ModalSyn4DBedlamTests(unittest.TestCase):
         self.assertEqual(len(plan["required_members"]), 54)
         self.assertNotIn("b2_clothing_npz_275", plan["required_members"])
 
-    def test_remote_tar_header_parser_matches_tarfile(self):
-        payload = b"PK\x03\x04synthetic-npz"
+    def test_streaming_copy_keeps_only_selected_members(self):
+        payloads = {
+            "subject/2000/2000.npz": b"PK\x03\x04selected",
+            "unused/9999/9999.npz": b"PK\x03\x04unused",
+        }
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "source.tar"
-            with tarfile.open(path, "w") as archive:
-                info = tarfile.TarInfo("subject/2000/2000.npz")
-                info.size = len(payload)
-                archive.addfile(info, io.BytesIO(payload))
-            parsed = parse_tar_header(path.read_bytes()[:512], 0)
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed.name, "subject/2000/2000.npz")
-        self.assertEqual(parsed.data_offset, 512)
-        self.assertEqual(parsed.size, len(payload))
+            source = Path(directory) / "source.tar"
+            destination = Path(directory) / "selected.tar"
+            with tarfile.open(source, "w") as archive:
+                for name, payload in payloads.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+            with source.open("rb") as stream:
+                sizes = copy_selected_tar_members(
+                    stream, destination, ["subject/2000/2000.npz"]
+                )
+            with tarfile.open(destination, "r") as archive:
+                names = archive.getnames()
+        self.assertEqual(names, ["subject/2000/2000.npz"])
+        self.assertEqual(sizes, {"subject/2000/2000.npz": len(payloads[names[0]])})
 
     def test_modal_job_is_cpu_tagged_and_uses_named_secret(self):
         self.assertIn('"owner": "jeet"', (ROOT / "tools/modal_training_profile.py").read_text())
