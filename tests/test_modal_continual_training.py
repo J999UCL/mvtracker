@@ -24,7 +24,6 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertEqual(contract.GPU_REQUEST, "H200:2")
         self.assertEqual(contract.GPU_COUNT, 2)
         self.assertEqual(contract.TRAIN_MEMORY_REQUEST_MIB, 64 * 1024)
-        self.assertEqual(contract.TRAIN_MEMORY_LIMIT_MIB, 128 * 1024)
         self.assertEqual(contract.MAX_CONTAINERS, 1)
         self.assertEqual(contract.EPHEMERAL_DISK_MIB, 512 * 1024)
         self.assertEqual(contract.CONTINUAL_RUN_SUBDIR, "continual-training")

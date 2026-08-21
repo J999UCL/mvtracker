@@ -178,7 +178,7 @@ modal run --timestamps tools/modal_continual_training.py::syn4d_train \
 Both GPU modes request exactly `H200:2`, set `max_containers=1`, and attach
 `owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
-directory. Training requests 64 GiB of RAM with a hard 128 GiB limit, and the
+directory. Training requests 64 GiB of RAM with a hard 256 GiB limit, and the
 DALI WebDataset reader uses plain I/O rather than mmap on the mounted Volume.
 Training entrypoints submit with Modal `Function.spawn()` and print a
 durable Function Call ID against the deployed worker; the remote job therefore
