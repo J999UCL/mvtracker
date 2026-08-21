@@ -177,8 +177,7 @@ def _official_sequence_items(
     official_module: Any,
     *,
     scene_root: Path,
-    primary_metadata_root: Path,
-    fallback_metadata_root: Path,
+    metadata_root: Path,
     sequence_base: str,
     frame_count: int,
 ) -> list[Mapping[str, Any]]:
@@ -186,8 +185,8 @@ def _official_sequence_items(
 
     dataset = official_module.Syn4D_Track(
         dataset_root=str(scene_root.parent),
-        metadata_root=str(primary_metadata_root),
-        fallback_metadata_root=str(fallback_metadata_root),
+        metadata_root=str(metadata_root),
+        fallback_metadata_root=None,
         scene_name_list=[scene_root.name],
         track_query_idx=0,
         use_augs=False,
@@ -413,8 +412,7 @@ def _convert_sequence(
     *,
     official_module: Any,
     scene_root: Path,
-    primary_metadata_root: Path,
-    fallback_metadata_root: Path,
+    metadata_root: Path,
     output_root: Path,
     sequence_base: str,
     device: str,
@@ -441,8 +439,7 @@ def _convert_sequence(
     items = _official_sequence_items(
         official_module,
         scene_root=scene_root,
-        primary_metadata_root=primary_metadata_root,
-        fallback_metadata_root=fallback_metadata_root,
+        metadata_root=metadata_root,
         sequence_base=sequence_base,
         frame_count=frame_count,
     )
@@ -550,8 +547,7 @@ def _convert_sequence(
 
 def convert_syn4d_sequence(
     scene_root: Path,
-    primary_metadata_root: Path,
-    fallback_metadata_root: Path,
+    metadata_root: Path,
     output_root: Path,
     *,
     official_visualizer_root: Path,
@@ -566,8 +562,7 @@ def convert_syn4d_sequence(
     """
 
     scene_root = Path(scene_root).resolve()
-    primary_metadata_root = Path(primary_metadata_root).resolve()
-    fallback_metadata_root = Path(fallback_metadata_root).resolve()
+    metadata_root = Path(metadata_root).resolve()
     output_root = Path(output_root).resolve()
     if re.fullmatch(r"seq_\d{6}", sequence) is None:
         raise ValueError(f"invalid Syn4D sequence {sequence!r}")
@@ -576,8 +571,7 @@ def convert_syn4d_sequence(
     destination = _convert_sequence(
         official_module=official_module,
         scene_root=scene_root,
-        primary_metadata_root=primary_metadata_root,
-        fallback_metadata_root=fallback_metadata_root,
+        metadata_root=metadata_root,
         output_root=output_root,
         sequence_base=sequence,
         device=device,

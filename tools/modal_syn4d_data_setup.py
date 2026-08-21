@@ -120,12 +120,21 @@ def _t4_image() -> modal.Image:
 
 
 def _cpu_image() -> modal.Image:
-    return _clone_source(
+    base = (
         modal.Image.debian_slim(python_version="3.11")
-        .apt_install("ca-certificates", "git", "zstd")
-        .pip_install("numpy==2.2.4", "torch==2.7.1", "torchvision==0.22.1", "wandb==0.19.9",
-                     index_url="https://download.pytorch.org/whl/cpu")
+        .apt_install("ca-certificates", "git", "libgl1", "libglib2.0-0", "zstd")
+        .pip_install(
+            "torch==2.7.1", "torchvision==0.22.1",
+            index_url="https://download.pytorch.org/whl/cpu",
+        )
+        .pip_install(
+            "numpy==2.2.4", "wandb==0.19.9", "opencv-python-headless==4.11.0.86",
+            "scipy==1.15.2", "matplotlib==3.10.1", "Pillow==11.1.0",
+            "pypng==0.20220715.0", "kornia==0.7.3", "mediapy==1.2.0",
+            "rerun-sdk==0.21.0", "pandas==2.2.3",
+        )
     )
+    return _clone_source(base)
 
 
 def _blender_image() -> modal.Image:
@@ -238,6 +247,15 @@ def download_dependencies_remote() -> dict[str, object]:
         (bedlam_root / "b2_assetdata_download/clothing/npz/archive_map.json").read_text()
     )
     bedlam_plan = sequence_bedlam_plan(mapping_destination.read_text(encoding="utf-8-sig"), archive_map)
+    clothing_root = DATA_ROOT / SYN4D_METADATA_ROOT / "b2_assetdata_download/clothing/npz"
+    clothing_root.mkdir(parents=True, exist_ok=True)
+    for archive in bedlam_plan["required_members"]:
+        source = bedlam_root / "b2_assetdata_download/clothing/npz" / f"{archive}.tar"
+        shutil.copyfile(source, clothing_root / source.name)
+    (clothing_root / "archive_map.json").write_text(
+        json.dumps(bedlam_plan["required_members"], indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     write_sequence_manifest(
         DATA_ROOT / SYN4D_ROOT / "manifest.json", source_archive=source_destination,
         mapping=mapping_destination, object_files=object_files, bedlam=bedlam_plan,
@@ -340,9 +358,9 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
 def convert_sequence_remote() -> dict[str, object]:
     """Convert only seq_000000 through the generic Syn4D converter."""
 
-    from mvtracker.preprocessing.syn4d import convert_syn4d_scene
+    from mvtracker.preprocessing.syn4d import convert_syn4d_sequence
     from mvtracker.profiling.modal_syn4d import (
-        SELECTIVE_BEDLAM_ROOT, SYN4D_CACHE_ROOT, SYN4D_METADATA_ROOT, SYN4D_ROOT,
+        SYN4D_CACHE_ROOT, SYN4D_METADATA_ROOT, SYN4D_ROOT,
         SYN4D_SEQUENCE, SYN4D_SCENE,
     )
 
@@ -356,10 +374,9 @@ def convert_sequence_remote() -> dict[str, object]:
     shutil.rmtree(extracted_root, ignore_errors=True)
     extracted_root.mkdir(parents=True)
     subprocess.run(["tar", "-I", "zstd -T0", "-xf", str(source_archive), "-C", str(extracted_root)], check=True)
-    result = convert_syn4d_scene(
+    result = convert_syn4d_sequence(
         extracted_root / SYN4D_SCENE,
         DATA_ROOT / SYN4D_METADATA_ROOT,
-        DATA_ROOT / SELECTIVE_BEDLAM_ROOT,
         DATA_ROOT / SYN4D_CACHE_ROOT,
         sequence=SYN4D_SEQUENCE,
         device="cuda",

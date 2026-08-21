@@ -77,8 +77,7 @@ class Syn4DConversionTests(unittest.TestCase):
         result = syn4d_conversion._official_sequence_items(
             module,
             scene_root=Path("/data/lab_bald"),
-            primary_metadata_root=Path("/metadata/primary"),
-            fallback_metadata_root=Path("/metadata/clothing"),
+            metadata_root=Path("/metadata"),
             sequence_base="seq_000000",
             frame_count=1,
         )
@@ -87,8 +86,8 @@ class Syn4DConversionTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         kwargs = calls[0]
         self.assertEqual(kwargs["dataset_root"], "/data")
-        self.assertEqual(kwargs["metadata_root"], "/metadata/primary")
-        self.assertEqual(kwargs["fallback_metadata_root"], "/metadata/clothing")
+        self.assertEqual(kwargs["metadata_root"], "/metadata")
+        self.assertIsNone(kwargs["fallback_metadata_root"])
         self.assertEqual(kwargs["scene_name_list"], ["lab_bald"])
         self.assertEqual(kwargs["track_query_idx"], 0)
         self.assertEqual(kwargs["S"], 1)
@@ -192,7 +191,6 @@ class Syn4DConversionTests(unittest.TestCase):
                 result = syn4d_conversion.convert_syn4d_sequence(
                     scene_root,
                     primary,
-                    clothing,
                     output,
                     official_visualizer_root=visualizer,
                     sequence="seq_000000",

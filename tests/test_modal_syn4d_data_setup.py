@@ -76,7 +76,7 @@ class ModalSyn4DDataSetupTests(unittest.TestCase):
     def test_launcher_is_single_sequence_and_all_jobs_are_billing_tagged(self):
         self.assertIn('"purpose": "profiling"', (ROOT / "tools/modal_training_profile.py").read_text())
         self.assertIn('SYN4D_HF_SOURCE = "data/syn4d_v1_stride_1/lab_bald.tar.zst"', PROFILE)
-        self.assertIn("convert_syn4d_scene", LAUNCHER)
+        self.assertIn("convert_syn4d_sequence", LAUNCHER)
         self.assertIn('gpu="T4"', LAUNCHER)
         self.assertIn('"gpu": "cpu"', LAUNCHER)
         self.assertIn("for index in range(5)", LAUNCHER)

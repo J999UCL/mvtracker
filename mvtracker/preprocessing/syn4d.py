@@ -1058,8 +1058,7 @@ def finalize_sequence_cache(
 
 def convert_syn4d_sequence(
     scene_root: Path,
-    primary_metadata_root: Path,
-    fallback_metadata_root: Path,
+    metadata_root: Path,
     output_root: Path,
     *,
     official_visualizer_root: Path,
@@ -1075,8 +1074,7 @@ def convert_syn4d_sequence(
 
     return run_conversion(
         scene_root,
-        primary_metadata_root,
-        fallback_metadata_root,
+        metadata_root,
         output_root,
         official_visualizer_root=official_visualizer_root,
         sequence=sequence,
