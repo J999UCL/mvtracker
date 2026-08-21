@@ -245,4 +245,5 @@ def probe() -> None:
 @app.local_entrypoint(name="download")
 def download(workers: int = 4) -> None:
     _preflight()
-    print(json.dumps(download_remote.remote(workers), indent=2, sort_keys=True))
+    call = download_remote.spawn(workers)
+    print(json.dumps({"function_call_id": call.object_id}, indent=2))
