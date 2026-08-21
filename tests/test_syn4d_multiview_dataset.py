@@ -1,4 +1,5 @@
 import json
+import pickle
 import tempfile
 import unittest
 from pathlib import Path
@@ -109,10 +110,18 @@ def _dataset(root: Path):
     dataset.replace_bounds = [2, 100]
     dataset._manifests = {name: dataset._load_manifest(name)}
     dataset._sequence_cache = _SequenceMmapCache(root, maximum=1)
+    dataset._mmap_cache_sequences = 1
     return dataset
 
 
 class Syn4DLoaderTests(unittest.TestCase):
+    def test_dataset_recreates_mmap_cache_in_spawned_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _dataset(Path(directory))
+            restored = pickle.loads(pickle.dumps(dataset))
+            self.assertEqual(restored._sequence_cache.maximum, 1)
+            self.assertIsNot(restored._sequence_cache, dataset._sequence_cache)
+
     def test_motion_preselection_does_not_substitute_missing_pools(self):
         movement = np.array([0.0] * 8 + [0.5] * 16, dtype=np.float32)
         selected = _preselect_tracks(

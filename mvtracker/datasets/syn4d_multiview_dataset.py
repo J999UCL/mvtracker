@@ -148,6 +148,18 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         self._sequence_cache = _SequenceMmapCache(
             Path(data_root), mmap_cache_sequences
         )
+        self._mmap_cache_sequences = int(mmap_cache_sequences)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_sequence_cache"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._sequence_cache = _SequenceMmapCache(
+            Path(self.data_root), self._mmap_cache_sequences
+        )
 
     def _load_manifest(self, sequence: str) -> dict[str, Any]:
         root = Path(self.data_root) / sequence
