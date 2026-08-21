@@ -431,6 +431,8 @@ def validation_series_from_scalars(
             continue
         if dataset_name == "tapvid3d-multiview-validation":
             source_name = "diegesis"
+        elif dataset_name == "syn4d-multiview-validation":
+            source_name = "syn4d"
         elif dataset_name.endswith("validation-full"):
             source_name = "mvkubric_full"
         elif dataset_name.endswith("validation-subset"):
@@ -440,22 +442,28 @@ def validation_series_from_scalars(
         grouped.setdefault(source_name, {})[metric] = points
 
     diegesis = grouped.get("diegesis", {})
+    syn4d = grouped.get("syn4d", {})
     for cohort in ("full", "subset"):
         mvkubric = grouped.get(f"mvkubric_{cohort}", {})
         combined = {}
-        for metric in diegesis.keys() & mvkubric.keys():
-            left = {int(point["step"]): point for point in diegesis[metric]}
-            right = {int(point["step"]): point for point in mvkubric[metric]}
+        for metric in diegesis.keys() & syn4d.keys() & mvkubric.keys():
+            sources = [
+                {int(point["step"]): point for point in metrics[metric]}
+                for metrics in (diegesis, syn4d, mvkubric)
+            ]
+            common_steps = set(sources[0])
+            for source in sources[1:]:
+                common_steps &= source.keys()
             combined[metric] = [
                 {
                     "step": step,
-                    "value": (
-                        float(left[step]["value"])
-                        + float(right[step]["value"])
+                    "value": sum(
+                        float(source[step]["value"])
+                        for source in sources
                     )
-                    / 2.0,
+                    / len(sources),
                 }
-                for step in sorted(left.keys() & right.keys())
+                for step in sorted(common_steps)
             ]
         if combined:
             grouped[f"combined_{cohort}"] = combined
@@ -1096,9 +1104,10 @@ INDEX_HTML = r"""<!doctype html>
       <h2>Validation through training</h2>
       <label>Metric<select id="validation-select" disabled><option>No validation metrics yet</option></select></label>
     </div>
-    <div class="grid-3" id="validation-chart-wrap" hidden>
-      <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap"><canvas id="validation-combined"></canvas></div><div class="chart-note">Equal-weight mean of DIEGESIS and MV-Kubric at the same step. Full and subset cohorts remain separate.</div></div>
+    <div class="grid-2" id="validation-chart-wrap" hidden>
+      <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap"><canvas id="validation-combined"></canvas></div><div class="chart-note">Equal-weight mean of DIEGESIS, Syn4D, and MV-Kubric at the same step. MV-Kubric full and subset cohorts remain separate.</div></div>
       <div class="chart-panel"><h3>DIEGESIS</h3><div class="chart-wrap"><canvas id="validation-diegesis"></canvas></div></div>
+      <div class="chart-panel"><h3>Syn4D</h3><div class="chart-wrap"><canvas id="validation-syn4d"></canvas></div></div>
       <div class="chart-panel"><h3>MV-Kubric</h3><div class="chart-wrap"><canvas id="validation-mvkubric"></canvas></div><div class="chart-note">Full (27 scenes) and subset (101–102) remain separate so unlike populations are never joined into one trend.</div></div>
     </div>
     <div class="empty" id="validation-empty"><div><strong>No validation series recorded</strong><div class="muted" id="validation-reason">Waiting for evaluation scalars…</div></div></div>
@@ -1185,6 +1194,7 @@ const charts={
   stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[rawPoints('Model / stationary',palette.s1),meanLine('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0})}),
   validationCombined:new Chart(document.getElementById('validation-combined'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
   validationDiegesis:new Chart(document.getElementById('validation-diegesis'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
+  validationSyn4d:new Chart(document.getElementById('validation-syn4d'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
   validationMvkubric:new Chart(document.getElementById('validation-mvkubric'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
   timing:new Chart(document.getElementById('step-timing'),{type:'line',data:{datasets:[line('Total',palette.s1),line('Data wait',palette.s2),line('Forward',palette.s3),line('Backward',palette.s4)]},options:options('Optimizer step','Seconds')}),
   learningRate:new Chart(document.getElementById('learning-rate'),{type:'line',data:{datasets:[line('Learning rate',palette.s1)]},options:options('Optimizer step','Learning rate',{legend:false,tickCallback:value=>Number(value).toExponential(1)})}),
@@ -1257,8 +1267,8 @@ const parityPoints=series=>points(series).map(point=>({x:point.x,y:1}));
 const pipePoints=(series,key)=>(series||[]).filter(point=>point[key]!=null).map(point=>({x:Number(point.step),y:Number(point[key])}));
 const gpuPoints=(series,key,gpuIndex=null)=>(series||[]).filter(point=>point[key]!=null&&(gpuIndex==null||Number(point.gpu_index)===gpuIndex)).map(point=>({x:Number(point.elapsed_seconds)/60,y:Number(point[key])}));
 function update(chart,datasets){datasets.forEach((data,index)=>{chart.data.datasets[index].data=data;});chart.update(reduced?'none':undefined);}
-const validationLabels={combined_full:'Combined · full 27',combined_subset:'Combined · scenes 101–102',diegesis:'DIEGESIS',mvkubric_full:'MV-Kubric · full 27',mvkubric_subset:'MV-Kubric · scenes 101–102'};
-const validationColors={combined_full:palette.s1,combined_subset:palette.s4,diegesis:palette.s3,mvkubric_full:palette.s1,mvkubric_subset:palette.s4};
+const validationLabels={combined_full:'Combined · full validation',combined_subset:'Combined · MV-Kubric 101–102',diegesis:'DIEGESIS',syn4d:'Syn4D',mvkubric_full:'MV-Kubric · full 27',mvkubric_subset:'MV-Kubric · scenes 101–102'};
+const validationColors={combined_full:palette.s1,combined_subset:palette.s4,diegesis:palette.s3,syn4d:palette.s2,mvkubric_full:palette.s1,mvkubric_subset:palette.s4};
 function updateValidation(chart,entries){chart.data.datasets=entries.map(([name,series],index)=>line(validationLabels[name]||name,validationColors[name]||[palette.s1,palette.s2,palette.s3,palette.s4,palette.s5][index%5],{data:points(series)}));chart.update(reduced?'none':undefined);}
 const text=(id,value)=>{document.getElementById(id).textContent=value;};
 function render(state){
@@ -1309,7 +1319,7 @@ function render(state){
   const validation=state.series?.validation||{}, tags=[...new Set(Object.values(validation).flatMap(metrics=>Object.keys(metrics)))].sort(), select=document.getElementById('validation-select');
   const previous=select.value;
   select.replaceChildren(...tags.map(tag=>{const option=document.createElement('option');option.value=tag;option.textContent=tag;return option;}));
-  const renderValidation=metric=>{const entries=Object.entries(validation).filter(([,metrics])=>metrics[metric]).map(([name,metrics])=>[name,metrics[metric]]);updateValidation(charts.validationCombined,entries.filter(([name])=>name.startsWith('combined_')));updateValidation(charts.validationDiegesis,entries.filter(([name])=>name==='diegesis'));updateValidation(charts.validationMvkubric,entries.filter(([name])=>name.startsWith('mvkubric_')));};
+  const renderValidation=metric=>{const entries=Object.entries(validation).filter(([,metrics])=>metrics[metric]).map(([name,metrics])=>[name,metrics[metric]]);updateValidation(charts.validationCombined,entries.filter(([name])=>name.startsWith('combined_')));updateValidation(charts.validationDiegesis,entries.filter(([name])=>name==='diegesis'));updateValidation(charts.validationSyn4d,entries.filter(([name])=>name==='syn4d'));updateValidation(charts.validationMvkubric,entries.filter(([name])=>name.startsWith('mvkubric_')));};
   if(tags.length){select.disabled=false;select.value=tags.includes(previous)?previous:tags[0];document.getElementById('validation-chart-wrap').hidden=false;document.getElementById('validation-empty').hidden=true;renderValidation(select.value);}
   else{select.disabled=true;const option=document.createElement('option');option.textContent='No validation metrics yet';select.append(option);document.getElementById('validation-chart-wrap').hidden=true;document.getElementById('validation-empty').hidden=false;text('validation-reason',(config.eval_datasets||[]).length?'Waiting for the first scheduled evaluation…':'No evaluation datasets are configured.');}
   select.onchange=()=>renderValidation(select.value);

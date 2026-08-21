@@ -227,11 +227,14 @@ class SourceSeriesTests(unittest.TestCase):
 
     def test_keeps_full_and_subset_mvkubric_validation_separate(self):
         diegesis = [{"step": 250, "value": 80.0}]
+        syn4d = [{"step": 250, "value": 90.0}]
         mvkubric = [{"step": 250, "value": 70.0}]
         validation = dashboard.validation_series_from_scalars(
             {
                 "eval/tapvid3d-multiview-validation/"
                 "eval_tapvid3d-multiview-validation/model__average_jaccard__any": diegesis,
+                "eval/syn4d-multiview-validation/"
+                "eval_syn4d-multiview-validation/model__average_jaccard__any": syn4d,
                 "eval/kubric-multiview-v3-validation-full/"
                 "eval_kubric-multiview-v3-validation-full/model__average_jaccard__any": mvkubric,
                 "eval/kubric-multiview-v3-validation-subset/"
@@ -245,6 +248,7 @@ class SourceSeriesTests(unittest.TestCase):
                 "combined_full",
                 "combined_subset",
                 "diegesis",
+                "syn4d",
                 "mvkubric_full",
                 "mvkubric_subset",
             },
@@ -255,7 +259,7 @@ class SourceSeriesTests(unittest.TestCase):
         )
         self.assertEqual(
             validation["combined_subset"]["model__average_jaccard__any"],
-            [{"step": 250, "value": 75.0}],
+            [{"step": 250, "value": 80.0}],
         )
 
 
@@ -407,6 +411,7 @@ class DashboardHTTPTests(unittest.TestCase):
             "stationary-ratio",
             "validation-combined",
             "validation-diegesis",
+            "validation-syn4d",
             "validation-mvkubric",
             "step-timing",
             "learning-rate",
@@ -442,7 +447,8 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("loss-large", html)
         self.assertIn("toggleLossSeries", html)
         self.assertIn("seriesKey:'trajectory'", html)
-        self.assertIn("combined_full:'Combined · full 27'", html)
+        self.assertIn("combined_full:'Combined · full validation'", html)
+        self.assertIn("Equal-weight mean of DIEGESIS, Syn4D, and MV-Kubric", html)
         self.assertIn("Full (27 scenes) and subset (101–102) remain separate", html)
         self.assertIn("movingAverageXY(trackMean)", html)
         self.assertIn("Clipped steps (last 50)", html)
