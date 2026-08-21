@@ -1471,3 +1471,35 @@ catastrophic forgetting, but it also did not improve all benchmark domains.
 - Checkpoint: `/media/data3/jthakwani/mvtracker/checkpoints/diegesis-mvkubric-gt-replay-step1000/model_final.pth`
 - Results: `/media/data3/jthakwani/mvtracker-evals/mvtracker-final-gt-replay-eval-20260821T000300Z/final-gt-replay-step1000-mixed-init/`
 - Log: `/media/data3/jthakwani/mvtracker-evals/mvtracker-final-gt-replay-eval-20260821T000300Z.ucl.log`
+
+## 21 August 2026: three-source Syn4D launch gate
+
+Source `e376e2dc7689ca1f4614adec9d713bba86ae31ad` added Syn4D to the
+continual-training scheduler at a global 25% DIEGESIS / 25% Syn4D / 50%
+MV-Kubric ratio. The selected cache contains 20 `lab_bald` sequences; sequences
+0--15 train and 16--19 validate. Syn4D uses its own 300 m depth ceiling. The
+run starts from the released mixed/noisy-depth checkpoint and otherwise keeps
+the prior BF16, global-batch-eight, peak-5e-5 recipe, extended to 2,000 steps.
+
+A one-update two-H200 smoke completed forward, loss, backward, optimizer,
+checkpointing and W&B logging with the exact global 2/2/4 source counts. The
+cold step took 63.20 seconds, including 44.05 seconds exposed data wait. H200
+memory was 42.7 and 41.2 GiB; container RAM was 39.4/128 GiB. W&B:
+https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/a022701d2fb1
+
+The first main attempt stopped before training because Syn4D lacked an
+evaluator-name mapping. Source `48b71a8ac902ecff4eb57c5d782467fce798798c`
+mapped it to the existing Kubric-style 3D tracking protocol. The fresh run
+then completed all initial DIEGESIS, four-sequence Syn4D, and 27-scene
+MV-Kubric validation and reached 16 optimizer updates. Warm steps took
+5.7--16.2 seconds; exposed data wait was usually 0.15--2.17 seconds after the
+cold step, and both H200s reached 98--100% utilization at the step-10 sample.
+
+The run was deliberately cancelled under the requested early safety gate:
+container RAM rose from 77.57 GiB at step 1 to 110.19 GiB at step 10 under a
+128 GiB hard limit. No periodic checkpoint existed before the step-250 save.
+The H200s were released and unrelated Modal containers were not interrupted.
+The likely bounded contributors are the four-step encoded lookahead plus
+Syn4D's mapped sequence cache, but the available two memory samples do not
+prove that the process had stabilized. W&B:
+https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/a96efc42247a

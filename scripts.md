@@ -155,6 +155,26 @@ modal run --timestamps tools/modal_continual_training.py::train \
   --run-name <existing-run-name> --confirm-main --resume-existing
 ```
 
+### Three-source DIEGESIS + Syn4D + MV-Kubric run
+
+The three-source recipe keeps a global batch of eight scenes at 25% DIEGESIS,
+25% Syn4D, and 50% MV-Kubric. It uses 16 `lab_bald` Syn4D sequences for
+training, four for validation, a 2,000-step OneCycle schedule, two H200s, and
+the same pushed-source and free-capacity gates as the two-source run.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
+
+modal deploy tools/modal_continual_training.py
+modal container list --json
+modal run --timestamps tools/modal_continual_training.py::syn4d_smoke1 \
+  --run-name <unique-smoke-name>
+modal container list --json
+modal run --timestamps tools/modal_continual_training.py::syn4d_train \
+  --run-name <unique-main-name> --confirm-main
+```
+
 Both GPU modes request exactly `H200:2`, set `max_containers=1`, and attach
 `owner=jeet`, `project=mvtracker`, and `purpose=training` billing tags. Reuse an
 explicit `--run-name` to resume the same run, W&B identity, seed, and checkpoint
