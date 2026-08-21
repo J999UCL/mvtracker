@@ -47,9 +47,7 @@ BLENDER_ARCHIVE = f"blender-{BLENDER_VERSION}-linux-x64.tar.xz"
 BLENDER_URL = f"https://download.blender.org/release/Blender4.5/{BLENDER_ARCHIVE}"
 BLENDER_ROOT = Path(f"/opt/blender-{BLENDER_VERSION}-linux-x64")
 BLENDER_BIN = BLENDER_ROOT / "blender"
-SMPLX_ADDON_PARTS = (
-    DATA_ROOT / "datasets/syn4d/temple_group/private/smplx_addon_parts"
-)
+SMPLX_ADDON_PARTS = DATA_ROOT / "datasets/syn4d/private/smplx_addon_parts"
 SMPLX_ADDON_BYTES = 387_473_505
 BEDLAM_SCRIPTS_ROOT = Path("/opt/syn4d-bedlam2")
 SYN4D_VISUALIZER_ROOT = Path("/opt/syn4d-visualizer")
@@ -59,6 +57,8 @@ BEDLAM_README_URL = (
 )
 MODAL_TAGS = {**BASE_TAGS, "experiment": "lab-bald-conversion", "gpu": "t4"}
 CPU_TAGS = {**BASE_TAGS, "experiment": "lab-bald-setup", "gpu": "cpu"}
+SHARD_A_SEQUENCES = tuple(f"seq_{index:06d}" for index in range(1, 10))
+SHARD_B_SEQUENCES = tuple(f"seq_{index:06d}" for index in range(10, 20))
 
 data_volume = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True, version=2)
 run_volume = modal.Volume.from_name(RUN_VOLUME_NAME, create_if_missing=True, version=2)
@@ -194,49 +194,52 @@ def _wandb_run(*, job_type: str, name: str, tags: list[str], config: dict):
     include_source=False,
 )
 def download_dependencies_remote() -> dict[str, object]:
-    """Stage the lab_bald archive, seq_000000 mapping, and exact dependencies."""
+    """Reuse seq0 staging and add only missing all-sequence dependencies."""
 
     from huggingface_hub import hf_hub_download
     from mvtracker.profiling.modal_syn4d import (
         SELECTIVE_BEDLAM_ROOT, SYN4D_HF_MAPPING, SYN4D_HF_SOURCE, SYN4D_MAPPING,
         SYN4D_METADATA_ROOT, SYN4D_OBJECT_ROOT_LOCAL, SYN4D_REPO_ID,
-        SYN4D_REVISION, SYN4D_ROOT,
-        SYN4D_SOURCE_BYTES, SYN4D_SOURCE_ROOT, sequence_bedlam_plan,
-        sequence_object_paths, write_sequence_manifest,
+        SYN4D_REVISION, SYN4D_ROOT, SYN4D_SOURCE_BYTES, SYN4D_SOURCE_ROOT,
+        scene_bedlam_plan, scene_object_paths, write_scene_manifest,
     )
 
     run = _wandb_run(
-        job_type="lab-bald-download", name="lab-bald-seq000000-selective-download",
+        job_type="lab-bald-download", name="lab-bald-all-sequences-selective-download",
         tags=["download", "cpu"], config={"source_revision": SYN4D_REVISION, **CPU_TAGS},
     )
     started = time.perf_counter()
     root = DATA_ROOT / SYN4D_ROOT
     root.mkdir(parents=True, exist_ok=True)
-    mapping_source = Path(hf_hub_download(
-        repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
-        filename=SYN4D_HF_MAPPING, token=os.environ["HF_TOKEN"], local_dir="/tmp/syn4d-mapping",
-    ))
     mapping_destination = DATA_ROOT / SYN4D_MAPPING
     mapping_destination.parent.mkdir(parents=True, exist_ok=True)
-    mapping_destination.write_bytes(mapping_source.read_bytes())
-    source_path = Path(hf_hub_download(
-        repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
-        filename=SYN4D_HF_SOURCE, token=os.environ["HF_TOKEN"], local_dir="/tmp/syn4d-source",
-    ))
-    if source_path.stat().st_size != SYN4D_SOURCE_BYTES:
-        raise RuntimeError("lab_bald source archive size does not match pin")
+    if not mapping_destination.is_file():
+        mapping_source = Path(hf_hub_download(
+            repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
+            filename=SYN4D_HF_MAPPING, token=os.environ["HF_TOKEN"], local_dir="/tmp/syn4d-mapping",
+        ))
+        mapping_destination.write_bytes(mapping_source.read_bytes())
     source_destination = DATA_ROOT / SYN4D_SOURCE_ROOT / "lab_bald.tar.zst"
     source_destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source_path, source_destination)
+    if not source_destination.is_file() or source_destination.stat().st_size != SYN4D_SOURCE_BYTES:
+        source_path = Path(hf_hub_download(
+            repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
+            filename=SYN4D_HF_SOURCE, token=os.environ["HF_TOKEN"], local_dir="/tmp/syn4d-source",
+        ))
+        if source_path.stat().st_size != SYN4D_SOURCE_BYTES:
+            raise RuntimeError("lab_bald source archive size does not match pin")
+        shutil.copyfile(source_path, source_destination)
 
     def stage_object(remote_path: Path) -> Path:
+        relative = remote_path.relative_to(Path("data/metadata/new_weight_bone"))
+        destination = DATA_ROOT / SYN4D_OBJECT_ROOT_LOCAL / relative
+        if destination.is_file():
+            return destination
         local_path = Path(hf_hub_download(
             repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
             filename=remote_path.as_posix(), token=os.environ["HF_TOKEN"],
             local_dir=f"/tmp/syn4d-object-{remote_path.parent.name}",
         ))
-        relative = remote_path.relative_to(Path("data/metadata/new_weight_bone"))
-        destination = DATA_ROOT / SYN4D_OBJECT_ROOT_LOCAL / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, destination)
         return destination
@@ -244,31 +247,33 @@ def download_dependencies_remote() -> dict[str, object]:
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        object_files = tuple(pool.map(stage_object, sequence_object_paths(mapping_destination)))
+        object_files = tuple(pool.map(stage_object, scene_object_paths(mapping_destination)))
     bedlam_root = DATA_ROOT / SELECTIVE_BEDLAM_ROOT
     archive_map = json.loads(
         (bedlam_root / "b2_assetdata_download/clothing/npz/archive_map.json").read_text()
     )
-    bedlam_plan = sequence_bedlam_plan(mapping_destination.read_text(encoding="utf-8-sig"), archive_map)
+    bedlam_plan = scene_bedlam_plan(mapping_destination, archive_map)
     clothing_root = DATA_ROOT / SYN4D_METADATA_ROOT / "b2_assetdata_download/clothing/npz"
     clothing_root.mkdir(parents=True, exist_ok=True)
     for archive in bedlam_plan["required_members"]:
         source = bedlam_root / "b2_assetdata_download/clothing/npz" / f"{archive}.tar"
-        shutil.copyfile(source, clothing_root / source.name)
+        destination = clothing_root / source.name
+        if not destination.is_file():
+            shutil.copyfile(source, destination)
     (clothing_root / "archive_map.json").write_text(
         json.dumps(bedlam_plan["required_members"], indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    write_sequence_manifest(
+    write_scene_manifest(
         DATA_ROOT / SYN4D_ROOT / "manifest.json", source_archive=source_destination,
         mapping=mapping_destination, object_files=object_files, bedlam=bedlam_plan,
         bedlam_root=bedlam_root,
     )
     data_volume.commit()
     result = {
-        "scene": "lab_bald", "sequence": "seq_000000",
+        "scene": "lab_bald", "sequence_count": 20,
         "source_archive_bytes": source_destination.stat().st_size,
-        "object_vertex_count": len(object_files), "body_count": 1, "clothing_count": 1,
+        "object_vertex_count": len(object_files), "body_count": 20, "clothing_count": 20,
         "elapsed_seconds": time.perf_counter() - started,
     }
     run.summary.update(result)
@@ -284,17 +289,17 @@ def download_dependencies_remote() -> dict[str, object]:
     include_source=False,
 )
 def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str, object]:
-    """Run official Blender BEDLAM2 conversion for the one pilot body."""
+    """Convert only missing BEDLAM2 body caches; seq0 is never reconverted."""
 
     from mvtracker.profiling.modal_syn4d import (
-        SELECTIVE_BEDLAM_ROOT, SYN4D_BODY_ROOT, SYN4D_MAPPING,
-        sequence_dependencies,
+        SELECTIVE_BEDLAM_ROOT, SYN4D_BODY_ROOT, SYN4D_MAPPING, SYN4D_SEQUENCE,
+        scene_dependencies,
     )
 
     if processes <= 0:
         raise ValueError("processes must be positive")
     run = _wandb_run(
-        job_type="bedlam2-conversion", name="lab-bald-seq000000-bedlam2-conversion",
+        job_type="bedlam2-conversion", name="lab-bald-remaining-bedlam2-conversion",
         tags=["bedlam2", "blender-4.5", "cpu"],
         config={"blender_version": BLENDER_VERSION, "processes": processes, **CPU_TAGS},
     )
@@ -308,13 +313,30 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
                 shutil.copyfileobj(source, output, 8 << 20)
     if addon.stat().st_size != SMPLX_ADDON_BYTES:
         raise RuntimeError(f"SMPL-X add-on parts total {addon.stat().st_size} bytes; expected {SMPLX_ADDON_BYTES}")
-    dependencies = sequence_dependencies(DATA_ROOT / SYN4D_MAPPING)
+    dependencies = scene_dependencies(DATA_ROOT / SYN4D_MAPPING)
+    published_root = DATA_ROOT / SYN4D_BODY_ROOT
+    seq0_motion = next(
+        plan["body_motion"] for plan in dependencies if plan["sequence"] == SYN4D_SEQUENCE
+    )
+    if not tuple(published_root.rglob(f"{seq0_motion}.npz")):
+        raise RuntimeError("seq_000000 body cache is required; refusing to reconvert it")
+    missing_motions = [
+        plan["body_motion"]
+        for plan in dependencies
+        if plan["sequence"] != SYN4D_SEQUENCE
+        and not tuple(published_root.rglob(f"{plan['body_motion']}.npz"))
+    ]
+    if not missing_motions:
+        result = {"motion_count": 0, "vertex_cache_count": 0, "skipped": True}
+        run.summary.update(result)
+        run.finish()
+        return result
     source_motions = DATA_ROOT / SELECTIVE_BEDLAM_ROOT / "b2_motions_npz_training/motions_npz_training"
     work_root = Path("/tmp/lab-bald-bedlam")
     motions_root, abc_root, vertices_root = work_root / "motions", work_root / "abc", work_root / "vertices"
     shutil.rmtree(work_root, ignore_errors=True)
     motions_root.mkdir(parents=True)
-    for motion in dependencies["motions"]:
+    for motion in missing_motions:
         shutil.copyfile(source_motions / f"{motion}.npz", motions_root / f"{motion}.npz")
     install = (
         f"{shlex.quote(str(BLENDER_BIN))} --background --python-expr "
@@ -337,16 +359,18 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
     subprocess.run(stage2, check=True)
     stage2_seconds = time.perf_counter() - started - stage1_seconds
     vertex_files = tuple(vertices_root.rglob("*.npz"))
-    if len(vertex_files) != 1:
-        raise RuntimeError(f"BEDLAM conversion produced {len(vertex_files)} vertex caches; expected 1")
-    published_root = DATA_ROOT / SYN4D_BODY_ROOT
+    if len(vertex_files) != len(missing_motions):
+        raise RuntimeError(
+            f"BEDLAM conversion produced {len(vertex_files)} vertex caches; "
+            f"expected {len(missing_motions)}"
+        )
     for source in vertex_files:
         destination = published_root / source.relative_to(vertices_root)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
     data_volume.commit()
     result = {"stage1_seconds": stage1_seconds, "stage2_seconds": stage2_seconds,
-              "motion_count": 1, "vertex_cache_count": 1}
+              "motion_count": len(missing_motions), "vertex_cache_count": len(vertex_files)}
     run.summary.update(result)
     run.finish()
     return result
@@ -356,39 +380,98 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
     image=t4_image, secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
     gpu="T4", cpu=T4_CPU, memory=T4_MEMORY_MIB, ephemeral_disk=T4_EPHEMERAL_DISK_MIB,
-    timeout=24 * 60 * 60, retries=0, max_containers=MAX_CONTAINERS, include_source=False,
+    timeout=24 * 60 * 60, retries=0, max_containers=1, include_source=False,
 )
-def convert_sequence_remote() -> dict[str, object]:
-    """Convert only seq_000000 through the generic Syn4D converter."""
+def convert_shard_a_remote() -> dict[str, object]:
+    """Convert seq_000001..seq_000009 from one archive extraction."""
 
     from mvtracker.preprocessing.syn4d import convert_syn4d_sequence
     from mvtracker.profiling.modal_syn4d import (
-        SYN4D_CACHE_ROOT, SYN4D_METADATA_ROOT, SYN4D_ROOT,
-        SYN4D_SEQUENCE, SYN4D_SCENE,
+        SYN4D_CACHE_ROOT, SYN4D_METADATA_ROOT, SYN4D_ROOT, SYN4D_SCENE,
     )
 
     run = _wandb_run(
-        job_type="syn4d-conversion", name="lab-bald-seq000000-conversion",
-        tags=["converter", "t4"], config={"sequence": SYN4D_SEQUENCE, **MODAL_TAGS},
+        job_type="syn4d-conversion-shard", name="lab-bald-shard-a",
+        tags=["converter", "t4", "shard-a"],
+        config={"sequences": list(SHARD_A_SEQUENCES), **MODAL_TAGS},
     )
-    started = time.perf_counter()
     source_archive = DATA_ROOT / SYN4D_ROOT / "source/lab_bald.tar.zst"
-    extracted_root = Path("/tmp/syn4d-lab-bald")
+    extracted_root = Path("/tmp/syn4d-lab-bald-shard-a")
     shutil.rmtree(extracted_root, ignore_errors=True)
     extracted_root.mkdir(parents=True)
-    subprocess.run(["tar", "-I", "zstd -T0", "-xf", str(source_archive), "-C", str(extracted_root)], check=True)
-    result = convert_syn4d_sequence(
-        extracted_root / SYN4D_SCENE,
-        DATA_ROOT / SYN4D_METADATA_ROOT,
-        DATA_ROOT / SYN4D_CACHE_ROOT,
-        sequence=SYN4D_SEQUENCE,
-        device="cuda",
-        official_visualizer_root=SYN4D_VISUALIZER_ROOT,
+    subprocess.run(
+        ["tar", "-I", "zstd -T0", "-xf", str(source_archive), "-C", str(extracted_root)],
+        check=True,
     )
-    result = {**result, "elapsed_seconds": time.perf_counter() - started}
-    run.summary.update(result)
+    started = time.perf_counter()
+    results = []
+    for sequence in SHARD_A_SEQUENCES:
+        sequence_started = time.perf_counter()
+        result = convert_syn4d_sequence(
+            extracted_root / SYN4D_SCENE,
+            DATA_ROOT / SYN4D_METADATA_ROOT,
+            DATA_ROOT / SYN4D_CACHE_ROOT,
+            sequence=sequence,
+            device="cuda",
+            official_visualizer_root=SYN4D_VISUALIZER_ROOT,
+        )
+        data_volume.commit()
+        result = {**result, "elapsed_seconds": time.perf_counter() - sequence_started}
+        results.append(result)
+        run.log({"sequence": sequence, "sequence_elapsed_seconds": result["elapsed_seconds"]})
+    result = {"shard": "a", "sequences": results, "elapsed_seconds": time.perf_counter() - started}
+    run.summary.update({"sequence_count": len(results), "elapsed_seconds": result["elapsed_seconds"]})
     run.finish()
-    data_volume.commit()
+    run_volume.commit()
+    return result
+
+
+@app.function(
+    image=t4_image, secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
+    gpu="T4", cpu=T4_CPU, memory=T4_MEMORY_MIB, ephemeral_disk=T4_EPHEMERAL_DISK_MIB,
+    timeout=24 * 60 * 60, retries=0, max_containers=1, include_source=False,
+)
+def convert_shard_b_remote() -> dict[str, object]:
+    """Convert seq_000010..seq_000019 from one archive extraction."""
+
+    from mvtracker.preprocessing.syn4d import convert_syn4d_sequence
+    from mvtracker.profiling.modal_syn4d import (
+        SYN4D_CACHE_ROOT, SYN4D_METADATA_ROOT, SYN4D_ROOT, SYN4D_SCENE,
+    )
+
+    run = _wandb_run(
+        job_type="syn4d-conversion-shard", name="lab-bald-shard-b",
+        tags=["converter", "t4", "shard-b"],
+        config={"sequences": list(SHARD_B_SEQUENCES), **MODAL_TAGS},
+    )
+    source_archive = DATA_ROOT / SYN4D_ROOT / "source/lab_bald.tar.zst"
+    extracted_root = Path("/tmp/syn4d-lab-bald-shard-b")
+    shutil.rmtree(extracted_root, ignore_errors=True)
+    extracted_root.mkdir(parents=True)
+    subprocess.run(
+        ["tar", "-I", "zstd -T0", "-xf", str(source_archive), "-C", str(extracted_root)],
+        check=True,
+    )
+    started = time.perf_counter()
+    results = []
+    for sequence in SHARD_B_SEQUENCES:
+        sequence_started = time.perf_counter()
+        result = convert_syn4d_sequence(
+            extracted_root / SYN4D_SCENE,
+            DATA_ROOT / SYN4D_METADATA_ROOT,
+            DATA_ROOT / SYN4D_CACHE_ROOT,
+            sequence=sequence,
+            device="cuda",
+            official_visualizer_root=SYN4D_VISUALIZER_ROOT,
+        )
+        data_volume.commit()
+        result = {**result, "elapsed_seconds": time.perf_counter() - sequence_started}
+        results.append(result)
+        run.log({"sequence": sequence, "sequence_elapsed_seconds": result["elapsed_seconds"]})
+    result = {"shard": "b", "sequences": results, "elapsed_seconds": time.perf_counter() - started}
+    run.summary.update({"sequence_count": len(results), "elapsed_seconds": result["elapsed_seconds"]})
+    run.finish()
     run_volume.commit()
     return result
 
@@ -489,10 +572,10 @@ def loader_smoke_remote() -> dict[str, object]:
     return result
 
 
-def _preflight(tags: dict[str, str]) -> None:
+def _preflight(tags: dict[str, str], *, required_free_slots: int = 1) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
-    preflight_active_containers(required_free_slots=1)
+    preflight_active_containers(required_free_slots=required_free_slots)
     app.set_tags(tags)
 
 
@@ -508,18 +591,14 @@ def convert_bedlam(processes: int = CPU_CONVERSION_PROCESSES) -> None:
     print(json.dumps(convert_bedlam_remote.remote(processes), indent=2, sort_keys=True))
 
 
-@app.local_entrypoint(name="convert")
-def convert() -> None:
-    _preflight(MODAL_TAGS)
-    print(json.dumps(convert_sequence_remote.remote(), indent=2, sort_keys=True))
+@app.local_entrypoint(name="remaining")
+def remaining() -> None:
+    """Run exactly two concurrent T4 workers and wait for both results."""
 
-
-@app.local_entrypoint(name="lab-bald")
-def lab_bald(processes: int = CPU_CONVERSION_PROCESSES) -> None:
-    _preflight(MODAL_TAGS)
-    download_dependencies_remote.remote()
-    convert_bedlam_remote.remote(processes)
-    print(json.dumps(convert_sequence_remote.remote(), indent=2, sort_keys=True))
+    _preflight(MODAL_TAGS, required_free_slots=2)
+    shard_a = convert_shard_a_remote.spawn()
+    shard_b = convert_shard_b_remote.spawn()
+    print(json.dumps({"shard_a": shard_a.get(), "shard_b": shard_b.get()}, indent=2, sort_keys=True))
 
 
 @app.local_entrypoint(name="loader-smoke")
@@ -529,4 +608,4 @@ def loader_smoke() -> None:
 
 
 if __name__ == "__main__":
-    print("Use: modal run tools/modal_syn4d_data_setup.py::<download|convert-bedlam|convert|lab-bald|loader-smoke>")
+    print("Use: modal run tools/modal_syn4d_data_setup.py::<download|convert-bedlam|remaining|loader-smoke>")

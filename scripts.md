@@ -359,14 +359,15 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
     --candidate-backend qkv
 ```
 
-## Convert the Syn4D `lab_bald` pilot on Modal
+## Convert all Syn4D `lab_bald` sequences on Modal
 
-Reuse the licensed SMPL-X add-on already staged by the temple pilot, deploy the
-tagged CPU/T4 conversion app, and stage only the top-level stride-1
-`lab_bald.tar.zst` archive, mapping,
-`seq_000000`, its one BEDLAM2 body/clothing dependency, and referenced object
-vertices. The generic converter writes the final unquantized cache under
-`datasets/syn4d-mvtracker/train` on `jeet-mvtracker-data-v2`.
+Reuse the staged stride-1 archive, mapping, seq0 objects/clothing, and seq0 body
+cache. The selective setup copies only missing object vertices and clothing
+archives for the other 19 sequences. The Blender stage uses 8 CPUs and 32 GiB
+to convert only missing body caches; it refuses to reconvert seq0. Two T4
+workers then extract the archive once each and convert shards A (`seq_000001`--
+`seq_000009`) and B (`seq_000010`--`seq_000019`) concurrently, committing after
+each completed sequence. Outputs live under `datasets/syn4d-mvtracker/train`.
 
 ```bash
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
@@ -379,11 +380,8 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::convert_bedlam
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::convert
+  modal run --timestamps tools/modal_syn4d_data_setup.py::remaining
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --timestamps tools/modal_syn4d_data_setup.py::loader_smoke
-
-MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::lab_bald
 ```
