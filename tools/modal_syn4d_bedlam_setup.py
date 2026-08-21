@@ -245,5 +245,6 @@ def probe() -> None:
 @app.local_entrypoint(name="download")
 def download(workers: int = 4) -> None:
     _preflight()
-    call = download_remote.spawn(workers)
+    deployed = modal.Function.from_name(APP_NAME, "download_remote")
+    call = deployed.spawn(workers)
     print(json.dumps({"function_call_id": call.object_id}, indent=2))
