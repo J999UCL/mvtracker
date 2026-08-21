@@ -321,7 +321,9 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
         f"{shlex.quote(str(BLENDER_BIN))} --background --python-expr "
         + shlex.quote(
             "import bpy; "
-            f"bpy.ops.preferences.addon_install(filepath={str(addon)!r}, overwrite=True); "
+            "bpy.ops.extensions.package_install_files("
+            f"filepath={str(addon)!r}, repo='user_default', "
+            "enable_on_install=True, overwrite=True); "
             "bpy.ops.wm.save_userpref(); "
             "assert hasattr(bpy.context.window_manager, 'smplx_tool')"
         )
@@ -336,10 +338,22 @@ def convert_bedlam_remote(processes: int = CPU_CONVERSION_PROCESSES) -> dict[str
     started = time.perf_counter()
     subprocess.run(stage1, check=True)
     stage1_seconds = time.perf_counter() - started
+    abc_files = tuple(abc_root.rglob("*.abc"))
+    if len(abc_files) != len(dependencies.body_motions):
+        raise RuntimeError(
+            f"BEDLAM stage 1 produced {len(abc_files)} ABCs; "
+            f"expected {len(dependencies.body_motions)}"
+        )
     run.log({"bedlam/stage1_seconds": stage1_seconds, "bedlam/stage1": 1})
     stage2_started = time.perf_counter()
     subprocess.run(stage2, check=True)
     stage2_seconds = time.perf_counter() - stage2_started
+    vertex_files = tuple(vertices_root.rglob("*.npz"))
+    if len(vertex_files) != len(dependencies.body_motions):
+        raise RuntimeError(
+            f"BEDLAM stage 2 produced {len(vertex_files)} vertex caches; "
+            f"expected {len(dependencies.body_motions)}"
+        )
     run.log({"bedlam/stage2_seconds": stage2_seconds, "bedlam/stage2": 1})
     published_root = DATA_ROOT / TEMPLE_GROUP_BODY_ROOT
     for source in vertices_root.rglob("*.npz"):
