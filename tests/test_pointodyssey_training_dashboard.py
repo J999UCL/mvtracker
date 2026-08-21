@@ -215,12 +215,14 @@ class SourceSeriesTests(unittest.TestCase):
             {
                 "live_flow_loss": point,
                 "source/diegesis/component/flow": point,
+                "source/syn4d/component/flow": point,
                 "source/mvkubric/component/flow": point,
             }
         )
 
         self.assertEqual(losses["combined"]["flow"], point)
         self.assertEqual(losses["diegesis"]["flow"], point)
+        self.assertEqual(losses["syn4d"]["flow"], point)
         self.assertEqual(losses["mvkubric"]["flow"], point)
 
     def test_keeps_full_and_subset_mvkubric_validation_separate(self):
@@ -324,6 +326,9 @@ class DashboardStateTests(unittest.TestCase):
                     "source/diegesis/loss": [
                         {"step": 0, "value": 0.25, "wall_time": 1.0}
                     ],
+                    "source/syn4d/loss": [
+                        {"step": 0, "value": 0.3, "wall_time": 1.0}
+                    ],
                     "source/mvkubric/loss": [
                         {"step": 0, "value": 0.35, "wall_time": 1.0}
                     ],
@@ -353,6 +358,7 @@ class DashboardStateTests(unittest.TestCase):
             self.assertEqual(snapshot["series"]["baseline"]["stationary"][0]["value"], 0.5)
             self.assertEqual(snapshot["series"]["losses"]["combined"]["total"][0]["value"], 0.3)
             self.assertEqual(snapshot["series"]["losses"]["diegesis"]["total"][0]["value"], 0.25)
+            self.assertEqual(snapshot["series"]["losses"]["syn4d"]["total"][0]["value"], 0.3)
             self.assertEqual(snapshot["series"]["losses"]["mvkubric"]["total"][0]["value"], 0.35)
             self.assertEqual(snapshot["series"]["gradients"]["pre_clip"][0]["value"], 2.0)
             self.assertEqual(snapshot["series"]["motion"]["window_mean"][0]["value"], 0.2)
@@ -395,6 +401,7 @@ class DashboardHTTPTests(unittest.TestCase):
         for chart_id in (
             "loss-combined",
             "loss-diegesis",
+            "loss-syn4d",
             "loss-mvkubric",
             "stationary-baseline",
             "stationary-ratio",

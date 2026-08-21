@@ -396,6 +396,13 @@ def loss_series_from_scalars(
             ),
             "flow": scalars.get("source/diegesis/component/flow", []),
         },
+        "syn4d": {
+            "total": scalars.get("source/syn4d/loss", []),
+            "visibility": scalars.get(
+                "source/syn4d/component/visibility", []
+            ),
+            "flow": scalars.get("source/syn4d/component/flow", []),
+        },
         "mvkubric": {
             "total": scalars.get("source/mvkubric/loss", []),
             "visibility": scalars.get(
@@ -1066,6 +1073,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="loss-stack">
       <div class="chart-panel"><h3>Combined</h3><div class="chart-wrap loss-large"><canvas id="loss-combined"></canvas></div></div>
       <div class="chart-panel"><h3>DIEGESIS</h3><div class="chart-wrap loss-large"><canvas id="loss-diegesis"></canvas></div></div>
+      <div class="chart-panel"><h3>Syn4D</h3><div class="chart-wrap loss-large"><canvas id="loss-syn4d"></canvas></div></div>
       <div class="chart-panel"><h3>MV-Kubric</h3><div class="chart-wrap loss-large"><canvas id="loss-mvkubric"></canvas></div></div>
     </div>
     <div class="chart-note">Faint points are raw updates; solid lines are trailing 50-sample means. Each panel shows total, visibility, and 3D trajectory loss.</div>
@@ -1166,6 +1174,7 @@ function toggleLossSeries(_event,legendItem,legend){const chart=legend.chart,key
 const charts={
   combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries})}),
   diegesis:new Chart(document.getElementById('loss-diegesis'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries})}),
+  syn4d:new Chart(document.getElementById('loss-syn4d'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries})}),
   mvkubric:new Chart(document.getElementById('loss-mvkubric'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries})}),
   stationary:new Chart(document.getElementById('stationary-baseline'),{type:'line',data:{datasets:[rawPoints('Model trajectory',palette.s1),meanLine('Model trajectory',palette.s1),rawPoints('Stationary baseline',palette.s4),meanLine('Stationary baseline',palette.s4,{borderDash:[6,4]})]},options:options('Optimizer step','Trajectory loss')}),
   stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[rawPoints('Model / stationary',palette.s1),meanLine('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0})}),
@@ -1236,9 +1245,9 @@ function render(state){
   const errors=document.getElementById('errors'), entries=Object.entries(state.errors||{}); errors.className=entries.length?'error visible':'error'; errors.textContent=entries.map(([key,value])=>`${key}: ${value}`).join('\n');
   text('latest-message',state.latest_log_message||'Waiting for training log…');
 
-  const losses=state.series?.losses||{}, combinedLosses=losses.combined||{}, diegesisLosses=losses.diegesis||{}, mvkubricLosses=losses.mvkubric||{};
+  const losses=state.series?.losses||{}, combinedLosses=losses.combined||{}, diegesisLosses=losses.diegesis||{}, syn4dLosses=losses.syn4d||{}, mvkubricLosses=losses.mvkubric||{};
   const lossData=source=>[points(source.total),movingAveragePoints(source.total),points(source.visibility),movingAveragePoints(source.visibility),points(source.flow),movingAveragePoints(source.flow)];
-  update(charts.combined,lossData(combinedLosses)); update(charts.diegesis,lossData(diegesisLosses)); update(charts.mvkubric,lossData(mvkubricLosses));
+  update(charts.combined,lossData(combinedLosses)); update(charts.diegesis,lossData(diegesisLosses)); update(charts.syn4d,lossData(syn4dLosses)); update(charts.mvkubric,lossData(mvkubricLosses));
   const baseline=state.series?.baseline||{};
   update(charts.stationary,[points(combinedLosses.flow),movingAveragePoints(combinedLosses.flow),points(baseline.stationary),movingAveragePoints(baseline.stationary)]);
   update(charts.stationaryRatio,[points(baseline.model_ratio),movingAveragePoints(baseline.model_ratio),parityPoints(baseline.model_ratio)]);
