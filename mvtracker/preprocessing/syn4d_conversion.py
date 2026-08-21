@@ -236,14 +236,10 @@ def _quarter_query_pixels(
         raise ValueError("query track and validity mask dimensions disagree")
     candidates = np.flatnonzero(valid.reshape(-1) & np.isfinite(track).all(axis=-1).reshape(-1))
     quarter_count = candidates.size // 4
-    if quarter_count < cap:
-        raise ValueError(
-            f"25% of query-valid pixels yields {quarter_count} tracks; need {cap}"
-        )
     retained = np.random.default_rng(seed).choice(
         candidates, size=quarter_count, replace=False
     )
-    selected = retained[:cap]
+    selected = retained[: min(cap, quarter_count)]
     ys, xs = np.divmod(selected, valid.shape[1])
     return selected, xs.astype(np.int32), ys.astype(np.int32), quarter_count
 
@@ -265,8 +261,9 @@ def _explicit_world_tracks(
         first_track,
         seed=int(sequence_base.removeprefix("seq_")),
     )
-    tracks = np.zeros((len(items), TRACK_COUNT, 3), dtype=np.float32)
-    valid = np.zeros((len(items), TRACK_COUNT), dtype=bool)
+    track_count = selected.size
+    tracks = np.zeros((len(items), track_count, 3), dtype=np.float32)
+    valid = np.zeros((len(items), track_count), dtype=bool)
     for frame, item in enumerate(items):
         camera_track = np.asarray(item["track"], dtype=np.float32)
         frame_valid = np.asarray(item["track_valid_mask"], dtype=bool)
@@ -285,8 +282,8 @@ def _explicit_world_tracks(
         [
             xs.astype(np.float32),
             ys.astype(np.float32),
-            np.zeros(TRACK_COUNT, dtype=np.float32),
-            np.zeros(TRACK_COUNT, dtype=np.float32),
+            np.zeros(track_count, dtype=np.float32),
+            np.zeros(track_count, dtype=np.float32),
         ],
         axis=-1,
     )
@@ -456,7 +453,7 @@ def _convert_sequence(
         sequence=sequence_base,
         frames=frame_count,
         query_valid_quarter=quarter_count,
-        tracks=TRACK_COUNT,
+        tracks=tracks.shape[1],
     )
 
     writer = create_sequence_cache(
@@ -464,6 +461,7 @@ def _convert_sequence(
         scene=scene,
         sequence_base=sequence_base,
         frame_count=frame_count,
+        track_count=tracks.shape[1],
     )
     _write_memmap(writer.array("tracks_xyz"), tracks)
     _write_memmap(writer.array("track_valid"), track_valid)

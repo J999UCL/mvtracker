@@ -111,8 +111,12 @@ class Syn4DConversionTests(unittest.TestCase):
         np.testing.assert_array_equal(selected, ys * 40 + xs)
 
         valid.reshape(-1)[399:] = False
-        with self.assertRaisesRegex(ValueError, "25%.*99 tracks; need 100"):
-            syn4d_conversion._quarter_query_pixels(valid, track, seed=3, cap=100)
+        selected, _, _, quarter_count = syn4d_conversion._quarter_query_pixels(
+            valid, track, seed=3, cap=100
+        )
+        self.assertEqual(quarter_count, 99)
+        self.assertEqual(selected.shape, (99,))
+        self.assertEqual(np.unique(selected).size, 99)
 
     def test_single_sequence_conversion_fills_direct_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -130,10 +134,12 @@ class Syn4DConversionTests(unittest.TestCase):
             dense_track[..., 2] = 2.0
             camera_to_world = np.eye(4, dtype=np.float32)
             camera_to_world[0, 3] = 100.0  # must not be applied again
+            query_valid = np.zeros((494, 878), dtype=bool)
+            query_valid.reshape(-1)[:400] = True
             official_items = [
                 {
                     "track": dense_track,
-                    "track_valid_mask": np.ones((494, 878), dtype=bool),
+                    "track_valid_mask": query_valid,
                     "camera_pose": camera_to_world,
                 }
             ]
@@ -223,9 +229,9 @@ class Syn4DConversionTests(unittest.TestCase):
             jpeg_offsets = np.load(destination / "view_0" / "jpeg_offsets.npy")
 
             self.assertEqual(manifest["queries"], "cache_pixel_xytv")
-            self.assertEqual(manifest["tracks"], 65_536)
+            self.assertEqual(manifest["tracks"], 100)
             self.assertEqual(manifest["views"], 8)
-            self.assertEqual(tracks.shape, (1, 65_536, 3))
+            self.assertEqual(tracks.shape, (1, 100, 3))
             np.testing.assert_allclose(tracks[0, 0], [0.0, 0.0, 2.0])
             self.assertTrue(valid.all())
             self.assertTrue(visibility.all())
