@@ -449,3 +449,9 @@ modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_shard_
 ```bash
 MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_track_overlay.py --run-name planet-castle-track-overlay-20260822
 ```
+
+### Render Syn4D eight-view RGB grids
+
+```bash
+MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_grid_video.py --scenes cave_group__seq_000008,desert_bald__seq_000012 --run-name cave-desert-grid-20260822
+```
