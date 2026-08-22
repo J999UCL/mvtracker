@@ -31,6 +31,7 @@ TRAINING_RUN = (
 OUTPUT_ROOT = RUN_ROOT / "syn4d-all-scene-audits"
 TAGS = {"owner": "jeet", "project": "mvtracker", "purpose": "evaluation"}
 SAMPLES_PER_SCENE = 50
+MAX_GENERATED_ATTEMPTS = 200
 
 
 app = modal.App(APP_NAME, tags={**TAGS, "experiment": "syn4d-all-scene-audit"})
@@ -178,6 +179,8 @@ def _sample_statistics(dataset, scene: str, records, scene_index: int):
     candidate = 0
     while len(values) < SAMPLES_PER_SCENE:
         if generated_requests:
+            if candidate == MAX_GENERATED_ATTEMPTS:
+                break
             request = ScheduledSampleRequest(
                 virtual_index=scene_index + candidate * len(dataset.seq_names),
                 scene_index=scene_index,
@@ -215,10 +218,32 @@ def _sample_statistics(dataset, scene: str, records, scene_index: int):
                 ).mean(),
             }
         )
-    return {
+    if not values:
+        return {
+            "sampled_plans": 0,
+            "attempted_plans": candidate,
+            "plan_rejection_fraction": 1.0,
+            "views": None,
+            "tracks": None,
+            "unique_track_fraction": None,
+            "visible_fraction": None,
+            "window_path_mean_m": None,
+            "window_static_fraction": None,
+            "full_dynamic_window_static_fraction": None,
+            "full_very_dynamic_window_static_fraction": None,
+        }
+    result = {
         name: float(np.mean([value[name] for value in values]))
         for name in values[0]
     }
+    result.update(
+        sampled_plans=len(values),
+        attempted_plans=(candidate if generated_requests else len(requests)),
+        plan_rejection_fraction=(
+            1.0 - len(values) / candidate if generated_requests else 0.0
+        ),
+    )
+    return result
 
 
 def _audit_scene(dataset, scene: str, records):
@@ -253,7 +278,7 @@ def _audit_scene(dataset, scene: str, records):
                 if report["recorded_total_loss_median"] is not None
                 else "not-top4"
             ),
-            report["full_dynamic_window_static_fraction"],
+            report["full_dynamic_window_static_fraction"] or 0.0,
         ),
         flush=True,
     )
@@ -265,7 +290,6 @@ def _correlations(reports):
     from scipy.stats import spearmanr
 
     usable = [report for report in reports if report["recorded_total_loss_median"] is not None]
-    losses = np.asarray([report["recorded_total_loss_median"] for report in usable])
     ignored = {
         "scene",
         "recorded_total_loss_median",
@@ -277,8 +301,16 @@ def _correlations(reports):
     for name in usable[0]:
         if name in ignored:
             continue
-        values = np.asarray([report[name] for report in usable], dtype=np.float64)
-        rho, pvalue = spearmanr(values, losses)
+        pairs = [
+            (report[name], report["recorded_total_loss_median"])
+            for report in usable
+            if report[name] is not None
+        ]
+        if len(pairs) < 3:
+            continue
+        values = np.asarray([pair[0] for pair in pairs], dtype=np.float64)
+        paired_losses = np.asarray([pair[1] for pair in pairs], dtype=np.float64)
+        rho, pvalue = spearmanr(values, paired_losses)
         result[name] = {"rho": float(rho), "pvalue": float(pvalue)}
     return result
 
