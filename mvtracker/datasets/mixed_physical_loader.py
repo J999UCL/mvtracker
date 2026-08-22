@@ -78,6 +78,17 @@ class PreparedMixedStep:
         return sum(len(group.samples) for group in self.groups)
 
 
+def singleton_prepared_groups(
+    groups: Sequence[PreparedPhysicalGroup],
+) -> tuple[PreparedPhysicalGroup, ...]:
+    """Split physical pairs so each gradient belongs to exactly one scene."""
+    return tuple(
+        PreparedPhysicalGroup((scene,), (sample,))
+        for group in groups
+        for scene, sample in zip(group.scenes, group.samples, strict=True)
+    )
+
+
 def _plan_summary(scene: PlannedScene) -> SceneSummary:
     plan = scene.plan
     return SceneSummary(
@@ -629,4 +640,5 @@ __all__ = [
     "PreparedMixedStep",
     "PreparedPhysicalGroup",
     "merge_decoded_datapoints",
+    "singleton_prepared_groups",
 ]

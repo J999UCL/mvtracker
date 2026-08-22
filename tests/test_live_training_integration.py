@@ -45,6 +45,7 @@ class LivePhysicalTrainingTests(unittest.TestCase):
         source = ast.unparse(_function("main"))
         self.assertIn("MixedStepLookahead", source)
         self.assertIn("PhysicalGroupPrefetchIterator", source)
+        self.assertIn("singleton_prepared_groups", source)
         self.assertIn("source_cursors = dict(physical_step.end_cursors)", source)
         self.assertIn(
             "gradient_accumulation_steps=gradient_accumulation_steps / batch_scene_count",

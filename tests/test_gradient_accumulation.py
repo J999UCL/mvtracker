@@ -1,7 +1,11 @@
 import ast
+import itertools
+import statistics
 import unittest
+from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
@@ -43,7 +47,103 @@ def _load_function_ast(name):
     )
 
 
+def _load_gradient_diagnostics():
+    path = Path(__file__).resolve().parents[1] / "mvtracker" / "cli" / "train.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names = {
+        "_global_gradient_l2_norm",
+        "_MicrobatchGradientDiagnostics",
+        "_sketch_cosine",
+        "_scene_gradient_agreement",
+    }
+    nodes = [
+        node
+        for node in tree.body
+        if getattr(node, "name", None) in names
+    ]
+    module = ast.Module(body=nodes, type_ignores=[])
+    namespace = {
+        "defaultdict": defaultdict,
+        "itertools": itertools,
+        "np": np,
+        "statistics": statistics,
+        "torch": torch,
+    }
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace
+
+
 class GradientAccumulationTests(unittest.TestCase):
+    def test_scene_gradient_sketches_group_pairwise_relations(self):
+        diagnostics = _load_gradient_diagnostics()
+        previous = {
+            ("diegesis", "scene-a"): {
+                "step": 1,
+                "sketch": torch.tensor((-1.0, 0.0)),
+            }
+        }
+        records = [
+            {
+                "source": "diegesis",
+                "scene": "scene-a",
+                "step": 26,
+                "sketch": torch.tensor((1.0, 0.0)),
+            },
+            {
+                "source": "diegesis",
+                "scene": "scene-b",
+                "step": 26,
+                "sketch": torch.tensor((1.0, 0.0)),
+            },
+            {
+                "source": "mvkubric",
+                "scene": "42",
+                "step": 26,
+                "sketch": torch.tensor((0.0, 1.0)),
+            },
+        ]
+
+        metrics, comparisons = diagnostics["_scene_gradient_agreement"](
+            records, previous
+        )
+
+        self.assertEqual(
+            metrics[
+                "optimization/scene_gradient_cosine/"
+                "same_source_different_scene/mean"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            metrics[
+                "optimization/scene_gradient_cosine/different_source/mean"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            metrics[
+                "optimization/scene_gradient_cosine/same_scene_previous/mean"
+            ],
+            -1.0,
+        )
+        self.assertTrue(any(row["first_scene"] == "scene-a" for row in comparisons))
+
+    def test_microbatch_diagnostics_capture_a_fixed_small_sketch(self):
+        diagnostics = _load_gradient_diagnostics()
+        model = torch.nn.Linear(4, 2)
+        monitor = diagnostics["_MicrobatchGradientDiagnostics"](
+            model.parameters(), sketch_size=3, sketch_seed=7
+        )
+        monitor.begin()
+        model(torch.ones(1, 4)).sum().backward()
+
+        result = monitor.finish()
+        monitor.close()
+
+        self.assertEqual(result["sketch"].shape, (3,))
+        self.assertTrue(torch.isfinite(result["sketch"]).all())
+        self.assertGreater(result["norm"], 0)
+
     def test_eight_serial_microbatches_match_one_batch_mean(self):
         serial = torch.nn.Linear(2, 1, bias=False)
         batched = torch.nn.Linear(2, 1, bias=False)
@@ -118,7 +218,7 @@ class GradientAccumulationTests(unittest.TestCase):
             "fabric.no_backward_sync(model, enabled=not is_final_microbatch)",
             microbatch_source,
         )
-        self.assertNotIn("fabric.barrier()", ast.unparse(main))
+        self.assertNotIn("fabric.barrier()", microbatch_source)
 
     def test_expensive_diagnostics_use_optimizer_step_interval(self):
         main_source = ast.unparse(_load_train_main_ast())
@@ -128,7 +228,15 @@ class GradientAccumulationTests(unittest.TestCase):
             main_source,
         )
         self.assertIn(
+            "(total_steps + 1) % gradient_diagnostics_interval == 0",
+            main_source,
+        )
+        self.assertIn(
             "run_expensive_diagnostics=run_expensive_diagnostics",
+            main_source,
+        )
+        self.assertIn(
+            "run_gradient_diagnostics=run_gradient_diagnostics",
             main_source,
         )
         self.assertIn(

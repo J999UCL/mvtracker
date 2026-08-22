@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 import contextlib
 import dataclasses
 import gpustat
+import itertools
 import json
 import statistics
 import threading
@@ -47,6 +48,7 @@ from mvtracker.datasets.mixed_physical_loader import (
     MixedStepLookahead,
     PhysicalBatchDecoder,
     PhysicalGroupPrefetchIterator,
+    singleton_prepared_groups,
 )
 from mvtracker.datasets.physical_batch_scheduler import BatchCapacity
 from mvtracker.datasets import TapVidDataset
@@ -70,7 +72,7 @@ import os
 
 import torch
 import time
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -208,7 +210,7 @@ class _MicrobatchGradientDiagnostics:
     reductions instead of another model-sized gradient buffer.
     """
 
-    def __init__(self, parameters, enabled=True):
+    def __init__(self, parameters, enabled=True, sketch_size=2048, sketch_seed=0):
         self.parameters = [parameter for parameter in parameters if parameter.requires_grad]
         self.enabled = bool(enabled)
         self.active = False
@@ -216,7 +218,46 @@ class _MicrobatchGradientDiagnostics:
         self.accumulator_dot_terms = []
         self.previous_accumulator_norm = None
         self.handles = []
+        self.sketch_size = 0
+        self.current_sketch = None
+        self.sketch_entries = {}
         if self.enabled:
+            total_parameters = sum(parameter.numel() for parameter in self.parameters)
+            self.sketch_size = min(int(sketch_size), total_parameters)
+            if self.sketch_size < 1:
+                raise ValueError("gradient sketch size must be positive")
+            selected = np.sort(
+                np.random.default_rng(int(sketch_seed)).choice(
+                    total_parameters,
+                    size=self.sketch_size,
+                    replace=False,
+                )
+            )
+            start = 0
+            for parameter in self.parameters:
+                stop = start + parameter.numel()
+                left = int(np.searchsorted(selected, start, side="left"))
+                right = int(np.searchsorted(selected, stop, side="left"))
+                if left < right:
+                    self.sketch_entries[id(parameter)] = (
+                        torch.as_tensor(
+                            selected[left:right] - start,
+                            device=parameter.device,
+                            dtype=torch.long,
+                        ),
+                        torch.arange(
+                            left,
+                            right,
+                            device=parameter.device,
+                            dtype=torch.long,
+                        ),
+                    )
+                start = stop
+            self.current_sketch = torch.zeros(
+                self.sketch_size,
+                device=self.parameters[0].device,
+                dtype=torch.float32,
+            )
             for parameter in self.parameters:
                 self.handles.append(parameter.register_hook(self._hook_for(parameter)))
 
@@ -226,6 +267,14 @@ class _MicrobatchGradientDiagnostics:
                 return gradient
             gradient_fp32 = gradient.detach().float()
             self.current_squared_norm_terms.append(gradient_fp32.square().sum())
+            sketch_entry = self.sketch_entries.get(id(parameter))
+            if sketch_entry is not None:
+                local_indices, sketch_indices = sketch_entry
+                self.current_sketch.index_copy_(
+                    0,
+                    sketch_indices,
+                    gradient_fp32.reshape(-1).index_select(0, local_indices),
+                )
             if parameter.grad is not None:
                 previous = parameter.grad.detach().float()
                 self.accumulator_dot_terms.append((previous * gradient_fp32).sum())
@@ -239,6 +288,7 @@ class _MicrobatchGradientDiagnostics:
         self.current_squared_norm_terms = []
         self.accumulator_dot_terms = []
         self.previous_accumulator_norm = _global_gradient_l2_norm(self.parameters).detach()
+        self.current_sketch.zero_()
         self.active = True
 
     def finish(self, unscale_factor=1.0):
@@ -266,12 +316,125 @@ class _MicrobatchGradientDiagnostics:
             # this is the norm of the microbatch's own mean loss gradient.
             "norm": float(current_norm.item() * unscale_factor),
             "cosine_to_running_accumulator": cosine,
+            "sketch": (
+                self.current_sketch.detach().mul(unscale_factor).cpu().clone()
+            ),
         }
 
     def close(self):
         for handle in self.handles:
             handle.remove()
         self.handles.clear()
+
+
+def _sketch_cosine(first, second):
+    first = torch.as_tensor(first, dtype=torch.float32)
+    second = torch.as_tensor(second, dtype=torch.float32)
+    denominator = first.norm() * second.norm()
+    if denominator.item() == 0:
+        return None
+    return float((torch.dot(first, second) / denominator).clamp(-1, 1).item())
+
+
+def _scene_gradient_agreement(records, previous_by_scene):
+    """Summarize fixed gradient sketches while retaining scene-level rows."""
+    grouped = defaultdict(list)
+    comparisons = []
+
+    def add(relation, first, second, cosine, *, record_comparison=True):
+        if cosine is None:
+            return
+        grouped[relation].append(cosine)
+        if record_comparison:
+            comparisons.append(
+                {
+                    "relation": relation,
+                    "cosine": cosine,
+                    "first_source": first["source"],
+                    "first_scene": first["scene"],
+                    "first_step": first.get("step"),
+                    "first_views": first.get("views"),
+                    "first_tracks": first.get("tracks"),
+                    "second_source": second["source"],
+                    "second_scene": second["scene"],
+                    "second_step": second.get("step"),
+                    "second_views": second.get("views"),
+                    "second_tracks": second.get("tracks"),
+                }
+            )
+
+    for first, second in itertools.combinations(records, 2):
+        cosine = _sketch_cosine(first["sketch"], second["sketch"])
+        if first["source"] == second["source"]:
+            if first["scene"] == second["scene"]:
+                relation = "same_scene_current"
+            else:
+                relation = "same_source_different_scene"
+                add(
+                    f"{relation}/{first['source']}",
+                    first,
+                    second,
+                    cosine,
+                    record_comparison=False,
+                )
+        else:
+            relation = "different_source"
+            pair = "__".join(sorted((first["source"], second["source"])))
+            add(
+                f"{relation}/{pair}",
+                first,
+                second,
+                cosine,
+                record_comparison=False,
+            )
+        add(relation, first, second, cosine)
+
+    for record in records:
+        key = (record["source"], record["scene"])
+        previous = previous_by_scene.get(key)
+        if previous is not None:
+            previous_record = {
+                "source": record["source"],
+                "scene": record["scene"],
+                "step": previous["step"],
+                "sketch": previous["sketch"],
+                "views": previous.get("views"),
+                "tracks": previous.get("tracks"),
+            }
+            cosine = _sketch_cosine(record["sketch"], previous["sketch"])
+            comparison_count = len(comparisons)
+            add("same_scene_previous", previous_record, record, cosine)
+            add(
+                f"same_scene_previous/{record['source']}",
+                previous_record,
+                record,
+                cosine,
+                record_comparison=False,
+            )
+            if len(comparisons) > comparison_count:
+                comparisons[-1]["previous_step"] = previous["step"]
+        previous_by_scene[key] = {
+            "step": int(record["step"]),
+            "sketch": torch.as_tensor(record["sketch"]).to(torch.float16).clone(),
+            "views": record.get("views"),
+            "tracks": record.get("tracks"),
+        }
+
+    metrics = {}
+    for relation, values in grouped.items():
+        prefix = f"optimization/scene_gradient_cosine/{relation}"
+        metrics[f"{prefix}/mean"] = statistics.fmean(values)
+        metrics[f"{prefix}/minimum"] = min(values)
+        metrics[f"{prefix}/count"] = len(values)
+    return metrics, comparisons
+
+
+def _gather_scene_gradient_records(fabric, local_records):
+    if fabric.world_size == 1:
+        return list(local_records)
+    gathered = [None] * fabric.world_size
+    torch.distributed.all_gather_object(gathered, list(local_records))
+    return [record for rank_records in gathered for record in rank_records]
 
 
 def _create_torch_profiler(cfg, experiment_path, global_rank):
@@ -657,6 +820,17 @@ def _checkpoint_source_cursors(checkpoint_path):
     }
 
 
+def _checkpoint_scene_gradient_sketches(checkpoint_path):
+    if checkpoint_path is None:
+        return None
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    return checkpoint.get("scene_gradient_sketches")
+
+
 def _write_latest_checkpoint_manifest(experiment_path, checkpoint_path, completed_steps):
     manifest_path = Path(experiment_path) / LATEST_CHECKPOINT_MANIFEST
     temporary_path = manifest_path.with_suffix(".tmp")
@@ -697,6 +871,7 @@ def _save_training_checkpoint(
     wandb_run_id,
     mixed_schedule_state=None,
     source_cursors=None,
+    scene_gradient_sketches=None,
 ):
     state = AttributeDict(
         model=model,
@@ -709,6 +884,8 @@ def _save_training_checkpoint(
     if mixed_schedule_state is not None:
         state.mixed_schedule_state = mixed_schedule_state
         state.source_cursors = dict(source_cursors)
+    if scene_gradient_sketches is not None:
+        state.scene_gradient_sketches = scene_gradient_sketches
     fabric.save(checkpoint_path, state)
     fabric.barrier()
     if fabric.global_rank == 0:
@@ -1563,6 +1740,7 @@ def _forward_backward_microbatch(
     gradient_accumulation_steps,
     is_final_microbatch,
     run_expensive_diagnostics,
+    run_gradient_diagnostics,
     gradient_diagnostics,
     memory_recorder,
 ):
@@ -1611,7 +1789,7 @@ def _forward_backward_microbatch(
             forward_duration = time.time() - forward_started_at
             memory_recorder.capture("after_forward", batch=batch)
 
-            if run_expensive_diagnostics:
+            if run_gradient_diagnostics:
                 gradient_diagnostics.begin()
             backward_started_at = time.time()
             with torch.profiler.record_function("train/backward"):
@@ -1622,7 +1800,7 @@ def _forward_backward_microbatch(
                 gradient_diagnostics.finish(
                     unscale_factor=gradient_accumulation_steps,
                 )
-                if run_expensive_diagnostics
+                if run_gradient_diagnostics
                 else None
             )
             backward_duration = time.time() - backward_started_at
@@ -1836,6 +2014,9 @@ def main(cfg: DictConfig):
 
     latest_checkpoint = _latest_checkpoint_path(cfg.experiment_path)
     resume_source_cursors = _checkpoint_source_cursors(latest_checkpoint)
+    resume_scene_gradient_sketches = _checkpoint_scene_gradient_sketches(
+        latest_checkpoint
+    )
 
     eval_dataloaders = []
     for dataset_name in cfg.datasets.eval.names:
@@ -2298,15 +2479,31 @@ def main(cfg: DictConfig):
     model.cuda()
     optimizer, scheduler = fetch_optimizer(cfg.trainer, model)
     model, optimizer = fabric.setup(model, optimizer)
+    gradient_diagnostics_enabled = bool(
+        cfg.trainer.get("gradient_diagnostics", True)
+    )
     gradient_diagnostics = _MicrobatchGradientDiagnostics(
         model.parameters(),
-        enabled=bool(cfg.trainer.get("gradient_diagnostics", True)),
+        enabled=gradient_diagnostics_enabled,
+        sketch_size=int(cfg.trainer.get("gradient_sketch_size", 2048)),
+        sketch_seed=int(cfg.reproducibility.seed),
+    )
+    gradient_diagnostics_interval = int(
+        cfg.trainer.get("gradient_diagnostics_interval", 25)
     )
     expensive_diagnostics_interval = int(
         cfg.trainer.get("expensive_diagnostics_interval", 50)
     )
+    if gradient_diagnostics_interval < 1:
+        raise ValueError("trainer.gradient_diagnostics_interval must be at least 1")
     if expensive_diagnostics_interval < 1:
         raise ValueError("trainer.expensive_diagnostics_interval must be at least 1")
+    previous_scene_gradient_sketches = dict(
+        resume_scene_gradient_sketches or {}
+    )
+    scene_gradient_log_path = (
+        Path(cfg.experiment_path) / "scene_gradient_agreement.jsonl"
+    )
 
     if latest_checkpoint is not None:
         state = AttributeDict(
@@ -2320,6 +2517,8 @@ def main(cfg: DictConfig):
         if mixed_training:
             state.mixed_schedule_state = mixed_schedule.state_dict()
             state.source_cursors = dict(source_cursors)
+        if resume_scene_gradient_sketches is not None:
+            state.scene_gradient_sketches = previous_scene_gradient_sketches
         fabric.load(latest_checkpoint, state)
         total_steps = int(state.total_steps)
         if int(state.master_seed) != int(cfg.reproducibility.seed):
@@ -2339,6 +2538,10 @@ def main(cfg: DictConfig):
                     sampler.set_start_cursor(source_cursors[source])
         elif train_loader is not None:
             epoch = total_steps // optimizer_steps_per_epoch - 1
+        if resume_scene_gradient_sketches is not None:
+            previous_scene_gradient_sketches = dict(
+                state.scene_gradient_sketches
+            )
         logging.info(
             "Resumed canonical checkpoint %s at %d completed steps",
             latest_checkpoint,
@@ -2349,7 +2552,12 @@ def main(cfg: DictConfig):
         restore_ckpt_path = cfg.restore_ckpt_path
         assert restore_ckpt_path.endswith(".pth")
         logging.info(f"Restoring pre-trained weights from {os.path.abspath(restore_ckpt_path)}")
-        training_ckpt = "total_steps" in torch.load(restore_ckpt_path)
+        checkpoint_metadata = torch.load(
+            restore_ckpt_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        training_ckpt = "total_steps" in checkpoint_metadata
         if training_ckpt:
             state = AttributeDict(
                 model=model,
@@ -2360,6 +2568,8 @@ def main(cfg: DictConfig):
             if mixed_training:
                 state.mixed_schedule_state = mixed_schedule.state_dict()
                 state.source_cursors = dict(source_cursors)
+            if "scene_gradient_sketches" in checkpoint_metadata:
+                state.scene_gradient_sketches = previous_scene_gradient_sketches
             fabric.load(restore_ckpt_path, state, strict=True)
             total_steps = int(state.total_steps)
             if mixed_training:
@@ -2371,6 +2581,10 @@ def main(cfg: DictConfig):
                 if source_samplers is not None:
                     for source, sampler in source_samplers.items():
                         sampler.set_start_cursor(source_cursors[source])
+            if "scene_gradient_sketches" in checkpoint_metadata:
+                previous_scene_gradient_sketches = dict(
+                    state.scene_gradient_sketches
+                )
             logging.info(
                 "Resumed explicit training checkpoint %s at %d completed steps",
                 restore_ckpt_path,
@@ -2491,6 +2705,7 @@ def main(cfg: DictConfig):
             wandb_run_id,
             mixed_schedule.state_dict() if mixed_training else None,
             checkpoint_source_cursors,
+            previous_scene_gradient_sketches,
         )
         logging.info(f"Saved checkpoint to {save_path}")
         logging.info(f"Calling sys.exit(0) now.")
@@ -2596,12 +2811,21 @@ def main(cfg: DictConfig):
         physical_batching_metrics = None
         microbatch_gradient_norms = []
         microbatch_gradient_cosines = []
+        scene_gradient_records = []
+        scene_gradient_metrics = {}
         mixed_step_batches = None
         physical_step = None
         physical_group_iterator = None
         physical_group_count = None
 
         while i_batch < n_batches and total_steps < cfg.trainer.num_steps:
+            run_gradient_diagnostics = (
+                gradient_diagnostics_enabled
+                and (
+                    total_steps == 0
+                    or (total_steps + 1) % gradient_diagnostics_interval == 0
+                )
+            )
             if accumulation_started_at is None:
                 accumulation_started_at = time.time()
                 optimizer.zero_grad()
@@ -2631,10 +2855,15 @@ def main(cfg: DictConfig):
                             raise RuntimeError(
                                 f"physical step materialization failed: {detail}"
                             )
-                        physical_group_count = len(physical_step.groups)
+                        groups_for_step = (
+                            singleton_prepared_groups(physical_step.groups)
+                            if run_gradient_diagnostics
+                            else physical_step.groups
+                        )
+                        physical_group_count = len(groups_for_step)
                         physical_group_iterator = iter(
                             PhysicalGroupPrefetchIterator(
-                                physical_step.groups, physical_decoder
+                                groups_for_step, physical_decoder
                             )
                         )
                         total_batches_loaded += physical_step.logical_scene_count
@@ -2643,9 +2872,20 @@ def main(cfg: DictConfig):
                             "planning_seconds": physical_step.planning_seconds,
                             "materialization_seconds": physical_step.materialization_seconds,
                             "encoded_cache_gib": physical_step.encoded_bytes / 1024**3,
-                            "pair_count": float(physical_step.pair_count),
-                            "padding_tracks": float(physical_step.padding_tracks),
+                            "pair_count": (
+                                0.0
+                                if run_gradient_diagnostics
+                                else float(physical_step.pair_count)
+                            ),
+                            "padding_tracks": (
+                                0.0
+                                if run_gradient_diagnostics
+                                else float(physical_step.padding_tracks)
+                            ),
                             "physical_group_count": float(physical_group_count),
+                            "diagnostic_singletons": float(
+                                run_gradient_diagnostics
+                            ),
                         }
                     physical_group, batch = next(physical_group_iterator)
                     current_sources = physical_group.sources
@@ -2832,6 +3072,10 @@ def main(cfg: DictConfig):
                 bool(cfg.trainer.get("expensive_diagnostics_enabled", True))
                 and total_steps % expensive_diagnostics_interval == 0
             )
+            if run_gradient_diagnostics and batch_scene_count != 1:
+                raise RuntimeError(
+                    "scene gradient diagnostics require singleton physical batches"
+                )
 
             try:
                 (
@@ -2855,6 +3099,7 @@ def main(cfg: DictConfig):
                     ),
                     is_final_microbatch=is_final_microbatch,
                     run_expensive_diagnostics=run_expensive_diagnostics,
+                    run_gradient_diagnostics=run_gradient_diagnostics,
                     gradient_diagnostics=gradient_diagnostics,
                     memory_recorder=memory_recorder,
                 )
@@ -2948,6 +3193,21 @@ def main(cfg: DictConfig):
                 cosine = microbatch_gradient["cosine_to_running_accumulator"]
                 if cosine is not None:
                     microbatch_gradient_cosines.append(cosine)
+                source = (
+                    current_sources[0]
+                    if current_sources is not None
+                    else "training"
+                )
+                scene_gradient_records.append(
+                    {
+                        "source": source,
+                        "scene": str(batch.seq_name[0]),
+                        "step": total_steps + 1,
+                        "views": source_view_count,
+                        "tracks": int(scene_track_counts[0]),
+                        "sketch": microbatch_gradient["sketch"],
+                    }
+                )
             microbatches_accumulated += 1
             if not planned_physical_batching:
                 if microbatches_accumulated < gradient_accumulation_steps:
@@ -2961,6 +3221,29 @@ def main(cfg: DictConfig):
                 if torch_profiler is not None:
                     torch_profiler.step()
                 continue
+
+            if run_gradient_diagnostics:
+                gathered_gradient_records = _gather_scene_gradient_records(
+                    fabric,
+                    scene_gradient_records,
+                )
+                if fabric.global_rank == 0:
+                    scene_gradient_metrics, comparisons = (
+                        _scene_gradient_agreement(
+                            gathered_gradient_records,
+                            previous_scene_gradient_sketches,
+                        )
+                    )
+                    for comparison in comparisons:
+                        comparison["optimizer_step"] = total_steps + 1
+                        logging.info(
+                            "[scene_gradient:%06d] %s",
+                            total_steps + 1,
+                            json.dumps(comparison, sort_keys=True),
+                        )
+                    with scene_gradient_log_path.open("a", encoding="utf-8") as output:
+                        for comparison in comparisons:
+                            output.write(json.dumps(comparison, sort_keys=True) + "\n")
 
             mean_loss_value = _reduce_scalar(
                 fabric,
@@ -3029,6 +3312,8 @@ def main(cfg: DictConfig):
                         total_steps + 1,
                     )
                 for metric_name, metric_value in reduced_source_values.items():
+                    tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
+                for metric_name, metric_value in scene_gradient_metrics.items():
                     tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
 
             # Log a limited number of grad + optimizer state pairs, also log current learning rate
@@ -3133,6 +3418,24 @@ def main(cfg: DictConfig):
                 if microbatch_gradient_cosines
                 else None
             )
+            if run_gradient_diagnostics:
+                if microbatch_gradient_norm_mean is not None:
+                    microbatch_gradient_norm_mean = _reduce_scalar(
+                        fabric, microbatch_gradient_norm_mean
+                    )
+                    microbatch_gradient_norm_min = _reduce_scalar(
+                        fabric, microbatch_gradient_norm_min, reduce_op="min"
+                    )
+                    microbatch_gradient_norm_max = _reduce_scalar(
+                        fabric, microbatch_gradient_norm_max, reduce_op="max"
+                    )
+                if microbatch_gradient_cosine_mean is not None:
+                    microbatch_gradient_cosine_mean = _reduce_scalar(
+                        fabric, microbatch_gradient_cosine_mean
+                    )
+                    microbatch_gradient_cosine_min = _reduce_scalar(
+                        fabric, microbatch_gradient_cosine_min, reduce_op="min"
+                    )
             if run_expensive_diagnostics:
                 reduced_optimization = _reduce_scalar_dict(
                     fabric,
@@ -3151,23 +3454,6 @@ def main(cfg: DictConfig):
                 gradient_norm_retention = reduced_optimization["gradient_norm_retention"]
                 clipped_element_fraction = reduced_optimization["clipped_element_fraction"]
                 clipped_step_fraction = reduced_optimization["clipped_step_fraction"]
-                if microbatch_gradient_norm_mean is not None:
-                    microbatch_gradient_norm_mean = _reduce_scalar(
-                        fabric, microbatch_gradient_norm_mean
-                    )
-                    microbatch_gradient_norm_min = _reduce_scalar(
-                        fabric, microbatch_gradient_norm_min, reduce_op="min"
-                    )
-                    microbatch_gradient_norm_max = _reduce_scalar(
-                        fabric, microbatch_gradient_norm_max, reduce_op="max"
-                    )
-                if microbatch_gradient_cosine_mean is not None:
-                    microbatch_gradient_cosine_mean = _reduce_scalar(
-                        fabric, microbatch_gradient_cosine_mean
-                    )
-                    microbatch_gradient_cosine_min = _reduce_scalar(
-                        fabric, microbatch_gradient_cosine_min, reduce_op="min"
-                    )
                 logging.info(
                     "[optimizer:%06d] loss=%.8f grad_pre=%.8f grad_post=%.8f "
                     "max_abs_pre=%.8f value_clip=%.8f norm_retention=%.8f "
@@ -3323,6 +3609,7 @@ def main(cfg: DictConfig):
                     wandb_run_id,
                     mixed_schedule.state_dict() if mixed_training else None,
                     source_cursors,
+                    previous_scene_gradient_sketches,
                 )
 
             if total_steps % cfg.trainer.eval_freq == 0:
@@ -3458,6 +3745,11 @@ def main(cfg: DictConfig):
                         fabric,
                         physical_batching_metrics["physical_group_count"],
                         reduce_op="sum",
+                    ),
+                    "diagnostic_singletons": _reduce_scalar(
+                        fabric,
+                        physical_batching_metrics["diagnostic_singletons"],
+                        reduce_op="max",
                     ),
                 }
             logging.info(
@@ -3623,6 +3915,8 @@ def main(cfg: DictConfig):
             accumulated_trajectory_count = 0.0
             microbatch_gradient_norms = []
             microbatch_gradient_cosines = []
+            scene_gradient_records = []
+            scene_gradient_metrics = {}
             physical_step = None
             physical_group_iterator = None
             physical_group_count = None
@@ -3660,6 +3954,7 @@ def main(cfg: DictConfig):
         wandb_run_id,
         mixed_schedule.state_dict() if mixed_training else None,
         source_cursors,
+        previous_scene_gradient_sketches,
     )
     if eval_dataloaders and last_eval_step != total_steps:
         _run_eval(

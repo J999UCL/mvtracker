@@ -175,6 +175,29 @@ class DDPTrainingContractTests(unittest.TestCase):
         source = ast.unparse(_function_node("main"))
         self.assertIn("start_request_cursor=resume_source_cursors.get(source, 0)", source)
 
+    def test_scene_gradient_history_is_optional_checkpoint_metadata(self):
+        (read_sketches,) = _load_functions(
+            "_checkpoint_scene_gradient_sketches",
+            namespace={"torch": torch},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "model.pth"
+            torch.save({"total_steps": 10}, checkpoint)
+            self.assertIsNone(read_sketches(checkpoint))
+            torch.save(
+                {
+                    "total_steps": 10,
+                    "scene_gradient_sketches": {
+                        ("source", "scene"): {"step": 1}
+                    },
+                },
+                checkpoint,
+            )
+            self.assertEqual(
+                read_sketches(checkpoint),
+                {("source", "scene"): {"step": 1}},
+            )
+
     def test_distributed_eval_gathers_metrics_and_writes_once(self):
         source = ast.unparse(_function_node("_run_eval"))
         self.assertEqual(source.count("fabric.barrier()"), 2)
