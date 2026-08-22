@@ -22,7 +22,7 @@ datasets:
       lookahead_steps: 4
       cpu_cache_gib_per_rank: 12
       decode_image_chunk_size: 64
-      max_scenes: 2
+      max_scenes: 1
       pair_track_capacity_by_views: {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 819, 6: 512}
       singleton_only_views: []
       rank_local: true
