@@ -1008,6 +1008,19 @@ DIEGESIS as well as Syn4D, rather than a Syn4D-only repair.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/pxrwarzy
 - Volume output: `diegesis-scene-loss-audits/diegesis-scene-loss-data-20260822`
 
+The motion preselector was subsequently changed for TAPVid/DIEGESIS and
+Syn4D only; MV-Kubric retains its upstream sampler. Static, dynamic
+(0.1--2.0 m) and very-dynamic (>2.0 m) pools are now mutually exclusive.
+Requested bucket capacity is taken where available, then remaining capacity is
+filled without replacement from other eligible tracks. Focused tests confirmed
+unique IDs and missing-bucket fill. A CPU verification against the real Modal
+dataset produced 50/50 accepted plans for both Brushify and Winter, with 100%
+unique selected track IDs and no plan rejection. All 16 configured Syn4D
+training scenes are now usable.
+
+- W&B verification: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/4mgdcq43
+- Volume output: `syn4d-all-scene-audits/syn4d-sampler-fixed-verification-20260822`
+
 ## 20 August 2026: H200 universal-pair training restart
 
 The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
