@@ -444,3 +444,8 @@ modal container list --json
 modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_shard_a
 modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_shard_b
 ```
+### Render visibility-aware Syn4D loss-spike track overlays
+
+```bash
+MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_track_overlay.py --run-name planet-castle-track-overlay-20260822
+```
