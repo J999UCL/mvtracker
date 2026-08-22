@@ -394,6 +394,7 @@ def _convert_jobs(environment_names: tuple[str, ...], shard: str) -> dict[str, o
     from huggingface_hub import hf_hub_download
     from mvtracker.preprocessing.syn4d import convert_syn4d_sequence
 
+    data_volume.reload()
     run = _wandb_run(
         job_type="syn4d-fixed-split-conversion", name=f"syn4d-fixed-split-{shard}",
         tags=["converter", "t4", f"shard-{shard}"],
