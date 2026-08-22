@@ -461,3 +461,9 @@ MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_grid_vi
 ```bash
 MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_motion_loss_audit.py --run-name planet-castle-cave-desert-motion-loss-20260822
 ```
+
+### Audit all Syn4D training scenes against recorded scene loss
+
+```bash
+MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_all_scene_audit.py --run-name syn4d-all-scene-loss-data-20260822
+```
