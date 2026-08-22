@@ -897,6 +897,34 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+## 22 August 2026: CPU audit of the Planet Bald and Castle loss spikes
+
+A CPU-only Modal audit inspected the exact Syn4D samples behind the largest
+Planet Bald and Castle training-loss spikes. It checked full-scene and sampled
+window 3-D displacement jumps, visibility across jumps, and projected depth
+agreement in the selected cameras. No model inference was run.
+
+Both source sequences contain real discontinuities, but neither discontinuity
+falls inside the logged high-loss sample. Planet Bald has a large frame
+100-to-101 event affecting 11,898 tracks, while its step-26 sample uses frames
+12--35 and contains no displacement above 0.5 m per frame. Castle has a smaller
+frame 127-to-128 discontinuity, while its step-132 sample uses frames 8--31 and
+contains no displacement above 0.25 m per frame.
+
+Depth and camera consistency in the exact windows were strong. Across Planet
+Bald's six selected views, median best-neighbour depth error was 0.0017--0.0039
+m and only 0.12--0.47% of visible projections exceeded 0.10 m. Castle's selected
+view had 0.0025 m median error and 0.24% above 0.10 m. Neither sample contained
+visible tracks with invalid depth. The audit therefore found no raw
+depth/visibility/camera defect that explains the headline spikes. The likely
+remaining causes are genuinely difficult visual evidence and fast continuous
+motion, including unusual or reflective actors, occlusion, and augmentation.
+The out-of-window discontinuities should still be excluded from future samples.
+
+- Modal run: `planet-castle-integrity-window-20260822`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/sc846272
+- Volume output: `syn4d-scene-audits/planet-castle-integrity-window-20260822`
+
 ## 20 August 2026: H200 universal-pair training restart
 
 The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
