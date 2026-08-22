@@ -195,7 +195,7 @@ def _archive_map(email: str, password: str) -> dict[str, list[str]]:
     image=setup_image,
     secrets=[hf_secret, wandb_secret, bedlam_secret],
     volumes={str(DATA_ROOT): data_volume, str(RUN_ROOT): run_volume},
-    cpu=8, memory=16 * 1024, ephemeral_disk=512 * 1024,
+    cpu=4, memory=8 * 1024, ephemeral_disk=512 * 1024,
     timeout=24 * 60 * 60, retries=1, max_containers=1, include_source=False,
 )
 def stage_dependencies_remote() -> dict[str, object]:
@@ -266,7 +266,7 @@ def stage_dependencies_remote() -> dict[str, object]:
         if stale.is_file():
             stale.unlink()
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
             pool.submit(refresh_archive, archive, members)
             for archive, members in required_members.items()
@@ -290,7 +290,7 @@ def stage_dependencies_remote() -> dict[str, object]:
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(stage_object, sorted(object_paths)))
     (DATA_ROOT / CLOTHING_ROOT).mkdir(parents=True, exist_ok=True)
     updated_archive_map = dict(local_archive_map)
