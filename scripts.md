@@ -424,10 +424,10 @@ export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
 modal run --detach --timestamps tools/modal_syn4d_split_setup.py::download
 
 # Detached CPU-only Blender body conversion into the selected metadata root.
-modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert-bedlam
+modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_bedlam
 
 # Launch exactly two detached T4 shard functions directly; they are disjoint.
 modal container list --json
-modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert-shard-a
-modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert-shard-b
+modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_shard_a
+modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_shard_b
 ```
