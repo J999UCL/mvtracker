@@ -1021,6 +1021,30 @@ training scenes are now usable.
 - W&B verification: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/4mgdcq43
 - Volume output: `syn4d-all-scene-audits/syn4d-sampler-fixed-verification-20260822`
 
+## 22 August 2026: centred three-source 2,000-step run
+
+A fresh two-H200 run was launched from the original released mixed-depth
+checkpoint while continuing to use ground-truth input depth. The training
+recipe remains 25% DIEGESIS, 25% Syn4D and 50% MV-Kubric with global scene
+batch eight, peak LR 5e-5 and a 2,000-step OneCycle schedule. This run adds the
+shared frame-zero camera-rig centering convention to DIEGESIS and Syn4D, uses
+the exclusive/fill motion sampler for those two sources, and preserves all
+scene records plus raw rank-local predictions/logits/gradient sketches every
+25 steps. MV-Kubric sampling remains upstream-compatible.
+
+Initial validation and optimizer step 1 completed. The cold update took 40.18
+seconds (16.49 data, 11.25 forward, 9.81 backward/optimizer); the first warm
+updates included 5.43--10.27 second steps plus several 18--24 second cache-fill
+outliers. Both rank-specific step-1 diagnostic files and the complete scene
+ledger were committed to the run Volume. Initial process RSS was roughly
+48/53 GiB per rank under the 256-GiB hard limit.
+
+- Run: `gt-replay-centered-syn4d-v3-ddp2-h200-20260822T195805Z`
+- Function call: `fc-01M0NGTYJ0TKT861JZ5EB28AKV`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/f5e7cfe5e0d1
+- Source: `d087d622cf1b350252444a86aaf60905c652bf94`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
 ## 20 August 2026: H200 universal-pair training restart
 
 The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
