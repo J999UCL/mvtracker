@@ -1,4 +1,4 @@
-"""Render visibility-aware track overlays for the two Syn4D loss spikes."""
+"""Render visibility-aware track overlays for the winter Syn4D flow spikes."""
 
 from __future__ import annotations
 
@@ -26,22 +26,40 @@ OUTPUT_ROOT = RUN_ROOT / "syn4d-track-overlays"
 TAGS = {"owner": "jeet", "project": "mvtracker", "purpose": "evaluation"}
 SCENES = (
     {
-        "name": "planet_bald__seq_000018",
-        "virtual_index": 70,
-        "view_count": 6,
-        "window": (12, 36),
-        "views": (0, 1, 2, 5, 6, 7),
-        "tracks": 1885,
-        "training_step": 26,
+        "name": "winter__seq_000015",
+        "virtual_index": 26,
+        "view_count": 5,
+        "window": (2, 26),
+        "views": (0, 2, 5, 6, 7),
+        "tracks": 1137,
+        "training_step": 14,
     },
     {
-        "name": "castle__seq_000007",
-        "virtual_index": 321,
-        "view_count": 1,
-        "window": (8, 32),
-        "views": (1,),
-        "tracks": 1530,
-        "training_step": 132,
+        "name": "winter__seq_000015",
+        "virtual_index": 46,
+        "view_count": 6,
+        "window": (264, 288),
+        "views": (0, 1, 2, 4, 6, 7),
+        "tracks": 1865,
+        "training_step": 24,
+    },
+    {
+        "name": "winter__seq_000015",
+        "virtual_index": 84,
+        "view_count": 3,
+        "window": (258, 282),
+        "views": (0, 4, 6),
+        "tracks": 2048,
+        "training_step": 43,
+    },
+    {
+        "name": "winter__seq_000015",
+        "virtual_index": 755,
+        "view_count": 3,
+        "window": (25, 49),
+        "views": (0, 1, 4),
+        "tracks": 1770,
+        "training_step": 375,
     },
 )
 
