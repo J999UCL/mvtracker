@@ -51,7 +51,6 @@ class KubricDaliSceneStream:
     scenes_per_batch = SCENES_PER_BATCH
     records_per_batch = RECORDS_PER_BATCH
     _selected_scene_ids = None
-    _resume_wrap_pending = False
 
     def __init__(
         self,
@@ -116,38 +115,29 @@ class KubricDaliSceneStream:
         if not assigned and not allow_empty:
             raise ValueError(f"rank {rank} was assigned no WebDataset shards")
         local_scene_count = int(scene_counts[int(rank)])
-        original_assigned = assigned
-        if assigned and start_group_index:
-            scene_offset = (
-                int(start_group_index) * int(scenes_per_batch)
-            ) % local_scene_count
-            start_shard = 0
-            while scene_offset:
-                shard_scene_count = len(assigned[start_shard][2])
-                if scene_offset < shard_scene_count:
-                    raise ValueError(
-                        "DALI resume position must align to a TAR boundary"
-                    )
-                scene_offset -= shard_scene_count
-                start_shard += 1
-            assigned = assigned[start_shard:] + assigned[:start_shard]
+        assigned_scene_count = sum(
+            len(scene_names) for _, _, scene_names, _ in assigned
+        )
+        if assigned_scene_count % int(scenes_per_batch):
+            raise ValueError("rank-local scene count must form complete DALI batches")
+        groups_per_epoch = assigned_scene_count // int(scenes_per_batch)
+        start_epoch, start_group_in_epoch = (
+            divmod(int(start_group_index), groups_per_epoch)
+            if groups_per_epoch
+            else (0, 0)
+        )
 
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.seed = int(seed)
         self.heartbeat_seconds = float(heartbeat_seconds)
         self.repeat = bool(repeat)
+        self._shuffle_shards = bool(shuffle_shards)
+        self._shuffle_scene_groups = bool(shuffle_shards)
         self.scenes_per_batch = int(scenes_per_batch)
         self.records_per_batch = self.scenes_per_batch * RECORDS_PER_SCENE
+        self._assigned = assigned
         self.assigned_shards = tuple(str(archive) for archive, _, _, _ in assigned)
-        self._original_expected_scenes = tuple(
-            scene_name
-            for _, _, scene_names, _ in original_assigned
-            for scene_name in scene_names
-        )
-        self._expected_scenes = tuple(
-            scene_name for _, _, scene_names, _ in assigned for scene_name in scene_names
-        )
         self._selected_scene_ids = selected_scene_ids
         self.local_scene_names = tuple(
             scene_name
@@ -156,8 +146,9 @@ class KubricDaliSceneStream:
         )
         self.local_scene_count = local_scene_count
         self._scene_cursor = 0
-        self._batch_index = 0
-        self._resume_wrap_pending = assigned != original_assigned
+        self._batch_index = int(start_group_index)
+        self._epoch = int(start_epoch)
+        self._group_in_epoch = 0
 
         if not assigned:
             self.build_seconds = 0.0
@@ -195,10 +186,31 @@ class KubricDaliSceneStream:
             return pipeline
 
         self._build_pipeline = build_pipeline
-        self._original_assigned = original_assigned
         build_started = time.perf_counter()
-        self._pipeline = build_pipeline(assigned)
+        self._start_epoch(self._epoch)
+        for _ in range(start_group_in_epoch):
+            self._pipeline.run()
+        self._scene_cursor = start_group_in_epoch * self.scenes_per_batch
+        self._group_in_epoch = start_group_in_epoch
         self.build_seconds = time.perf_counter() - build_started
+
+    def _epoch_assignment(self, epoch: int):
+        assigned = list(self._assigned)
+        if self._shuffle_shards:
+            random.Random(f"{self.seed}:{self.rank}:{int(epoch)}").shuffle(assigned)
+        return tuple(assigned)
+
+    def _start_epoch(self, epoch: int) -> None:
+        assigned = self._epoch_assignment(epoch)
+        self._pipeline = self._build_pipeline(assigned)
+        self._expected_scenes = tuple(
+            scene_name
+            for _, _, scene_names, _ in assigned
+            for scene_name in scene_names
+        )
+        self._scene_cursor = 0
+        self._group_in_epoch = 0
+        self._epoch = int(epoch)
 
     def _heartbeat(self, stop: threading.Event, batch_index: int, started: float) -> None:
         while not stop.wait(self.heartbeat_seconds):
@@ -243,19 +255,18 @@ class KubricDaliSceneStream:
             except StopIteration:
                 if not self.repeat:
                     raise
-                if self._resume_wrap_pending:
-                    self._pipeline = self._build_pipeline(
-                        self._original_assigned
-                    )
-                    self._expected_scenes = self._original_expected_scenes
-                    self._scene_cursor = 0
-                    self._resume_wrap_pending = False
+                if self._shuffle_shards:
+                    self._start_epoch(self._epoch + 1)
                     print(
-                        f"DALI_STREAM event=resume_wrap rank={self.rank}",
+                        f"DALI_STREAM event=epoch_reshuffle "
+                        f"rank={self.rank} epoch={self._epoch}",
                         flush=True,
                     )
                 else:
                     self._pipeline.reset()
+                    self._epoch += 1
+                    self._scene_cursor = 0
+                    self._group_in_epoch = 0
                     print(
                         f"DALI_STREAM event=epoch_reset rank={self.rank}",
                         flush=True,
@@ -309,6 +320,12 @@ class KubricDaliSceneStream:
                 + sum(map(len, scene_rgb))
                 + sum(map(len, scene_depth))
             )
+
+        if self._shuffle_scene_groups and len(scenes) > 1:
+            random.Random(
+                f"{self.seed}:{self.rank}:{self._epoch}:{self._group_in_epoch}"
+            ).shuffle(scenes)
+        self._group_in_epoch += 1
 
         return KubricDaliSceneGroup(
             scenes=tuple(scenes),

@@ -114,7 +114,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
 
     collate_fn = staticmethod(collate_encoded_tapvid3d)
     requires_cuda_prefetch = True
-    _scene_reuse_passes = 2
+    _scene_reuse_passes = 1
     _fixed_views = None
     _seed_by_scene = False
     _stream_start_offset = 0
@@ -132,7 +132,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         stream_shuffle_shards: bool = True,
         stream_include_scene_ids: tuple[str, ...] | None = None,
         stream_allow_empty: bool = False,
-        scene_reuse_passes: int = 2,
+        scene_reuse_passes: int = 1,
         fixed_views: tuple[int, ...] | None = None,
         seed_by_scene: bool = False,
         stream_start_request_cursor: int = 0,
@@ -158,7 +158,9 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             allow_empty=stream_allow_empty,
             start_group_index=int(stream_start_request_cursor) // requests_per_group,
         )
-        self._scene_reuse_passes = int(scene_reuse_passes)
+        if int(scene_reuse_passes) != 1:
+            raise ValueError("MV-Kubric DALI scenes must be consumed once per epoch")
+        self._scene_reuse_passes = 1
         self._fixed_views = fixed_views
         self._seed_by_scene = bool(seed_by_scene)
         self._stream_start_offset = int(stream_start_request_cursor) % requests_per_group

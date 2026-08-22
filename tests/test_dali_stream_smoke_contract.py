@@ -140,6 +140,9 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         stream._expected_scenes = scene_names
         stream._scene_cursor = 0
         stream._batch_index = 0
+        stream._epoch = 0
+        stream._group_in_epoch = 0
+        stream._shuffle_scene_groups = False
         stream._pipeline = _Pipeline(_scene_outputs(scene_names))
 
         group = stream.next_scene_group()
@@ -164,6 +167,39 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
                 ),
             )
 
+    def test_complete_scene_groups_are_shuffled_after_assembly(self):
+        scene_names = ("scene-a", "scene-b", "scene-c", "scene-d")
+        stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
+        stream.rank = 0
+        stream.seed = 72
+        stream.heartbeat_seconds = 60.0
+        stream._expected_scenes = scene_names
+        stream._scene_cursor = 0
+        stream._batch_index = 0
+        stream._epoch = 0
+        stream._group_in_epoch = 0
+        stream._shuffle_scene_groups = True
+        stream._pipeline = _Pipeline(_scene_outputs(scene_names))
+
+        group = stream.next_scene_group()
+
+        shuffled = tuple(scene.scene_name for scene in group.scenes)
+        self.assertEqual(set(shuffled), set(scene_names))
+        self.assertNotEqual(shuffled, scene_names)
+
+    def test_each_epoch_has_a_new_shard_order(self):
+        stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
+        stream.rank = 0
+        stream.seed = 72
+        stream._shuffle_shards = True
+        stream._assigned = tuple(range(8))
+
+        first = stream._epoch_assignment(0)
+        second = stream._epoch_assignment(1)
+
+        self.assertEqual(set(first), set(second))
+        self.assertNotEqual(first, second)
+
     def test_native_reader_resets_at_epoch_boundary(self):
         scene_names = ("scene-a", "scene-b", "scene-c", "scene-d")
         stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
@@ -172,6 +208,10 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         stream._expected_scenes = scene_names
         stream._scene_cursor = 0
         stream._batch_index = 0
+        stream._epoch = 0
+        stream._group_in_epoch = 0
+        stream._shuffle_shards = False
+        stream._shuffle_scene_groups = False
         stream._pipeline = _ResettingPipeline(_scene_outputs(scene_names))
 
         group = stream.next_scene_group()
@@ -255,8 +295,9 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         ]
         self.assertEqual(assigned_scene_counts, [8, 8])
 
-    def test_resume_rotates_to_the_next_unconsumed_scene_group(self):
+    def test_resume_skips_to_the_next_unconsumed_scene_group(self):
         reader_calls = []
+        pipelines = []
 
         def webdataset(**kwargs):
             reader_calls.append(tuple(kwargs["paths"]))
@@ -264,9 +305,15 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
 
         def pipeline_def(function):
             def build_pipeline(**_kwargs):
-                return types.SimpleNamespace(
-                    outputs=function(), build=lambda: None
+                pipeline = types.SimpleNamespace(
+                    outputs=function(), build=lambda: None, runs=0
                 )
+                pipeline.run = lambda: (
+                    setattr(pipeline, "runs", pipeline.runs + 1)
+                    or pipeline.outputs
+                )
+                pipelines.append(pipeline)
+                return pipeline
 
             return build_pipeline
 
@@ -320,44 +367,46 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
             reader_calls[0],
             tuple(
                 str(root / f"shard-{index}.tar")
-                for index in (1, 2, 0)
+                for index in (0, 1, 2)
             ),
         )
-        self.assertTrue(stream.local_scene_names[0].startswith("scene-1-"))
-        self.assertTrue(stream._resume_wrap_pending)
-        self.assertTrue(stream._original_expected_scenes[0].startswith("scene-0-"))
-        self.assertTrue(stream._expected_scenes[0].startswith("scene-1-"))
+        self.assertEqual(pipelines[0].runs, 1)
+        self.assertEqual(stream._scene_cursor, 4)
+        self.assertEqual(stream._group_in_epoch, 1)
+        self.assertTrue(stream._expected_scenes[0].startswith("scene-0-"))
 
-    def test_resumed_stream_wraps_to_the_original_epoch_order(self):
+    def test_shuffled_stream_rebuilds_for_the_next_epoch(self):
         original_names = ("a", "b", "c", "d")
+        pair = (Path("epoch.tar"), Path("epoch.idx"), original_names, original_names)
         stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
         stream.rank = 0
+        stream.seed = 72
         stream.repeat = True
         stream.heartbeat_seconds = 60.0
         stream.records_per_batch = 44
         stream.scenes_per_batch = 4
         stream._batch_index = 0
         stream._scene_cursor = 0
-        stream._resume_wrap_pending = True
-        stream._original_assigned = ("original",)
-        stream._original_expected_scenes = original_names
-        stream._expected_scenes = ("e", "f", "g", "h")
+        stream._epoch = 0
+        stream._group_in_epoch = 0
+        stream._shuffle_shards = True
+        stream._shuffle_scene_groups = False
+        stream._assigned = (pair,)
+        stream._expected_scenes = original_names
         stream._pipeline = types.SimpleNamespace(
             run=lambda: (_ for _ in ()).throw(StopIteration)
         )
         replacement = _Pipeline(_scene_outputs(original_names))
-        stream._build_pipeline = lambda assigned: (
-            replacement if assigned == ("original",) else None
-        )
+        stream._build_pipeline = lambda assigned: replacement if assigned == (pair,) else None
 
         group = stream.next_scene_group()
 
         self.assertEqual(
             tuple(scene.scene_name for scene in group.scenes), original_names
         )
-        self.assertFalse(stream._resume_wrap_pending)
+        self.assertEqual(stream._epoch, 1)
 
-    def test_one_scene_group_is_consumed_in_two_ordered_passes(self):
+    def test_one_scene_group_is_consumed_once(self):
         scenes = tuple(
             KubricDaliSceneBundle(name, b"meta", (b"rgb",) * 10, (b"depth",) * 10)
             for name in ("a", "b", "c", "d")
@@ -372,20 +421,21 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         dataset = DaliKubricMultiViewDataset.__new__(DaliKubricMultiViewDataset)
         dataset.stream = stream
         dataset._streamed_scenes = deque()
+        dataset._scene_reuse_passes = 1
 
-        consumed = [dataset._next_scene() for _ in range(8)]
+        consumed = [dataset._next_scene() for _ in range(4)]
 
         self.assertEqual(
             [bundle.scene_name for bundle, *_ in consumed],
-            ["a", "b", "c", "d", "a", "b", "c", "d"],
+            ["a", "b", "c", "d"],
         )
-        self.assertEqual([position for _, _, position, _ in consumed], [0, 1, 2, 3] * 2)
-        self.assertEqual([reuse for *_, reuse in consumed], [0] * 4 + [1] * 4)
-        for start in range(0, 8, 2):
+        self.assertEqual([position for _, _, position, _ in consumed], [0, 1, 2, 3])
+        self.assertEqual([reuse for *_, reuse in consumed], [0] * 4)
+        for start in range(0, 4, 2):
             pair = [consumed[index][0].scene_name for index in (start, start + 1)]
             self.assertEqual(len(set(pair)), 2)
 
-    def test_resume_offset_continues_inside_the_reused_group(self):
+    def test_resume_offset_continues_inside_the_group(self):
         scenes = tuple(
             KubricDaliSceneBundle(name, b"meta", (b"rgb",) * 10, (b"depth",) * 10)
             for name in ("a", "b", "c", "d")
@@ -394,14 +444,14 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         dataset = DaliKubricMultiViewDataset.__new__(DaliKubricMultiViewDataset)
         dataset.stream = types.SimpleNamespace(next_scene_group=lambda: group)
         dataset._streamed_scenes = deque()
-        dataset._scene_reuse_passes = 2
-        dataset._stream_start_offset = 5
+        dataset._scene_reuse_passes = 1
+        dataset._stream_start_offset = 1
 
         consumed = [dataset._next_scene()[0].scene_name for _ in range(3)]
 
         self.assertEqual(consumed, ["b", "c", "d"])
 
-    def test_reused_scene_uses_each_requests_independent_virtual_index(self):
+    def test_repeated_scene_uses_each_requests_independent_virtual_index(self):
         bundle = _training_bundle("scene-a")
         group = KubricDaliSceneGroup(
             scenes=(bundle,),
@@ -411,7 +461,7 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         )
         dataset = DaliKubricMultiViewDataset.__new__(DaliKubricMultiViewDataset)
         dataset._streamed_scenes = deque(
-            [(bundle, group, 0, 0), (bundle, group, 0, 1)]
+            [(bundle, group, 0, 0), (bundle, group, 0, 0)]
         )
         dataset.seq_names = ["scene-a"]
         dataset.seed = 72
@@ -467,7 +517,7 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         self.assertEqual((first.seed, second.seed), (172, 173))
         self.assertEqual(
             (first.metadata["dali_reuse_pass"], second.metadata["dali_reuse_pass"]),
-            (0, 1),
+            (0, 0),
         )
         self.assertFalse(np.array_equal(first.theta, second.theta))
 
