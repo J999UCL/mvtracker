@@ -404,7 +404,7 @@ def _convert_jobs(environment_names: tuple[str, ...], shard: str) -> dict[str, o
     results = []
     for job in jobs_for(environment_names):
         cached = DATA_ROOT / job.output_root / job.output_name / "manifest.json"
-        if job.environment == "lab_bald" and job.sequence == "seq_000017" and cached.is_file():
+        if cached.is_file():
             results.append({
                 "scene": job.environment, "sequence": job.sequence,
                 "output_path": str(cached.parent), "reused": True,
