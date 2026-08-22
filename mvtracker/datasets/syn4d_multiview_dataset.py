@@ -20,6 +20,7 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
     _camera_rig_anchor,
     _project,
     _recenter_world_coordinates,
+    _preselect_available_motion_tracks,
     _sample_depth_patch_operations,
     _sample_rgb_augmentation,
     _sample_tracks,
@@ -102,32 +103,14 @@ def _preselect_tracks(
     ratio_very_dynamic: float,
     maximum: int | None,
 ) -> np.ndarray:
-    candidates = np.flatnonzero(eligible)
-    static = candidates[movement[candidates] < 0.01]
-    very_dynamic = candidates[movement[candidates] > 2.0]
-    dynamic = candidates[movement[candidates] > 0.1]
-    ratio_static = 1.0 - ratio_dynamic - ratio_very_dynamic
-    target = min(
-        len(candidates),
-        int(len(dynamic) / ratio_dynamic) if ratio_dynamic else len(candidates),
-        int(len(very_dynamic) / ratio_very_dynamic)
-        if ratio_very_dynamic
-        else len(candidates),
-        int(len(static) / ratio_static) if ratio_static else len(candidates),
+    return _preselect_available_motion_tracks(
+        movement,
+        eligible,
+        rng,
+        ratio_dynamic=ratio_dynamic,
+        ratio_very_dynamic=ratio_very_dynamic,
+        maximum=maximum,
     )
-    if maximum is not None:
-        target = min(target, int(maximum))
-    dynamic_count = int(target * ratio_dynamic)
-    very_dynamic_count = int(target * ratio_very_dynamic)
-    static_count = target - dynamic_count - very_dynamic_count
-    selected = [
-        rng.choice(dynamic, dynamic_count, replace=False),
-        rng.choice(very_dynamic, very_dynamic_count, replace=False),
-        rng.choice(static, static_count, replace=False),
-    ]
-    result = np.concatenate(selected) if selected else np.empty(0, dtype=np.int64)
-    rng.shuffle(result)
-    return result.astype(np.int64, copy=False)
 
 
 class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):

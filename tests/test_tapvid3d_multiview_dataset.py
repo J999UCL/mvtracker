@@ -520,6 +520,23 @@ class FromNameTests(unittest.TestCase):
 
 
 class MvTrackerSamplingParityTests(unittest.TestCase):
+    def test_available_motion_sampling_uses_exclusive_buckets_and_fill(self):
+        movement = np.asarray(
+            [0.0] * 2 + [0.05] * 2 + [0.5] * 4 + [3.0] * 4,
+            dtype=np.float32,
+        )
+        selected = loader._preselect_available_motion_tracks(
+            movement,
+            np.ones_like(movement, dtype=bool),
+            np.random.RandomState(9),
+            ratio_dynamic=0.5,
+            ratio_very_dynamic=0.25,
+            maximum=12,
+        )
+
+        self.assertEqual(selected.size, 12)
+        self.assertEqual(np.unique(selected).size, 12)
+
     def test_visible_path_length_only_counts_consecutively_visible_steps(self):
         tracks = np.zeros((4, 2, 3), dtype=np.float32)
         tracks[:, 0, 0] = [0.0, 0.1, 0.3, 0.6]

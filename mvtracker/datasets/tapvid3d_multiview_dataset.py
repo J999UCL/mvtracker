@@ -675,6 +675,53 @@ def _preselect_motion_tracks(
     return selected.astype(np.int64, copy=False)
 
 
+def _preselect_available_motion_tracks(
+    movement: np.ndarray,
+    eligible: np.ndarray,
+    rng: np.random.RandomState,
+    *,
+    ratio_dynamic: float,
+    ratio_very_dynamic: float,
+    maximum: int | None,
+) -> np.ndarray:
+    """Sample exclusive motion buckets and fill unavailable capacity."""
+    candidates = np.flatnonzero(eligible)
+    if not len(candidates):
+        return np.empty(0, dtype=np.int64)
+    target = len(candidates) if maximum is None else min(len(candidates), int(maximum))
+    desired_dynamic = int(target * ratio_dynamic)
+    desired_very_dynamic = int(target * ratio_very_dynamic)
+    desired_static = target - desired_dynamic - desired_very_dynamic
+    pools = (
+        candidates[movement[candidates] < 0.01],
+        candidates[
+            (movement[candidates] > 0.1) & (movement[candidates] <= 2.0)
+        ],
+        candidates[movement[candidates] > 2.0],
+    )
+    desired = (desired_static, desired_dynamic, desired_very_dynamic)
+    selected_parts = [
+        rng.choice(pool, min(count, len(pool)), replace=False)
+        for pool, count in zip(pools, desired, strict=True)
+        if len(pool) and count
+    ]
+    selected = (
+        np.concatenate(selected_parts)
+        if selected_parts
+        else np.empty(0, dtype=np.int64)
+    )
+    if len(selected) < target:
+        remaining = np.setdiff1d(candidates, selected, assume_unique=False)
+        selected = np.concatenate(
+            [
+                selected,
+                rng.choice(remaining, target - len(selected), replace=False),
+            ]
+        )
+    rng.shuffle(selected)
+    return selected.astype(np.int64, copy=False)
+
+
 def _scene_transform(
     tracks: np.ndarray,
     query_points: np.ndarray,
@@ -1117,9 +1164,10 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 for view in views
             ]
         )
-        preselected = _preselect_motion_tracks(
-            tracks_all,
-            visibility_all,
+        full_movement_all = _visible_path_lengths(tracks_all, visibility_all)
+        preselected = _preselect_available_motion_tracks(
+            full_movement_all,
+            np.ones(tracks_all.shape[1], dtype=bool),
             rng,
             ratio_dynamic=float(getattr(self, "ratio_dynamic", 0.5)),
             ratio_very_dynamic=float(getattr(self, "ratio_very_dynamic", 0.25)),
@@ -1225,10 +1273,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         selected_tracks = tracks[:, selected]
         selected_visibility = visibility_np[:, :, selected]
         selected_global = preselected[selected]
-        full_movement = _visible_path_lengths(
-            tracks_all[:, selected_global],
-            visibility_all[:, :, selected_global],
-        )
+        full_movement = full_movement_all[selected_global]
         window_movement = _visible_path_lengths(
             tracks_all[frame_indices][:, selected_global],
             visibility_all[:, frame_indices][:, :, selected_global],

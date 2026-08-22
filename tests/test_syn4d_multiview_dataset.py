@@ -155,7 +155,7 @@ class Syn4DLoaderTests(unittest.TestCase):
             self.assertEqual(restored._sequence_cache.maximum, 1)
             self.assertIsNot(restored._sequence_cache, dataset._sequence_cache)
 
-    def test_motion_preselection_does_not_substitute_missing_pools(self):
+    def test_motion_preselection_fills_missing_buckets(self):
         movement = np.array([0.0] * 8 + [0.5] * 16, dtype=np.float32)
         selected = _preselect_tracks(
             movement,
@@ -165,9 +165,10 @@ class Syn4DLoaderTests(unittest.TestCase):
             ratio_very_dynamic=0.25,
             maximum=24,
         )
-        self.assertEqual(selected.size, 0)
+        self.assertEqual(selected.size, 24)
+        self.assertEqual(np.unique(selected).size, 24)
 
-    def test_motion_preselection_scales_to_the_limiting_pool(self):
+    def test_motion_preselection_uses_every_candidate_without_duplicates(self):
         movement = np.array([0.0] * 100 + [0.5] * 80 + [3.0] * 20, dtype=np.float32)
         selected = _preselect_tracks(
             movement,
@@ -177,7 +178,8 @@ class Syn4DLoaderTests(unittest.TestCase):
             ratio_very_dynamic=0.25,
             maximum=200,
         )
-        self.assertEqual(selected.size, 80)
+        self.assertEqual(selected.size, 200)
+        self.assertEqual(np.unique(selected).size, 200)
 
     def test_factory_maps_the_direct_sequence_cache(self):
         config = SimpleNamespace(
