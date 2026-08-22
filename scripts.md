@@ -467,3 +467,9 @@ MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_motion_
 ```bash
 MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_all_scene_audit.py --run-name syn4d-all-scene-loss-data-20260822
 ```
+
+### Audit all DIEGESIS training rooms against recorded scene loss
+
+```bash
+MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_diegesis_scene_loss_audit.py --run-name diegesis-scene-loss-data-20260822
+```
