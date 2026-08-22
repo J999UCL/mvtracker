@@ -446,11 +446,15 @@ def _finalize_scene_loss_records(pending_records, optimizer_step):
     visibility_losses = torch.stack(
         [record.pop("_visibility_loss") for record in pending_records]
     ).float().cpu().tolist()
+    raw_visibility_losses = torch.stack(
+        [record.pop("_raw_visibility_loss") for record in pending_records]
+    ).float().cpu().tolist()
     result = []
-    for record, trajectory_loss, visibility_loss in zip(
+    for record, trajectory_loss, visibility_loss, raw_visibility_loss in zip(
         pending_records,
         trajectory_losses,
         visibility_losses,
+        raw_visibility_losses,
         strict=True,
     ):
         result.append(
@@ -459,10 +463,33 @@ def _finalize_scene_loss_records(pending_records, optimizer_step):
                 "optimizer_step": int(optimizer_step),
                 "trajectory_loss": float(trajectory_loss),
                 "visibility_loss": float(visibility_loss),
+                "raw_visibility_loss": float(raw_visibility_loss),
                 "total_loss": float(trajectory_loss + visibility_loss),
             }
         )
     return result
+
+
+def _compact_training_trace(trace):
+    if trace is None:
+        return None
+    return {
+        "coordinates": [
+            tensor.detach().to(device="cpu", dtype=torch.float32)
+            for tensor in trace["coordinates"]
+        ],
+        "visibility_logits": [
+            tensor.detach().to(device="cpu", dtype=torch.float16)
+            for tensor in trace["visibility_logits"]
+        ],
+    }
+
+
+def _write_training_diagnostic(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
 
 
 def _create_torch_profiler(cfg, experiment_path, global_rank):
@@ -1733,6 +1760,7 @@ def forward_batch_multi_view(
         "metrics": diagnostic_metrics,
         "scene_losses": {
             "flow": torch.stack(scene_losses).detach(),
+            "visibility_raw": torch.stack(scene_vis_losses).detach(),
             "visibility": (
                 torch.stack(scene_vis_losses).detach()
                 * cfg.trainer.visibility_loss_weight
@@ -1802,17 +1830,21 @@ def _forward_backward_microbatch(
                         f"{completed_steps}_global_rank-{fabric.global_rank}",
                     ),
                     run_expensive_diagnostics=run_expensive_diagnostics,
+                    capture_training_trace=run_gradient_diagnostics,
                 )
 
             loss = torch.zeros((), device=fabric.device)
             component_losses = {}
             metrics = {}
             scene_losses = None
+            training_trace = None
             for name, value in output.items():
                 if name == "metrics":
                     metrics.update({key: float(item) for key, item in value.items()})
                 elif name == "scene_losses":
                     scene_losses = value
+                elif name == "training_trace":
+                    training_trace = value
                 elif "loss" in value:
                     loss = loss + value["loss"]
                     component_losses[name] = value["loss"].detach()
@@ -1844,6 +1876,7 @@ def _forward_backward_microbatch(
         component_losses,
         metrics,
         scene_losses,
+        training_trace,
         microbatch_gradient,
         forward_duration,
         backward_duration,
@@ -2848,6 +2881,7 @@ def main(cfg: DictConfig):
         microbatch_gradient_norms = []
         microbatch_gradient_cosines = []
         scene_gradient_records = []
+        training_trace_records = []
         scene_gradient_metrics = {}
         pending_scene_loss_records = []
         top_scene_loss_metrics = {}
@@ -3123,6 +3157,7 @@ def main(cfg: DictConfig):
                     component_losses,
                     microbatch_metrics,
                     scene_losses,
+                    training_trace,
                     microbatch_gradient,
                     forward_duration,
                     backward_duration,
@@ -3239,6 +3274,7 @@ def main(cfg: DictConfig):
                         "source": str(record_sources[scene_index]),
                         "scene": str(record_scenes[scene_index]),
                         "rank": int(fabric.global_rank),
+                        "physical_group_index": int(microbatches_accumulated),
                         "views": source_view_count,
                         "tracks": int(scene_track_counts[scene_index]),
                         "window_start": int(metadata.get("window_start", 0)),
@@ -3265,6 +3301,35 @@ def main(cfg: DictConfig):
                         ),
                         "_trajectory_loss": scene_losses["flow"][scene_index],
                         "_visibility_loss": scene_losses["visibility"][scene_index],
+                        "_raw_visibility_loss": scene_losses["visibility_raw"][scene_index],
+                    }
+                )
+            if training_trace is not None:
+                training_trace_records.append(
+                    {
+                        "sources": [str(source) for source in record_sources],
+                        "scenes": [str(scene) for scene in record_scenes],
+                        "sample_metadata": [
+                            {
+                                "virtual_index": int(metadata.get("virtual_index", -1)),
+                                "seed": int(metadata.get("seed", -1)),
+                                "window_start": int(metadata.get("window_start", 0)),
+                                "window_end_exclusive": int(
+                                    metadata.get(
+                                        "window_end_exclusive",
+                                        batch.video.shape[2],
+                                    )
+                                ),
+                                "selected_views": [
+                                    int(view)
+                                    for view in metadata.get(
+                                        "selected_views", range(source_view_count)
+                                    )
+                                ],
+                            }
+                            for metadata in record_metadata
+                        ],
+                        "trace": _compact_training_trace(training_trace),
                     }
                 )
             accumulated_fwd_duration += forward_duration
@@ -3344,6 +3409,7 @@ def main(cfg: DictConfig):
                 )[:scene_loss_top_k]
                 payload = {
                     "optimizer_step": total_steps + 1,
+                    "scenes": gathered_scene_loss_records,
                     "top_scenes": top_scenes,
                 }
                 with scene_loss_log_path.open("a", encoding="utf-8") as loss_log:
@@ -3410,6 +3476,9 @@ def main(cfg: DictConfig):
                             "component/visibility": accumulated_source_components.get(
                                 (source, "visibility"), 0.0
                             ),
+                            "component/visibility_raw": accumulated_source_components.get(
+                                (source, "visibility_raw"), 0.0
+                            ),
                         },
                         reduce_op="sum",
                     )
@@ -3429,7 +3498,7 @@ def main(cfg: DictConfig):
                         reduced_source_values[f"source/{source}/{name}"] = (
                             sums[name] / global_count
                         )
-                    for component in ("flow", "visibility"):
+                    for component in ("flow", "visibility", "visibility_raw"):
                         reduced_source_values[
                             f"source/{source}/component/{component}"
                         ] = sums[f"component/{component}"] / global_count
@@ -3535,6 +3604,29 @@ def main(cfg: DictConfig):
                     hardware_metrics.update(container_monitor.sample())
             if mixed_training:
                 checkpoint_source_cursors = dict(source_cursors)
+            if run_gradient_diagnostics:
+                diagnostic_payload = {
+                    "schema_version": 1,
+                    "optimizer_step": int(total_steps),
+                    "rank": int(fabric.global_rank),
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                    "source_cursors": (
+                        dict(source_cursors) if mixed_training else None
+                    ),
+                    "microbatches": training_trace_records,
+                    "gradient_sketches": scene_gradient_records,
+                }
+                diagnostic_path = (
+                    Path(cfg.experiment_path)
+                    / "training_diagnostics"
+                    / f"step_{total_steps:06d}_rank_{fabric.global_rank}.pt"
+                )
+                diagnostic_writer = threading.Thread(
+                    target=_write_training_diagnostic,
+                    args=(diagnostic_path, diagnostic_payload),
+                )
+                diagnostic_writer.start()
+                threads.append(diagnostic_writer)
 
             microbatch_gradient_norm_mean = (
                 statistics.fmean(microbatch_gradient_norms)
@@ -4055,6 +4147,7 @@ def main(cfg: DictConfig):
             microbatch_gradient_norms = []
             microbatch_gradient_cosines = []
             scene_gradient_records = []
+            training_trace_records = []
             scene_gradient_metrics = {}
             pending_scene_loss_records = []
             top_scene_loss_metrics = {}

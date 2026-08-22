@@ -10,7 +10,9 @@ import numpy as np
 from mvtracker.datasets.syn4d_multiview_dataset import (
     Syn4DMultiViewDataset,
     _SequenceMmapCache,
+    _camera_rig_anchor,
     _preselect_tracks,
+    _recenter_world_coordinates,
 )
 
 
@@ -115,6 +117,35 @@ def _dataset(root: Path):
 
 
 class Syn4DLoaderTests(unittest.TestCase):
+    def test_camera_rig_recentering_preserves_projection(self):
+        centres = np.asarray(((1000.0, 20.0, -3.0), (1002.0, 22.0, -3.0)))
+        extrinsics = np.repeat(
+            np.eye(4, dtype=np.float32)[None, None], 2, axis=0
+        )
+        extrinsics[:, 0, :3, 3] = -centres
+        tracks = np.asarray([[[1010.0, 24.0, 7.0]]], dtype=np.float32)
+
+        anchor = _camera_rig_anchor(extrinsics)
+        centred_tracks, centred_extrinsics = _recenter_world_coordinates(
+            tracks,
+            extrinsics[:, :, :3, :4],
+            anchor,
+        )
+
+        np.testing.assert_allclose(anchor, centres.mean(axis=0))
+        for view in range(2):
+            original_camera = (
+                tracks[0, 0]
+                @ extrinsics[view, 0, :3, :3].T
+                + extrinsics[view, 0, :3, 3]
+            )
+            centred_camera = (
+                centred_tracks[0, 0]
+                @ centred_extrinsics[view, 0, :3, :3].T
+                + centred_extrinsics[view, 0, :3, 3]
+            )
+            np.testing.assert_allclose(centred_camera, original_camera)
+
     def test_dataset_recreates_mmap_cache_in_spawned_workers(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = _dataset(Path(directory))

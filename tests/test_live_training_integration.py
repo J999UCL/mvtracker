@@ -64,6 +64,8 @@ class LivePhysicalTrainingTests(unittest.TestCase):
         self.assertIn("singleton_prepared_groups", source)
         self.assertIn("source_cursors = dict(physical_step.end_cursors)", source)
         self.assertIn("per_scene_losses.jsonl", source)
+        self.assertIn("'scenes': gathered_scene_loss_records", source)
+        self.assertIn("training_diagnostics", source)
         self.assertIn("diagnostics/top_scene_loss", source)
         self.assertIn(
             "gradient_accumulation_steps=gradient_accumulation_steps / batch_scene_count",

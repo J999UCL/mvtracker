@@ -86,6 +86,7 @@ class GradientAccumulationTests(unittest.TestCase):
                     "tracks": 512,
                     "_trajectory_loss": torch.tensor(0.2),
                     "_visibility_loss": torch.tensor(0.03),
+                    "_raw_visibility_loss": torch.tensor(0.3),
                 }
             ],
             25,
@@ -94,6 +95,7 @@ class GradientAccumulationTests(unittest.TestCase):
         self.assertEqual(records[0]["optimizer_step"], 25)
         self.assertEqual(records[0]["scene"], "kitchen01")
         self.assertAlmostEqual(records[0]["total_loss"], 0.23, places=6)
+        self.assertAlmostEqual(records[0]["raw_visibility_loss"], 0.3, places=6)
 
     def test_scene_gradient_sketches_group_pairwise_relations(self):
         diagnostics = _load_gradient_diagnostics()

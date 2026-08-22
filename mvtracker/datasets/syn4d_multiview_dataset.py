@@ -29,6 +29,31 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
 
 _DATASET_PREFIX = "syn4d-multiview-"
 _SPLITS = {"training": "train", "validation": "validation", "test": "test"}
+
+
+def _camera_rig_anchor(extrinsics: np.ndarray) -> np.ndarray:
+    """Return the mean frame-zero camera centre in world coordinates."""
+    frame_zero = np.asarray(extrinsics[:, 0, :3, :4], dtype=np.float32)
+    rotations = frame_zero[:, :3, :3]
+    translations = frame_zero[:, :3, 3]
+    centres = -np.einsum("vji,vj->vi", rotations, translations)
+    return centres.mean(axis=0, dtype=np.float64).astype(np.float32)
+
+
+def _recenter_world_coordinates(
+    tracks: np.ndarray,
+    extrinsics: np.ndarray,
+    anchor: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Translate a world frame while preserving every camera projection."""
+    centred_tracks = np.asarray(tracks, dtype=np.float32) - anchor[None, None]
+    centred_extrinsics = np.asarray(extrinsics, dtype=np.float32).copy()
+    centred_extrinsics[..., 3] += np.einsum(
+        "vtij,j->vti", centred_extrinsics[..., :3], anchor
+    )
+    return centred_tracks, centred_extrinsics
+
+
 class _MappedSequence:
     def __init__(self, root: Path):
         self.root = root
@@ -164,9 +189,23 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
     def _load_manifest(self, sequence: str) -> dict[str, Any]:
         root = Path(self.data_root) / sequence
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        view_count = int(manifest["views"])
+        frame_zero_extrinsics = np.stack(
+            [
+                np.load(
+                    root / str(view) / "extrinsics_w2c.npy",
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )[0:1]
+                for view in range(view_count)
+            ]
+        )
+        manifest["world_anchor"] = _camera_rig_anchor(
+            frame_zero_extrinsics
+        ).tolist()
         manifest["frame_count"] = int(manifest["frames"])
         manifest["point_count"] = int(manifest["tracks"])
-        manifest["views"] = list(range(int(manifest["views"])))
+        manifest["views"] = list(range(view_count))
         manifest["resolution_hw"] = list(manifest["cache_resolution"])
         return manifest
 
@@ -292,6 +331,13 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
                 [store.read(f"{view}/extrinsics_w2c.npy", np.s_[start:stop, :3, :4]) for view in views]
             ).astype(np.float32, copy=False)
 
+        world_anchor = np.asarray(manifest["world_anchor"], dtype=np.float32)
+        tracks, extrinsics = _recenter_world_coordinates(
+            tracks,
+            extrinsics,
+            world_anchor,
+        )
+
         xy, camera_z = _project(tracks, extrinsics, intrinsics)
         selected_visibility &= (
             np.isfinite(xy).all(axis=-1)
@@ -383,6 +429,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             "selected_views": views,
             "requested_view_count": request.view_count if request is not None else None,
             "depth_source": "gt",
+            "world_anchor": world_anchor.tolist(),
             "gotit": True,
             "apply_rgb_aug": apply_rgb_aug,
             "apply_depth_aug": apply_depth_aug,
