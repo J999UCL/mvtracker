@@ -158,9 +158,10 @@ modal run --timestamps tools/modal_continual_training.py::train \
 ### Three-source DIEGESIS + Syn4D + MV-Kubric run
 
 The three-source recipe keeps a global batch of eight scenes at 25% DIEGESIS,
-25% Syn4D, and 50% MV-Kubric. It uses 16 `lab_bald` Syn4D sequences for
-training, four for validation, a 2,000-step OneCycle schedule, two H200s, and
-the same pushed-source and free-capacity gates as the two-source run.
+25% Syn4D, and 50% MV-Kubric. It uses the fixed environment-disjoint Syn4D
+split (16 training environments and four validation environments), a 2,000-step
+OneCycle schedule, two H200s, and the same pushed-source and free-capacity gates
+as the two-source run.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
