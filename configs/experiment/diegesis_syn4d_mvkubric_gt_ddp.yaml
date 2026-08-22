@@ -86,7 +86,7 @@ datasets:
       - kubric-multiview-v3-validation-subset
       - kubric-multiview-v3-validation-full
     schedule:
-      - steps: [0, 500, 1000, 1500, 2000]
+      - steps: [0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000]
         names:
           - tapvid3d-multiview-validation
           - syn4d-multiview-validation
@@ -117,7 +117,7 @@ datasets:
 trainer:
   num_steps: 2000
   lr_schedule_steps: 2000
-  eval_freq: 500
+  eval_freq: 250
   viz_freq: 10000
   save_ckpt_freq: 250
   lr: 0.00005
