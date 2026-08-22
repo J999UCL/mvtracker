@@ -99,7 +99,7 @@ def _setup_image() -> modal.Image:
         modal.Image.debian_slim(python_version="3.11")
         .apt_install("ca-certificates", "git", "zstd")
         .pip_install(
-            "hf-xet==1.1.8", "huggingface-hub==0.30.2", "numpy==2.2.4",
+            "hf-xet==1.6.0", "huggingface-hub==1.28.0", "numpy==2.2.4",
             "requests==2.32.3", "wandb==0.19.9",
         )
     )
@@ -141,7 +141,7 @@ def _t4_image() -> modal.Image:
         .apt_install("ca-certificates", "curl", "ffmpeg", "git", "libgl1", "libglib2.0-0", "libopenexr-dev", "openexr", "zstd")
         .pip_install("torch==2.7.1", "torchvision==0.22.1", "torchaudio==2.7.1", index_url="https://download.pytorch.org/whl/cu128")
         .pip_install(
-            "hf-xet==1.1.8", "huggingface-hub==0.30.2", "nvidia-dali-cuda120==1.53.0",
+            "hf-xet==1.6.0", "huggingface-hub==1.28.0", "nvidia-dali-cuda120==1.53.0",
             "OpenEXR==3.3.5", "safetensors==0.5.3", "wandb==0.19.9",
             "opencv-python-headless==4.11.0.86", "pandas==2.2.3", "scipy==1.15.2",
             "matplotlib==3.10.1", "Pillow==11.1.0", "imageio==2.37.0", "pypng==0.20220715.0",
@@ -428,7 +428,8 @@ def _convert_jobs(environment_names: tuple[str, ...], shard: str) -> dict[str, o
                 hf_work.mkdir()
                 os.environ["HF_HOME"] = str(work / "hf-home")
                 os.environ["HF_XET_CACHE"] = str(work / "hf-xet")
-                os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "4"
+                os.environ["HF_XET_CHUNK_CACHE_SIZE_BYTES"] = "0"
+                os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "8"
                 source = hf_hub_download(
                     repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
                     filename=f"{SYN4D_SUBSET}/{job.environment}.tar.zst",
