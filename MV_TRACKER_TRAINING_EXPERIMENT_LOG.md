@@ -986,6 +986,28 @@ before another Syn4D run.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/mduq74qg
 - Volume output: `syn4d-all-scene-audits/syn4d-all-scene-loss-data-v3-20260822`
 
+## 22 August 2026: DIEGESIS scene-loss audit
+
+The equivalent CPU audit over all 17 DIEGESIS training rooms found the same
+absolute-coordinate sensitivity at a smaller scale. Frame-zero camera-rig
+origin distance was the strongest measured predictor of recorded scene loss:
+rho=0.755 for total loss (p=4.6e-4), rho=0.733 for trajectory loss
+(p=8.2e-4), and rho=0.691 for visibility loss (p=0.0021). Rooms centred
+around 19--22 m (Bathroom 03, Bedroom 02 and Kitchen 01) had median total loss
+0.342--0.362, while rooms around 2--5 m (Bedroom 03 and Dining Room 04) had
+loss 0.217--0.231.
+
+Camera-rig radius, centred scene size, motion-bucket composition, depth,
+foreground coverage, RGB brightness/texture, view count, track count,
+duplicate fraction and full-sequence/window motion mismatch were not
+significant scene-loss predictors. Camera path length was weaker and not
+significant (rho=0.441, p=0.076). These results indicate that fixed camera-rig
+recentering should be a shared training/evaluation coordinate convention for
+DIEGESIS as well as Syn4D, rather than a Syn4D-only repair.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/pxrwarzy
+- Volume output: `diegesis-scene-loss-audits/diegesis-scene-loss-data-20260822`
+
 ## 20 August 2026: H200 universal-pair training restart
 
 The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
