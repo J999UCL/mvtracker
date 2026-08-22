@@ -897,6 +897,25 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+## 22 August 2026: singleton physical-batch relaunch
+
+Scene pairing was disabled while retaining the four-step planner and encoded
+lookahead. Validation was aligned with the 250-step checkpoint cadence; the
+full 27-scene MV-Kubric validation remains at steps 0, 1000 and 2000.
+
+The first launch exposed that `BatchCapacity.max_group_size` was passed into
+the rank-local scheduler but never consulted by `_can_pair()`. It was stopped
+after five updates when paired scene names appeared in the live log. Source
+`2651a9717f50980e1257165740baf330c6e5451e` added the missing capacity check
+and launched a fresh run. Both ranks then showed exactly four singleton
+microbatches. The cold first update took 49.46 seconds, including 16.58 seconds
+of data wait; warm update 2 took 8.76 seconds with 0.38 seconds of data wait.
+
+- Run: `gt-replay-centered-syn4d-v5-b1-ddp2-h200-20260822T205118Z`
+- Function call: `fc-01M0NKXVRHWGTQ2QNNNN8TS9Y2`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/87d43184ad2a
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
 ## 22 August 2026: CPU audit of the Planet Bald and Castle loss spikes
 
 A CPU-only Modal audit inspected the exact Syn4D samples behind the largest
