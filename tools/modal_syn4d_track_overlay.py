@@ -88,7 +88,7 @@ def _sample_plan(dataset, specification):
     request = ScheduledSampleRequest(
         virtual_index=int(specification["virtual_index"]),
         scene_index=scene_index,
-        view_count=int(specification["view_count"]),
+        view_count=None,
     )
     plan = dataset.plan_sample(request)
     observed = {
