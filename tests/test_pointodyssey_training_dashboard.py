@@ -209,6 +209,23 @@ class WandbRunReaderTests(unittest.TestCase):
 
 
 class SourceSeriesTests(unittest.TestCase):
+    def test_aggregated_ratio_uses_matching_step_losses(self):
+        ratio = dashboard.aggregated_ratio_series(
+            [
+                {"step": 1, "value": 0.0467},
+                {"step": 2, "value": 0.2},
+                {"step": 51, "value": 0.0577},
+            ],
+            [
+                {"step": 1, "value": 0.5637},
+                {"step": 51, "value": 0.5148},
+            ],
+        )
+
+        self.assertEqual([point["step"] for point in ratio], [1, 51])
+        self.assertAlmostEqual(ratio[0]["value"], 0.0467 / 0.5637)
+        self.assertAlmostEqual(ratio[1]["value"], 0.0577 / 0.5148)
+
     def test_groups_combined_and_per_source_losses(self):
         point = [{"step": 1, "value": 0.2}]
         losses = dashboard.loss_series_from_scalars(
@@ -360,6 +377,10 @@ class DashboardStateTests(unittest.TestCase):
             self.assertEqual(snapshot["series"]["pipeline"][0]["tracks_mean"], 64)
             self.assertEqual(snapshot["series"]["gpu"][0]["utilization_percent"], 100)
             self.assertEqual(snapshot["series"]["baseline"]["stationary"][0]["value"], 0.5)
+            self.assertAlmostEqual(
+                snapshot["series"]["baseline"]["model_ratio"][0]["value"],
+                0.2,
+            )
             self.assertEqual(snapshot["series"]["losses"]["combined"]["total"][0]["value"], 0.3)
             self.assertEqual(snapshot["series"]["losses"]["diegesis"]["total"][0]["value"], 0.25)
             self.assertEqual(snapshot["series"]["losses"]["syn4d"]["total"][0]["value"], 0.3)
@@ -444,6 +465,9 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("`${label} · EMA`", html)
         self.assertIn("solid lines are debiased exponential moving averages", html)
         self.assertIn("lossLines", html)
+        self.assertIn("fitLossScale", html)
+        self.assertIn("updateLossChart", html)
+        self.assertIn("no smoothing is applied", html)
         self.assertIn("loss-large", html)
         self.assertIn("toggleLossSeries", html)
         self.assertIn("seriesKey:'trajectory'", html)

@@ -413,6 +413,39 @@ def loss_series_from_scalars(
     }
 
 
+def aggregated_ratio_series(
+    numerator: list[dict[str, float | int]],
+    denominator: list[dict[str, float | int]],
+) -> list[dict[str, float | int]]:
+    """Compute a sparse ratio from two losses already aggregated per step."""
+    denominator_by_step = {
+        int(point["step"]): point for point in denominator
+    }
+    output: list[dict[str, float | int]] = []
+    for numerator_point in numerator:
+        step = int(numerator_point["step"])
+        denominator_point = denominator_by_step.get(step)
+        if denominator_point is None:
+            continue
+        numerator_value = finite_float(numerator_point.get("value"))
+        denominator_value = finite_float(denominator_point.get("value"))
+        if (
+            numerator_value is None
+            or denominator_value is None
+            or denominator_value <= 0.0
+        ):
+            continue
+        point: dict[str, float | int] = {
+            "step": step,
+            "value": numerator_value / denominator_value,
+        }
+        wall_time = numerator_point.get("wall_time", denominator_point.get("wall_time"))
+        if wall_time is not None:
+            point["wall_time"] = float(wall_time)
+        output.append(point)
+    return output
+
+
 def validation_series_from_scalars(
     scalars: dict[str, list[dict[str, float | int]]],
 ) -> dict[str, dict[str, list[dict[str, float | int]]]]:
@@ -807,14 +840,15 @@ class TrainingDashboardState:
             failed = len(self.log_reader.failure_events)
 
             losses = loss_series_from_scalars(scalars)
+            stationary = scalars.get(
+                "baseline/stationary_trajectory_loss",
+                [],
+            )
             baseline = {
-                "stationary": scalars.get(
-                    "baseline/stationary_trajectory_loss",
-                    [],
-                ),
-                "model_ratio": scalars.get(
-                    "baseline/model_to_stationary_ratio",
-                    [],
+                "stationary": stationary,
+                "model_ratio": aggregated_ratio_series(
+                    losses["combined"]["flow"],
+                    stationary,
                 ),
             }
             gradients = {
@@ -1094,8 +1128,8 @@ INDEX_HTML = r"""<!doctype html>
   <section>
     <h2>Trajectory baseline</h2>
     <div class="grid-2">
-      <div class="chart-panel"><h3>Model versus stationary prediction</h3><div class="chart-wrap"><canvas id="stationary-baseline"></canvas></div><div class="chart-note">Faint points are diagnostic samples; solid lines are trailing 50-sample means. Stationary holds every track at its query coordinate.</div></div>
-      <div class="chart-panel"><h3>Model / stationary loss</h3><div class="chart-wrap"><canvas id="stationary-ratio"></canvas></div><div class="chart-note">Faint points are diagnostic samples; the solid line is the trailing 50-sample mean. Below 1.0 means the model beats the no-motion baseline.</div></div>
+      <div class="chart-panel"><h3>Model versus stationary prediction</h3><div class="chart-wrap"><canvas id="stationary-baseline"></canvas></div><div class="chart-note">Model loss is shown continuously; stationary loss is shown at diagnostic steps only. Stationary holds every track at its query coordinate.</div></div>
+      <div class="chart-panel"><h3>Model / stationary loss</h3><div class="chart-wrap"><canvas id="stationary-ratio"></canvas></div><div class="chart-note">Each point is the ratio of the aggregated model and stationary losses at a diagnostic step; no smoothing is applied. Below 1.0 means the model beats the no-motion baseline.</div></div>
     </div>
   </section>
 
@@ -1184,14 +1218,16 @@ const compactNumber=value=>{
 function options(xTitle,yTitle,extra={}){
   return {responsive:true,maintainAspectRatio:false,animation:reduced?false:{duration:180},interaction:{mode:'index',intersect:false},plugins:{legend:{display:extra.legend!==false,position:'bottom',...(extra.legendOnClick?{onClick:extra.legendOnClick}:{}),labels:{color:palette.text,usePointStyle:true,boxWidth:8,filter:(item,data)=>data.datasets[item.datasetIndex].showInLegend!==false}},tooltip:{enabled:true,backgroundColor:palette.panel,titleColor:palette.text,bodyColor:palette.text,borderColor:palette.border,borderWidth:1}},scales:{x:{type:extra.xType||'linear',grid:{color:palette.border},ticks:{color:palette.muted,maxTicksLimit:10},title:{display:true,text:xTitle,color:palette.muted}},y:{min:extra.min,max:extra.max,grid:{color:palette.border},ticks:{color:palette.muted,callback:extra.tickCallback||compactNumber},title:{display:true,text:yTitle,color:palette.muted}},...(extra.scales||{})}};
 }
-function toggleLossSeries(_event,legendItem,legend){const chart=legend.chart,key=chart.data.datasets[legendItem.datasetIndex].seriesKey,visible=chart.isDatasetVisible(legendItem.datasetIndex);chart.data.datasets.forEach((dataset,index)=>{if(dataset.seriesKey===key)chart.setDatasetVisibility(index,!visible);});chart.update(reduced?'none':undefined);}
+function fitLossScale(chart){const values=chart.data.datasets.flatMap((dataset,index)=>chart.isDatasetVisible(index)?dataset.data.map(point=>Number(point.y)).filter(Number.isFinite):[]);if(!values.length){delete chart.options.scales.y.min;delete chart.options.scales.y.max;return;}const minimum=Math.min(...values),maximum=Math.max(...values),range=maximum-minimum||Math.max(Math.abs(maximum)*.1,1e-6),padding=range*.08;chart.options.scales.y.min=Math.max(0,minimum-padding);chart.options.scales.y.max=maximum+padding;}
+function updateLossChart(chart,datasets){datasets.forEach((data,index)=>{chart.data.datasets[index].data=data;});fitLossScale(chart);chart.update(reduced?'none':undefined);}
+function toggleLossSeries(_event,legendItem,legend){const chart=legend.chart,key=chart.data.datasets[legendItem.datasetIndex].seriesKey,visible=chart.isDatasetVisible(legendItem.datasetIndex);chart.data.datasets.forEach((dataset,index)=>{if(dataset.seriesKey===key)chart.setDatasetVisibility(index,!visible);});fitLossScale(chart);chart.update(reduced?'none':undefined);}
 const charts={
   combined:new Chart(document.getElementById('loss-combined'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries,xType:'logarithmic'})}),
   diegesis:new Chart(document.getElementById('loss-diegesis'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries,xType:'logarithmic'})}),
   syn4d:new Chart(document.getElementById('loss-syn4d'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries,xType:'logarithmic'})}),
   mvkubric:new Chart(document.getElementById('loss-mvkubric'),{type:'line',data:{datasets:lossLines()},options:options('Optimizer step','Loss',{legendOnClick:toggleLossSeries,xType:'logarithmic'})}),
-  stationary:new Chart(document.getElementById('stationary-baseline'),{type:'line',data:{datasets:[rawPoints('Model trajectory',palette.s1),meanLine('Model trajectory',palette.s1),rawPoints('Stationary baseline',palette.s4),meanLine('Stationary baseline',palette.s4,{borderDash:[6,4]})]},options:options('Optimizer step','Trajectory loss',{xType:'logarithmic'})}),
-  stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[rawPoints('Model / stationary',palette.s1),meanLine('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0,xType:'logarithmic'})}),
+  stationary:new Chart(document.getElementById('stationary-baseline'),{type:'line',data:{datasets:[line('Model trajectory',palette.s1),rawPoints('Stationary baseline',palette.s4)]},options:options('Optimizer step','Trajectory loss',{xType:'logarithmic'})}),
+  stationaryRatio:new Chart(document.getElementById('stationary-ratio'),{type:'line',data:{datasets:[line('Model / stationary',palette.s1),line('Parity',palette.muted,{borderDash:[5,4],pointRadius:0})]},options:options('Optimizer step','Loss ratio',{min:0,xType:'logarithmic'})}),
   validationCombined:new Chart(document.getElementById('validation-combined'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
   validationDiegesis:new Chart(document.getElementById('validation-diegesis'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
   validationSyn4d:new Chart(document.getElementById('validation-syn4d'),{type:'line',data:{datasets:[]},options:options('Optimizer step','Score')}),
@@ -1253,10 +1289,10 @@ const debiasedEmaXY=(input,weight=lossSmoothingWeight)=>{
 const debiasedEmaPoints=series=>debiasedEmaXY(points(series));
 function renderLossCharts(){
   const lossData=source=>[points(source.total),debiasedEmaPoints(source.total),points(source.visibility),debiasedEmaPoints(source.visibility),points(source.flow),debiasedEmaPoints(source.flow)];
-  update(charts.combined,lossData(currentLosses.combined||{}));
-  update(charts.diegesis,lossData(currentLosses.diegesis||{}));
-  update(charts.syn4d,lossData(currentLosses.syn4d||{}));
-  update(charts.mvkubric,lossData(currentLosses.mvkubric||{}));
+  updateLossChart(charts.combined,lossData(currentLosses.combined||{}));
+  updateLossChart(charts.diegesis,lossData(currentLosses.diegesis||{}));
+  updateLossChart(charts.syn4d,lossData(currentLosses.syn4d||{}));
+  updateLossChart(charts.mvkubric,lossData(currentLosses.mvkubric||{}));
 }
 lossSmoothing.addEventListener('input',event=>{
   lossSmoothingWeight=Number(event.target.value);
@@ -1289,8 +1325,8 @@ function render(state){
   renderLossCharts();
   const combinedLosses=currentLosses.combined||{};
   const baseline=state.series?.baseline||{};
-  update(charts.stationary,[points(combinedLosses.flow),movingAveragePoints(combinedLosses.flow),points(baseline.stationary),movingAveragePoints(baseline.stationary)]);
-  update(charts.stationaryRatio,[points(baseline.model_ratio),movingAveragePoints(baseline.model_ratio),parityPoints(baseline.model_ratio)]);
+  update(charts.stationary,[points(combinedLosses.flow),points(baseline.stationary)]);
+  update(charts.stationaryRatio,[points(baseline.model_ratio),parityPoints(baseline.model_ratio)]);
   const timing=state.series?.timing||{};
   update(charts.timing,[points(timing.total),points(timing.data),points(timing.fwd),points(timing.bwd)]);
   update(charts.learningRate,[points(state.series?.learning_rate)]);
