@@ -925,6 +925,16 @@ The out-of-window discontinuities should still be excluded from future samples.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/sc846272
 - Volume output: `syn4d-scene-audits/planet-castle-integrity-window-20260822`
 
+The exact step-26 Planet Bald and step-132 Castle samples were subsequently
+replayed through the live stochastic sampler and rendered as visibility-aware
+track overlays. Every currently source-visible selected track is drawn, with
+eight-frame trails for the 256 fastest tracks in each sampled window. Selected
+views are bright, unselected views are dimmed, and the sampled 24-frame interval
+is marked in the video. The CPU-only run completed successfully:
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/n1a7zamv
+- Volume output: `syn4d-track-overlays/planet-castle-track-overlay-v2-20260822`
+
 ## 20 August 2026: H200 universal-pair training restart
 
 The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
