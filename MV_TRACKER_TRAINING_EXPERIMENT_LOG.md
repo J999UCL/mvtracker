@@ -1532,3 +1532,31 @@ step-250 and step-500 checkpoints remain on the run Volume.
 - Run: `gt-replay-syn4d-main-ddp2-h200-256g-d44c73d-20260821T231000Z`
 - Function call: `fc-01M0K63D2YX68PJ3TVCDKPHJ06`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/b7f6de8d6ff6
+
+## 22 August 2026: environment-disjoint Syn4D relaunch gate
+
+The three-source recipe was updated to 16 environment-disjoint Syn4D training
+sequences and four different validation environments. MV-Kubric scenes 101--102
+were added to every validation checkpoint while the full 101--127 cohort
+remained restricted to steps 0, 1000 and 2000. Per-scene top-loss records and
+source/scene gradient agreement were also enabled.
+
+Two initial launch attempts exposed a local-variable collision in the new
+diagnostic logging: file handles named `output` shadowed the model prediction
+mapping after optimizer step 1. Both handles were renamed, and an AST contract
+now rejects file handles named `output` inside the training loop. The failed
+W&B runs were `02dfbc91692e` and `df0ab3c8905b`; neither produced a checkpoint.
+
+The corrected run completed all step-zero validation and nine optimizer
+updates, confirming that both new diagnostic streams work. It was stopped
+under the early safety gate because direct cold reads remained unsuitable for
+a long two-H200 run. Exposed data waits included 105.6 seconds on update 1,
+44.6 seconds on update 5 and 72.0 seconds on update 7. Warm updates could be
+fast (5.9--7.2 seconds), but minute-scale stalls recurred rather than being a
+single startup event. The H200 container was stopped before a periodic
+checkpoint, and unrelated Modal containers were not interrupted.
+
+- Run: `gt-replay-syn4d-envsplit-v2-ddp2-h200-20260822T111243Z`
+- Function call: `fc-01M0MJSMW53QHXZC10PFY14NEN`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/34be2cae1229
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
