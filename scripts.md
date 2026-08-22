@@ -185,6 +185,18 @@ Training entrypoints submit with Modal `Function.spawn()` and print a
 durable Function Call ID against the deployed worker; the remote job therefore
 survives both CLI disconnection and closure of the ephemeral launcher app.
 
+### Audit high-loss Syn4D scenes on CPU
+
+Audit raw 3D jumps, visibility and RGB-D projection consistency for the exact
+Planet Bald and Castle spike windows. The job uses no GPU and writes reports
+under `jeet-mvtracker-runs-v2/syn4d-scene-audits/`.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT=<full-pushed-origin-main-sha>
+modal run --timestamps tools/modal_syn4d_scene_audit.py
+```
+
 The CPU setup expands the DIEGESIS archive and each official 1,000-scene
 MV-Kubric archive once under `/mnt/mvtracker-data`. It copies validation scenes
 `101`--`127`, builds `MVTracker_index` from the observed scene inventory, and
