@@ -219,6 +219,23 @@ def _audit_scene(scene_root: Path, specification, output_root: Path):
             "visible_both_fraction": float((jumps & pair_visible).sum() / max(1, jumps.sum())),
         }
 
+    start, stop = (int(value) for value in specification["window"])
+    window_slice = slice(start, stop - 1)
+    window_usable = usable[window_slice]
+    window_visible = pair_visible[window_slice]
+    window_displacement = displacement[window_slice]
+    report["spike_window_displacement_metres"] = _distribution(
+        window_displacement[window_usable]
+    )
+    report["spike_window_jump_thresholds"] = {}
+    for threshold in JUMP_THRESHOLDS_METRES:
+        jumps = window_usable & (window_displacement > threshold)
+        report["spike_window_jump_thresholds"][str(threshold)] = {
+            "frame_track_pairs": int(jumps.sum()),
+            "unique_tracks": int(np.any(jumps, axis=0).sum()),
+            "visible_both_ends": int((jumps & window_visible).sum()),
+        }
+
     threshold = 0.5
     jump_mask = usable & (displacement > threshold)
     frame_counts = jump_mask.sum(axis=1)
@@ -254,7 +271,6 @@ def _audit_scene(scene_root: Path, specification, output_root: Path):
             }
         )
 
-    start, stop = specification["window"]
     report["depth_consistency"] = _audit_depth(
         scene_root,
         tracks,
