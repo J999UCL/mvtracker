@@ -935,6 +935,26 @@ is marked in the video. The CPU-only run completed successfully:
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/n1a7zamv
 - Volume output: `syn4d-track-overlays/planet-castle-track-overlay-v2-20260822`
 
+A follow-up CPU audit replayed 813 recorded samples from Planet Bald, Castle,
+Cave Group and Desert Bald, then correlated loss with sampled world velocity,
+acceleration, jerk, image displacement, visibility transitions and duplicate
+track selection. The simple motion hypothesis was rejected. Cave Group had
+higher median p90 acceleration (21.19 versus 14.83 m/s²) and jerk (535.76
+versus 335.25 m/s³) than Planet Bald, but its median trajectory loss was 0.048
+instead of 0.669. Within Planet, trajectory loss had effectively zero Spearman
+correlation with velocity, acceleration, jerk, pixel motion, visibility or
+track uniqueness (all absolute rho below 0.06).
+
+Planet's largest step-26 sample was ordinary for that scene: its acceleration
+and jerk were at approximately the 50th percentile and its visibility-transition
+rate was at the 24th percentile. Castle's step-132 sample differed: its
+visibility-transition rate was at the 99.5th percentile and only 64.4% of valid
+track-frame entries were visible. This supports severe occlusion/visibility
+complexity for the Castle spike, but not a motion explanation for Planet.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/psyjyg08
+- Volume output: `syn4d-motion-loss-audits/planet-castle-cave-desert-motion-loss-20260822`
+
 ## 20 August 2026: H200 universal-pair training restart
 
 The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
