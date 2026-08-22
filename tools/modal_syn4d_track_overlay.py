@@ -204,7 +204,9 @@ def _render_scene(dataset, specification, output_root: Path):
     tile_width, tile_height = 480, 270
     columns, rows = 4, 2
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = output_root / f"{plan.sequence}_tracks.mp4"
+    output_path = output_root / (
+        f"{plan.sequence}_training-step-{int(specification['training_step']):04d}_tracks.mp4"
+    )
     command = [
         "ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{columns * tile_width}x{rows * tile_height}", "-r", str(fps), "-i", "-",
