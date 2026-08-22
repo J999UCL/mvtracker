@@ -3344,8 +3344,8 @@ def main(cfg: DictConfig):
                     "optimizer_step": total_steps + 1,
                     "top_scenes": top_scenes,
                 }
-                with scene_loss_log_path.open("a", encoding="utf-8") as output:
-                    output.write(json.dumps(payload, sort_keys=True) + "\n")
+                with scene_loss_log_path.open("a", encoding="utf-8") as loss_log:
+                    loss_log.write(json.dumps(payload, sort_keys=True) + "\n")
                 logging.info(
                     "[top_scene_loss:%06d] %s",
                     total_steps + 1,
