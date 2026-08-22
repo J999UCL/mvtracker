@@ -217,6 +217,8 @@ def _validate_summaries(
 def _can_pair(
     first: SceneSummary, second: SceneSummary, capacity: BatchCapacity
 ) -> bool:
+    if capacity.max_group_size < 2:
+        return False
     if first.shape_key != second.shape_key:
         return False
     if first.view_count in capacity.singleton_only_views:
