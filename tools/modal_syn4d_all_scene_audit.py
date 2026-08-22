@@ -153,6 +153,7 @@ def _sample_statistics(dataset, scene: str, records, scene_index: int):
     from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
     from mvtracker.datasets.tapvid3d_multiview_dataset import _visible_path_lengths
 
+    generated_requests = not records
     if records:
         positions = np.linspace(
             0, len(records) - 1, min(SAMPLES_PER_SCENE, len(records)), dtype=np.int64
@@ -166,14 +167,7 @@ def _sample_statistics(dataset, scene: str, records, scene_index: int):
             for position in positions
         ]
     else:
-        requests = [
-            ScheduledSampleRequest(
-                virtual_index=scene_index + sample * len(dataset.seq_names),
-                scene_index=scene_index,
-                view_count=None,
-            )
-            for sample in range(SAMPLES_PER_SCENE)
-        ]
+        requests = []
     movement = np.load(
         Path(dataset.data_root) / scene / "motion_path_length.npy", mmap_mode="r"
     )
@@ -181,8 +175,24 @@ def _sample_statistics(dataset, scene: str, records, scene_index: int):
         Path(dataset.data_root) / scene / "tracks_xyz.npy", mmap_mode="r"
     )
     values = []
-    for request in requests:
+    candidate = 0
+    while len(values) < SAMPLES_PER_SCENE:
+        if generated_requests:
+            request = ScheduledSampleRequest(
+                virtual_index=scene_index + candidate * len(dataset.seq_names),
+                scene_index=scene_index,
+                view_count=None,
+            )
+            candidate += 1
+        else:
+            if len(values) == len(requests):
+                break
+            request = requests[len(values)]
         plan = dataset.plan_sample(request)
+        if plan is None:
+            if generated_requests:
+                continue
+            raise RuntimeError(f"recorded accepted sample was rejected: {scene} {request}")
         selected = np.asarray(plan.selected_global_track_indices, dtype=np.int64)
         window_movement = _visible_path_lengths(
             np.asarray(tracks[plan.frame_indices][:, selected]),
