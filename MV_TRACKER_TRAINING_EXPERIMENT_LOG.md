@@ -955,6 +955,37 @@ complexity for the Castle spike, but not a motion explanation for Planet.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/psyjyg08
 - Volume output: `syn4d-motion-loss-audits/planet-castle-cave-desert-motion-loss-20260822`
 
+## 22 August 2026: complete Syn4D scene-loss audit
+
+A CPU audit compared all 16 Syn4D training scenes against the completed
+2,000-step run's retained scene losses. Arbitrary Unreal world-origin distance
+was overwhelmingly the strongest scene-level predictor of loss: Spearman
+rho=0.890 for total loss (p=2.0e-5), rho=0.881 for trajectory loss, and
+rho=0.829 for visibility loss. The relationship was not driven only by Planet
+Bald and Castle. After excluding both, origin distance still correlated with
+total loss at rho=0.825 (p=9.5e-4) and trajectory loss at rho=0.811.
+
+The scene ordering was consistent: Planet 1,071 m / median loss 1.075; Castle
+524 m / 0.787; Post 142 m / 0.458; Desert 105 m / 0.431; Flying 76 m / 0.452;
+Countryside 53 m / 0.407. Normally centred scenes around 4--26 m generally
+had median loss 0.219--0.318, except Hospital where visibility loss dominated.
+Camera motion, rig radius, centred scene size, full/window motion, view count,
+track count, duplicate fraction and visibility did not significantly explain
+the ranking. This strongly supports fixed camera-rig recentering across every
+Syn4D scene, not merely special-casing two outliers.
+
+The audit also found that Brushify and Winter supplied zero accepted training
+samples. Neither ever appeared in the top-scene ledger, and 200 deterministic
+sample attempts per scene were all rejected. Their precomputed full-sequence
+motion arrays contain zero tracks below the required 1 cm static threshold, so
+the strict 25% static/50% dynamic/25% very-dynamic preselector always computes
+a target size of zero. The effective Syn4D training pool was therefore 14
+scenes, not 16. This is separate from the coordinate fix and must be addressed
+before another Syn4D run.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/mduq74qg
+- Volume output: `syn4d-all-scene-audits/syn4d-all-scene-loss-data-v3-20260822`
+
 ## 20 August 2026: H200 universal-pair training restart
 
 The preceding two-H100 run failed at optimizer step 44. GPU memory had reached
