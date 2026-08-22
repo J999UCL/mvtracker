@@ -3322,9 +3322,11 @@ def main(cfg: DictConfig):
                             total_steps + 1,
                             json.dumps(comparison, sort_keys=True),
                         )
-                    with scene_gradient_log_path.open("a", encoding="utf-8") as output:
+                    with scene_gradient_log_path.open("a", encoding="utf-8") as gradient_log:
                         for comparison in comparisons:
-                            output.write(json.dumps(comparison, sort_keys=True) + "\n")
+                            gradient_log.write(
+                                json.dumps(comparison, sort_keys=True) + "\n"
+                            )
 
             local_scene_loss_records = _finalize_scene_loss_records(
                 pending_scene_loss_records,

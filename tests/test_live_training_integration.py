@@ -26,6 +26,22 @@ def _function(name):
 
 
 class LivePhysicalTrainingTests(unittest.TestCase):
+    def test_training_loop_does_not_shadow_model_output_with_a_file_handle(self):
+        main = next(
+            node
+            for node in TRAIN_TREE.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        file_handle_names = {
+            item.optional_vars.id
+            for node in ast.walk(main)
+            if isinstance(node, ast.With)
+            for item in node.items
+            if isinstance(item.optional_vars, ast.Name)
+        }
+
+        self.assertNotIn("output", file_handle_names)
+
     def test_physical_loss_weights_scene_count(self):
         node = _function("_scale_physical_batch_loss")
         namespace = {}
