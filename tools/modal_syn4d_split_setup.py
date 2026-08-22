@@ -427,6 +427,7 @@ def _convert_jobs(environment_names: tuple[str, ...], shard: str) -> dict[str, o
                 hf_work.mkdir()
                 os.environ["HF_HOME"] = str(work / "hf-home")
                 os.environ["HF_XET_CACHE"] = str(work / "hf-xet")
+                os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "4"
                 source = hf_hub_download(
                     repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION,
                     filename=f"{SYN4D_SUBSET}/{job.environment}.tar.zst",
