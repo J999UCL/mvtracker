@@ -137,7 +137,16 @@ def _jpeg_bytes(height, width, value):
     return np.frombuffer(output.getvalue(), dtype=np.uint8)
 
 
-def _write_raw(root: Path, *, frames=6, points=6, views=2, height=8, width=10):
+def _write_raw(
+    root: Path,
+    *,
+    frames=6,
+    points=6,
+    views=2,
+    height=8,
+    width=10,
+    world_anchor=(0.0, 0.0, 0.0),
+):
     sequence = root / "train/scene-alpha"
     sequence.mkdir(parents=True)
     tracks = np.zeros((frames, points, 3), dtype=np.float32)
@@ -145,6 +154,7 @@ def _write_raw(root: Path, *, frames=6, points=6, views=2, height=8, width=10):
     tracks[..., 1] = np.linspace(-0.3, 0.3, points)
     tracks[..., 2] = 2.0
     tracks[:, 0, 0] += np.arange(frames, dtype=np.float32) * 0.1
+    tracks += np.asarray(world_anchor, dtype=np.float32)
     np.save(sequence / "tracks_xyz.npy", tracks)
     np.save(sequence / "queries_xytv.npy", np.zeros((points, 4), dtype=np.float32))
     for view in range(views):
@@ -155,7 +165,9 @@ def _write_raw(root: Path, *, frames=6, points=6, views=2, height=8, width=10):
             images[frame] = _jpeg_bytes(height, width, 20 + frame + view)
         np.save(view_root / "images_jpeg_bytes.npy", images, allow_pickle=True)
         np.save(view_root / "intrinsics.npy", np.asarray([5, 5, width / 2, height / 2], dtype=np.float32))
-        np.save(view_root / "extrinsics_w2c.npy", np.repeat(np.eye(4, dtype=np.float32)[None], frames, axis=0))
+        extrinsics = np.repeat(np.eye(4, dtype=np.float32)[None], frames, axis=0)
+        extrinsics[:, :3, 3] = -np.asarray(world_anchor, dtype=np.float32)
+        np.save(view_root / "extrinsics_w2c.npy", extrinsics)
         np.save(view_root / "visibility.npy", np.ones((frames, points), dtype=np.bool_))
         np.save(view_root / "depth.npy", np.full((frames, height, width), 2, dtype=np.float32))
         np.save(view_root / "foreground_mask.npy", np.ones((frames, height, width), dtype=np.bool_))
@@ -184,8 +196,13 @@ def _write_estimated_depth(root: Path, *, frames=6, views=(2, 0, 3, 1), height=8
     }))
 
 
-def _dataset(root: Path, *, points=16, views=4):
-    _write_raw(root / "raw", points=points, views=views)
+def _dataset(root: Path, *, points=16, views=4, world_anchor=(0.0, 0.0, 0.0)):
+    _write_raw(
+        root / "raw",
+        points=points,
+        views=views,
+        world_anchor=world_anchor,
+    )
     loader.prepare_tapvid3d_cache(root / "raw", root / "cache")
     dataset = loader.TapVid3DMultiViewDataset.__new__(loader.TapVid3DMultiViewDataset)
     dataset.raw_root = root / "raw/train"
@@ -305,6 +322,20 @@ class CacheTests(unittest.TestCase):
 
 
 class SelectiveLoaderTests(unittest.TestCase):
+    def test_plan_recentres_world_coordinates_and_preserves_cameras(self):
+        with tempfile.TemporaryDirectory() as directory:
+            anchor = np.asarray((100.0, 20.0, 0.0), dtype=np.float32)
+            dataset = _dataset(Path(directory), world_anchor=anchor)
+            dataset.augmentation_probability = 0.0
+            dataset.enable_rgb_augs = False
+            dataset.enable_depth_augs = False
+            dataset.enable_variable_trajpersample_augs = False
+            plan = dataset.plan_sample(0)
+
+            np.testing.assert_allclose(plan.metadata["world_anchor"], anchor)
+            self.assertLess(float(np.abs(plan.trajectory_3d).max()), 3.0)
+            np.testing.assert_allclose(plan.extrinsics[..., 3], 0.0, atol=1e-5)
+
     def test_plan_is_metadata_only_and_materialization_reads_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

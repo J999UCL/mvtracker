@@ -17,7 +17,9 @@ from mvtracker.datasets.kubric_multiview_dataset import _legal_contiguous_window
 from mvtracker.datasets.tapvid3d_multiview_dataset import (
     SamplePlan,
     TapVid3DMultiViewDataset,
+    _camera_rig_anchor,
     _project,
+    _recenter_world_coordinates,
     _sample_depth_patch_operations,
     _sample_rgb_augmentation,
     _sample_tracks,
@@ -29,29 +31,6 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
 
 _DATASET_PREFIX = "syn4d-multiview-"
 _SPLITS = {"training": "train", "validation": "validation", "test": "test"}
-
-
-def _camera_rig_anchor(extrinsics: np.ndarray) -> np.ndarray:
-    """Return the mean frame-zero camera centre in world coordinates."""
-    frame_zero = np.asarray(extrinsics[:, 0, :3, :4], dtype=np.float32)
-    rotations = frame_zero[:, :3, :3]
-    translations = frame_zero[:, :3, 3]
-    centres = -np.einsum("vji,vj->vi", rotations, translations)
-    return centres.mean(axis=0, dtype=np.float64).astype(np.float32)
-
-
-def _recenter_world_coordinates(
-    tracks: np.ndarray,
-    extrinsics: np.ndarray,
-    anchor: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Translate a world frame while preserving every camera projection."""
-    centred_tracks = np.asarray(tracks, dtype=np.float32) - anchor[None, None]
-    centred_extrinsics = np.asarray(extrinsics, dtype=np.float32).copy()
-    centred_extrinsics[..., 3] += np.einsum(
-        "vtij,j->vti", centred_extrinsics[..., :3], anchor
-    )
-    return centred_tracks, centred_extrinsics
 
 
 class _MappedSequence:

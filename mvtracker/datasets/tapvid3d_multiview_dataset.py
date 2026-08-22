@@ -459,6 +459,29 @@ def _project(tracks: np.ndarray, extrinsics: np.ndarray, intrinsics: np.ndarray)
     return np.asarray(xy, dtype=np.float32), np.asarray(camera[..., 2], dtype=np.float32)
 
 
+def _camera_rig_anchor(extrinsics: np.ndarray) -> np.ndarray:
+    """Return the mean frame-zero camera centre in world coordinates."""
+    frame_zero = np.asarray(extrinsics[:, 0, :3, :4], dtype=np.float32)
+    rotations = frame_zero[:, :3, :3]
+    translations = frame_zero[:, :3, 3]
+    centres = -np.einsum("vji,vj->vi", rotations, translations)
+    return centres.mean(axis=0, dtype=np.float64).astype(np.float32)
+
+
+def _recenter_world_coordinates(
+    tracks: np.ndarray,
+    extrinsics: np.ndarray,
+    anchor: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Translate a world frame while preserving every camera projection."""
+    centred_tracks = np.asarray(tracks, dtype=np.float32) - anchor[None, None]
+    centred_extrinsics = np.asarray(extrinsics, dtype=np.float32).copy()
+    centred_extrinsics[..., 3] += np.einsum(
+        "vtij,j->vti", centred_extrinsics[..., :3], anchor
+    )
+    return centred_tracks, centred_extrinsics
+
+
 def _spatial_transform(
     xy: np.ndarray,
     visibility: np.ndarray,
@@ -923,6 +946,20 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             manifest["views"],
         ):
             raise ValueError(f"{cache_root}: cache is incomplete; rerun TAPVid-3D preparation")
+        source_root = self.raw_root / manifest["source_sequence"]
+        frame_zero_extrinsics = np.stack(
+            [
+                np.load(
+                    source_root / str(view) / "extrinsics_w2c.npy",
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )[0:1]
+                for view in manifest["views"]
+            ]
+        )
+        manifest["world_anchor"] = _camera_rig_anchor(
+            frame_zero_extrinsics
+        ).tolist()
         return manifest
 
     def _manifest(self, sequence: str) -> dict[str, Any]:
@@ -1116,6 +1153,12 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         extrinsics_np = np.stack(extrinsics)
         intrinsics_np = np.stack(intrinsics)
         visibility_np = np.stack(visibility)
+        world_anchor = np.asarray(manifest["world_anchor"], dtype=np.float32)
+        tracks, extrinsics_np = _recenter_world_coordinates(
+            tracks,
+            extrinsics_np,
+            world_anchor,
+        )
         xy, camera_z = _project(tracks, extrinsics_np, intrinsics_np)
         visibility_np &= np.isfinite(xy).all(axis=-1) & np.isfinite(camera_z) & (camera_z > 0)
         augment_this_datapoint = bool(
@@ -1259,6 +1302,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "window_end_exclusive": start + self.seq_len,
                 "selected_views": views,
                 "depth_source": depth_type,
+                "world_anchor": world_anchor.tolist(),
                 "requested_view_count": request.view_count if request is not None else None,
                 "gotit": True,
                 "apply_rgb_aug": bool(apply_rgb_aug),

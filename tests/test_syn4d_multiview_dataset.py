@@ -10,8 +10,10 @@ import numpy as np
 from mvtracker.datasets.syn4d_multiview_dataset import (
     Syn4DMultiViewDataset,
     _SequenceMmapCache,
-    _camera_rig_anchor,
     _preselect_tracks,
+)
+from mvtracker.datasets.tapvid3d_multiview_dataset import (
+    _camera_rig_anchor,
     _recenter_world_coordinates,
 )
 
