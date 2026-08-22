@@ -56,6 +56,7 @@ trainer:
   gradient_diagnostics: true
   gradient_diagnostics_interval: 25 # per-scene gradient sketches, in optimizer steps
   gradient_sketch_size: 2048
+  per_scene_loss_top_k: 4
   expensive_diagnostics_interval: 50 # stationary/reprojection diagnostics, in optimizer steps
   precision: 16-mixed               # training precision (e.g., 16-mixed, bf16-mixed or 32-true)
   visibility_loss_weight: 0.1

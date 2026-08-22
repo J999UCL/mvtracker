@@ -429,12 +429,40 @@ def _scene_gradient_agreement(records, previous_by_scene):
     return metrics, comparisons
 
 
-def _gather_scene_gradient_records(fabric, local_records):
+def _gather_rank_records(fabric, local_records):
     if fabric.world_size == 1:
         return list(local_records)
     gathered = [None] * fabric.world_size
     torch.distributed.all_gather_object(gathered, list(local_records))
     return [record for rank_records in gathered for record in rank_records]
+
+
+def _finalize_scene_loss_records(pending_records, optimizer_step):
+    if not pending_records:
+        return []
+    trajectory_losses = torch.stack(
+        [record.pop("_trajectory_loss") for record in pending_records]
+    ).float().cpu().tolist()
+    visibility_losses = torch.stack(
+        [record.pop("_visibility_loss") for record in pending_records]
+    ).float().cpu().tolist()
+    result = []
+    for record, trajectory_loss, visibility_loss in zip(
+        pending_records,
+        trajectory_losses,
+        visibility_losses,
+        strict=True,
+    ):
+        result.append(
+            {
+                **record,
+                "optimizer_step": int(optimizer_step),
+                "trajectory_loss": float(trajectory_loss),
+                "visibility_loss": float(visibility_loss),
+                "total_loss": float(trajectory_loss + visibility_loss),
+            }
+        )
+    return result
 
 
 def _create_torch_profiler(cfg, experiment_path, global_rank):
@@ -934,9 +962,13 @@ def _eval_dataset_names_for_step(cfg, step):
     schedule = cfg.datasets.eval.get("schedule")
     if schedule is None:
         return tuple(cfg.datasets.eval.names)
+    selected = []
     for entry in schedule:
-        if int(step) in {int(value) for value in entry.steps}:
-            return tuple(entry.names)
+        if int(step) not in {int(value) for value in entry.steps}:
+            continue
+        selected.extend(name for name in entry.names if name not in selected)
+    if selected:
+        return tuple(selected)
     raise ValueError(f"no evaluation dataset schedule entry configured for step {step}")
 
 
@@ -2504,6 +2536,10 @@ def main(cfg: DictConfig):
     scene_gradient_log_path = (
         Path(cfg.experiment_path) / "scene_gradient_agreement.jsonl"
     )
+    scene_loss_log_path = Path(cfg.experiment_path) / "per_scene_losses.jsonl"
+    scene_loss_top_k = int(cfg.trainer.get("per_scene_loss_top_k", 4))
+    if scene_loss_top_k < 1:
+        raise ValueError("trainer.per_scene_loss_top_k must be positive")
 
     if latest_checkpoint is not None:
         state = AttributeDict(
@@ -2813,6 +2849,9 @@ def main(cfg: DictConfig):
         microbatch_gradient_cosines = []
         scene_gradient_records = []
         scene_gradient_metrics = {}
+        pending_scene_loss_records = []
+        top_scene_loss_metrics = {}
+        top_scene_loss_text = ""
         mixed_step_batches = None
         physical_step = None
         physical_group_iterator = None
@@ -3186,6 +3225,48 @@ def main(cfg: DictConfig):
                             accumulated_source_metrics.get(key, 0.0)
                             + metric_value * batch_scene_count
                         )
+            record_sources = current_sources or ("training",) * batch_scene_count
+            record_metadata = batch.sample_metadata or ({},) * batch_scene_count
+            record_scenes = (
+                list(batch.seq_name)
+                if isinstance(batch.seq_name, (list, tuple))
+                else [batch.seq_name] * batch_scene_count
+            )
+            for scene_index in range(batch_scene_count):
+                metadata = record_metadata[scene_index]
+                pending_scene_loss_records.append(
+                    {
+                        "source": str(record_sources[scene_index]),
+                        "scene": str(record_scenes[scene_index]),
+                        "rank": int(fabric.global_rank),
+                        "views": source_view_count,
+                        "tracks": int(scene_track_counts[scene_index]),
+                        "window_start": int(metadata.get("window_start", 0)),
+                        "window_end_exclusive": int(
+                            metadata.get("window_end_exclusive", batch.video.shape[2])
+                        ),
+                        "selected_views": [
+                            int(view)
+                            for view in metadata.get(
+                                "selected_views", range(source_view_count)
+                            )
+                        ],
+                        "virtual_index": int(metadata.get("virtual_index", -1)),
+                        "seed": int(metadata.get("seed", -1)),
+                        "depth_source": str(metadata.get("depth_source", "unknown")),
+                        "rgb_augmented": bool(metadata.get("apply_rgb_aug", False)),
+                        "depth_augmented": bool(metadata.get("apply_depth_aug", False)),
+                        "cropping_enabled": bool(cfg.augmentations.cropping),
+                        "scene_transform_enabled": bool(
+                            cfg.augmentations.scene_transform
+                        ),
+                        "camera_noise_enabled": bool(
+                            cfg.augmentations.camera_params_noise
+                        ),
+                        "_trajectory_loss": scene_losses["flow"][scene_index],
+                        "_visibility_loss": scene_losses["visibility"][scene_index],
+                    }
+                )
             accumulated_fwd_duration += forward_duration
             accumulated_bwd_duration += backward_duration
             if microbatch_gradient is not None:
@@ -3223,7 +3304,7 @@ def main(cfg: DictConfig):
                 continue
 
             if run_gradient_diagnostics:
-                gathered_gradient_records = _gather_scene_gradient_records(
+                gathered_gradient_records = _gather_rank_records(
                     fabric,
                     scene_gradient_records,
                 )
@@ -3244,6 +3325,54 @@ def main(cfg: DictConfig):
                     with scene_gradient_log_path.open("a", encoding="utf-8") as output:
                         for comparison in comparisons:
                             output.write(json.dumps(comparison, sort_keys=True) + "\n")
+
+            local_scene_loss_records = _finalize_scene_loss_records(
+                pending_scene_loss_records,
+                total_steps + 1,
+            )
+            gathered_scene_loss_records = _gather_rank_records(
+                fabric,
+                local_scene_loss_records,
+            )
+            if fabric.global_rank == 0:
+                top_scenes = sorted(
+                    gathered_scene_loss_records,
+                    key=lambda record: record["total_loss"],
+                    reverse=True,
+                )[:scene_loss_top_k]
+                payload = {
+                    "optimizer_step": total_steps + 1,
+                    "top_scenes": top_scenes,
+                }
+                with scene_loss_log_path.open("a", encoding="utf-8") as output:
+                    output.write(json.dumps(payload, sort_keys=True) + "\n")
+                logging.info(
+                    "[top_scene_loss:%06d] %s",
+                    total_steps + 1,
+                    json.dumps(top_scenes, sort_keys=True),
+                )
+                if top_scenes:
+                    top_scene_loss_metrics = {
+                        "diagnostics/top_scene_loss/total": top_scenes[0]["total_loss"],
+                        "diagnostics/top_scene_loss/trajectory": top_scenes[0]["trajectory_loss"],
+                        "diagnostics/top_scene_loss/visibility": top_scenes[0]["visibility_loss"],
+                    }
+                    for source in sorted(
+                        {record["source"] for record in gathered_scene_loss_records}
+                    ):
+                        source_maximum = max(
+                            record["total_loss"]
+                            for record in gathered_scene_loss_records
+                            if record["source"] == source
+                        )
+                        top_scene_loss_metrics[
+                            f"diagnostics/top_scene_loss/{source}/total"
+                        ] = source_maximum
+                    top_scene_loss_text = "\n".join(
+                        f"{record['source']}/{record['scene']}: "
+                        f"{record['total_loss']:.6f}"
+                        for record in top_scenes
+                    )
 
             mean_loss_value = _reduce_scalar(
                 fabric,
@@ -3315,6 +3444,14 @@ def main(cfg: DictConfig):
                     tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
                 for metric_name, metric_value in scene_gradient_metrics.items():
                     tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
+                for metric_name, metric_value in top_scene_loss_metrics.items():
+                    tb_writer.add_scalar(metric_name, metric_value, total_steps + 1)
+                if top_scene_loss_text:
+                    tb_writer.add_text(
+                        "diagnostics/top_scene_loss/scenes",
+                        top_scene_loss_text,
+                        total_steps + 1,
+                    )
 
             # Log a limited number of grad + optimizer state pairs, also log current learning rate
             if (total_steps <= 10) or (total_steps % cfg.trainer.viz_freq == 0):
@@ -3917,6 +4054,9 @@ def main(cfg: DictConfig):
             microbatch_gradient_cosines = []
             scene_gradient_records = []
             scene_gradient_metrics = {}
+            pending_scene_loss_records = []
+            top_scene_loss_metrics = {}
+            top_scene_loss_text = ""
             physical_step = None
             physical_group_iterator = None
             physical_group_count = None

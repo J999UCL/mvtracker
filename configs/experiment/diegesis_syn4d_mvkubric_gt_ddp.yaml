@@ -57,22 +57,22 @@ datasets:
         name: syn4d-multiview-training
         root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/syn4d-mvtracker
         include_scene_ids:
-          - lab_bald__seq_000000
-          - lab_bald__seq_000001
-          - lab_bald__seq_000002
-          - lab_bald__seq_000003
-          - lab_bald__seq_000004
-          - lab_bald__seq_000005
-          - lab_bald__seq_000006
-          - lab_bald__seq_000007
-          - lab_bald__seq_000008
-          - lab_bald__seq_000009
-          - lab_bald__seq_000010
-          - lab_bald__seq_000011
-          - lab_bald__seq_000012
-          - lab_bald__seq_000013
-          - lab_bald__seq_000014
-          - lab_bald__seq_000015
+          - bigoffice_v1__seq_000004
+          - scifiroom_bald__seq_000010
+          - cave_group__seq_000008
+          - flying_group__seq_000015
+          - desert_bald__seq_000012
+          - space_bald__seq_000003
+          - brushify_bald__seq_000005
+          - countryside__seq_000019
+          - lab_bald__seq_000017
+          - post_bald__seq_000002
+          - castle__seq_000007
+          - winter__seq_000015
+          - hospital__seq_000003
+          - temple_group__seq_000011
+          - planet_bald__seq_000018
+          - cyber_bald__seq_000001
         view_count_probabilities: [0.20, 0.10, 0.10, 0.25, 0.10, 0.25]
       mvkubric:
         name: kubric-multiview-v3-training
@@ -86,16 +86,14 @@ datasets:
       - kubric-multiview-v3-validation-subset
       - kubric-multiview-v3-validation-full
     schedule:
-      - steps: [0, 1000, 2000]
-        names:
-          - tapvid3d-multiview-validation
-          - syn4d-multiview-validation
-          - kubric-multiview-v3-validation-full
-      - steps: [500, 1500]
+      - steps: [0, 500, 1000, 1500, 2000]
         names:
           - tapvid3d-multiview-validation
           - syn4d-multiview-validation
           - kubric-multiview-v3-validation-subset
+      - steps: [0, 1000, 2000]
+        names:
+          - kubric-multiview-v3-validation-full
     num_workers: 4
     sources:
       diegesis:
@@ -104,12 +102,12 @@ datasets:
         views: [0, 1, 2, 3]
       syn4d:
         root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/syn4d-mvtracker
-        storage_split: train
+        storage_split: validation
         include_scene_ids:
-          - lab_bald__seq_000016
-          - lab_bald__seq_000017
-          - lab_bald__seq_000018
-          - lab_bald__seq_000019
+          - warehouse_group_static__seq_000018
+          - winter_group_static__seq_000009
+          - middleeast_bald__seq_000009
+          - japenese_bald__seq_000009
       mvkubric:
         root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
         subset_scene_ids: ["101", "102"]
@@ -159,11 +157,12 @@ logging:
   log_wandb: true
   wandb_entity: jeetucl-ucl
   wandb_project: mvtracker-continual-training
-  wandb_group: gt-depth-replay-syn4d-v1
+  wandb_group: gt-depth-replay-syn4d-v2
   wandb_run_name: ${oc.env:MVTRACKER_WANDB_RUN_NAME}
   wandb_run_id: ${oc.env:MVTRACKER_WANDB_RUN_ID}
   tags:
     - diegesis-syn4d-mvkubric-25-25-50
+    - syn4d-environment-split-v1
     - gt-depth
     - ddp2-h200
     - full-model

@@ -53,6 +53,7 @@ def _load_gradient_diagnostics():
     names = {
         "_global_gradient_l2_norm",
         "_MicrobatchGradientDiagnostics",
+        "_finalize_scene_loss_records",
         "_sketch_cosine",
         "_scene_gradient_agreement",
     }
@@ -74,6 +75,26 @@ def _load_gradient_diagnostics():
 
 
 class GradientAccumulationTests(unittest.TestCase):
+    def test_scene_loss_records_keep_metadata_and_weighted_components(self):
+        diagnostics = _load_gradient_diagnostics()
+        records = diagnostics["_finalize_scene_loss_records"](
+            [
+                {
+                    "source": "diegesis",
+                    "scene": "kitchen01",
+                    "views": 3,
+                    "tracks": 512,
+                    "_trajectory_loss": torch.tensor(0.2),
+                    "_visibility_loss": torch.tensor(0.03),
+                }
+            ],
+            25,
+        )
+
+        self.assertEqual(records[0]["optimizer_step"], 25)
+        self.assertEqual(records[0]["scene"], "kitchen01")
+        self.assertAlmostEqual(records[0]["total_loss"], 0.23, places=6)
+
     def test_scene_gradient_sketches_group_pairwise_relations(self):
         diagnostics = _load_gradient_diagnostics()
         previous = {

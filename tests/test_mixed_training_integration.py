@@ -116,22 +116,64 @@ class MixedTrainingIntegrationTests(unittest.TestCase):
             config["datasets"]["eval"]["schedule"],
             [
                 {
-                    "steps": [0, 1000],
-                    "names": [
-                        "tapvid3d-multiview-validation",
-                        "kubric-multiview-v3-validation-full",
-                    ],
-                },
-                {
-                    "steps": [250, 500, 750],
+                    "steps": [0, 250, 500, 750, 1000],
                     "names": [
                         "tapvid3d-multiview-validation",
                         "kubric-multiview-v3-validation-subset",
                     ],
                 },
+                {
+                    "steps": [0, 1000],
+                    "names": [
+                        "kubric-multiview-v3-validation-full",
+                    ],
+                },
             ],
         )
 
+    def test_syn4d_recipe_uses_environment_disjoint_fixed_split(self):
+        from mvtracker.profiling.modal_syn4d_split import (
+            TRAIN_ENVIRONMENTS,
+            VALIDATION_ENVIRONMENTS,
+        )
+
+        config_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiment/diegesis_syn4d_mvkubric_gt_ddp.yaml"
+        )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        train = config["datasets"]["train"]["sources"]["syn4d"]
+        validation = config["datasets"]["eval"]["sources"]["syn4d"]
+
+        self.assertEqual(
+            set(train["include_scene_ids"]),
+            {f"{scene}__{sequence}" for scene, sequence in TRAIN_ENVIRONMENTS},
+        )
+        self.assertEqual(validation["storage_split"], "validation")
+        self.assertEqual(
+            set(validation["include_scene_ids"]),
+            {
+                f"{scene}__{sequence}"
+                for scene, sequence in VALIDATION_ENVIRONMENTS
+            },
+        )
+        self.assertTrue(
+            set(train["include_scene_ids"]).isdisjoint(
+                validation["include_scene_ids"]
+            )
+        )
+        schedule = config["datasets"]["eval"]["schedule"]
+        for step in (0, 500, 1000, 1500, 2000):
+            names = {
+                name
+                for entry in schedule
+                if step in entry["steps"]
+                for name in entry["names"]
+            }
+            self.assertIn("kubric-multiview-v3-validation-subset", names)
+            self.assertEqual(
+                "kubric-multiview-v3-validation-full" in names,
+                step in (0, 1000, 2000),
+            )
     def test_eval_schedule_selects_configured_names(self):
         select = _load(
             "_eval_dataset_names_for_step",
@@ -144,13 +186,14 @@ class MixedTrainingIntegrationTests(unittest.TestCase):
                 eval=AttrDict(
                     names=["default"],
                     schedule=[
+                        AttrDict(steps=[0, 1000], names=["subset"]),
                         AttrDict(steps=[0, 1000], names=["full"]),
                         AttrDict(steps=[250, 500, 750], names=["subset"]),
                     ],
                 )
             )
         )
-        self.assertEqual(select(cfg, 0), ("full",))
+        self.assertEqual(select(cfg, 0), ("subset", "full"))
         self.assertEqual(select(cfg, 500), ("subset",))
         with self.assertRaisesRegex(ValueError, "no evaluation dataset schedule"):
             select(cfg, 1250)

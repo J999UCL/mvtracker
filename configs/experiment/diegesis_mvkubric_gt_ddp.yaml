@@ -62,14 +62,13 @@ datasets:
       - kubric-multiview-v3-validation-subset
       - kubric-multiview-v3-validation-full
     schedule:
-      - steps: [0, 1000]
-        names:
-          - tapvid3d-multiview-validation
-          - kubric-multiview-v3-validation-full
-      - steps: [250, 500, 750]
+      - steps: [0, 250, 500, 750, 1000]
         names:
           - tapvid3d-multiview-validation
           - kubric-multiview-v3-validation-subset
+      - steps: [0, 1000]
+        names:
+          - kubric-multiview-v3-validation-full
     num_workers: 4
     sources:
       diegesis:

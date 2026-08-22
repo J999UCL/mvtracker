@@ -44,6 +44,10 @@ from mvtracker.profiling.modal_continual_training import (
     require_remote_main_confirmation,
     validate_run_name,
 )
+from mvtracker.profiling.modal_syn4d_split import (
+    TRAIN_ENVIRONMENTS,
+    VALIDATION_ENVIRONMENTS,
+)
 APP_NAME = "jeet-mvtracker-continual-training"
 SOURCE_ROOT = Path("/opt/mvtracker")
 LOADER_PROFILE_WARMUP = 4
@@ -303,20 +307,31 @@ def train_remote(
     data_inventory = json.loads(
         (Path(DATA_VOLUME_ROOT) / "direct-volume-data-manifest.json").read_text()
     )
-    syn4d_sequences = None
+    syn4d_inventory = None
     if mode.startswith("syn4d_"):
-        syn4d_root = (
-            Path(DATA_VOLUME_ROOT) / "datasets/syn4d-mvtracker/train"
-        )
-        syn4d_sequences = sorted(
-            path.name for path in syn4d_root.iterdir() if path.is_dir()
-        )
-        if len(syn4d_sequences) != 20:
-            raise RuntimeError(
-                f"Syn4D training cache has {len(syn4d_sequences)} sequences; expected 20"
-            )
+        syn4d_root = Path(DATA_VOLUME_ROOT) / "datasets/syn4d-mvtracker"
+        syn4d_inventory = {
+            "train": [
+                f"{environment}__{sequence}"
+                for environment, sequence in TRAIN_ENVIRONMENTS
+            ],
+            "validation": [
+                f"{environment}__{sequence}"
+                for environment, sequence in VALIDATION_ENVIRONMENTS
+            ],
+        }
+        for split, sequences in syn4d_inventory.items():
+            missing = [
+                sequence
+                for sequence in sequences
+                if not (syn4d_root / split / sequence).is_dir()
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Syn4D {split} cache is missing: {', '.join(missing)}"
+                )
     wandb_group = (
-        "gt-depth-replay-syn4d-v1"
+        "gt-depth-replay-syn4d-v2"
         if mode.startswith("syn4d_")
         else WANDB_GROUP
     )
@@ -325,8 +340,8 @@ def train_remote(
         "validation_scene_count": data_inventory["validation_scene_count"],
         "validation_scene_ids": data_inventory["validation_scene_ids"],
     }
-    if syn4d_sequences is not None:
-        run_data_inventory["syn4d_sequences"] = syn4d_sequences
+    if syn4d_inventory is not None:
+        run_data_inventory["syn4d_sequences"] = syn4d_inventory
     modal_tags = PROFILE_TAGS if mode == "memory_profile" else MODAL_TAGS
     manifest = {
         "mode": mode,

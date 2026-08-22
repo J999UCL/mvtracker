@@ -147,6 +147,16 @@ class ModalContinualTrainingContractTests(unittest.TestCase):
         self.assertIn('"function_call_id": call.object_id', source)
         self.assertNotIn("train_remote.remote(", entrypoints)
 
+    def test_syn4d_launch_uses_the_environment_disjoint_split(self):
+        source = (ROOT / "tools/modal_continual_training.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("TRAIN_ENVIRONMENTS", source)
+        self.assertIn("VALIDATION_ENVIRONMENTS", source)
+        self.assertIn('"gt-depth-replay-syn4d-v2"', source)
+        self.assertNotIn("expected 20", source)
+
     def test_resume_preserves_existing_identity_and_skips_duplicate_eval(self):
         source = (ROOT / "tools/modal_continual_training.py").read_text(
             encoding="utf-8"
