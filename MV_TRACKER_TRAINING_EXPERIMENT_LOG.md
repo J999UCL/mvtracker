@@ -934,6 +934,38 @@ than the earlier two-source step-1,000 continuation, especially on DexYCB.
 - Results: `/media/data3/jthakwani/mvtracker-evals/mvtracker-centered-v5-final-eval-20260823T082852Z/final-centered-syn4d-v5/`
 - Log: `/media/data3/jthakwani/mvtracker-evals/mvtracker-centered-v5-final-eval-20260823T082852Z.ucl.log`
 
+### Step-1,500 matched external evaluation
+
+The exact centered-run step-1,500 checkpoint was transferred separately and
+verified as SHA-256
+`3185c09b766dd32024e2d866e689fc34054b94f515df31651ddc6aef6a180929`.
+It completed the same 46-sequence Dopey evaluation without traceback or OOM.
+
+| Benchmark | Metric | Published mixed | Step 1,500 | Step 2,000 |
+|---|---|---:|---:|---:|
+| MV-Kubric | AJ | 73.59 | 72.54 | 72.72 |
+| MV-Kubric | Delta-avg | 84.22 | 83.52 | 83.71 |
+| MV-Kubric | MTE | 7.76 | 8.07 | 8.26 |
+| MV-Kubric | Occlusion accuracy | 91.88 | 91.62 | 91.60 |
+| Panoptic | AJ | 86.03 | 87.40 | 87.02 |
+| Panoptic | Delta-avg | 94.71 | 96.31 | 95.99 |
+| Panoptic | MTE | 3.13 | 2.74 | 2.78 |
+| Panoptic | Occlusion accuracy | 92.28 | 92.04 | 91.99 |
+| DexYCB | AJ | 72.99 | 73.70 | 73.80 |
+| DexYCB | Delta-avg | 82.22 | 83.25 | 83.37 |
+| DexYCB | MTE | 1.85 | 1.67 | 1.60 |
+| DexYCB | Occlusion accuracy | 91.05 | 91.05 | 91.05 |
+
+Step 1,500 is the better balanced checkpoint: it is clearly stronger on
+Panoptic and has better aggregate MTE/occlusion trade-offs, while step 2,000
+is slightly stronger on DexYCB and on MV-Kubric AJ/Delta. Neither checkpoint
+dominates every metric.
+
+- UCL run: `mvtracker-centered-v5-step1500-eval-20260823T090419Z`
+- Checkpoint on Dopey: `/media/data3/jthakwani/mvtracker/checkpoints/gt-replay-centered-syn4d-v5/model_001500.pth`
+- Results: `/media/data3/jthakwani/mvtracker-evals/mvtracker-centered-v5-step1500-eval-20260823T090419Z/step1500-centered-syn4d-v5/`
+- Log: `/media/data3/jthakwani/mvtracker-evals/mvtracker-centered-v5-step1500-eval-20260823T090419Z.ucl.log`
+
 ## 22 August 2026: singleton physical-batch relaunch
 
 Scene pairing was disabled while retaining the four-step planner and encoded
