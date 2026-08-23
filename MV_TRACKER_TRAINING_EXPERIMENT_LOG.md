@@ -897,6 +897,43 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+## 23 August 2026: centered three-source final external evaluation
+
+The completed 2,000-step singleton-batch checkpoint was transferred from the
+Modal run Volume to Dopey and verified as SHA-256
+`3cab615d029fd9706fdc3fbdcc473873ea7afeb761bfc24a9f86926239e31ad8`.
+The existing matched evaluator checkout `7c6a46cd2f8b82f7497b91da1b3637a660ed5e44`
+ran the same cached four-view 30-scene MV-Kubric, six-sequence Panoptic and
+ten-sequence DexYCB benchmark suite as the published mixed-depth baseline.
+All 46 sequences completed on Dopey's RTX 3090 in about 2 minutes 37 seconds;
+all three metric CSVs were written and the log contained no traceback or OOM.
+W&B remained unavailable on Dopey, so the run was durably file-logged.
+
+| Benchmark | Metric | Published mixed-depth | Centered step 2000 | Delta |
+|---|---|---:|---:|---:|
+| MV-Kubric | AJ | 73.59 | 72.72 | -0.87 |
+| MV-Kubric | Delta-avg | 84.22 | 83.71 | -0.51 |
+| MV-Kubric | MTE | 7.76 | 8.26 | +0.50 |
+| MV-Kubric | Occlusion accuracy | 91.88 | 91.60 | -0.28 |
+| Panoptic | AJ | 86.03 | 87.02 | +0.99 |
+| Panoptic | Delta-avg | 94.71 | 95.99 | +1.28 |
+| Panoptic | MTE | 3.13 | 2.78 | -0.35 |
+| Panoptic | Occlusion accuracy | 92.28 | 91.99 | -0.29 |
+| DexYCB | AJ | 72.99 | 73.80 | +0.81 |
+| DexYCB | Delta-avg | 82.22 | 83.37 | +1.15 |
+| DexYCB | MTE | 1.85 | 1.60 | -0.25 |
+| DexYCB | Occlusion accuracy | 91.05 | 91.05 | 0.00 |
+
+The checkpoint modestly regressed synthetic MV-Kubric while improving all
+three trajectory metrics on both real benchmarks. Visibility was neutral on
+DexYCB and slightly lower on Panoptic. This is stronger real-domain transfer
+than the earlier two-source step-1,000 continuation, especially on DexYCB.
+
+- UCL run: `mvtracker-centered-v5-final-eval-20260823T082852Z`
+- Checkpoint on Dopey: `/media/data3/jthakwani/mvtracker/checkpoints/gt-replay-centered-syn4d-v5/model_final.pth`
+- Results: `/media/data3/jthakwani/mvtracker-evals/mvtracker-centered-v5-final-eval-20260823T082852Z/final-centered-syn4d-v5/`
+- Log: `/media/data3/jthakwani/mvtracker-evals/mvtracker-centered-v5-final-eval-20260823T082852Z.ucl.log`
+
 ## 22 August 2026: singleton physical-batch relaunch
 
 Scene pairing was disabled while retaining the four-step planner and encoded

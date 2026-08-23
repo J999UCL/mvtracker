@@ -473,3 +473,34 @@ MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_syn4d_all_sce
 ```bash
 MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) modal run tools/modal_diegesis_scene_loss_audit.py --run-name diegesis-scene-loss-data-20260822
 ```
+
+### Evaluate one continual-training checkpoint on the matched MVTracker benchmarks
+
+Dopey already holds the cached 30-scene MV-Kubric, six-sequence Panoptic and
+ten-sequence DexYCB benchmarks. W&B is unavailable there, so this established
+matched evaluation is file-logged under `/media/data3`.
+
+```bash
+ucl exec dopey --gpu 0 --min-free-vram-gb 20 --detach --new-session \
+  --session <run-name> --project mvtracker-external-evaluation \
+  --log /media/data3/jthakwani/mvtracker-evals/<run-name>.ucl.log \
+  --shell bash --stdin <<'SCRIPT'
+set -euo pipefail
+export CUDA_VISIBLE_DEVICES=0
+export WANDB_MODE=disabled
+export PYTHONPATH=/media/data3/jthakwani/mvtracker
+cd /media/data3/jthakwani/mvtracker
+PPT_EVAL_ROOT=/media/data3/jthakwani/mvtracker-evals/<run-name>
+mkdir -p "$PPT_EVAL_ROOT"
+exec /media/data3/jthakwani/mvtracker-venv/bin/python -m mvtracker.cli.eval \
+  experiment_path="$PPT_EVAL_ROOT/<checkpoint-label>" \
+  model=mvtracker \
+  datasets.root=/media/data3/jthakwani/datasets/mv3dpt-benchmarks \
+  'datasets.eval.names=[kubric-multiview-v3-views0123-cached,panoptic-multiview-views1_7_14_20-cached,dex-ycb-multiview-duster0123-cached]' \
+  restore_ckpt_path=/media/data3/jthakwani/mvtracker/checkpoints/<checkpoint>.pth \
+  logging.log_wandb=false \
+  evaluation.evaluator.rerun_viz_indices=null \
+  evaluation.evaluator.forward_pass_log_indices=null \
+  evaluation.evaluator.mp4_track_viz_indices=null
+SCRIPT
+```
