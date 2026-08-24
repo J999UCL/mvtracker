@@ -18,7 +18,7 @@ from torch.nn import functional as F
 from torchvision.io import ImageReadMode, decode_jpeg
 from torchvision.transforms import functional as TF
 
-from mvtracker.datasets.estimated_depth import ESTIMATED_DEPTH_TYPE_PROBABILITIES
+from mvtracker.datasets.estimated_depth import sample_depth_source
 from mvtracker.datasets.kubric_multiview_dataset import (
     KubricMultiViewDataset,
     _legal_contiguous_window_starts,
@@ -1087,7 +1087,6 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             "enable_variable_depth_type_augs": bool(
                 requested == "training"
                 and kwargs.get("enable_variable_depth_type_augs")
-                and datasets_cfg.get("estimated_depth_root")
             ),
         })
         estimated_depth_root = datasets_cfg.get("estimated_depth_root")
@@ -1150,12 +1149,13 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             raise ValueError(f"{source_root}: requires {view_count} views")
         views = sorted(rng.choice(available_views, view_count, replace=False).tolist())
 
-        depth_type = "gt"
-        if getattr(self, "enable_variable_depth_type_augs", False):
-            depth_type = str(rng.choice(
-                tuple(ESTIMATED_DEPTH_TYPE_PROBABILITIES),
-                p=tuple(ESTIMATED_DEPTH_TYPE_PROBABILITIES.values()),
-            ))
+        depth_type = sample_depth_source(
+            rng,
+            variable=getattr(self, "enable_variable_depth_type_augs", False),
+            replay_depth_source=(
+                getattr(request, "depth_source", None) if request is not None else None
+            ),
+        )
 
         tracks_all = np.asarray(self._mmap(source_root / "tracks_xyz.npy"), dtype=np.float32)
         visibility_all = np.stack(

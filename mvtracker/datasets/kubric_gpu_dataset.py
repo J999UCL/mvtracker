@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from mvtracker.datasets.estimated_depth import sample_depth_source
 from mvtracker.datasets.kubric_multiview_dataset import (
     KubricMultiViewDataset,
     _legal_contiguous_window_starts,
@@ -40,8 +41,8 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
             raise ValueError("MV-Kubric GPU decode requires kubric_metadata_index_root")
         if self.use_duster_depths or self.clean_duster_depths:
             raise ValueError("MV-Kubric GPU decode supports native GT depth only")
-        if self.estimated_depth_store.enabled or self.enable_variable_depth_type_augs:
-            raise ValueError("MV-Kubric GPU decode does not support estimated depth substitution")
+        if self.estimated_depth_store.enabled:
+            raise ValueError("MV-Kubric GPU decode does not support estimated depth sidecars")
         if self.novel_views is not None or self.normalize_scene_following_vggt:
             raise ValueError("MV-Kubric GPU decode does not support novel-view/VGGT modes")
 
@@ -62,6 +63,13 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
         else:
             seed = int(self.seed + virtual_index if self.add_index_to_seed else self.seed)
         rng = np.random.RandomState(seed)
+        depth_source = sample_depth_source(
+            rng,
+            variable=self.enable_variable_depth_type_augs,
+            replay_depth_source=(
+                getattr(request, "depth_source", None) if request is not None else None
+            ),
+        )
         scene_path = Path(self.data_root) / sequence
         scene, arrays = self.metadata_index.scene(sequence)
 
@@ -253,7 +261,7 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
             source_size=source_size,
             output_size=output_size,
             image_codec="nvimagecodec",
-            depth_source="gt",
+            depth_source=depth_source,
             rgb_sources=tuple(rgb_sources),
             depth_sources=tuple(depth_sources),
             apply_rgb_aug=apply_rgb_aug,
@@ -273,7 +281,7 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
                 "window_start": start,
                 "window_end_exclusive": start + self.seq_len,
                 "selected_views": views,
-                "depth_source": "gt",
+                "depth_source": depth_source,
                 "gotit": True,
                 "apply_rgb_aug": bool(apply_rgb_aug),
                 "apply_depth_aug": bool(apply_depth_aug),
@@ -297,6 +305,10 @@ class GpuDecodedKubricMultiViewDataset(KubricMultiViewDataset):
         )
 
     def materialize_sample(self, plan: SamplePlan):
+        if plan.depth_source != "gt":
+            raise RuntimeError(
+                f"MV-Kubric native media cannot materialize {plan.depth_source} depth"
+            )
         load_started = time.perf_counter()
         rgb_bytes = tuple(path.read_bytes() for path in plan.rgb_sources)
         depth_bytes = tuple(path.read_bytes() for path in plan.depth_sources)

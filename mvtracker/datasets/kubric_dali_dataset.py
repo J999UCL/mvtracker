@@ -12,6 +12,7 @@ import time
 import numpy as np
 import torch
 
+from mvtracker.datasets.estimated_depth import sample_depth_source
 from mvtracker.datasets.kubric_dali_stream import (
     KubricDaliSceneBundle,
     KubricDaliSceneGroup,
@@ -188,12 +189,28 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         virtual_index = request.virtual_index if request is not None else int(index)
         bundle, group, scene_position, reuse_pass = self._next_scene()
         scene = _scene_metadata(bundle)
+        expected_scene = (
+            getattr(request, "expected_scene", None) if request is not None else None
+        )
+        if expected_scene is not None:
+            if scene.name != expected_scene:
+                raise RuntimeError(
+                    "DALI recipe scene diverged: "
+                    f"expected {expected_scene!r}, got {scene.name!r}"
+                )
         if scene.invalid_frame_indices:
             return None
         scene_index = self.seq_names.index(scene.name)
         seed_index = scene_index if self._seed_by_scene else virtual_index
         seed = int(self.seed + seed_index) if self.seed is not None else None
         rng = np.random.RandomState(seed)
+        depth_source = sample_depth_source(
+            rng,
+            variable=getattr(self, "enable_variable_depth_type_augs", False),
+            replay_depth_source=(
+                getattr(request, "depth_source", None) if request is not None else None
+            ),
+        )
 
         if self._fixed_views is not None:
             views = self._fixed_views
@@ -334,7 +351,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             "window_start": 0,
             "window_end_exclusive": 24,
             "selected_views": list(views),
-            "depth_source": "gt" if self.depth_provider == "gt" else "estimated",
+            "depth_source": depth_source,
             "gotit": True,
             "record_store": "dali-webdataset",
             "dali_batch_index": group.batch_index,
@@ -381,7 +398,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             source_size=source_size,
             output_size=output_size,
             image_codec="dali",
-            depth_source="gt" if self.depth_provider == "gt" else "estimated",
+            depth_source=depth_source,
             rgb_sources=rgb_sources,
             depth_sources=depth_sources,
             apply_rgb_aug=apply_rgb_aug,
@@ -397,6 +414,12 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         )
 
     def materialize_sample(self, plan: SamplePlan):
+        payload_depth_source = "gt" if self.depth_provider == "gt" else "estimated"
+        if plan.depth_source != payload_depth_source:
+            raise RuntimeError(
+                f"planned {plan.depth_source} depth but DALI payload contains "
+                f"{payload_depth_source} depth"
+            )
         started = time.perf_counter()
         metadata = dict(plan.metadata)
         metadata["worker_prepare_seconds"] = time.perf_counter() - started

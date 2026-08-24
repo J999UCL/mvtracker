@@ -28,6 +28,7 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
     _spatial_transform,
     _visible_path_lengths,
 )
+from mvtracker.datasets.estimated_depth import sample_depth_source
 
 
 _DATASET_PREFIX = "syn4d-multiview-"
@@ -209,7 +210,10 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             ),
             mmap_cache_sequences=int(datasets_cfg.get("syn4d_mmap_cache_sequences", 4)),
             max_depth=float(datasets_cfg.get("syn4d_max_depth", 300.0)),
-            enable_variable_depth_type_augs=False,
+            enable_variable_depth_type_augs=bool(
+                requested == "training"
+                and kwargs.get("enable_variable_depth_type_augs")
+            ),
             estimated_depth_root=datasets_cfg.get("estimated_depth_root"),
             estimated_depth_provider=datasets_cfg.get("estimated_depth_provider"),
         )
@@ -237,6 +241,13 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             else int(self.seed + virtual_index if self.add_index_to_seed else self.seed)
         )
         rng = np.random.RandomState(seed)
+        depth_source = sample_depth_source(
+            rng,
+            variable=getattr(self, "enable_variable_depth_type_augs", False),
+            replay_depth_source=(
+                getattr(request, "depth_source", None) if request is not None else None
+            ),
+        )
         manifest = self._manifest(sequence)
         frame_count = int(manifest["frame_count"])
         views_available = list(manifest["views"])
@@ -384,7 +395,6 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         if self.enable_camera_params_noise_augs:
             intrinsics += rng.normal(0, 0.001, size=intrinsics.shape)
             extrinsics += rng.normal(0, 0.001, size=extrinsics.shape)
-        depth_source = "estimated" if self.estimated_depth_store.enabled else "gt"
         metadata = {
             "virtual_index": virtual_index,
             "scene_index": scene_index,

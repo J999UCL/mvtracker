@@ -19,6 +19,28 @@ ESTIMATED_DEPTH_TYPE_PROBABILITIES = {
 }
 
 
+def sample_depth_source(
+    rng: np.random.RandomState,
+    *,
+    variable: bool,
+    replay_depth_source: str | None = None,
+) -> str:
+    """Make the native depth draw, optionally replaying a recorded result."""
+    sampled = "gt"
+    if variable:
+        sampled = str(
+            rng.choice(
+                tuple(ESTIMATED_DEPTH_TYPE_PROBABILITIES),
+                p=tuple(ESTIMATED_DEPTH_TYPE_PROBABILITIES.values()),
+            )
+        )
+    if replay_depth_source is None:
+        return sampled
+    if replay_depth_source not in ESTIMATED_DEPTH_TYPE_PROBABILITIES:
+        raise ValueError(f"unknown depth source: {replay_depth_source}")
+    return replay_depth_source
+
+
 class EstimatedDepthStore:
     def __init__(self, root: str | Path | None, provider: str | None):
         if (root is None) != (provider is None):

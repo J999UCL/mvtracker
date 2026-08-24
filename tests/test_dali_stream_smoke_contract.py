@@ -15,6 +15,7 @@ import yaml
 from mvtracker.datasets import kubric_dali_dataset
 from mvtracker.datasets.kubric_dali_dataset import DaliKubricMultiViewDataset
 from mvtracker.datasets.kubric_dali_stream import (
+    KubricDaliSceneOrder,
     KubricDaliSceneBundle,
     KubricDaliSceneGroup,
     KubricDaliSceneStream,
@@ -188,17 +189,63 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         self.assertNotEqual(shuffled, scene_names)
 
     def test_each_epoch_has_a_new_shard_order(self):
-        stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
-        stream.rank = 0
-        stream.seed = 72
-        stream._shuffle_shards = True
-        stream._assigned = tuple(range(8))
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = Path(temporary) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "shards": [
+                            {
+                                "tar": f"shard-{index}.tar",
+                                "nsamples": 44,
+                                "scene_ids": [f"scene-{index}-{scene}" for scene in range(4)],
+                            }
+                            for index in range(8)
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            order = KubricDaliSceneOrder(
+                manifest_path, rank=0, world_size=1, seed=72
+            )
 
-        first = stream._epoch_assignment(0)
-        second = stream._epoch_assignment(1)
-
+        first = order.epoch_shards(0)
+        second = order.epoch_shards(1)
         self.assertEqual(set(first), set(second))
         self.assertNotEqual(first, second)
+
+    def test_manifest_only_recipe_order_matches_group_shuffle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = Path(temporary) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "shards": [
+                            {
+                                "tar": "shard-0.tar",
+                                "nsamples": 88,
+                                "scene_ids": [f"scene-{index}" for index in range(8)],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            order = KubricDaliSceneOrder(
+                manifest_path, rank=0, world_size=1, seed=72
+            )
+
+            expected = []
+            raw = order.raw_scene_names(0)
+            for group_index in range(2):
+                group = list(raw[group_index * 4 : (group_index + 1) * 4])
+                import random
+                random.Random(f"72:0:0:{group_index}").shuffle(group)
+                expected.extend(group)
+
+            self.assertEqual(order.recipe_scene_names(0), tuple(expected))
+            self.assertFalse(any(manifest_path.parent.glob("*.tar")))
 
     def test_native_reader_resets_at_epoch_boundary(self):
         scene_names = ("scene-a", "scene-b", "scene-c", "scene-d")
@@ -377,7 +424,12 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
 
     def test_shuffled_stream_rebuilds_for_the_next_epoch(self):
         original_names = ("a", "b", "c", "d")
-        pair = (Path("epoch.tar"), Path("epoch.idx"), original_names, original_names)
+        pair = types.SimpleNamespace(
+            archive=Path("epoch.tar"),
+            index=Path("epoch.idx"),
+            scene_names=original_names,
+            selected_scene_names=original_names,
+        )
         stream = KubricDaliSceneStream.__new__(KubricDaliSceneStream)
         stream.rank = 0
         stream.seed = 72
@@ -392,6 +444,10 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         stream._shuffle_shards = True
         stream._shuffle_scene_groups = False
         stream._assigned = (pair,)
+        stream.scene_order = types.SimpleNamespace(
+            epoch_shards=lambda _epoch: (pair,),
+            raw_scene_names=lambda _epoch: original_names,
+        )
         stream._expected_scenes = original_names
         stream._pipeline = types.SimpleNamespace(
             run=lambda: (_ for _ in ()).throw(StopIteration)
@@ -434,6 +490,20 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         for start in range(0, 4, 2):
             pair = [consumed[index][0].scene_name for index in (start, start + 1)]
             self.assertEqual(len(set(pair)), 2)
+
+    def test_recipe_scene_is_asserted_before_planning(self):
+        bundle = _training_bundle("scene-a")
+        group = KubricDaliSceneGroup((bundle,), 1, 0.1, 1)
+        dataset = DaliKubricMultiViewDataset.__new__(DaliKubricMultiViewDataset)
+        dataset._streamed_scenes = deque([(bundle, group, 0, 0)])
+
+        request = types.SimpleNamespace(
+            virtual_index=0,
+            scene_index=0,
+            expected_scene="scene-b",
+        )
+        with self.assertRaisesRegex(RuntimeError, "DALI recipe scene diverged"):
+            dataset.plan_sample(request)
 
     def test_resume_offset_continues_inside_the_group(self):
         scenes = tuple(

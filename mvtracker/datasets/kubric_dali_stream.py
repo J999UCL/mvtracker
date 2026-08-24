@@ -35,6 +35,100 @@ class KubricDaliSceneGroup:
     payload_bytes: int
 
 
+@dataclass(frozen=True)
+class KubricDaliShard:
+    archive: Path
+    index: Path
+    scene_names: tuple[str, ...]
+    selected_scene_names: tuple[str, ...]
+
+
+class KubricDaliSceneOrder:
+    """Pure manifest-based view of the rank-local DALI scene order."""
+
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        *,
+        rank: int,
+        world_size: int,
+        seed: int,
+        shuffle_shards: bool = True,
+        include_scene_ids: tuple[str, ...] | None = None,
+    ):
+        manifest_path = Path(manifest_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        selected = (
+            None if include_scene_ids is None else frozenset(map(str, include_scene_ids))
+        )
+        shards = []
+        for item in manifest["shards"]:
+            scene_names = tuple(map(str, item["scene_ids"]))
+            if int(item["nsamples"]) != len(scene_names) * RECORDS_PER_SCENE:
+                raise ValueError(f"{item['tar']}: record count does not match its scenes")
+            selected_names = (
+                scene_names
+                if selected is None
+                else tuple(name for name in scene_names if name in selected)
+            )
+            if selected_names:
+                archive = manifest_path.parent / str(item["tar"])
+                shards.append(
+                    KubricDaliShard(
+                        archive=archive,
+                        index=archive.with_suffix(".idx"),
+                        scene_names=scene_names,
+                        selected_scene_names=selected_names,
+                    )
+                )
+        if shuffle_shards:
+            random.Random(int(seed)).shuffle(shards)
+        shards.sort(key=lambda shard: len(shard.selected_scene_names), reverse=True)
+        partitions: list[list[KubricDaliShard]] = [[] for _ in range(world_size)]
+        counts = [0] * world_size
+        for shard in shards:
+            destination = min(range(world_size), key=counts.__getitem__)
+            partitions[destination].append(shard)
+            counts[destination] += len(shard.selected_scene_names)
+
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.shuffle_shards = bool(shuffle_shards)
+        self.selected_scene_ids = selected
+        self.assigned = tuple(partitions[rank])
+        self.local_scene_count = counts[rank]
+
+    def epoch_shards(self, epoch: int) -> tuple[KubricDaliShard, ...]:
+        assigned = list(self.assigned)
+        if self.shuffle_shards:
+            random.Random(f"{self.seed}:{self.rank}:{int(epoch)}").shuffle(assigned)
+        return tuple(assigned)
+
+    def raw_scene_names(self, epoch: int) -> tuple[str, ...]:
+        return tuple(
+            name
+            for shard in self.epoch_shards(epoch)
+            for name in shard.scene_names
+        )
+
+    def recipe_scene_names(
+        self, epoch: int, scenes_per_batch: int = SCENES_PER_BATCH
+    ) -> tuple[str, ...]:
+        """Return scenes exactly as the stream exposes them after group shuffling."""
+        ordered = self.raw_scene_names(epoch)
+        result = []
+        for group_index, start in enumerate(range(0, len(ordered), scenes_per_batch)):
+            group = list(ordered[start : start + scenes_per_batch])
+            if self.shuffle_shards and len(group) > 1:
+                random.Random(
+                    f"{self.seed}:{self.rank}:{int(epoch)}:{group_index}"
+                ).shuffle(group)
+            if self.selected_scene_ids is not None:
+                group = [name for name in group if name in self.selected_scene_ids]
+            result.extend(group)
+        return tuple(result)
+
+
 def _tensor_bytes(tensor) -> bytes:
     return np.asarray(tensor, dtype=np.uint8).reshape(-1).tobytes()
 
@@ -77,47 +171,19 @@ class KubricDaliSceneStream:
             raise ValueError("start_group_index must be non-negative")
 
         manifest_path = Path(manifest_path)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        selected_scene_ids = (
-            None if include_scene_ids is None else frozenset(map(str, include_scene_ids))
+        self.scene_order = KubricDaliSceneOrder(
+            manifest_path,
+            rank=rank,
+            world_size=world_size,
+            seed=seed,
+            shuffle_shards=shuffle_shards,
+            include_scene_ids=include_scene_ids,
         )
-        shard_pairs = []
-        for shard in manifest["shards"]:
-            scene_names = tuple(map(str, shard["scene_ids"]))
-            if int(shard["nsamples"]) != len(scene_names) * RECORDS_PER_SCENE:
-                raise ValueError(
-                    f"{shard['tar']}: record count does not match its scenes"
-                )
-            archive = manifest_path.parent / str(shard["tar"])
-            selected_names = (
-                scene_names
-                if selected_scene_ids is None
-                else tuple(name for name in scene_names if name in selected_scene_ids)
-            )
-            if selected_names:
-                shard_pairs.append(
-                    (archive, archive.with_suffix(".idx"), scene_names, selected_names)
-                )
-        if shuffle_shards:
-            random.Random(int(seed)).shuffle(shard_pairs)
-        shard_pairs.sort(key=lambda pair: len(pair[3]), reverse=True)
-        partitions: list[
-            list[tuple[Path, Path, tuple[str, ...], tuple[str, ...]]]
-        ] = [
-            [] for _ in range(world_size)
-        ]
-        scene_counts = [0] * world_size
-        for pair in shard_pairs:
-            destination = min(range(world_size), key=lambda value: scene_counts[value])
-            partitions[destination].append(pair)
-            scene_counts[destination] += len(pair[3])
-        assigned = tuple(partitions[int(rank)])
+        assigned = self.scene_order.assigned
         if not assigned and not allow_empty:
             raise ValueError(f"rank {rank} was assigned no WebDataset shards")
-        local_scene_count = int(scene_counts[int(rank)])
-        assigned_scene_count = sum(
-            len(scene_names) for _, _, scene_names, _ in assigned
-        )
+        local_scene_count = self.scene_order.local_scene_count
+        assigned_scene_count = sum(len(shard.scene_names) for shard in assigned)
         if assigned_scene_count % int(scenes_per_batch):
             raise ValueError("rank-local scene count must form complete DALI batches")
         groups_per_epoch = assigned_scene_count // int(scenes_per_batch)
@@ -137,12 +203,12 @@ class KubricDaliSceneStream:
         self.scenes_per_batch = int(scenes_per_batch)
         self.records_per_batch = self.scenes_per_batch * RECORDS_PER_SCENE
         self._assigned = assigned
-        self.assigned_shards = tuple(str(archive) for archive, _, _, _ in assigned)
-        self._selected_scene_ids = selected_scene_ids
+        self.assigned_shards = tuple(str(shard.archive) for shard in assigned)
+        self._selected_scene_ids = self.scene_order.selected_scene_ids
         self.local_scene_names = tuple(
             scene_name
-            for _, _, _, selected_names in assigned
-            for scene_name in selected_names
+            for shard in assigned
+            for scene_name in shard.selected_scene_names
         )
         self.local_scene_count = local_scene_count
         self._scene_cursor = 0
@@ -159,8 +225,8 @@ class KubricDaliSceneStream:
         from nvidia.dali import pipeline_def
 
         def build_pipeline(shards):
-            paths = [str(archive) for archive, _, _, _ in shards]
-            index_paths = [str(index) for _, index, _, _ in shards]
+            paths = [str(shard.archive) for shard in shards]
+            index_paths = [str(shard.index) for shard in shards]
 
             @pipeline_def
             def scene_pipeline():
@@ -195,19 +261,12 @@ class KubricDaliSceneStream:
         self.build_seconds = time.perf_counter() - build_started
 
     def _epoch_assignment(self, epoch: int):
-        assigned = list(self._assigned)
-        if self._shuffle_shards:
-            random.Random(f"{self.seed}:{self.rank}:{int(epoch)}").shuffle(assigned)
-        return tuple(assigned)
+        return self.scene_order.epoch_shards(epoch)
 
     def _start_epoch(self, epoch: int) -> None:
         assigned = self._epoch_assignment(epoch)
         self._pipeline = self._build_pipeline(assigned)
-        self._expected_scenes = tuple(
-            scene_name
-            for _, _, scene_names, _ in assigned
-            for scene_name in scene_names
-        )
+        self._expected_scenes = self.scene_order.raw_scene_names(epoch)
         self._scene_cursor = 0
         self._group_in_epoch = 0
         self._epoch = int(epoch)
@@ -338,5 +397,6 @@ class KubricDaliSceneStream:
 __all__ = [
     "KubricDaliSceneBundle",
     "KubricDaliSceneGroup",
+    "KubricDaliSceneOrder",
     "KubricDaliSceneStream",
 ]

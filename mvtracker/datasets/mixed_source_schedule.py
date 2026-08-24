@@ -9,7 +9,9 @@ import numpy as np
 class ScheduledSampleRequest:
     virtual_index: int
     scene_index: int
-    view_count: None = None
+    view_count: int | None = None
+    depth_source: str | None = None
+    expected_scene: str | None = None
 
 
 @dataclass(frozen=True)
