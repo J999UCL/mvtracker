@@ -508,7 +508,7 @@ SCRIPT
 ### Run long-sequence VGGT-Omega inference and storage/readback profiling
 
 This uses the current DIEGESIS, Syn4D, and MV-Kubric Volume layouts, profiles
-24/48/96/192-frame windows plus full-scene attempts on one exact H100, writes
+24/48/96-frame windows on one exact H100, writes
 float32 per-view sidecars, repacks the two MV-Kubric scenes as float32 TIFF
 depth records for DALI, and measures sidecar/DALI reads outside the H100.
 

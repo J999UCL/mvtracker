@@ -166,6 +166,7 @@ def _probe(source, model, device, candidates, infer_temporal_chunks, *, batch_so
             torch.cuda.empty_cache()
             result["status"] = "oom"
         trials.append(result)
+        print(json.dumps({"event": "window_trial", **result}, sort_keys=True), flush=True)
     safe = [trial for trial in trials if trial["status"] == "safe"]
     if not safe:
         raise RuntimeError(f"no safe VGGT-Omega temporal window for {source.description.name}")
@@ -308,15 +309,15 @@ def infer(run_name: str = "vggt-omega-long") -> dict:
             dataset_sources[0],
             model,
             device,
-            sorted(set([24, 48, 96, 192, dataset_sources[0].description.frame_count])),
+            [24, 48, 96],
             infer_temporal_chunks,
         )
         batch_profile = {
             "batch_1": _probe(
-                dataset_sources[0], model, device, [24, 48, 96], infer_temporal_chunks
+                dataset_sources[0], model, device, [24, 48], infer_temporal_chunks
             ),
             "batch_2": _probe(
-                dataset_sources[0], model, device, [24, 48, 96], infer_temporal_chunks,
+                dataset_sources[0], model, device, [24, 48], infer_temporal_chunks,
                 batch_sources=dataset_sources,
             )
             if len(dataset_sources) == 2
