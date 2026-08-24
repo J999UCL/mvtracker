@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Callable, Mapping, Sequence
@@ -296,41 +297,43 @@ def _decode_rgb_video_dali(
     frame_count: int,
     device: str,
 ) -> np.ndarray:
-    """Decode one complete CFR MP4 with DALI/NVDEC and fused resize."""
+    """Decode and resize one CFR MP4 on CPU with ffmpeg.
 
-    import torch
-    from nvidia.dali import fn, pipeline_def, types
+    The public argument name is retained for compatibility with the existing
+    conversion tests and callers.  Syn4D preparation is deliberately CPU-only
+    now, so ``device`` is only used to reject accidental GPU launches.
+    """
 
-    cuda_device = torch.device(device)
-    if cuda_device.type != "cuda":
-        raise ValueError("DALI video conversion requires a CUDA device")
-    device_id = 0 if cuda_device.index is None else cuda_device.index
-
-    @pipeline_def(batch_size=1, num_threads=4, device_id=device_id)
-    def video_pipeline():
-        frames, _labels = fn.readers.video_resize(
-            device="gpu",
-            filenames=[str(path)],
-            labels=[0],
-            sequence_length=frame_count,
-            step=frame_count,
-            stride=1,
-            random_shuffle=False,
-            pad_sequences=False,
-            resize_x=CACHE_WIDTH,
-            resize_y=CACHE_HEIGHT,
-            dtype=types.UINT8,
-            image_type=types.RGB,
-            name="syn4d_video",
+    if str(device) != "cpu":
+        raise ValueError("Syn4D conversion is CPU-only; pass device='cpu'")
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-threads",
+        str(max(1, min(8, os.cpu_count() or 1))),
+        "-i",
+        str(path),
+        "-frames:v",
+        str(frame_count),
+        "-vf",
+        f"scale={CACHE_WIDTH}:{CACHE_HEIGHT}:flags=bilinear",
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
+    result = subprocess.run(command, check=True, capture_output=True)
+    expected_bytes = frame_count * CACHE_HEIGHT * CACHE_WIDTH * 3
+    if len(result.stdout) != expected_bytes:
+        raise ValueError(
+            f"ffmpeg decoded {len(result.stdout)} bytes for {path}; "
+            f"expected {expected_bytes}"
         )
-        return frames
-
-    pipeline = video_pipeline()
-    pipeline.build()
-    output = pipeline.run()[0].as_cpu().as_array()
-    if output.shape != (1, frame_count, CACHE_HEIGHT, CACHE_WIDTH, 3):
-        raise ValueError(f"DALI returned unexpected video shape {output.shape} for {path}")
-    return np.ascontiguousarray(output[0], dtype=np.uint8)
+    return np.frombuffer(result.stdout, dtype=np.uint8).reshape(
+        frame_count, CACHE_HEIGHT, CACHE_WIDTH, 3
+    ).copy()
 
 
 def _write_jpeg_store(frames_rgb: np.ndarray, destination: Path, *, workers: int) -> None:
@@ -417,14 +420,14 @@ def _convert_sequence(
 ) -> Path:
     _emit(progress, stage="sequence_started", sequence=sequence_base)
     scene = scene_root.name
-    destination = output_root / f"{scene}__{sequence_base}"
-    if (destination / "manifest.json").is_file():
+    final_destination = output_root / f"{scene}__{sequence_base}"
+    if (final_destination / "manifest.json").is_file():
         _emit(progress, stage="sequence_reused", sequence=sequence_base)
-        return destination
+        return final_destination
+    destination = output_root / f".{scene}__{sequence_base}.partial"
     if destination.exists():
-        raise FileExistsError(
-            f"incomplete Syn4D cache exists without a manifest: {destination}"
-        )
+        shutil.rmtree(destination)
+        _emit(progress, stage="sequence_partial_removed", sequence=sequence_base)
     rows_by_view = _sequence_rows(scene_root, sequence_base)
     frame_count = len(rows_by_view[0])
     videos, video_metadata = _sequence_video_metadata(
@@ -569,8 +572,9 @@ def _convert_sequence(
         source_width=source_width,
         source_height=source_height,
     )
-    _emit(progress, stage="sequence_complete", sequence=sequence_base, path=str(manifest))
-    return destination
+    destination.replace(final_destination)
+    _emit(progress, stage="sequence_complete", sequence=sequence_base, path=str(final_destination))
+    return final_destination
 
 
 def convert_syn4d_sequence(
@@ -580,7 +584,7 @@ def convert_syn4d_sequence(
     *,
     official_visualizer_root: Path,
     sequence: str,
-    device: str = "cuda",
+    device: str = "cpu",
     progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Convert exactly one sequence from the scene at ``scene_root``.

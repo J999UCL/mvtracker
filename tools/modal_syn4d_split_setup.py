@@ -447,7 +447,7 @@ def _convert_jobs(environment_names: tuple[str, ...], shard: str) -> dict[str, o
                 DATA_ROOT / SHARED_METADATA_ROOT,
                 DATA_ROOT / job.output_root,
                 sequence=job.sequence,
-                device="cuda",
+                device="cpu",
                 official_visualizer_root=VISUALIZER_ROOT,
             )
             data_volume.commit()

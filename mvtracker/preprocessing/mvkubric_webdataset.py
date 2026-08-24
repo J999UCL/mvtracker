@@ -620,7 +620,7 @@ def finalize_shards(
     if scenes_per_shard <= 0:
         raise ValueError("scenes_per_shard must be positive")
     split_root = Path(output_root)
-    expected = tuple(sorted((str(scene) for scene in expected_scene_ids), key=int))
+    expected = tuple(str(scene) for scene in expected_scene_ids)
     if len(set(expected)) != len(expected):
         raise ValueError("expected_scene_ids must be unique")
     if not expected:

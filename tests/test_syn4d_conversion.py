@@ -212,7 +212,7 @@ class Syn4DConversionTests(unittest.TestCase):
                     output,
                     official_visualizer_root=visualizer,
                     sequence="seq_000000",
-                    device="cuda",
+                    device="cpu",
                     progress=progress.append,
                 )
 

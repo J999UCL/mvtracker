@@ -1,0 +1,10 @@
+{
+  "name": "syn4d-stride1-backfill",
+  "sequences": [
+    {
+      "environment": "countryside",
+      "sequence": "seq_000000",
+      "split": "train"
+    }
+  ]
+}

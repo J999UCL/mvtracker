@@ -1063,7 +1063,7 @@ def convert_syn4d_sequence(
     *,
     official_visualizer_root: Path,
     sequence: str,
-    device: str = "cuda",
+    device: str = "cpu",
     progress=None,
 ):
     """Lazy public entry point for the single-sequence converter."""

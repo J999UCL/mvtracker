@@ -414,7 +414,7 @@ def convert_shard_a_remote() -> dict[str, object]:
             DATA_ROOT / SYN4D_METADATA_ROOT,
             DATA_ROOT / SYN4D_CACHE_ROOT,
             sequence=sequence,
-            device="cuda",
+            device="cpu",
             official_visualizer_root=SYN4D_VISUALIZER_ROOT,
         )
         data_volume.commit()
@@ -464,7 +464,7 @@ def convert_shard_b_remote() -> dict[str, object]:
             DATA_ROOT / SYN4D_METADATA_ROOT,
             DATA_ROOT / SYN4D_CACHE_ROOT,
             sequence=sequence,
-            device="cuda",
+            device="cpu",
             official_visualizer_root=SYN4D_VISUALIZER_ROOT,
         )
         data_volume.commit()
