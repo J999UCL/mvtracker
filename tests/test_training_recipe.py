@@ -51,7 +51,14 @@ class _MetadataDataset:
 
 
 class TrainingRecipeTests(unittest.TestCase):
-    def _plan(self, root: Path, *, steps: int = 2, heartbeat_seconds: float = 10.0):
+    def _plan(
+        self,
+        root: Path,
+        *,
+        steps: int = 2,
+        heartbeat_seconds: float = 10.0,
+        worker_count: int = 1,
+    ):
         datasets = {
             "diegesis": _MetadataDataset("diegesis", reject_virtual_index=0),
             "kubric": _MetadataDataset("kubric"),
@@ -75,6 +82,7 @@ class TrainingRecipeTests(unittest.TestCase):
             },
             heartbeat_seconds=heartbeat_seconds,
             log=logs.append,
+            worker_count=worker_count,
         )
         return datasets, logs, summary
 
@@ -163,6 +171,21 @@ class TrainingRecipeTests(unittest.TestCase):
                 log=logs.append,
             )
             self.assertTrue(any(line.startswith("recipe heartbeat") for line in logs))
+
+    def test_parallel_planning_matches_serial_recipe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._plan(root / "serial", steps=4, worker_count=1)
+            self._plan(root / "parallel", steps=4, worker_count=6)
+            for name in (
+                "rank-0.jsonl",
+                "rank-1.jsonl",
+                "estimated-depth-requests.jsonl",
+            ):
+                self.assertEqual(
+                    (root / "serial" / "recipe" / name).read_text(),
+                    (root / "parallel" / "recipe" / name).read_text(),
+                )
 
 
 if __name__ == "__main__":

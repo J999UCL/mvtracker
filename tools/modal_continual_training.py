@@ -469,6 +469,8 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 },
             },
             heartbeat_seconds=10,
+            worker_count=16,
+            block_steps=25,
         )
     finally:
         heartbeat_stop.set()

@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -254,12 +255,16 @@ def plan_training_recipe(
     heartbeat_seconds: float = 10.0,
     log: LogFunction = _print_log,
     physical_scheduler: Callable[[Sequence[Any]], Any] | None = None,
+    worker_count: int = 1,
+    block_steps: int = 25,
 ) -> dict[str, Any]:
     """Plan every rank without calling any dataset materialization method."""
     if step_count < 1:
         raise ValueError("step_count must be positive")
     if heartbeat_seconds <= 0:
         raise ValueError("heartbeat_seconds must be positive")
+    if worker_count < 1 or block_steps < 1:
+        raise ValueError("worker_count and block_steps must be positive")
     started = time.perf_counter()
     cursors = {
         source: int((source_cursors or {}).get(source, 0))
@@ -267,6 +272,7 @@ def plan_training_recipe(
     }
     progress: dict[str, Any] = {
         "step": 0,
+        "planned": 0,
         "records": 0,
         "retries": 0,
         "source": "startup",
@@ -284,12 +290,14 @@ def plan_training_recipe(
 
     def status() -> str:
         elapsed = max(time.perf_counter() - started, 1e-9)
-        rate = progress["records"] / elapsed
-        remaining = records_per_step * step_count - progress["records"]
+        completed = max(progress["planned"], progress["records"])
+        rate = completed / elapsed
+        remaining = records_per_step * step_count - completed
         eta = remaining / rate if rate else 0.0
         return (
             "recipe heartbeat "
-            f"step={progress['step']}/{step_count} records={progress['records']} "
+            f"step={progress['step']}/{step_count} planned={progress['planned']} "
+            f"records={progress['records']} "
             f"source={progress['source']} scene={progress['scene']} "
             f"retries={progress['retries']} rate={rate:.1f}/s eta={eta:.1f}s "
             f"depth={dict(depth_counts)}"
@@ -311,15 +319,30 @@ def plan_training_recipe(
         step_count=step_count,
         records_per_step=records_per_step,
     )
-    try:
-        with _Heartbeat(heartbeat_seconds, log, status):
-            for step in range(step_count):
-                accepted: list[tuple[int, int, str, int, int, Any, Any]] = []
-                for microbatch, source in enumerate(schedule.source_pattern):
-                    cursor = cursors[source]
+
+    source_positions = {
+        source: tuple(
+            index
+            for index, candidate in enumerate(schedule.source_pattern)
+            if candidate == source
+        )
+        for source in schedule.scene_counts
+    }
+    progress_lock = threading.Lock()
+
+    def plan_source_block(source, start_step, end_step, start_cursor):
+        cursor = int(start_cursor)
+        accepted = []
+        retries = 0
+        calls = 0
+        planning_seconds = 0.0
+        rank_workers = min(int(schedule.world_size), max(1, worker_count))
+        with ThreadPoolExecutor(max_workers=rank_workers) as rank_pool:
+            for step in range(start_step, end_step):
+                for microbatch in source_positions[source]:
                     rejected = 0
                     while True:
-                        candidates = []
+                        requests = []
                         for scheduled_rank in range(schedule.world_size):
                             request = schedule.sample_source(
                                 source, cursor, scheduled_rank
@@ -329,23 +352,32 @@ def plan_training_recipe(
                             )
                             if resolver is not None:
                                 request = resolver(request)
+                            requests.append((scheduled_rank, request))
+                        started_calls = time.perf_counter()
+                        futures = [
+                            rank_pool.submit(datasets[source].plan_sample, request)
+                            for _, request in requests
+                        ]
+                        plans = [future.result() for future in futures]
+                        planning_seconds += time.perf_counter() - started_calls
+                        calls += len(plans)
+                        with progress_lock:
                             progress.update(
                                 source=source,
-                                scene=f"scene-index-{request.scene_index}",
+                                scene=(
+                                    str(plans[-1].sequence)
+                                    if plans[-1] is not None
+                                    else f"scene-index-{requests[-1][1].scene_index}"
+                                ),
+                                planned=progress["planned"] + len(plans),
                             )
-                            planning_started = time.perf_counter()
-                            plan = datasets[source].plan_sample(request)
-                            source_planning_seconds[source] += (
-                                time.perf_counter() - planning_started
-                            )
-                            source_plan_calls[source] += 1
-                            if plan is None:
-                                break
-                            candidates.append((scheduled_rank, request, plan))
-                        if len(candidates) == schedule.world_size:
-                            for scheduled_rank, request, plan in candidates:
+                        if all(plan is not None for plan in plans):
+                            for (scheduled_rank, request), plan in zip(
+                                requests, plans
+                            ):
                                 accepted.append(
                                     (
+                                        step,
                                         microbatch,
                                         scheduled_rank,
                                         source,
@@ -355,57 +387,112 @@ def plan_training_recipe(
                                         plan,
                                     )
                                 )
-                            cursors[source] = cursor + 1
+                            cursor += 1
                             break
                         cursor += 1
                         rejected += 1
-                        progress["retries"] += 1
+                        retries += 1
+                        with progress_lock:
+                            progress["retries"] += 1
+        return source, cursor, accepted, retries, calls, planning_seconds
 
-                if physical_scheduler is None:
-                    assignments = [
-                        (
-                            PhysicalAssignment(
-                                rank=int(item[1]),
-                                group=int(item[0]),
-                                position=0,
-                            ),
-                            item,
+    try:
+        with _Heartbeat(heartbeat_seconds, log, status):
+            source_workers = min(len(source_positions), worker_count)
+            with ThreadPoolExecutor(max_workers=source_workers) as source_pool:
+                for block_start in range(0, step_count, block_steps):
+                    block_end = min(block_start + block_steps, step_count)
+                    futures = [
+                        source_pool.submit(
+                            plan_source_block,
+                            source,
+                            block_start,
+                            block_end,
+                            cursors[source],
                         )
-                        for item in accepted
+                        for source in source_positions
                     ]
-                else:
-                    summaries = tuple(
-                        _scene_summary(source, plan)
-                        for _, _, source, _, _, _, plan in accepted
-                    )
-                    physical = physical_scheduler(summaries)
-                    by_identity = {
-                        (source, plan.sequence, int(plan.virtual_index)): item
-                        for item in accepted
-                        for source, plan in ((item[2], item[6]),)
+                    accepted = []
+                    for future in futures:
+                        (
+                            source,
+                            end_cursor,
+                            source_accepted,
+                            _,
+                            calls,
+                            planning_seconds,
+                        ) = future.result()
+                        cursors[source] = end_cursor
+                        accepted.extend(source_accepted)
+                        source_plan_calls[source] += calls
+                        source_planning_seconds[source] += planning_seconds
+
+                    by_step = {
+                        step: sorted(
+                            (item for item in accepted if item[0] == step),
+                            key=lambda item: (item[1], item[2]),
+                        )
+                        for step in range(block_start, block_end)
                     }
-                    assignments = []
-                    for rank_wave in physical.ranks:
-                        for group_index, group in enumerate(rank_wave.groups):
-                            for position, summary in enumerate(group.scenes):
-                                assignments.append(
-                                    (
-                                        PhysicalAssignment(
-                                            rank=int(rank_wave.rank),
-                                            group=group_index,
-                                            position=position,
-                                        ),
-                                        by_identity[
-                                            (
-                                                summary.source,
-                                                summary.scene,
-                                                summary.cursor,
-                                            )
-                                        ],
-                                    )
+                    for step in range(block_start, block_end):
+                        step_items = by_step[step]
+                        if physical_scheduler is None:
+                            assignments = [
+                                (
+                                    PhysicalAssignment(
+                                        rank=int(item[2]),
+                                        group=int(item[1]),
+                                        position=0,
+                                    ),
+                                    item,
                                 )
-                for physical_assignment, item in assignments:
-                            microbatch, scheduled_rank, source, cursor, retries, request, plan = item
+                                for item in step_items
+                            ]
+                        else:
+                            summaries = tuple(
+                                _scene_summary(item[3], item[7])
+                                for item in step_items
+                            )
+                            physical = physical_scheduler(summaries)
+                            by_identity = {
+                                (
+                                    item[3],
+                                    item[7].sequence,
+                                    int(item[7].virtual_index),
+                                ): item
+                                for item in step_items
+                            }
+                            assignments = []
+                            for rank_wave in physical.ranks:
+                                for group_index, group in enumerate(rank_wave.groups):
+                                    for position, summary in enumerate(group.scenes):
+                                        assignments.append(
+                                            (
+                                                PhysicalAssignment(
+                                                    rank=int(rank_wave.rank),
+                                                    group=group_index,
+                                                    position=position,
+                                                ),
+                                                by_identity[
+                                                    (
+                                                        summary.source,
+                                                        summary.scene,
+                                                        summary.cursor,
+                                                    )
+                                                ],
+                                            )
+                                        )
+                        for physical_assignment, item in assignments:
+                            (
+                                _,
+                                microbatch,
+                                scheduled_rank,
+                                source,
+                                cursor,
+                                retries,
+                                request,
+                                plan,
+                            ) = item
                             depth_source = str(plan.depth_source)
                             augmentation = {
                                 "apply_rgb": bool(plan.apply_rgb_aug),
@@ -449,13 +536,13 @@ def plan_training_recipe(
                                 estimated.setdefault(
                                     (source, str(plan.sequence)), set()
                                 ).add(depth_source)
-                            progress.update(
-                                records=progress["records"] + 1,
-                                source=source,
-                                scene=str(plan.sequence),
-                            )
-                progress["step"] = step + 1
-                if progress["step"] % 25 == 0 or progress["step"] == step_count:
+                            with progress_lock:
+                                progress.update(
+                                    records=progress["records"] + 1,
+                                    source=source,
+                                    scene=str(plan.sequence),
+                                )
+                        progress["step"] = step + 1
                     log(status())
 
         elapsed = time.perf_counter() - started
