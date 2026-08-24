@@ -303,10 +303,12 @@ def _save_burst(result, source, output_root: Path, start: int, end: int) -> dict
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=False)
-    np.save(staging / "depth.npy", np.asarray(result.depth, dtype=np.float32))
-    np.save(staging / "cleaned_mask.npy", np.asarray(result.cleaned_mask, dtype=np.bool_))
-    np.save(staging / "intrinsics.npy", np.asarray(result.intrinsics, dtype=np.float32))
-    np.save(staging / "extrinsics_w2c.npy", np.asarray(result.extrinsics_w2c, dtype=np.float32))
+    # Canonical storage is view-major so training can slice one view's frames
+    # with the same layout as the native per-view depth arrays.
+    np.save(staging / "depth.npy", np.asarray(result.depth, dtype=np.float32).transpose(1, 0, 2, 3))
+    np.save(staging / "cleaned_mask.npy", np.asarray(result.cleaned_mask, dtype=np.bool_).transpose(1, 0, 2, 3))
+    np.save(staging / "intrinsics.npy", np.asarray(result.intrinsics, dtype=np.float32).transpose(1, 0, 2, 3))
+    np.save(staging / "extrinsics_w2c.npy", np.asarray(result.extrinsics_w2c, dtype=np.float32).transpose(1, 0, 2, 3))
     np.save(staging / "scale.npy", np.asarray(result.scale, dtype=np.float32))
     manifest = {
         "format": "mvtracker_vggt_omega_burst",
@@ -318,7 +320,8 @@ def _save_burst(result, source, output_root: Path, start: int, end: int) -> dict
         "frame_end_exclusive": end,
         "frame_count": end - start,
         "resolution_hw": list(source.description.resolution_hw),
-        "depth_shape": list(result.depth.shape),
+        "layout": "view_major",
+        "depth_shape": [len(source.description.view_ids), end - start, *source.description.resolution_hw],
         "depth_dtype": "float32",
         "cleaned_mask_dtype": "bool",
     }
