@@ -90,7 +90,9 @@ def _sources(data_root: Path):
     diegesis = []
     for scene in SCENES["diegesis"]:
         cache = data_root / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache/train" / scene
-        camera_root = data_root / "datasets/diegesis-mvtracker/TAPVid3D_raw/train" / scene / "tracking/sequence"
+        # Modal Volume mounts preserve the raw-tree symlinks but do not resolve
+        # them.  The immutable source tree is mounted in the same Volume.
+        camera_root = data_root / "source/diegesis/scenes" / scene / "tracking/sequence"
         diegesis.append(PackedJpegSceneSource(cache, camera_root=camera_root, view_ids=(0, 1, 2, 3)))
     syn4d = [
         PackedJpegSceneSource(
