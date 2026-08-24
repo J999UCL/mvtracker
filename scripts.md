@@ -416,7 +416,21 @@ MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
   modal run --detach --timestamps tools/modal_syn4d_data_setup.py::remaining
 
 MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)" \
-  modal run --timestamps tools/modal_syn4d_data_setup.py::loader_smoke
+modal run --timestamps tools/modal_syn4d_data_setup.py::loader_smoke
+```
+
+## Download all Syn4D stride-1 environment archives
+
+This CPU-only job downloads all 20 Syn4D environment archives from the pinned
+stride-1 source, reuses the already-present `lab_bald` and `temple_group`
+archives, verifies exact byte sizes, and commits a manifest after every
+archive. It downloads source archives and the mapping only; sequence
+conversion and dependency expansion remain separate stages.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --timestamps tools/modal_syn4d_full_download.py
 ```
 
 ## Convert the fixed Syn4D environment split on Modal
