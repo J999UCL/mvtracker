@@ -1796,3 +1796,46 @@ checkpoint, and unrelated Modal containers were not interrupted.
 - Function call: `fc-01M0MJSMW53QHXZC10PFY14NEN`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/34be2cae1229
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 25 August 2026: CPU-planned recipe and exact-H100 replay smoke
+
+Training sampling can now be fixed before GPU work. A 16-core Modal planner
+uses the live source samplers and rank-local DALI scene order, reads only
+MV-Kubric `meta.npz` records, and writes plain manifest/JSONL recipes to the
+runs Volume. Depth type remains MV-Tracker's native stochastic 70/20/10 draw.
+Training replays each request and records planned versus effective depth; an
+explicit `force_gt_depth` flag supports GT-only experiments without treating a
+missing estimated-depth sidecar as a fallback.
+
+The complete 20-step smoke recipe contains 160 samples: 40 DIEGESIS, 40
+Syn4D, and 80 MV-Kubric, split 80/80 across ranks. It had zero rejected
+requests. Its depth draws were 126 GT, 26 estimated, and 8 estimated-cleaned;
+32 unique scenes would need estimated-depth sidecars. Metadata loading covered
+all 1,992 MV-Kubric scenes, and multiprocessing planned the 160 records in
+33.67 seconds.
+
+- Recipe: `training-recipes/diegesis-syn4d-mvkubric-recipe-smoke20-20260824T232554Z`
+- Recipe W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/7ozhgpkj
+
+The final integration smoke ran 20 optimizer steps on two exact H100 80GB
+GPUs, with validation disabled and all effective depth forced to GT. All 160
+recipe records matched the replayed scenes, frames, views, tracks, and native
+depth choices. Every estimated/cleaned choice was visibly logged as effective
+GT. The first update included cold data/decode setup; subsequent sample waits
+had a 0.05-second median. The final warm step took 5.13 seconds, processed 8
+global samples / 7,651 trajectories, and reached 1,492 trajectories/s. Final
+container RAM was 85.75 GiB under the 256 GiB limit. The durable checkpoint
+stores `total_steps=20`, `recipe_position=20`, seed 72, and logical source
+cursors DIEGESIS 20 / Syn4D 20 / MV-Kubric 40.
+
+- Run: `recipe-gt-smoke20-20260824T234356Z`
+- Run Volume: `continual-training/recipe-gt-smoke20-20260824T234356Z`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/d8dac23cd768
+- Final checkpoint: `model_final.pth`
+
+A full 2,000-step recipe was deliberately stopped after 225 planned steps:
+despite 16 processes and continuous progress logs, full trajectory planning
+projected roughly 45 minutes. The implementation supports full recipes, but
+that path still needs additional sampler-side optimization before it should be
+used as a routine preflight. No silent or unbounded full planning run was left
+active.
