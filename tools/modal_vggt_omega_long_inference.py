@@ -662,8 +662,6 @@ def pack_mvkubric(run_name: str = "vggt-omega-long") -> dict:
 
 @app.function(
     image=image,
-    gpu="T4",
-    secrets=[wandb_secret],
     volumes={str(RUN_ROOT): run_volume.with_mount_options(read_only=True)},
     cpu=8,
     memory=32768,
@@ -675,7 +673,6 @@ def dali_readback(run_name: str = "vggt-omega-long") -> dict:
     from io import BytesIO
     import numpy as np
     import sys
-    import torch
     import nvidia.dali.fn as fn
     import nvidia.dali.types as types
     from nvidia.dali import Pipeline
@@ -710,17 +707,17 @@ def dali_readback(run_name: str = "vggt-omega-long") -> dict:
 
     class DecodePipeline(Pipeline):
         def __init__(self):
-            super().__init__(batch_size=len(rgb_encoded), num_threads=8, device_id=0, exec_pipelined=False)
+            super().__init__(batch_size=len(rgb_encoded), num_threads=8, device_id=None, exec_pipelined=False)
 
         def define_graph(self):
             rgb_input = fn.external_source(name="rgb", device="cpu", batch=True)
             depth_input = fn.external_source(name="depth", device="cpu", batch=True)
             rgb_output = fn.experimental.decoders.image(
-                rgb_input, device="mixed", output_type=types.RGB, dtype=types.UINT8
+                rgb_input, device="cpu", output_type=types.RGB, dtype=types.UINT8
             )
             depth_output = fn.experimental.decoders.image(
                 depth_input, device="cpu", output_type=types.ANY_DATA, dtype=types.FLOAT
-            ).gpu()
+            )
             return rgb_output, depth_output
 
     pipeline = DecodePipeline()
@@ -729,14 +726,14 @@ def dali_readback(run_name: str = "vggt-omega-long") -> dict:
     pipeline.feed_input("rgb", [np.frombuffer(frame, dtype=np.uint8) for frame in rgb_encoded])
     pipeline.feed_input("depth", [np.frombuffer(frame, dtype=np.uint8) for frame in depth_encoded])
     decoded_rgb, decoded_depth = pipeline.run()
-    torch.cuda.synchronize()
     return {
         "format": "mvtracker_vggt_omega_dali_readback",
+        "device": "cpu",
         "dali_reader_seconds": group.read_seconds,
         "decode_seconds": time.perf_counter() - started,
         "rgb_frames": len(decoded_rgb),
         "depth_frames": len(decoded_depth),
-        "depth_dtype": str(decoded_depth.as_tensor().dtype),
+        "depth_dtype": str(decoded_depth.as_array().dtype),
     }
 
 
