@@ -330,7 +330,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     from mvtracker.datasets.kubric_dali_dataset import DaliKubricRecipePlanner
     from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
     from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
-    from mvtracker.datasets.training_recipe import plan_training_recipe
+    from mvtracker.datasets.training_recipe import plan_training_recipe_parallel
 
     validate_run_name(recipe_name)
     seed = 72
@@ -343,20 +343,6 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
         f"volume_output={output_dir}",
         flush=True,
     )
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        group="training-recipe-planning",
-        job_type="recipe-planning",
-        name=recipe_name,
-        tags=["modal", "recipe", "cpu16", "training"],
-        config={
-            "source_commit": _source_commit(),
-            "step_count": int(step_count),
-            "cpu_cores": 16,
-            **MODAL_TAGS,
-        },
-    )
     os.environ.update(
         {
             "MVTRACKER_TRAINING_RUN_DIR": str(output_dir),
@@ -365,7 +351,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
             ),
             "MVTRACKER_TRAINING_SEED": str(seed),
             "MVTRACKER_WANDB_RUN_NAME": recipe_name,
-            "MVTRACKER_WANDB_RUN_ID": str(run.id),
+            "MVTRACKER_WANDB_RUN_ID": recipe_name,
         }
     )
     phase = {"name": "config"}
@@ -454,7 +440,9 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
             master_seed=seed,
         )
         phase["name"] = "sample_planning"
-        summary = plan_training_recipe(
+        heartbeat_stop.set()
+        heartbeat_thread.join()
+        summary = plan_training_recipe_parallel(
             local_output_dir,
             datasets=datasets,
             schedule=schedule,
@@ -468,13 +456,27 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                     for source, dataset in datasets.items()
                 },
             },
-            heartbeat_seconds=10,
             worker_count=16,
             block_steps=25,
+            heartbeat_seconds=10,
         )
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join()
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group="training-recipe-planning",
+        job_type="recipe-planning",
+        name=recipe_name,
+        tags=["modal", "recipe", "cpu16", "training"],
+        config={
+            "source_commit": _source_commit(),
+            "step_count": int(step_count),
+            "cpu_cores": 16,
+            **MODAL_TAGS,
+        },
+    )
     run.summary.update(summary)
     run.finish()
     print(

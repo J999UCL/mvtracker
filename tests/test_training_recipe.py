@@ -12,7 +12,11 @@ from types import SimpleNamespace
 import numpy as np
 
 from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
-from mvtracker.datasets.training_recipe import RecipeReader, plan_training_recipe
+from mvtracker.datasets.training_recipe import (
+    RecipeReader,
+    plan_training_recipe,
+    plan_training_recipe_parallel,
+)
 
 
 class _MetadataDataset:
@@ -176,7 +180,32 @@ class TrainingRecipeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self._plan(root / "serial", steps=4, worker_count=1)
-            self._plan(root / "parallel", steps=4, worker_count=6)
+            datasets = {
+                "diegesis": _MetadataDataset(
+                    "diegesis", reject_virtual_index=0
+                ),
+                "kubric": _MetadataDataset("kubric"),
+            }
+            schedule = BalancedMixedSourceSchedule(
+                {"diegesis": 5, "kubric": 4},
+                ("diegesis", "kubric", "diegesis", "kubric"),
+                world_size=2,
+                master_seed=31,
+            )
+            plan_training_recipe_parallel(
+                root / "parallel" / "recipe",
+                datasets=datasets,
+                schedule=schedule,
+                step_count=4,
+                manifest={
+                    "recipe_name": "unit-test",
+                    "source_commit": "abc123",
+                    "scene_lists": {"diegesis": ["a"], "kubric": ["b"]},
+                },
+                worker_count=4,
+                block_steps=2,
+                log=lambda _: None,
+            )
             for name in (
                 "rank-0.jsonl",
                 "rank-1.jsonl",
