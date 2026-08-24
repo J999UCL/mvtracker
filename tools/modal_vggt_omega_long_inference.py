@@ -56,6 +56,7 @@ def _image() -> modal.Image:
             "hf_xet==1.1.9",
             "wandb==0.19.9",
             "Pillow",
+            "matplotlib==3.8.3",
             "nvidia-dali-cuda120==1.53.0",
         )
         .run_commands(clone)
