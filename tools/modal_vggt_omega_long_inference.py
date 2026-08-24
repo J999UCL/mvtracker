@@ -670,9 +670,24 @@ def pack_mvkubric(run_name: str = "vggt-omega-long") -> dict:
     include_source=False,
 )
 def dali_readback(run_name: str = "vggt-omega-long") -> dict:
+    import importlib.util
+    from io import BytesIO
+    import numpy as np
+    import sys
     import torch
-    from mvtracker.datasets.kubric_dali_stream import KubricDaliSceneStream
-    from mvtracker.datasets.tapvid3d_multiview_dataset import DaliEncodedImageDecoder
+    import nvidia.dali.fn as fn
+    import nvidia.dali.types as types
+    from nvidia.dali import Pipeline
+
+    stream_spec = importlib.util.spec_from_file_location(
+        "kubric_dali_stream_direct", "/opt/mvtracker/mvtracker/datasets/kubric_dali_stream.py"
+    )
+    if stream_spec is None or stream_spec.loader is None:
+        raise RuntimeError("could not load the DALI stream module")
+    stream_module = importlib.util.module_from_spec(stream_spec)
+    sys.modules[stream_spec.name] = stream_module
+    stream_spec.loader.exec_module(stream_module)
+    KubricDaliSceneStream = stream_module.KubricDaliSceneStream
 
     manifest = RUN_ROOT / run_name / "mvkubric-vggt-webdataset" / "train" / "manifest.json"
     stream = KubricDaliSceneStream(
@@ -685,14 +700,34 @@ def dali_readback(run_name: str = "vggt-omega-long") -> dict:
         shuffle_shards=False,
     )
     group = stream.next_scene_group()
-    decoder = DaliEncodedImageDecoder(torch.device("cuda"), max_encoded_images=512)
     rgb = [payload for scene in group.scenes for payload in scene.rgb_npz]
     depth = [payload for scene in group.scenes for payload in scene.depth_npz]
+    rgb_encoded = [frame for payload in rgb for frame in _packed_frames(payload)]
+    depth_encoded = [frame for payload in depth for frame in _packed_frames(payload)]
+    if len(rgb_encoded) != len(depth_encoded):
+        raise RuntimeError("DALI RGB/depth frame counts diverged")
+
+    class DecodePipeline(Pipeline):
+        def __init__(self):
+            super().__init__(batch_size=len(rgb_encoded), num_threads=8, device_id=0, exec_pipelined=False)
+
+        def define_graph(self):
+            rgb_input = fn.external_source(name="rgb", device="cpu", batch=True)
+            depth_input = fn.external_source(name="depth", device="cpu", batch=True)
+            rgb_output = fn.experimental.decoders.image(
+                rgb_input, device="mixed", output_type=types.RGB, dtype=types.UINT8
+            )
+            depth_output = fn.experimental.decoders.image(
+                depth_input, device="cpu", output_type=types.ANY_DATA, dtype=types.FLOAT
+            ).gpu()
+            return rgb_output, depth_output
+
+    pipeline = DecodePipeline()
+    pipeline.build()
     started = time.perf_counter()
-    decoded_rgb, decoded_depth = decoder.decode(
-        [frame for payload in rgb for frame in _packed_frames(payload)],
-        [frame for payload in depth for frame in _packed_frames(payload)],
-    )
+    pipeline.feed_input("rgb", [np.frombuffer(frame, dtype=np.uint8) for frame in rgb_encoded])
+    pipeline.feed_input("depth", [np.frombuffer(frame, dtype=np.uint8) for frame in depth_encoded])
+    decoded_rgb, decoded_depth = pipeline.run()
     torch.cuda.synchronize()
     return {
         "format": "mvtracker_vggt_omega_dali_readback",
@@ -700,7 +735,7 @@ def dali_readback(run_name: str = "vggt-omega-long") -> dict:
         "decode_seconds": time.perf_counter() - started,
         "rgb_frames": len(decoded_rgb),
         "depth_frames": len(decoded_depth),
-        "depth_dtype": str(decoded_depth[0].dtype),
+        "depth_dtype": str(decoded_depth.as_tensor().dtype),
     }
 
 
