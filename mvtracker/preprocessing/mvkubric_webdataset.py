@@ -17,7 +17,6 @@ import time
 from typing import Iterable, Sequence
 
 import numpy as np
-from PIL import Image
 
 
 WEB_DATASET_FORMAT = "mvtracker-kubric-webdataset"
@@ -237,6 +236,8 @@ def _packed_float_depth_frames(
     cleaned: bool,
 ) -> bytes:
     """Encode float32 estimated depth as TIFF bytes for the DALI reader."""
+    import tifffile
+
     scene_root = Path(estimated_depth_root) / str(scene_id)
     if (scene_root / "manifest.json").is_file() and (scene_root / str(view) / "depth.npy").is_file():
         manifest = json.loads((scene_root / "manifest.json").read_text(encoding="utf-8"))
@@ -276,7 +277,7 @@ def _packed_float_depth_frames(
         if cleaned:
             frame = np.where(mask_getter(frame_index), frame, 0.0).astype(np.float32, copy=False)
         stream = io.BytesIO()
-        Image.fromarray(frame, mode="F").save(stream, format="TIFF")
+        tifffile.imwrite(stream, frame, dtype=np.float32)
         payload = stream.getvalue()
         encoded.append(payload)
         offsets.append(offsets[-1] + len(payload))
