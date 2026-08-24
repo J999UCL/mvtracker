@@ -269,6 +269,32 @@ def _emit(event: str, **fields) -> None:
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
+def _download_checkpoint(token: str) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    last_error = None
+    for attempt in range(1, 4):
+        _emit("checkpoint_download_start", attempt=attempt, revision=CHECKPOINT_REVISION)
+        try:
+            path = Path(
+                hf_hub_download(
+                    repo_id=CHECKPOINT_REPO,
+                    filename=CHECKPOINT_FILENAME,
+                    revision=CHECKPOINT_REVISION,
+                    token=token,
+                    local_dir="/tmp/vggt-omega-checkpoint",
+                )
+            )
+            _emit("checkpoint_download_complete", attempt=attempt, path=str(path))
+            return path
+        except Exception as error:
+            last_error = error
+            _emit("checkpoint_download_failed", attempt=attempt, error=repr(error))
+            if attempt < 3:
+                time.sleep(5 * attempt)
+    raise RuntimeError("VGGT-Omega checkpoint download failed after three attempts") from last_error
+
+
 def _save_burst(result, source, output_root: Path, start: int, end: int) -> dict:
     import numpy as np
 
@@ -342,15 +368,7 @@ def burst(
         config={**BASE_TAGS, "dataset": dataset, "window_frames": window_frames, "batch_size": batch_size},
     )
     _emit("burst_start", run_name=run_name, dataset=dataset, window_frames=window_frames, start_frame=start_frame, batch_size=batch_size)
-    checkpoint = Path(
-        hf_hub_download(
-            repo_id=CHECKPOINT_REPO,
-            filename=CHECKPOINT_FILENAME,
-            revision=CHECKPOINT_REVISION,
-            token=os.environ["HF_TOKEN"],
-            local_dir="/tmp/vggt-omega-checkpoint",
-        )
-    )
+    checkpoint = _download_checkpoint(os.environ["HF_TOKEN"])
     device = torch.device("cuda")
     model = load_model(checkpoint, device)
     sources = _sources(DATA_ROOT)[dataset]
