@@ -361,8 +361,8 @@ def burst(
 
     if dataset not in SCENES:
         raise ValueError(f"unsupported dataset {dataset!r}")
-    if window_frames not in {24, 48, 96}:
-        raise ValueError("window_frames must be one of 24, 48, 96")
+    if window_frames not in {24, 32, 48, 64, 96, 120}:
+        raise ValueError("window_frames must be one of 24, 32, 48, 64, 96, 120")
     if batch_size not in {1, 2}:
         raise ValueError("batch_size must be 1 or 2")
     run = wandb.init(
