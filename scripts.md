@@ -524,3 +524,16 @@ modal run --timestamps tools/modal_vggt_omega_long_inference.py::pack_mvkubric \
 modal run --timestamps tools/modal_vggt_omega_long_inference.py::dali_readback \
   --run-name vggt-omega-long-20260824
 ```
+
+For incremental monitored bursts, use the bounded entrypoint below. Each call
+persists its burst before returning; increase the window or batch only after
+the previous call completes and its artifact is present.
+
+```bash
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --timestamps tools/modal_vggt_omega_long_inference.py::burst \
+  --run-name vggt-omega-bursts-20260824 \
+  --dataset diegesis --window-frames 24 --batch-size 1
+modal run --timestamps tools/modal_vggt_omega_long_inference.py::burst_readback \
+  --run-name vggt-omega-bursts-20260824 --dataset diegesis
+```

@@ -265,6 +265,147 @@ def _write_scene(source, output_root, model, device, temporal_frames, infer_temp
     return manifest
 
 
+def _emit(event: str, **fields) -> None:
+    print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
+
+
+def _save_burst(result, source, output_root: Path, start: int, end: int) -> dict:
+    import numpy as np
+
+    burst_root = output_root / source.description.name / f"frames-{start:06d}-{end:06d}"
+    staging = output_root / source.description.name / f".frames-{start:06d}-{end:06d}.partial"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=False)
+    np.save(staging / "depth.npy", np.asarray(result.depth, dtype=np.float32))
+    np.save(staging / "cleaned_mask.npy", np.asarray(result.cleaned_mask, dtype=np.bool_))
+    np.save(staging / "intrinsics.npy", np.asarray(result.intrinsics, dtype=np.float32))
+    np.save(staging / "extrinsics_w2c.npy", np.asarray(result.extrinsics_w2c, dtype=np.float32))
+    np.save(staging / "scale.npy", np.asarray(result.scale, dtype=np.float32))
+    manifest = {
+        "format": "mvtracker_vggt_omega_burst",
+        "provider": "vggt_omega",
+        "complete": True,
+        "scene": source.description.name,
+        "view_ids": list(source.description.view_ids),
+        "frame_start": start,
+        "frame_end_exclusive": end,
+        "frame_count": end - start,
+        "resolution_hw": list(source.description.resolution_hw),
+        "depth_shape": list(result.depth.shape),
+        "depth_dtype": "float32",
+        "cleaned_mask_dtype": "bool",
+    }
+    (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    if burst_root.exists():
+        shutil.rmtree(burst_root)
+    os.replace(staging, burst_root)
+    return manifest
+
+
+@app.function(
+    image=image,
+    gpu="H100!",
+    secrets=[hf_secret, wandb_secret],
+    volumes={str(DATA_ROOT): data_volume.with_mount_options(read_only=True), str(RUN_ROOT): run_volume},
+    cpu=8,
+    memory=65536,
+    ephemeral_disk=512 * 1024,
+    timeout=15 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def burst(
+    run_name: str = "vggt-omega-bursts",
+    dataset: str = "diegesis",
+    window_frames: int = 24,
+    start_frame: int = 0,
+    batch_size: int = 1,
+) -> dict:
+    """Run and persist one small bounded burst per selected scene group."""
+    import torch
+    import wandb
+    from huggingface_hub import hf_hub_download
+    from mvtracker.preprocessing.vggt_omega import infer_temporal_chunks, load_model
+
+    if dataset not in SCENES:
+        raise ValueError(f"unsupported dataset {dataset!r}")
+    if window_frames not in {24, 48, 96}:
+        raise ValueError("window_frames must be one of 24, 48, 96")
+    if batch_size not in {1, 2}:
+        raise ValueError("batch_size must be 1 or 2")
+    run = wandb.init(
+        project="mvtracker-modal-profiling",
+        job_type="vggt-omega-burst",
+        name=run_name,
+        tags=["modal", "h100", "vggt-omega", "burst"],
+        config={**BASE_TAGS, "dataset": dataset, "window_frames": window_frames, "batch_size": batch_size},
+    )
+    _emit("burst_start", run_name=run_name, dataset=dataset, window_frames=window_frames, start_frame=start_frame, batch_size=batch_size)
+    checkpoint = Path(
+        hf_hub_download(
+            repo_id=CHECKPOINT_REPO,
+            filename=CHECKPOINT_FILENAME,
+            revision=CHECKPOINT_REVISION,
+            token=os.environ["HF_TOKEN"],
+            local_dir="/tmp/vggt-omega-checkpoint",
+        )
+    )
+    device = torch.device("cuda")
+    model = load_model(checkpoint, device)
+    sources = _sources(DATA_ROOT)[dataset]
+    output_root = RUN_ROOT / run_name / "bursts" / dataset
+    results = []
+    try:
+        for group_start in range(0, len(sources), batch_size):
+            group = tuple(sources[group_start : group_start + batch_size])
+            end = start_frame + window_frames
+            if any(end > source.description.frame_count for source in group):
+                raise ValueError(f"burst exceeds frame count for {[source.description.name for source in group]}")
+            _emit(
+                "burst_forward_start",
+                dataset=dataset,
+                scenes=[source.description.name for source in group],
+                frame_start=start_frame,
+                frame_end_exclusive=end,
+                batch_size=len(group),
+            )
+            torch.cuda.reset_peak_memory_stats(device)
+            result = infer_temporal_chunks(
+                group,
+                range(start_frame, end),
+                model,
+                device=device,
+                image_resolution=512,
+                loader_workers=8,
+            )
+            torch.cuda.synchronize(device)
+            peak_reserved = int(torch.cuda.max_memory_reserved(device))
+            _emit(
+                "burst_forward_complete",
+                dataset=dataset,
+                scenes=[source.description.name for source in group],
+                peak_reserved_bytes=peak_reserved,
+                batch_size=len(group),
+            )
+            for source, scene_result in zip(group, result.scenes):
+                _emit("burst_save_start", dataset=dataset, scene=source.description.name)
+                manifest = _save_burst(scene_result, source, output_root, start_frame, end)
+                _emit("burst_save_complete", dataset=dataset, scene=source.description.name, path=str(output_root / source.description.name / f"frames-{start_frame:06d}-{end:06d}"))
+                results.append(manifest)
+            run_volume.commit()
+            _emit("burst_commit_complete", dataset=dataset, scenes=[source.description.name for source in group])
+            run.log({"peak_vram_bytes": peak_reserved, "batch_size": len(group), "window_frames": window_frames})
+    except Exception as error:
+        _emit("burst_failed", dataset=dataset, error=repr(error))
+        run.finish(exit_code=1)
+        raise
+    run.summary.update({"dataset": dataset, "burst_count": len(results), "artifacts": results})
+    run.finish()
+    _emit("burst_complete", dataset=dataset, burst_count=len(results))
+    return {"format": "mvtracker_vggt_omega_burst_run", "dataset": dataset, "artifacts": results}
+
+
 @app.function(
     image=image,
     gpu="H100!",
@@ -398,6 +539,44 @@ def readback(run_name: str = "vggt-omega-long") -> dict:
                 }
             )
         report["datasets"][dataset] = entries
+    return report
+
+
+@app.function(
+    image=image,
+    cpu=8,
+    memory=32768,
+    timeout=10 * 60,
+    volumes={str(RUN_ROOT): run_volume.with_mount_options(read_only=True)},
+    include_source=False,
+)
+def burst_readback(run_name: str = "vggt-omega-bursts", dataset: str = "diegesis") -> dict:
+    import numpy as np
+
+    root = RUN_ROOT / run_name / "bursts" / dataset
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+    report = {"format": "mvtracker_vggt_omega_burst_readback", "dataset": dataset, "scenes": []}
+    for scene_root in sorted(path for path in root.iterdir() if path.is_dir()):
+        for burst_root in sorted(path for path in scene_root.iterdir() if path.is_dir()):
+            _emit("burst_read_start", dataset=dataset, scene=scene_root.name, path=str(burst_root))
+            started = time.perf_counter()
+            depth = np.load(burst_root / "depth.npy", mmap_mode="r", allow_pickle=False)
+            mask = np.load(burst_root / "cleaned_mask.npy", mmap_mode="r", allow_pickle=False)
+            selected_depth = np.asarray(depth, dtype=np.float32).copy()
+            selected_mask = np.asarray(mask, dtype=np.bool_).copy()
+            elapsed = time.perf_counter() - started
+            entry = {
+                "scene": scene_root.name,
+                "burst": burst_root.name,
+                "read_seconds": elapsed,
+                "depth_shape": list(selected_depth.shape),
+                "mask_shape": list(selected_mask.shape),
+                "depth_dtype": str(selected_depth.dtype),
+                "mask_dtype": str(selected_mask.dtype),
+            }
+            report["scenes"].append(entry)
+            _emit("burst_read_complete", **entry)
     return report
 
 
