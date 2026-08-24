@@ -555,3 +555,18 @@ modal run --timestamps tools/modal_vggt_omega_long_inference.py::burst \
 modal run --timestamps tools/modal_vggt_omega_long_inference.py::burst_readback \
   --run-name vggt-omega-bursts-20260824 --dataset diegesis
 ```
+
+### Plan and smoke-test a continual-training recipe
+
+The planner uses exactly 16 CPU cores and writes a complete 2,000-step recipe
+to the runs Volume. The smoke consumes its first 20 steps on two H100s with
+explicit GT-depth substitution and no validation.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --detach --timestamps tools/modal_continual_training.py::plan-recipe \
+  --recipe-name <recipe-name> --step-count 2000
+modal run --detach --timestamps tools/modal_continual_training.py::recipe-smoke20 \
+  --run-name <run-name> --recipe-name <recipe-name>
+```

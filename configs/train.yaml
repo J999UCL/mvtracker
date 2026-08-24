@@ -19,6 +19,8 @@ datasets:
     cuda_prefetch_queue_depth: 4
     cuda_decode_batch_size: 2
     materialize_whole_step: false
+    recipe_path: null
+    force_gt_depth: false
     physical_batching:
       enabled: false
       capacity_name: h100-profile-20260816

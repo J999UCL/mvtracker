@@ -44,6 +44,7 @@ from mvtracker.datasets import (
 from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
 from mvtracker.datasets.kubric_dali_dataset import DaliKubricValidationDataset
 from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
+from mvtracker.datasets.mixed_source_schedule import MixedSourceSample, ScheduledSampleRequest
 from mvtracker.datasets.mixed_physical_loader import (
     MixedStepLookahead,
     PhysicalBatchDecoder,
@@ -79,6 +80,124 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 LATEST_CHECKPOINT_MANIFEST = "latest_checkpoint.json"
 WANDB_RUN_ID_FILE = "wandb_run_id.txt"
+
+
+class _RecipeMixedSourceSchedule:
+    """Expose recorded requests through the existing physical lookahead API."""
+
+    def __init__(self, recipe_path, rank, world_size):
+        from mvtracker.datasets.training_recipe import RecipeReader
+
+        self.reader = RecipeReader(recipe_path)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        records = tuple(self.reader.records(self.rank))
+        if not records:
+            raise ValueError(f"training recipe has no records for rank {self.rank}")
+        self.source_pattern = tuple(
+            record.source
+            for record in sorted(
+                (record for record in records if int(record.step) == 0),
+                key=lambda record: int(record.microbatch),
+            )
+        )
+        sources = tuple(dict.fromkeys(record.source for record in records))
+        self._records_by_source = {
+            source: tuple(
+                sorted(
+                    (record for record in records if record.source == source),
+                    key=lambda record: (int(record.step), int(record.microbatch)),
+                )
+            )
+            for source in sources
+        }
+        self._records_by_request = {
+            (str(record.source), int(record.request["virtual_index"])): record
+            for record in records
+        }
+
+    def sample_source(self, source, local_cursor, rank):
+        if int(rank) != self.rank:
+            raise ValueError("recipe schedule only serves its local DDP rank")
+        try:
+            record = self._records_by_source[str(source)][int(local_cursor)]
+        except (KeyError, IndexError) as error:
+            raise RuntimeError(
+                f"recipe has no {source} record at logical cursor {local_cursor}"
+            ) from error
+        return MixedSourceSample(
+            source=str(source),
+            request=record.replay_request(ScheduledSampleRequest),
+        )
+
+    def record_for_request(self, source, request):
+        return self._records_by_request[(str(source), int(request.virtual_index))]
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state):
+        if state:
+            raise ValueError("recipe schedule checkpoint state must be empty")
+
+
+class _RecipeDataset:
+    """Validate replayed plans and optionally substitute GT depth."""
+
+    def __init__(self, source, dataset, schedule, force_gt_depth):
+        self.source = str(source)
+        self.dataset = dataset
+        self.schedule = schedule
+        self.force_gt_depth = bool(force_gt_depth)
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def plan_sample(self, request):
+        plan = self.dataset.plan_sample(request)
+        if plan is None:
+            raise RuntimeError("an accepted recipe request replayed as an invalid plan")
+        record = self.schedule.record_for_request(self.source, request)
+        observed = (
+            int(plan.seed),
+            str(plan.sequence),
+            tuple(int(value) for value in plan.frame_indices),
+            tuple(int(value) for value in plan.views),
+            int(plan.track_count),
+            tuple(int(value) for value in plan.selected_global_track_indices),
+            str(plan.depth_source),
+        )
+        expected = (
+            int(record.seed),
+            str(record.scene),
+            tuple(record.frames),
+            tuple(record.views),
+            int(record.track_count),
+            tuple(record.tracks),
+            str(record.depth_source),
+        )
+        if observed != expected:
+            raise RuntimeError(
+                f"recipe replay diverged for {self.source} request "
+                f"{request.virtual_index}"
+            )
+        metadata = dict(plan.metadata)
+        metadata["recipe_step"] = int(record.step)
+        metadata["recipe_microbatch"] = int(record.microbatch)
+        metadata["recipe_source_cursor"] = int(record.source_cursor)
+        metadata["recipe_retry_count"] = int(record.retry_count)
+        metadata["planned_depth_source"] = record.depth_source
+        metadata["effective_depth_source"] = (
+            "gt" if self.force_gt_depth else record.depth_source
+        )
+        return dataclasses.replace(
+            plan,
+            depth_source="gt" if self.force_gt_depth else plan.depth_source,
+            metadata=metadata,
+        )
+
+    def materialize_sample(self, plan):
+        return self.dataset.materialize_sample(plan)
 
 
 class _ContainerHardwareMonitor:
@@ -886,6 +1005,17 @@ def _checkpoint_scene_gradient_sketches(checkpoint_path):
     return checkpoint.get("scene_gradient_sketches")
 
 
+def _checkpoint_recipe_position(checkpoint_path):
+    if checkpoint_path is None:
+        return 0
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    return int(checkpoint.get("recipe_position", checkpoint.get("total_steps", 0)))
+
+
 def _write_latest_checkpoint_manifest(experiment_path, checkpoint_path, completed_steps):
     manifest_path = Path(experiment_path) / LATEST_CHECKPOINT_MANIFEST
     temporary_path = manifest_path.with_suffix(".tmp")
@@ -927,6 +1057,7 @@ def _save_training_checkpoint(
     mixed_schedule_state=None,
     source_cursors=None,
     scene_gradient_sketches=None,
+    recipe_position=None,
 ):
     state = AttributeDict(
         model=model,
@@ -941,6 +1072,8 @@ def _save_training_checkpoint(
         state.source_cursors = dict(source_cursors)
     if scene_gradient_sketches is not None:
         state.scene_gradient_sketches = scene_gradient_sketches
+    if recipe_position is not None:
+        state.recipe_position = int(recipe_position)
     fabric.save(checkpoint_path, state)
     fabric.barrier()
     if fabric.global_rank == 0:
@@ -2078,6 +2211,30 @@ def main(cfg: DictConfig):
     torch.Tensor.numpy = patched_numpy
 
     latest_checkpoint = _latest_checkpoint_path(cfg.experiment_path)
+    recipe_path = cfg.datasets.train.get("recipe_path")
+    force_gt_depth = bool(cfg.datasets.train.get("force_gt_depth", False))
+    recipe_resume_position = _checkpoint_recipe_position(latest_checkpoint)
+    if force_gt_depth and not recipe_path:
+        raise ValueError("datasets.train.force_gt_depth requires datasets.train.recipe_path")
+    if recipe_path:
+        from mvtracker.datasets.training_recipe import RecipeReader
+
+        recipe_manifest = RecipeReader(recipe_path).manifest
+        for source, scenes in recipe_manifest.get("scene_lists", {}).items():
+            if source in cfg.datasets.train.sources:
+                cfg.datasets.train.sources[source].include_scene_ids = list(scenes)
+        logging.info(
+            "Recipe training enabled: path=%s rank=%d resume_step=%d "
+            "force_gt_depth=%s scene_counts=%s",
+            recipe_path,
+            fabric.global_rank,
+            recipe_resume_position,
+            force_gt_depth,
+            {
+                source: len(scenes)
+                for source, scenes in recipe_manifest.get("scene_lists", {}).items()
+            },
+        )
     resume_source_cursors = _checkpoint_source_cursors(latest_checkpoint)
     resume_scene_gradient_sketches = _checkpoint_scene_gradient_sketches(
         latest_checkpoint
@@ -2403,6 +2560,25 @@ def main(cfg: DictConfig):
             world_size=fabric.world_size,
             master_seed=int(cfg.reproducibility.seed),
         )
+        if recipe_path:
+            mixed_schedule = _RecipeMixedSourceSchedule(
+                recipe_path,
+                rank=fabric.global_rank,
+                world_size=fabric.world_size,
+            )
+            if tuple(mixed_schedule.source_pattern) != source_pattern:
+                raise ValueError(
+                    "recipe source pattern does not match datasets.train.source_schedule"
+                )
+            train_datasets = {
+                source: _RecipeDataset(
+                    source,
+                    dataset,
+                    mixed_schedule,
+                    force_gt_depth,
+                )
+                for source, dataset in train_datasets.items()
+            }
         source_cursors = {source: 0 for source in train_datasets}
         planned_physical_batching = _planned_physical_batching(cfg)
         if _mvkubric_dali_stream(cfg):
@@ -2421,6 +2597,8 @@ def main(cfg: DictConfig):
             rank_local = bool(
                 cfg.datasets.train.physical_batching.get("rank_local", False)
             )
+            if recipe_path and not rank_local:
+                raise ValueError("recipe training requires rank-local physical batching")
             if not rank_local and fabric.world_size != capacity.rank_count:
                 raise ValueError(
                     "global physical batching requires exactly "
@@ -2588,8 +2766,12 @@ def main(cfg: DictConfig):
             state.source_cursors = dict(source_cursors)
         if resume_scene_gradient_sketches is not None:
             state.scene_gradient_sketches = previous_scene_gradient_sketches
+        if recipe_path:
+            state.recipe_position = recipe_resume_position
         fabric.load(latest_checkpoint, state)
         total_steps = int(state.total_steps)
+        if recipe_path and int(state.recipe_position) != total_steps:
+            raise ValueError("checkpoint recipe position does not match completed steps")
         if int(state.master_seed) != int(cfg.reproducibility.seed):
             raise ValueError(
                 "resume master seed does not match reproducibility.seed"
@@ -2775,6 +2957,7 @@ def main(cfg: DictConfig):
             mixed_schedule.state_dict() if mixed_training else None,
             checkpoint_source_cursors,
             previous_scene_gradient_sketches,
+            total_steps if recipe_path else None,
         )
         logging.info(f"Saved checkpoint to {save_path}")
         logging.info(f"Calling sys.exit(0) now.")
@@ -3088,6 +3271,27 @@ def main(cfg: DictConfig):
             )
             if batch.sample_metadata:
                 metadata = batch.sample_metadata
+                if recipe_path:
+                    for item in metadata:
+                        planned_depth = item.get(
+                            "planned_depth_source", item.get("depth_source")
+                        )
+                        effective_depth = item.get(
+                            "effective_depth_source", item.get("depth_source")
+                        )
+                        logging.info(
+                            "[recipe rank=%d step=%d] source=%s scene=%s "
+                            "recipe_source_cursor=%s retries=%s "
+                            "planned_depth_source=%s effective_depth_source=%s",
+                            fabric.global_rank,
+                            total_steps,
+                            item.get("source"),
+                            item.get("scene_name", item.get("sequence")),
+                            item.get("recipe_source_cursor"),
+                            item.get("recipe_retry_count"),
+                            planned_depth,
+                            effective_depth,
+                        )
                 accumulated_loader_worker_seconds += float(np.mean([
                     item.get("worker_prepare_seconds", 0.0) for item in metadata
                 ]))
@@ -3195,6 +3399,8 @@ def main(cfg: DictConfig):
                 if mixed_training:
                     state.mixed_schedule_state = mixed_schedule.state_dict()
                     state.source_cursors = dict(checkpoint_source_cursors)
+                if recipe_path:
+                    state.recipe_position = int(total_steps)
                 fabric._strategy.checkpoint_io.save_checkpoint(
                     checkpoint=fabric._strategy._convert_stateful_objects_in_state(_unwrap_objects(state), filter={}),
                     path=save_path,
@@ -3841,6 +4047,7 @@ def main(cfg: DictConfig):
                     mixed_schedule.state_dict() if mixed_training else None,
                     source_cursors,
                     previous_scene_gradient_sketches,
+                    total_steps if recipe_path else None,
                 )
 
             if total_steps % cfg.trainer.eval_freq == 0:
@@ -4190,6 +4397,7 @@ def main(cfg: DictConfig):
         mixed_schedule.state_dict() if mixed_training else None,
         source_cursors,
         previous_scene_gradient_sketches,
+        total_steps if recipe_path else None,
     )
     if eval_dataloaders and last_eval_step != total_steps:
         _run_eval(
