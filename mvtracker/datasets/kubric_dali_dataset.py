@@ -136,6 +136,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         fixed_views: tuple[int, ...] | None = None,
         seed_by_scene: bool = False,
         stream_start_request_cursor: int = 0,
+        depth_provider: str = "gt",
         **kwargs,
     ):
         manifest_path = Path(webdataset_root) / webdataset_split / "manifest.json"
@@ -163,6 +164,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         self._scene_reuse_passes = 1
         self._fixed_views = fixed_views
         self._seed_by_scene = bool(seed_by_scene)
+        self.depth_provider = str(depth_provider)
         self._stream_start_offset = int(stream_start_request_cursor) % requests_per_group
         self._streamed_scenes: deque[
             tuple[KubricDaliSceneBundle, KubricDaliSceneGroup, int, int]
@@ -332,7 +334,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             "window_start": 0,
             "window_end_exclusive": 24,
             "selected_views": list(views),
-            "depth_source": "gt",
+            "depth_source": "gt" if self.depth_provider == "gt" else "estimated",
             "gotit": True,
             "record_store": "dali-webdataset",
             "dali_batch_index": group.batch_index,
@@ -379,7 +381,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             source_size=source_size,
             output_size=output_size,
             image_codec="dali",
-            depth_source="gt",
+            depth_source="gt" if self.depth_provider == "gt" else "estimated",
             rgb_sources=rgb_sources,
             depth_sources=depth_sources,
             apply_rgb_aug=apply_rgb_aug,

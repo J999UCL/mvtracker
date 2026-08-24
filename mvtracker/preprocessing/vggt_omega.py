@@ -192,6 +192,97 @@ class TapVid3DSceneSource(SceneSource):
         ).astype(np.float32)
 
 
+class PackedJpegSceneSource(SceneSource):
+    """Read the packed JPEG cache used by DIEGESIS and Syn4D.
+
+    The RGB cache and camera arrays are intentionally separate for DIEGESIS:
+    the former lives in ``TAPVid3D_MVTracker_cache`` while the latter remains
+    in the raw sequence tree.  Syn4D stores both under the same scene root.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        camera_root: Path | None = None,
+        view_ids: Sequence[int] | None = None,
+    ) -> None:
+        super().__init__(root, view_ids)
+        root = Path(root)
+        camera_root = root if camera_root is None else Path(camera_root)
+        manifest_path = root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        available = [
+            int(path.name.removeprefix("view_"))
+            for path in root.glob("view_*")
+            if path.is_dir()
+        ]
+        selected = _select_views(sorted(available), view_ids)
+        self._jpeg_handles: dict[int, int] = {}
+        self._jpeg_offsets: dict[int, np.ndarray] = {}
+        self._extrinsics: dict[int, np.ndarray] = {}
+        fingerprint_paths = [manifest_path]
+        for view in selected:
+            view_root = root / f"view_{view}"
+            byte_path = view_root / "jpeg_bytes.bin"
+            offsets_path = view_root / "jpeg_offsets.npy"
+            camera_path = camera_root / str(view) / "extrinsics_w2c.npy"
+            self._jpeg_handles[view] = os.open(byte_path, os.O_RDONLY)
+            self._jpeg_offsets[view] = np.load(offsets_path, mmap_mode="r", allow_pickle=False)
+            self._extrinsics[view] = np.load(camera_path, mmap_mode="r", allow_pickle=False)
+            fingerprint_paths.extend([byte_path, offsets_path, camera_path])
+        frame_count = int(manifest.get("frames", manifest.get("frame_count", 0)))
+        if frame_count <= 0:
+            frame_count = int(self._jpeg_offsets[selected[0]].shape[0] - 1)
+        resolution_values = manifest.get("cache_resolution") or manifest.get("resolution_hw")
+        if resolution_values is None:
+            raise ValueError(f"{manifest_path}: missing cache_resolution/resolution_hw")
+        resolution = tuple(int(value) for value in resolution_values)
+        if len(resolution) != 2:
+            raise ValueError(f"{manifest_path}: expected two resolution values")
+        resolution = (resolution[0], resolution[1])
+        for view in selected:
+            offsets = self._jpeg_offsets[view]
+            extrinsics = self._extrinsics[view]
+            if offsets.shape != (frame_count + 1,):
+                raise ValueError(f"{root}/view_{view}/jpeg_offsets.npy: invalid frame count")
+            if extrinsics.shape != (frame_count, 4, 4):
+                raise ValueError(f"{camera_root}/{view}/extrinsics_w2c.npy: expected [F,4,4]")
+        self._description = SceneDescription(
+            name=root.name,
+            frame_count=frame_count,
+            view_ids=selected,
+            resolution_hw=resolution,
+            source_fingerprint=_stat_fingerprint(fingerprint_paths),
+        )
+
+    @property
+    def description(self) -> SceneDescription:
+        return self._description
+
+    def load_rgb(self, view_id: int, frame_index: int) -> Image.Image:
+        offsets = self._jpeg_offsets[view_id]
+        start, end = (int(offsets[frame_index]), int(offsets[frame_index + 1]))
+        encoded = os.pread(self._jpeg_handles[view_id], end - start, start)
+        with Image.open(io.BytesIO(encoded)) as image:
+            return image.convert("RGB")
+
+    def extrinsics_w2c(self, frame_indices: Sequence[int]) -> np.ndarray:
+        return np.stack(
+            [
+                np.stack([self._extrinsics[view][frame] for view in self.description.view_ids])
+                for frame in frame_indices
+            ]
+        ).astype(np.float32)
+
+    def __del__(self):
+        for handle in getattr(self, "_jpeg_handles", {}).values():
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+
+
 class MVKubricSceneSource(SceneSource):
     """Read RGB and camera metadata from one native MV-Kubric scene."""
 

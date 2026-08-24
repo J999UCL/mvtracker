@@ -11,6 +11,7 @@ import numpy as np
 
 ESTIMATED_DEPTH_FORMAT = "mvtracker_estimated_depth"
 ESTIMATED_DEPTH_SCHEMA_VERSION = 2
+ESTIMATED_DEPTH_PER_VIEW_SCHEMA_VERSION = 3
 ESTIMATED_DEPTH_TYPE_PROBABILITIES = {
     "gt": 0.70,
     "estimated": 0.20,
@@ -36,9 +37,14 @@ class EstimatedDepthStore:
             scene_root = self.root / scene
             path = scene_root / "manifest.json"
             manifest = json.loads(path.read_text(encoding="utf-8"))
+            schema_version = manifest.get("schema_version")
+            supported = schema_version in {
+                ESTIMATED_DEPTH_SCHEMA_VERSION,
+                ESTIMATED_DEPTH_PER_VIEW_SCHEMA_VERSION,
+            }
             if (
                 manifest.get("format") != ESTIMATED_DEPTH_FORMAT
-                or manifest.get("schema_version") != ESTIMATED_DEPTH_SCHEMA_VERSION
+                or not supported
                 or manifest.get("provider") != self.provider
                 or manifest.get("complete") is not True
             ):
@@ -62,9 +68,38 @@ class EstimatedDepthStore:
         scene_root = self.root / scene
         manifest = self._manifest(scene)
         manifest_views = [int(view) for view in manifest["view_ids"]]
+        manifest_frame_count = int(manifest["frame_count"])
+        try:
+            selected_views = [manifest_views.index(int(view)) for view in view_ids]
+        except ValueError as error:
+            raise ValueError(f"{scene_root}: selected view is absent from sidecar") from error
+        if manifest.get("layout") == "per_view" or manifest.get("schema_version") == ESTIMATED_DEPTH_PER_VIEW_SCHEMA_VERSION:
+            requested_frames = None if frame_indices is None else [int(frame) for frame in frame_indices]
+            if requested_frames is not None and any(
+                frame < 0 or frame >= manifest_frame_count for frame in requested_frames
+            ):
+                raise ValueError(f"{scene_root}: requested frame is outside sidecar bounds")
+            depths = []
+            masks = []
+            for view_position in selected_views:
+                view = manifest_views[view_position]
+                depth = self._mmap(scene_root / str(view) / "depth.npy")
+                cleaned_mask = self._mmap(scene_root / str(view) / "cleaned_mask.npy")
+                expected_shape = (
+                    manifest_frame_count,
+                    *tuple(int(value) for value in manifest["resolution_hw"]),
+                )
+                if depth.shape != expected_shape or depth.dtype != np.float32:
+                    raise ValueError(f"{scene_root}/{view}/depth.npy: expected {expected_shape} float32")
+                if cleaned_mask.shape != expected_shape or cleaned_mask.dtype != np.bool_:
+                    raise ValueError(f"{scene_root}/{view}/cleaned_mask.npy: expected {expected_shape} bool")
+                index = slice(None) if requested_frames is None else requested_frames
+                depths.append(np.asarray(depth[index]))
+                masks.append(np.asarray(cleaned_mask[index]))
+            return np.stack(depths), np.stack(masks)
+
         depth = self._mmap(scene_root / "depth.npy")
         cleaned_mask = self._mmap(scene_root / "cleaned_mask.npy")
-        manifest_frame_count = int(manifest["frame_count"])
         expected_shape = (
             len(manifest_views),
             manifest_frame_count,
@@ -76,10 +111,6 @@ class EstimatedDepthStore:
             raise ValueError(
                 f"{scene_root / 'cleaned_mask.npy'}: expected {expected_shape} bool"
             )
-        try:
-            selected_views = [manifest_views.index(int(view)) for view in view_ids]
-        except ValueError as error:
-            raise ValueError(f"{scene_root}: selected view is absent from sidecar") from error
         if frame_indices is not None:
             requested_frames = [int(frame) for frame in frame_indices]
             selected_frames = requested_frames

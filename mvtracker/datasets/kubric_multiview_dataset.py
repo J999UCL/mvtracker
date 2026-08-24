@@ -312,9 +312,28 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
                 raise ValueError(
                     "mvkubric_storage=dali_stream requires mvkubric_webdataset_root"
                 )
+            depth_provider = str(
+                training_args.datasets.train.get(
+                    "mvkubric_depth_provider",
+                    training_args.datasets.get("estimated_depth_provider", "gt")
+                    if training_args.datasets.get("estimated_depth_root")
+                    else "gt",
+                )
+            )
+            if depth_provider != "gt":
+                estimated_webdataset_root = training_args.datasets.train.get(
+                    "mvkubric_estimated_webdataset_root"
+                )
+                if estimated_webdataset_root is None:
+                    raise ValueError(
+                        "non-GT MV-Kubric DALI depth requires "
+                        "mvkubric_estimated_webdataset_root"
+                    )
+                webdataset_root = estimated_webdataset_root
             if not os.path.isabs(str(webdataset_root)):
                 webdataset_root = os.path.join(dataset_root, str(webdataset_root))
             kubric_kwargs["webdataset_root"] = webdataset_root
+            kubric_kwargs["depth_provider"] = depth_provider
             kubric_kwargs["webdataset_split"] = "train"
             kubric_kwargs["stream_rank"] = int(fabric.global_rank)
             kubric_kwargs["stream_world_size"] = int(fabric.world_size)

@@ -504,3 +504,23 @@ exec /media/data3/jthakwani/mvtracker-venv/bin/python -m mvtracker.cli.eval \
   evaluation.evaluator.mp4_track_viz_indices=null
 SCRIPT
 ```
+
+### Run long-sequence VGGT-Omega inference and storage/readback profiling
+
+This uses the current DIEGESIS, Syn4D, and MV-Kubric Volume layouts, profiles
+24/48/96/192-frame windows plus full-scene attempts on one exact H100, writes
+float32 per-view sidecars, repacks the two MV-Kubric scenes as float32 TIFF
+depth records for DALI, and measures sidecar/DALI reads outside the H100.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --timestamps tools/modal_vggt_omega_long_inference.py::infer \
+  --run-name vggt-omega-long-20260824
+modal run --timestamps tools/modal_vggt_omega_long_inference.py::readback \
+  --run-name vggt-omega-long-20260824
+modal run --timestamps tools/modal_vggt_omega_long_inference.py::pack_mvkubric \
+  --run-name vggt-omega-long-20260824
+modal run --timestamps tools/modal_vggt_omega_long_inference.py::dali_readback \
+  --run-name vggt-omega-long-20260824
+```

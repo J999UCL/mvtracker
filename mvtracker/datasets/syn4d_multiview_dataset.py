@@ -210,9 +210,12 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             mmap_cache_sequences=int(datasets_cfg.get("syn4d_mmap_cache_sequences", 4)),
             max_depth=float(datasets_cfg.get("syn4d_max_depth", 300.0)),
             enable_variable_depth_type_augs=False,
-            estimated_depth_root=None,
-            estimated_depth_provider=None,
+            estimated_depth_root=datasets_cfg.get("estimated_depth_root"),
+            estimated_depth_provider=datasets_cfg.get("estimated_depth_provider"),
         )
+        estimated_root = kwargs.get("estimated_depth_root")
+        if estimated_root is not None and not os.path.isabs(str(estimated_root)):
+            kwargs["estimated_depth_root"] = os.path.join(dataset_root, str(estimated_root))
         if requested == "training" and kwargs.get("enable_variable_num_views_augs"):
             kwargs["num_views"] = None
         if just_return_kwargs:
@@ -381,6 +384,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         if self.enable_camera_params_noise_augs:
             intrinsics += rng.normal(0, 0.001, size=intrinsics.shape)
             extrinsics += rng.normal(0, 0.001, size=extrinsics.shape)
+        depth_source = "estimated" if self.estimated_depth_store.enabled else "gt"
         metadata = {
             "virtual_index": virtual_index,
             "scene_index": scene_index,
@@ -390,7 +394,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             "window_end_exclusive": stop,
             "selected_views": views,
             "requested_view_count": request.view_count if request is not None else None,
-            "depth_source": "gt",
+            "depth_source": depth_source,
             "world_anchor": world_anchor.tolist(),
             "gotit": True,
             "apply_rgb_aug": apply_rgb_aug,
@@ -435,7 +439,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             source_size=source_size,
             output_size=output_size,
             image_codec="jpeg",
-            depth_source="gt",
+            depth_source=depth_source,
             rgb_sources=tuple(
                 (
                     root / f"view_{view}" / "jpeg_bytes.bin",

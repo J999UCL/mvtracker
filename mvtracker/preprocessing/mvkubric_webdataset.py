@@ -17,6 +17,7 @@ import time
 from typing import Iterable, Sequence
 
 import numpy as np
+from PIL import Image
 
 
 WEB_DATASET_FORMAT = "mvtracker-kubric-webdataset"
@@ -228,6 +229,48 @@ def _packed_encoded_frames(paths: Sequence[Path]) -> bytes:
     )
 
 
+def _packed_float_depth_frames(
+    estimated_depth_root: Path,
+    scene_id: str,
+    view: int,
+    *,
+    cleaned: bool,
+) -> bytes:
+    """Encode float32 estimated depth as TIFF bytes for the DALI reader."""
+    scene_root = Path(estimated_depth_root) / str(scene_id)
+    manifest = json.loads((scene_root / "manifest.json").read_text(encoding="utf-8"))
+    view_name = str(view)
+    depth = np.load(scene_root / view_name / "depth.npy", mmap_mode="r", allow_pickle=False)
+    if depth.dtype != np.float32:
+        raise ValueError(f"{scene_root}/{view_name}/depth.npy must be float32")
+    if cleaned:
+        mask = np.load(
+            scene_root / view_name / "cleaned_mask.npy",
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        if mask.dtype != np.bool_ or mask.shape != depth.shape:
+            raise ValueError(f"{scene_root}/{view_name}: invalid cleaned mask")
+    encoded: list[bytes] = []
+    offsets = [0]
+    for frame_index in range(depth.shape[0]):
+        frame = np.asarray(depth[frame_index], dtype=np.float32)
+        if cleaned:
+            frame = np.where(mask[frame_index], frame, 0.0).astype(np.float32, copy=False)
+        stream = io.BytesIO()
+        Image.fromarray(frame, mode="F").save(stream, format="TIFF")
+        payload = stream.getvalue()
+        encoded.append(payload)
+        offsets.append(offsets[-1] + len(payload))
+    expected_frames = int(manifest["frame_count"])
+    if depth.shape[0] != expected_frames:
+        raise ValueError(f"{scene_root}/{view_name}: frame count does not match manifest")
+    return _npz_bytes(
+        bytes=np.frombuffer(b"".join(encoded), dtype=np.uint8),
+        offsets=np.asarray(offsets, dtype=np.int64),
+    )
+
+
 def _load_camera(scene_root: Path, view_names: Sequence[str]) -> dict[str, np.ndarray]:
     intrinsics = []
     extrinsics = []
@@ -322,7 +365,12 @@ def _view_paths(scene_root: Path) -> tuple[Path, ...]:
 
 
 def _scene_records(
-    scene_root: Path, scene_id: str, read_workers: int
+    scene_root: Path,
+    scene_id: str,
+    read_workers: int,
+    *,
+    estimated_depth_root: Path | None = None,
+    estimated_depth_cleaned: bool = False,
 ) -> tuple[bytes, dict[int, tuple[bytes, bytes]]]:
     view_paths = _view_paths(scene_root)
     view_names = tuple(path.name for path in view_paths)
@@ -340,19 +388,44 @@ def _scene_records(
             raise ValueError(
                 f"{scene_root}/{view_path.name}: expected {n_frames} RGB/depth frames, got {len(rgb)}/{len(depth)}"
             )
-        jobs.extend(((view_index, "rgb", rgb), (view_index, "depth", depth)))
+        jobs.append((view_index, "rgb", rgb))
+        if estimated_depth_root is None:
+            jobs.append((view_index, "depth", depth))
     with ThreadPoolExecutor(max_workers=read_workers) as executor:
         futures = {(view, kind): executor.submit(_packed_encoded_frames, paths) for view, kind, paths in jobs}
         media = {
-            view: (futures[(view, "rgb")].result(), futures[(view, "depth")].result())
+            view: (
+                futures[(view, "rgb")].result(),
+                _packed_float_depth_frames(
+                    estimated_depth_root,
+                    scene_id,
+                    view,
+                    cleaned=estimated_depth_cleaned,
+                )
+                if estimated_depth_root is not None
+                else futures[(view, "depth")].result(),
+            )
             for view in range(len(view_paths))
         }
     return _npz_bytes(**meta), media
 
 
-def _scene_components(scene_root: Path, scene_id: str, read_workers: int) -> dict[str, bytes]:
+def _scene_components(
+    scene_root: Path,
+    scene_id: str,
+    read_workers: int,
+    *,
+    estimated_depth_root: Path | None = None,
+    estimated_depth_cleaned: bool = False,
+) -> dict[str, bytes]:
     """Return the mixed sample components for one scene."""
-    metadata, media = _scene_records(Path(scene_root), scene_id, read_workers)
+    metadata, media = _scene_records(
+        Path(scene_root),
+        scene_id,
+        read_workers,
+        estimated_depth_root=estimated_depth_root,
+        estimated_depth_cleaned=estimated_depth_cleaned,
+    )
     components = {f"scene-{scene_id}.{META_COMPONENT}": metadata}
     for view, (rgb, depth) in media.items():
         key = f"scene-{scene_id}-view-{view:02d}"
@@ -386,6 +459,8 @@ def write_shard(
     output_tar: Path,
     *,
     read_workers: int = 16,
+    estimated_depth_root: Path | None = None,
+    estimated_depth_cleaned: bool = False,
     progress_callback=None,
 ) -> dict[str, object]:
     """Write one uncompressed TAR and return its sample inventory."""
@@ -403,7 +478,13 @@ def write_shard(
             view_count = _scene_view_count(scene_root, scene_id)
             if view_count != expected_view_count:
                 raise ValueError(f"{shard.name}: scene {scene_id} has an inconsistent view count")
-            metadata, media = _scene_records(Path(scene_root) / scene_id, scene_id, read_workers)
+            metadata, media = _scene_records(
+                Path(scene_root) / scene_id,
+                scene_id,
+                read_workers,
+                estimated_depth_root=estimated_depth_root,
+                estimated_depth_cleaned=estimated_depth_cleaned,
+            )
             meta_key = f"scene-{scene_id}"
             _tar_add_bytes(archive, f"{meta_key}.{META_COMPONENT}", metadata)
             sample_records.append({"key": meta_key, "scene": str(scene_id), "kind": "metadata"})
