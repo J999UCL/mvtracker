@@ -55,7 +55,9 @@ def _image() -> modal.Image:
         .pip_install(
             "hf-xet==1.6.0", "huggingface-hub==1.28.0", "OpenEXR==3.3.5",
             "opencv-python-headless==4.11.0.86", "numpy==2.2.4", "scipy==1.15.2",
-            "pandas==2.2.3", "wandb==0.19.9",
+            "pandas==2.2.3", "Pillow==11.1.0", "kornia==0.7.3",
+            "mediapy==1.2.0", "pypng==0.20220715.0", "rerun-sdk==0.21.0",
+            "wandb==0.19.9",
         )
         .run_commands(
             "mkdir -p /opt/syn4d-visualizer",

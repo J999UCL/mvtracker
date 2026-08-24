@@ -299,13 +299,11 @@ def _decode_rgb_video_dali(
 ) -> np.ndarray:
     """Decode and resize one CFR MP4 on CPU with ffmpeg.
 
-    The public argument name is retained for compatibility with the existing
-    conversion tests and callers.  Syn4D preparation is deliberately CPU-only
-    now, so ``device`` is only used to reject accidental GPU launches.
+    The public argument name is retained for compatibility with existing
+    callers. The decoder always uses CPU ffmpeg.
     """
 
-    if str(device) != "cpu":
-        raise ValueError("Syn4D conversion is CPU-only; pass device='cpu'")
+    del device
     command = [
         "ffmpeg",
         "-v",
