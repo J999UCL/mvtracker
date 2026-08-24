@@ -333,6 +333,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     from mvtracker.datasets.training_recipe import plan_training_recipe
 
     validate_run_name(recipe_name)
+    seed = 72
     output_dir = RECIPE_ROOT / recipe_name
     local_output_dir = Path("/tmp/mvtracker-training-recipes") / recipe_name
     print(
@@ -356,91 +357,124 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
             **MODAL_TAGS,
         },
     )
-    with initialize_config_dir(config_dir=str(SOURCE_ROOT / "configs"), version_base="1.3"):
-        cfg = compose(
-            config_name="train.yaml",
-            overrides=[
-                "+experiment=diegesis_syn4d_mvkubric_gt_ddp",
-                f"trainer.num_steps={int(step_count)}",
-                "datasets.train.recipe_path=null",
-                "datasets.train.force_gt_depth=false",
-                "augmentations.variable_depth_type=true",
-                "+datasets.train.kubric_metadata_index_root="
-                f"{DATA_VOLUME_ROOT}/datasets/kubric-multiview/train/MVTracker_index",
-            ],
+    os.environ.update(
+        {
+            "MVTRACKER_TRAINING_RUN_DIR": str(output_dir),
+            "MVTRACKER_TRAINING_CHECKPOINT": str(
+                Path(DATA_VOLUME_ROOT) / "checkpoints/mvtracker_200000_june2025.pth"
+            ),
+            "MVTRACKER_TRAINING_SEED": str(seed),
+            "MVTRACKER_WANDB_RUN_NAME": recipe_name,
+            "MVTRACKER_WANDB_RUN_ID": str(run.id),
+        }
+    )
+    phase = {"name": "config"}
+    heartbeat_stop = threading.Event()
+
+    def heartbeat():
+        started = time.monotonic()
+        while not heartbeat_stop.wait(10):
+            print(
+                f"recipe heartbeat phase={phase['name']} "
+                f"elapsed={time.monotonic() - started:.1f}s",
+                flush=True,
+            )
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    try:
+        with initialize_config_dir(config_dir=str(SOURCE_ROOT / "configs"), version_base="1.3"):
+            cfg = compose(
+                config_name="train.yaml",
+                overrides=[
+                    "+experiment=diegesis_syn4d_mvkubric_gt_ddp",
+                    f"trainer.num_steps={int(step_count)}",
+                    "datasets.train.recipe_path=null",
+                    "datasets.train.force_gt_depth=false",
+                    "augmentations.variable_depth_type=true",
+                    "+datasets.train.kubric_metadata_index_root="
+                    f"{DATA_VOLUME_ROOT}/datasets/kubric-multiview/train/MVTracker_index",
+                ],
+            )
+        phase["name"] = "scene_inventory"
+        diegesis_source = cfg.datasets.train.sources.diegesis
+        diegesis_cache = (
+            Path(diegesis_source.root) / "TAPVid3D_MVTracker_cache" / "train"
         )
-    diegesis_source = cfg.datasets.train.sources.diegesis
-    diegesis_cache = (
-        Path(diegesis_source.root) / "TAPVid3D_MVTracker_cache" / "train"
-    )
-    held_out_diegesis = set(cfg.datasets.eval.sources.diegesis.include_scene_ids)
-    diegesis_source.include_scene_ids = sorted(
-        path.name
-        for path in diegesis_cache.iterdir()
-        if path.is_dir() and path.name not in held_out_diegesis
-    )
-    print(
-        "recipe phase=scene_inventory "
-        f"diegesis_train={len(diegesis_source.include_scene_ids)} "
-        f"diegesis_held_out={sorted(held_out_diegesis)}",
-        flush=True,
-    )
-    fabric = SimpleNamespace(world_size=2, global_rank=0)
-    source_pattern = tuple(cfg.datasets.train.source_schedule)
-    datasets = {}
-    for source, source_cfg in cfg.datasets.train.sources.items():
-        if source != "mvkubric":
-            datasets[source] = _build_training_dataset(
+        held_out_diegesis = set(cfg.datasets.eval.sources.diegesis.include_scene_ids)
+        diegesis_source.include_scene_ids = sorted(
+            path.name
+            for path in diegesis_cache.iterdir()
+            if path.is_dir() and path.name not in held_out_diegesis
+        )
+        print(
+            "recipe phase=scene_inventory "
+            f"diegesis_train={len(diegesis_source.include_scene_ids)} "
+            f"diegesis_held_out={sorted(held_out_diegesis)}",
+            flush=True,
+        )
+        phase["name"] = "dataset_construction"
+        fabric = SimpleNamespace(world_size=2, global_rank=0)
+        source_pattern = tuple(cfg.datasets.train.source_schedule)
+        datasets = {}
+        for source, source_cfg in cfg.datasets.train.sources.items():
+            print(f"recipe phase=dataset_construction source={source}", flush=True)
+            if source != "mvkubric":
+                datasets[source] = _build_training_dataset(
+                    source_cfg.name,
+                    source_cfg.root,
+                    cfg,
+                    fabric,
+                    source_cfg,
+                )
+                continue
+            kwargs = KubricMultiViewDataset.from_name(
                 source_cfg.name,
                 source_cfg.root,
                 cfg,
                 fabric,
-                source_cfg,
+                just_return_kwargs=True,
+                include_scene_ids=source_cfg.get("include_scene_ids"),
+                exclude_scene_ids=source_cfg.get("exclude_scene_ids", ()),
             )
-            continue
-        kwargs = KubricMultiViewDataset.from_name(
-            source_cfg.name,
-            source_cfg.root,
-            cfg,
-            fabric,
-            just_return_kwargs=True,
-            include_scene_ids=source_cfg.get("include_scene_ids"),
-            exclude_scene_ids=source_cfg.get("exclude_scene_ids", ()),
+            native_data_root = kwargs.pop("data_root")
+            metadata_index_root = kwargs.pop("metadata_index_root")
+            datasets[source] = DaliKubricRecipePlanner(
+                **kwargs,
+                webdataset_root=cfg.datasets.train.mvkubric_webdataset_root,
+                native_data_root=native_data_root,
+                metadata_index_root=metadata_index_root,
+                webdataset_split="train",
+                stream_world_size=2,
+                stream_seed=seed,
+                stream_include_scene_ids=source_cfg.get("include_scene_ids"),
+            )
+        schedule = BalancedMixedSourceSchedule(
+            {source: dataset.real_len for source, dataset in datasets.items()},
+            source_pattern,
+            world_size=2,
+            master_seed=seed,
         )
-        native_data_root = kwargs.pop("data_root")
-        metadata_index_root = kwargs.pop("metadata_index_root")
-        datasets[source] = DaliKubricRecipePlanner(
-            **kwargs,
-            webdataset_root=cfg.datasets.train.mvkubric_webdataset_root,
-            native_data_root=native_data_root,
-            metadata_index_root=metadata_index_root,
-            webdataset_split="train",
-            stream_world_size=2,
-            stream_seed=int(cfg.reproducibility.seed),
-            stream_include_scene_ids=source_cfg.get("include_scene_ids"),
-        )
-    schedule = BalancedMixedSourceSchedule(
-        {source: dataset.real_len for source, dataset in datasets.items()},
-        source_pattern,
-        world_size=2,
-        master_seed=int(cfg.reproducibility.seed),
-    )
-    summary = plan_training_recipe(
-        local_output_dir,
-        datasets=datasets,
-        schedule=schedule,
-        step_count=int(step_count),
-        manifest={
-            "source_commit": _source_commit(),
-            "seed": int(cfg.reproducibility.seed),
-            "config": OmegaConf.to_container(cfg, resolve=True),
-            "scene_lists": {
-                source: list(dataset.seq_names)
-                for source, dataset in datasets.items()
+        phase["name"] = "sample_planning"
+        summary = plan_training_recipe(
+            local_output_dir,
+            datasets=datasets,
+            schedule=schedule,
+            step_count=int(step_count),
+            manifest={
+                "source_commit": _source_commit(),
+                "seed": seed,
+                "config": OmegaConf.to_container(cfg, resolve=True),
+                "scene_lists": {
+                    source: list(dataset.seq_names)
+                    for source, dataset in datasets.items()
+                },
             },
-        },
-        heartbeat_seconds=10,
-    )
+            heartbeat_seconds=10,
+        )
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join()
     run.summary.update(summary)
     run.finish()
     print(
@@ -479,7 +513,11 @@ def recipe_smoke20_remote(run_name: str, recipe_name: str) -> dict:
     recipe_path = RECIPE_ROOT / recipe_name
     run_dir = RUN_ROOT / CONTINUAL_RUN_SUBDIR / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    seed, wandb_run_id = _run_identity(run_name, commit)
+    _, wandb_run_id = _run_identity(run_name, commit)
+    recipe_manifest = json.loads(
+        (recipe_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    seed = int(recipe_manifest["seed"])
     environment = os.environ.copy()
     environment.update(
         {

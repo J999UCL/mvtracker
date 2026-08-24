@@ -565,8 +565,8 @@ explicit GT-depth substitution and no validation.
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker
 export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
-modal run --detach --timestamps tools/modal_continual_training.py::plan-recipe \
+modal run --detach --timestamps tools/modal_continual_training.py::plan_recipe \
   --recipe-name <recipe-name> --step-count 2000
-modal run --detach --timestamps tools/modal_continual_training.py::recipe-smoke20 \
+modal run --detach --timestamps tools/modal_continual_training.py::recipe_smoke20 \
   --run-name <run-name> --recipe-name <recipe-name>
 ```
