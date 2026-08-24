@@ -2222,7 +2222,12 @@ def main(cfg: DictConfig):
         recipe_manifest = RecipeReader(recipe_path).manifest
         for source, scenes in recipe_manifest.get("scene_lists", {}).items():
             if source in cfg.datasets.train.sources:
-                cfg.datasets.train.sources[source].include_scene_ids = list(scenes)
+                OmegaConf.update(
+                    cfg,
+                    f"datasets.train.sources.{source}.include_scene_ids",
+                    list(scenes),
+                    force_add=True,
+                )
         logging.info(
             "Recipe training enabled: path=%s rank=%d resume_step=%d "
             "force_gt_depth=%s scene_counts=%s",

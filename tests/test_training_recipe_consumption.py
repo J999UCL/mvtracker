@@ -49,6 +49,8 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
         self.assertIn('metadata["planned_depth_source"]', source)
         self.assertIn('metadata["effective_depth_source"]', source)
         self.assertIn('depth_source="gt" if self.force_gt_depth', source)
+        self.assertIn("OmegaConf.update(", source)
+        self.assertIn("force_add=True", source)
 
     def test_replay_uses_logical_ordinals_when_actual_cursors_have_gaps(self):
         with tempfile.TemporaryDirectory() as temporary:
