@@ -525,6 +525,10 @@ modal run --timestamps tools/modal_vggt_omega_long_inference.py::dali_readback \
   --run-name vggt-omega-long-20260824
 ```
 
+The DALI readback entrypoint uses the CPU decoder when the Modal T4 reports an
+NVML driver error; it still validates the exact encoded float32 TIFF records
+that the training DALI reader consumes.
+
 For incremental monitored bursts, use the bounded entrypoint below. Each call
 persists its burst before returning; increase the window or batch only after
 the previous call completes and its artifact is present.
