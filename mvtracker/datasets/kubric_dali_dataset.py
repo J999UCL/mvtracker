@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from io import BytesIO
 import json
@@ -548,8 +549,45 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
             for rank in range(self._recipe_world_size)
         )
         self._native_data_root = Path(native_data_root)
+        self._recipe_metadata = {}
         self._fixed_views = fixed_views
         self._seed_by_scene = bool(seed_by_scene)
+
+    def preload_recipe_metadata(self, workers: int = 16) -> None:
+        scene_names = tuple(
+            dict.fromkeys(
+                scene
+                for order in self._recipe_orders
+                for shard in order.assigned
+                for scene in shard.selected_scene_names
+            )
+        )
+        started = time.perf_counter()
+        print(
+            f"RECIPE_METADATA event=start scenes={len(scene_names)} workers={workers}",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=int(workers)) as executor:
+            futures = {
+                executor.submit(
+                    _native_scene_metadata,
+                    self._native_data_root,
+                    self.metadata_index,
+                    scene,
+                ): scene
+                for scene in scene_names
+            }
+            for completed, future in enumerate(as_completed(futures), start=1):
+                scene = futures[future]
+                self._recipe_metadata[scene] = future.result()
+                if completed % 100 == 0 or completed == len(scene_names):
+                    elapsed = time.perf_counter() - started
+                    print(
+                        "RECIPE_METADATA event=progress "
+                        f"completed={completed}/{len(scene_names)} "
+                        f"rate={completed / max(elapsed, 1e-9):.1f}_scenes_per_second",
+                        flush=True,
+                    )
 
     def resolve_recipe_request(self, request, *, rank=None, local_cursor=None):
         if rank is None:
@@ -573,11 +611,14 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
 
     def plan_sample(self, request) -> SamplePlan | None:
         resolved = self.resolve_recipe_request(request)
-        scene = _native_scene_metadata(
-            self._native_data_root,
-            self.metadata_index,
-            resolved.expected_scene,
-        )
+        scene = self._recipe_metadata.get(resolved.expected_scene)
+        if scene is None:
+            scene = _native_scene_metadata(
+                self._native_data_root,
+                self.metadata_index,
+                resolved.expected_scene,
+            )
+            self._recipe_metadata[resolved.expected_scene] = scene
         return self._plan_scene_metadata(resolved, scene)
 
 

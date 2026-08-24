@@ -263,12 +263,34 @@ class KubricMetadataIndex:
         if not self.source_fingerprint:
             raise ValueError(f"MV-Kubric metadata index has no source fingerprint: {manifest_path}")
         self._arrays = {}
-        for name, entry in self.scenes.items():
+        started = time.perf_counter()
+
+        def load_arrays(item):
+            name, entry = item
             arrays_path = self.root / entry["arrays"]
             if not arrays_path.is_file():
                 raise FileNotFoundError(f"MV-Kubric indexed arrays are missing: {arrays_path}")
             with np.load(arrays_path) as arrays:
-                self._arrays[name] = {key: arrays[key].copy() for key in arrays.files}
+                return name, {key: arrays[key].copy() for key in arrays.files}
+
+        items = tuple(self.scenes.items())
+        print(
+            f"INDEX_LOAD event=start scenes={len(items)} workers=16",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(load_arrays, item) for item in items]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                name, arrays = future.result()
+                self._arrays[name] = arrays
+                if completed % 250 == 0 or completed == len(items):
+                    elapsed = time.perf_counter() - started
+                    print(
+                        "INDEX_LOAD event=progress "
+                        f"completed={completed}/{len(items)} "
+                        f"rate={completed / max(elapsed, 1e-9):.1f}_scenes_per_second",
+                        flush=True,
+                    )
 
     def validate_source(self, data_root):
         actual = compute_source_fingerprint(data_root, self.scenes)

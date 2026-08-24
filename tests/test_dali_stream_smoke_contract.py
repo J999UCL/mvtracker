@@ -669,7 +669,9 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
             with patch.object(
                 Path, "read_bytes", side_effect=AssertionError("media read")
             ), patch.object(np, "load", side_effect=metadata_load):
+                planner.preload_recipe_metadata(workers=2)
                 cpu_plan = planner.plan_sample(request)
+            self.assertIn("scene-a", planner._recipe_metadata)
 
             group = KubricDaliSceneGroup((bundle,), 1, 0.1, 123)
             live = DaliKubricMultiViewDataset.__new__(DaliKubricMultiViewDataset)

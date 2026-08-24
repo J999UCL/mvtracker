@@ -449,6 +449,8 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 stream_seed=seed,
                 stream_include_scene_ids=source_cfg.get("include_scene_ids"),
             )
+            phase["name"] = "mvkubric_metadata_preload"
+            datasets[source].preload_recipe_metadata(workers=16)
         schedule = BalancedMixedSourceSchedule(
             {source: dataset.real_len for source, dataset in datasets.items()},
             source_pattern,
