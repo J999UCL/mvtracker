@@ -114,7 +114,7 @@ EXPERIMENT_PHASES = {
     ),
 }
 RECIPE_ROOT = RUN_ROOT / "training-recipes"
-RECIPE_SMOKE_GPU_REQUEST = "H100:2"
+RECIPE_SMOKE_GPU_REQUEST = "H100!:2"
 
 
 def _run_logged_command(command, *, cwd, environment, log_path, label):

@@ -109,7 +109,7 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
         self.assertIn("cpu=16", planner_decorator)
         self.assertIn("data_volume.with_mount_options(read_only=True)", planner_decorator)
         self.assertIn("str(RUN_ROOT): run_volume", planner_decorator)
-        self.assertIn('RECIPE_SMOKE_GPU_REQUEST = "H100:2"', source)
+        self.assertIn('RECIPE_SMOKE_GPU_REQUEST = "H100!:2"', source)
         self.assertIn("gpu=RECIPE_SMOKE_GPU_REQUEST", smoke_decorator)
         self.assertIn('heartbeat_seconds=10', source)
         self.assertIn('"purpose": "training"', (

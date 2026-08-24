@@ -91,6 +91,12 @@ class _RecipeMixedSourceSchedule:
         self.reader = RecipeReader(recipe_path)
         self.rank = int(rank)
         self.world_size = int(world_size)
+        self.scene_counts = {
+            source: len(scenes)
+            for source, scenes in self.reader.manifest.get(
+                "scene_lists", {}
+            ).items()
+        }
         records = tuple(self.reader.records(self.rank))
         if not records:
             raise ValueError(f"training recipe has no records for rank {self.rank}")
