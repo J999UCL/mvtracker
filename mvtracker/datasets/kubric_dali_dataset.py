@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 import json
 from pathlib import Path
@@ -17,7 +17,9 @@ from mvtracker.datasets.kubric_dali_stream import (
     KubricDaliSceneBundle,
     KubricDaliSceneGroup,
     KubricDaliSceneStream,
+    KubricDaliSceneOrder,
 )
+from mvtracker.datasets.kubric_metadata_index import KubricMetadataIndex
 from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
 from mvtracker.datasets.tapvid3d_multiview_dataset import (
     EncodedTapVid3DSample,
@@ -110,6 +112,39 @@ def _scene_metadata(bundle: KubricDaliSceneBundle) -> KubricSceneMetadata:
     )
 
 
+def _native_scene_metadata(
+    data_root: Path,
+    metadata_index: KubricMetadataIndex,
+    scene_name: str,
+) -> KubricSceneMetadata:
+    """Load compact tracks/cameras only; never open RGB or depth frames."""
+    entry, arrays = metadata_index.scene(scene_name)
+    scene_root = data_root / scene_name
+    with np.load(scene_root / "tracks_3d.npz", allow_pickle=False) as payload:
+        tracks_3d = np.asarray(payload["tracks_3d"], dtype=np.float32)
+    visibility = []
+    for view_name in entry["view_names"]:
+        with np.load(
+            scene_root / view_name / "tracks_2d.npz", allow_pickle=False
+        ) as payload:
+            visibility.append(~np.asarray(payload["occlusion"], dtype=np.bool_))
+    with (scene_root / entry["view_names"][0] / "metadata.json").open(
+        encoding="utf-8"
+    ) as handle:
+        width, height = json.load(handle)["metadata"]["resolution"]
+    return KubricSceneMetadata(
+        name=scene_name,
+        tracks_3d=tracks_3d,
+        visibility=np.stack(visibility),
+        intrinsics=np.asarray(arrays["intrinsics"], dtype=np.float32),
+        extrinsics=np.asarray(arrays["extrinsics"], dtype=np.float32),
+        sensor_widths=np.asarray(arrays["sensor_widths"], dtype=np.float32),
+        focal_lengths=np.asarray(arrays["focal_lengths"], dtype=np.float32),
+        invalid_frame_indices=tuple(map(int, entry["invalid_frame_indices"])),
+        resolution_hw=(int(height), int(width)),
+    )
+
+
 class DaliKubricMultiViewDataset(KubricMultiViewDataset):
     """Apply the existing live sampler to scenes streamed directly by DALI."""
 
@@ -186,7 +221,6 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
 
     def plan_sample(self, index) -> SamplePlan | None:
         request = index if hasattr(index, "virtual_index") else None
-        virtual_index = request.virtual_index if request is not None else int(index)
         bundle, group, scene_position, reuse_pass = self._next_scene()
         scene = _scene_metadata(bundle)
         expected_scene = (
@@ -198,6 +232,34 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
                     "DALI recipe scene diverged: "
                     f"expected {expected_scene!r}, got {scene.name!r}"
                 )
+        plan = self._plan_scene_metadata(request or int(index), scene)
+        if plan is None:
+            return None
+        rgb_sources = tuple(
+            frame for view in plan.views for frame in _packed_frames(bundle.rgb_npz[view])
+        )
+        depth_sources = tuple(
+            frame for view in plan.views for frame in _packed_frames(bundle.depth_npz[view])
+        )
+        metadata = {
+            **plan.metadata,
+            "record_store": "dali-webdataset",
+            "dali_batch_index": group.batch_index,
+            "dali_read_seconds": group.read_seconds,
+            "dali_payload_bytes": group.payload_bytes,
+            "dali_scene_position": scene_position,
+            "dali_reuse_pass": reuse_pass,
+        }
+        return replace(
+            plan,
+            rgb_sources=rgb_sources,
+            depth_sources=depth_sources,
+            metadata=metadata,
+        )
+
+    def _plan_scene_metadata(self, index, scene: KubricSceneMetadata) -> SamplePlan | None:
+        request = index if hasattr(index, "virtual_index") else None
+        virtual_index = request.virtual_index if request is not None else int(index)
         if scene.invalid_frame_indices:
             return None
         scene_index = self.seq_names.index(scene.name)
@@ -337,12 +399,6 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             intrinsics += rng.normal(0, 0.001, size=intrinsics.shape)
             extrinsics += rng.normal(0, 0.001, size=extrinsics.shape)
 
-        rgb_sources = tuple(
-            frame for view in views for frame in _packed_frames(bundle.rgb_npz[view])
-        )
-        depth_sources = tuple(
-            frame for view in views for frame in _packed_frames(bundle.depth_npz[view])
-        )
         metadata = {
             "virtual_index": virtual_index,
             "scene_index": scene_index,
@@ -353,12 +409,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             "selected_views": list(views),
             "depth_source": depth_source,
             "gotit": True,
-            "record_store": "dali-webdataset",
-            "dali_batch_index": group.batch_index,
-            "dali_read_seconds": group.read_seconds,
-            "dali_payload_bytes": group.payload_bytes,
-            "dali_scene_position": scene_position,
-            "dali_reuse_pass": reuse_pass,
+            "record_store": "metadata-only",
             "apply_rgb_aug": apply_rgb_aug,
             "apply_depth_aug": apply_depth_aug,
             "motion_track_count": int(len(selected_global)),
@@ -399,8 +450,8 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             output_size=output_size,
             image_codec="dali",
             depth_source=depth_source,
-            rgb_sources=rgb_sources,
-            depth_sources=depth_sources,
+            rgb_sources=(),
+            depth_sources=(),
             apply_rgb_aug=apply_rgb_aug,
             rgb_augmentation=rgb_augmentation,
             apply_depth_aug=apply_depth_aug,
@@ -452,6 +503,82 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             depth_focal_lengths=plan.depth_focal_lengths,
         )
         return sample, True
+
+
+class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
+    """CPU-only MV-Kubric planner following the exact live DALI scene order."""
+
+    requires_cuda_prefetch = False
+
+    def __init__(
+        self,
+        *args,
+        webdataset_root: str,
+        native_data_root: str,
+        metadata_index_root: str,
+        webdataset_split: str = "train",
+        stream_world_size: int = 1,
+        stream_seed: int | None = None,
+        stream_scenes_per_batch: int = 4,
+        stream_shuffle_shards: bool = True,
+        stream_include_scene_ids: tuple[str, ...] | None = None,
+        stream_start_request_cursor: int = 0,
+        fixed_views: tuple[int, ...] | None = None,
+        seed_by_scene: bool = False,
+        **kwargs,
+    ):
+        manifest_path = Path(webdataset_root) / webdataset_split / "manifest.json"
+        kwargs["data_root"] = str(native_data_root)
+        kwargs["metadata_index_root"] = str(metadata_index_root)
+        kwargs["metadata_catalog"] = None
+        KubricMultiViewDataset.__init__(self, *args, **kwargs)
+        resolved_seed = self.seed if stream_seed is None else stream_seed
+        self._recipe_world_size = int(stream_world_size)
+        self._recipe_start_cursor = int(stream_start_request_cursor)
+        self._recipe_scenes_per_batch = int(stream_scenes_per_batch)
+        self._recipe_orders = tuple(
+            KubricDaliSceneOrder(
+                manifest_path,
+                rank=rank,
+                world_size=self._recipe_world_size,
+                seed=int(0 if resolved_seed is None else resolved_seed),
+                shuffle_shards=stream_shuffle_shards,
+                include_scene_ids=stream_include_scene_ids,
+            )
+            for rank in range(self._recipe_world_size)
+        )
+        self._native_data_root = Path(native_data_root)
+        self._fixed_views = fixed_views
+        self._seed_by_scene = bool(seed_by_scene)
+
+    def resolve_recipe_request(self, request, *, rank=None, local_cursor=None):
+        if rank is None:
+            rank = int(request.virtual_index) % self._recipe_world_size
+        if local_cursor is None:
+            local_cursor = int(request.virtual_index) // self._recipe_world_size
+        cursor = self._recipe_start_cursor + int(local_cursor)
+        order = self._recipe_orders[int(rank)]
+        first_epoch = order.recipe_scene_names(
+            0, self._recipe_scenes_per_batch
+        )
+        epoch, position = divmod(cursor, len(first_epoch))
+        scene_name = order.recipe_scene_names(
+            epoch, self._recipe_scenes_per_batch
+        )[position]
+        return replace(
+            request,
+            scene_index=self.seq_names.index(scene_name),
+            expected_scene=scene_name,
+        )
+
+    def plan_sample(self, request) -> SamplePlan | None:
+        resolved = self.resolve_recipe_request(request)
+        scene = _native_scene_metadata(
+            self._native_data_root,
+            self.metadata_index,
+            resolved.expected_scene,
+        )
+        return self._plan_scene_metadata(resolved, scene)
 
 
 class DaliKubricValidationDataset(DaliKubricMultiViewDataset):
@@ -519,6 +646,7 @@ class DaliKubricValidationDataset(DaliKubricMultiViewDataset):
 
 __all__ = [
     "DaliKubricMultiViewDataset",
+    "DaliKubricRecipePlanner",
     "DaliKubricValidationDataset",
     "KubricSceneMetadata",
     "KubricWebDatasetCatalog",

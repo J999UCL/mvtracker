@@ -13,13 +13,17 @@ import numpy as np
 import yaml
 
 from mvtracker.datasets import kubric_dali_dataset
-from mvtracker.datasets.kubric_dali_dataset import DaliKubricMultiViewDataset
+from mvtracker.datasets.kubric_dali_dataset import (
+    DaliKubricMultiViewDataset,
+    DaliKubricRecipePlanner,
+)
 from mvtracker.datasets.kubric_dali_stream import (
     KubricDaliSceneOrder,
     KubricDaliSceneBundle,
     KubricDaliSceneGroup,
     KubricDaliSceneStream,
 )
+from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +82,77 @@ def _training_bundle(scene_name: str) -> KubricDaliSceneBundle:
         rgb_npz=tuple(_packed_frames(f"rgb:{view}") for view in range(views)),
         depth_npz=tuple(_packed_frames(f"depth:{view}") for view in range(views)),
     )
+
+
+def _native_recipe_fixture(root: Path, bundle: KubricDaliSceneBundle):
+    with np.load(io.BytesIO(bundle.metadata_npz), allow_pickle=False) as payload:
+        metadata = {name: np.asarray(payload[name]) for name in payload.files}
+    scene_name = bundle.scene_name
+    scene_root = root / "native" / scene_name
+    scene_root.mkdir(parents=True)
+    np.savez(scene_root / "tracks_3d.npz", tracks_3d=metadata["tracks_3d"])
+    view_names = []
+    for view in range(10):
+        view_name = f"view_{view}"
+        view_names.append(view_name)
+        view_root = scene_root / view_name
+        view_root.mkdir()
+        np.savez(
+            view_root / "tracks_2d.npz",
+            tracks_2d=np.zeros((24, 8, 2), dtype=np.float32),
+            occlusion=~metadata["visibility"][view],
+        )
+        (view_root / "metadata.json").write_text(
+            json.dumps({"metadata": {"resolution": [32, 32]}}),
+            encoding="utf-8",
+        )
+
+    index_root = root / "index"
+    (index_root / "scenes").mkdir(parents=True)
+    np.savez(
+        index_root / "scenes" / f"{scene_name}.npz",
+        intrinsics=metadata["intrinsics"],
+        extrinsics=metadata["extrinsics"],
+        sensor_widths=metadata["sensor_widths"],
+        focal_lengths=metadata["focal_lengths"],
+    )
+    (index_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_fingerprint": "fixture",
+                "scenes": {
+                    scene_name: {
+                        "n_frames": 24,
+                        "n_tracks": 8,
+                        "invalid_frame_indices": [],
+                        "view_names": view_names,
+                        "rgba_files": [[] for _ in view_names],
+                        "depth_files": [[] for _ in view_names],
+                        "arrays": f"scenes/{scene_name}.npz",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    web_root = root / "web" / "train"
+    web_root.mkdir(parents=True)
+    (web_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "shards": [
+                    {
+                        "tar": "shard.tar",
+                        "nsamples": 11,
+                        "scene_ids": [scene_name],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return scene_root.parent, index_root, web_root.parent
 
 
 class _TensorList:
@@ -246,6 +321,58 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
 
             self.assertEqual(order.recipe_scene_names(0), tuple(expected))
             self.assertFalse(any(manifest_path.parent.glob("*.tar")))
+
+    def test_recipe_request_resolves_each_rank_and_epoch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = Path(temporary) / "manifest.json"
+            scene_names = [
+                f"scene-{shard}-{position}"
+                for shard in range(4)
+                for position in range(4)
+            ]
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "shards": [
+                            {
+                                "tar": f"shard-{shard}.tar",
+                                "nsamples": 44,
+                                "scene_ids": [
+                                    f"scene-{shard}-{position}"
+                                    for position in range(4)
+                                ],
+                            }
+                            for shard in range(4)
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            orders = tuple(
+                KubricDaliSceneOrder(
+                    manifest_path, rank=rank, world_size=2, seed=72
+                )
+                for rank in range(2)
+            )
+            planner = DaliKubricRecipePlanner.__new__(DaliKubricRecipePlanner)
+            planner._recipe_world_size = 2
+            planner._recipe_start_cursor = 0
+            planner._recipe_scenes_per_batch = 4
+            planner._recipe_orders = orders
+            planner.seq_names = sorted(scene_names)
+
+            for rank in range(2):
+                first = planner.resolve_recipe_request(
+                    ScheduledSampleRequest(rank, 0)
+                )
+                next_epoch = planner.resolve_recipe_request(
+                    ScheduledSampleRequest(16 + rank, 0)
+                )
+                self.assertEqual(first.expected_scene, orders[rank].recipe_scene_names(0)[0])
+                self.assertEqual(
+                    next_epoch.expected_scene,
+                    orders[rank].recipe_scene_names(1)[0],
+                )
 
     def test_native_reader_resets_at_epoch_boundary(self):
         scene_names = ("scene-a", "scene-b", "scene-c", "scene-d")
@@ -504,6 +631,65 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "DALI recipe scene diverged"):
             dataset.plan_sample(request)
+
+    def test_metadata_only_recipe_plan_matches_live_dali_plan(self):
+        bundle = _training_bundle("scene-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            native_root, index_root, web_root = _native_recipe_fixture(
+                Path(temporary), bundle
+            )
+            planner = DaliKubricRecipePlanner(
+                webdataset_root=str(web_root),
+                native_data_root=str(native_root),
+                metadata_index_root=str(index_root),
+                stream_world_size=2,
+                stream_seed=72,
+                seq_len=24,
+                num_views=4,
+                traj_per_sample=4,
+                seed=72,
+                ratio_dynamic=0.0,
+                ratio_very_dynamic=0.0,
+                max_tracks_to_preload=None,
+                augmentation_probability=1.0,
+                enable_variable_depth_type_augs=True,
+            )
+            request = ScheduledSampleRequest(virtual_index=0, scene_index=999)
+            resolved = planner.resolve_recipe_request(request)
+            self.assertEqual(resolved.expected_scene, "scene-a")
+
+            original_load = np.load
+
+            def metadata_load(path, *args, **kwargs):
+                name = str(path)
+                if "rgba_" in name or "depth_" in name:
+                    raise AssertionError(f"media read: {name}")
+                return original_load(path, *args, **kwargs)
+
+            with patch.object(
+                Path, "read_bytes", side_effect=AssertionError("media read")
+            ), patch.object(np, "load", side_effect=metadata_load):
+                cpu_plan = planner.plan_sample(request)
+
+            group = KubricDaliSceneGroup((bundle,), 1, 0.1, 123)
+            live = DaliKubricMultiViewDataset.__new__(DaliKubricMultiViewDataset)
+            live.__dict__.update(planner.__dict__)
+            live._streamed_scenes = deque([(bundle, group, 0, 0)])
+            live_plan = live.plan_sample(resolved)
+
+        self.assertEqual(cpu_plan.sequence, live_plan.sequence)
+        self.assertEqual(cpu_plan.depth_source, live_plan.depth_source)
+        self.assertEqual(cpu_plan.views, live_plan.views)
+        np.testing.assert_array_equal(
+            cpu_plan.selected_global_track_indices,
+            live_plan.selected_global_track_indices,
+        )
+        np.testing.assert_allclose(cpu_plan.trajectory, live_plan.trajectory)
+        np.testing.assert_allclose(cpu_plan.theta, live_plan.theta)
+        self.assertEqual(cpu_plan.rgb_sources, ())
+        self.assertEqual(cpu_plan.depth_sources, ())
+        self.assertGreater(len(live_plan.rgb_sources), 0)
+        self.assertGreater(len(live_plan.depth_sources), 0)
 
     def test_resume_offset_continues_inside_the_group(self):
         scenes = tuple(
