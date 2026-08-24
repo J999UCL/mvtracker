@@ -726,7 +726,7 @@ def dali_readback(run_name: str = "vggt-omega-long") -> dict:
     pipeline.feed_input("rgb", [np.frombuffer(frame, dtype=np.uint8) for frame in rgb_encoded])
     pipeline.feed_input("depth", [np.frombuffer(frame, dtype=np.uint8) for frame in depth_encoded])
     decoded_rgb, decoded_depth = pipeline.run()
-    return {
+    report = {
         "format": "mvtracker_vggt_omega_dali_readback",
         "device": "cpu",
         "dali_reader_seconds": group.read_seconds,
@@ -735,6 +735,8 @@ def dali_readback(run_name: str = "vggt-omega-long") -> dict:
         "depth_frames": len(decoded_depth),
         "depth_dtype": str(decoded_depth.as_array().dtype),
     }
+    _emit("dali_readback_complete", **report)
+    return report
 
 
 def _packed_frames(payload: bytes) -> tuple[bytes, ...]:
