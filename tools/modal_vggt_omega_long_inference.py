@@ -624,6 +624,9 @@ def pack_mvkubric(run_name: str = "vggt-omega-long") -> dict:
     output_root.mkdir(parents=True, exist_ok=True)
     source_root = DATA_ROOT / "datasets/kubric-multiview/train"
     estimated_root = RUN_ROOT / run_name / "estimated-depth" / "mv-kubric"
+    if not estimated_root.is_dir():
+        estimated_root = RUN_ROOT / run_name / "bursts" / "mv-kubric"
+    _emit("dali_pack_start", run_name=run_name, source_root=str(source_root), estimated_root=str(estimated_root))
     shard = write_shard(
         source_root,
         SceneShard(name="mvkubric-vggt-00000", scene_ids=SCENES["mv-kubric"], index=0),
@@ -651,6 +654,7 @@ def pack_mvkubric(run_name: str = "vggt-omega-long") -> dict:
     partial.replace(index_path)
     manifest = finalize_shards(output_root, SCENES["mv-kubric"], scenes_per_shard=2)
     run_volume.commit()
+    _emit("dali_pack_complete", run_name=run_name, output_root=str(output_root), bytes=shard["bytes"])
     return {"shard": shard, "manifest": manifest}
 
 

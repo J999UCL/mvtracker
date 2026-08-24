@@ -238,9 +238,26 @@ def _packed_float_depth_frames(
 ) -> bytes:
     """Encode float32 estimated depth as TIFF bytes for the DALI reader."""
     scene_root = Path(estimated_depth_root) / str(scene_id)
-    manifest = json.loads((scene_root / "manifest.json").read_text(encoding="utf-8"))
-    view_name = str(view)
-    depth = np.load(scene_root / view_name / "depth.npy", mmap_mode="r", allow_pickle=False)
+    if (scene_root / "manifest.json").is_file() and (scene_root / str(view) / "depth.npy").is_file():
+        manifest = json.loads((scene_root / "manifest.json").read_text(encoding="utf-8"))
+        depth = np.load(scene_root / str(view) / "depth.npy", mmap_mode="r", allow_pickle=False)
+        cleaned_mask = np.load(
+            scene_root / str(view) / "cleaned_mask.npy",
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        frame_getter = lambda frame_index: depth[frame_index]
+        mask_getter = lambda frame_index: cleaned_mask[frame_index]
+    else:
+        burst_roots = sorted(path for path in scene_root.glob("frames-*") if path.is_dir())
+        if len(burst_roots) != 1:
+            raise ValueError(f"{scene_root}: expected exactly one completed burst")
+        burst_root = burst_roots[0]
+        manifest = json.loads((burst_root / "manifest.json").read_text(encoding="utf-8"))
+        depth = np.load(burst_root / "depth.npy", mmap_mode="r", allow_pickle=False)
+        mask = np.load(burst_root / "cleaned_mask.npy", mmap_mode="r", allow_pickle=False)
+        frame_getter = lambda frame_index: depth[view, frame_index]
+        mask_getter = lambda frame_index: mask[view, frame_index]
     if depth.dtype != np.float32:
         raise ValueError(f"{scene_root}/{view_name}/depth.npy must be float32")
     if cleaned:
@@ -254,9 +271,9 @@ def _packed_float_depth_frames(
     encoded: list[bytes] = []
     offsets = [0]
     for frame_index in range(depth.shape[0]):
-        frame = np.asarray(depth[frame_index], dtype=np.float32)
+        frame = np.asarray(frame_getter(frame_index), dtype=np.float32)
         if cleaned:
-            frame = np.where(mask[frame_index], frame, 0.0).astype(np.float32, copy=False)
+            frame = np.where(mask_getter(frame_index), frame, 0.0).astype(np.float32, copy=False)
         stream = io.BytesIO()
         Image.fromarray(frame, mode="F").save(stream, format="TIFF")
         payload = stream.getvalue()
