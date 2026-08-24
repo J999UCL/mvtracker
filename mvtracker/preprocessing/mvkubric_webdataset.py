@@ -248,6 +248,9 @@ def _packed_float_depth_frames(
         )
         frame_getter = lambda frame_index: depth[frame_index]
         mask_getter = lambda frame_index: cleaned_mask[frame_index]
+        depth_label = scene_root / str(view) / "depth.npy"
+        mask_array = cleaned_mask
+        frame_count = int(depth.shape[0])
     else:
         burst_roots = sorted(path for path in scene_root.glob("frames-*") if path.is_dir())
         if len(burst_roots) != 1:
@@ -258,19 +261,17 @@ def _packed_float_depth_frames(
         mask = np.load(burst_root / "cleaned_mask.npy", mmap_mode="r", allow_pickle=False)
         frame_getter = lambda frame_index: depth[view, frame_index]
         mask_getter = lambda frame_index: mask[view, frame_index]
+        depth_label = burst_root / "depth.npy"
+        mask_array = mask
+        frame_count = int(depth.shape[1])
     if depth.dtype != np.float32:
-        raise ValueError(f"{scene_root}/{view_name}/depth.npy must be float32")
+        raise ValueError(f"{depth_label} must be float32")
     if cleaned:
-        mask = np.load(
-            scene_root / view_name / "cleaned_mask.npy",
-            mmap_mode="r",
-            allow_pickle=False,
-        )
-        if mask.dtype != np.bool_ or mask.shape != depth.shape:
-            raise ValueError(f"{scene_root}/{view_name}: invalid cleaned mask")
+        if mask_array.dtype != np.bool_ or mask_array.shape != depth.shape:
+            raise ValueError(f"{depth_label.parent}: invalid cleaned mask")
     encoded: list[bytes] = []
     offsets = [0]
-    for frame_index in range(depth.shape[0]):
+    for frame_index in range(frame_count):
         frame = np.asarray(frame_getter(frame_index), dtype=np.float32)
         if cleaned:
             frame = np.where(mask_getter(frame_index), frame, 0.0).astype(np.float32, copy=False)
@@ -280,7 +281,7 @@ def _packed_float_depth_frames(
         encoded.append(payload)
         offsets.append(offsets[-1] + len(payload))
     expected_frames = int(manifest["frame_count"])
-    if depth.shape[0] != expected_frames:
+    if frame_count != expected_frames:
         raise ValueError(f"{scene_root}/{view_name}: frame count does not match manifest")
     return _npz_bytes(
         bytes=np.frombuffer(b"".join(encoded), dtype=np.uint8),
