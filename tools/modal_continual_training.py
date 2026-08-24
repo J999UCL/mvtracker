@@ -392,8 +392,6 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                     "datasets.train.recipe_path=null",
                     "datasets.train.force_gt_depth=false",
                     "augmentations.variable_depth_type=true",
-                    "+datasets.train.kubric_metadata_index_root="
-                    f"{DATA_VOLUME_ROOT}/datasets/kubric-multiview/train/MVTracker_index",
                 ],
             )
         phase["name"] = "scene_inventory"
@@ -437,13 +435,11 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 include_scene_ids=source_cfg.get("include_scene_ids"),
                 exclude_scene_ids=source_cfg.get("exclude_scene_ids", ()),
             )
-            native_data_root = kwargs.pop("data_root")
-            metadata_index_root = kwargs.pop("metadata_index_root")
+            kwargs.pop("data_root")
+            kwargs.pop("metadata_index_root")
             datasets[source] = DaliKubricRecipePlanner(
                 **kwargs,
                 webdataset_root=cfg.datasets.train.mvkubric_webdataset_root,
-                native_data_root=native_data_root,
-                metadata_index_root=metadata_index_root,
                 webdataset_split="train",
                 stream_world_size=2,
                 stream_seed=seed,

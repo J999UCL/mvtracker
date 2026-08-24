@@ -2,6 +2,7 @@ import inspect
 import io
 import json
 import sys
+import tarfile
 import tempfile
 import types
 import unittest
@@ -84,75 +85,47 @@ def _training_bundle(scene_name: str) -> KubricDaliSceneBundle:
     )
 
 
-def _native_recipe_fixture(root: Path, bundle: KubricDaliSceneBundle):
-    with np.load(io.BytesIO(bundle.metadata_npz), allow_pickle=False) as payload:
-        metadata = {name: np.asarray(payload[name]) for name in payload.files}
+def _recipe_web_fixture(root: Path, bundle: KubricDaliSceneBundle):
     scene_name = bundle.scene_name
-    scene_root = root / "native" / scene_name
-    scene_root.mkdir(parents=True)
-    np.savez(scene_root / "tracks_3d.npz", tracks_3d=metadata["tracks_3d"])
-    view_names = []
-    for view in range(10):
-        view_name = f"view_{view}"
-        view_names.append(view_name)
-        view_root = scene_root / view_name
-        view_root.mkdir()
-        np.savez(
-            view_root / "tracks_2d.npz",
-            tracks_2d=np.zeros((24, 8, 2), dtype=np.float32),
-            occlusion=~metadata["visibility"][view],
-        )
-        (view_root / "metadata.json").write_text(
-            json.dumps({"metadata": {"resolution": [32, 32]}}),
-            encoding="utf-8",
-        )
-
-    index_root = root / "index"
-    (index_root / "scenes").mkdir(parents=True)
-    np.savez(
-        index_root / "scenes" / f"{scene_name}.npz",
-        intrinsics=metadata["intrinsics"],
-        extrinsics=metadata["extrinsics"],
-        sensor_widths=metadata["sensor_widths"],
-        focal_lengths=metadata["focal_lengths"],
-    )
-    (index_root / "manifest.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "source_fingerprint": "fixture",
-                "scenes": {
-                    scene_name: {
-                        "n_frames": 24,
-                        "n_tracks": 8,
-                        "invalid_frame_indices": [],
-                        "view_names": view_names,
-                        "rgba_files": [[] for _ in view_names],
-                        "depth_files": [[] for _ in view_names],
-                        "arrays": f"scenes/{scene_name}.npz",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
     web_root = root / "web" / "train"
     web_root.mkdir(parents=True)
+    archive_path = web_root / "shard.tar"
+    member_name = f"scene-{scene_name}.meta.npz"
+    with tarfile.open(archive_path, "w") as archive:
+        info = tarfile.TarInfo(member_name)
+        info.size = len(bundle.metadata_npz)
+        archive.addfile(info, io.BytesIO(bundle.metadata_npz))
+    with tarfile.open(archive_path) as archive:
+        member = archive.getmember(member_name)
+    (web_root / "shard.idx").write_text(
+        f"v1.2 1\nmeta.npz {member.offset_data} {member.size} {member_name}\n",
+        encoding="utf-8",
+    )
     (web_root / "manifest.json").write_text(
         json.dumps(
             {
+                "format": "mvtracker-kubric-webdataset",
                 "shards": [
                     {
                         "tar": "shard.tar",
                         "nsamples": 11,
                         "scene_ids": [scene_name],
                     }
-                ]
+                ],
+                "scenes": {
+                    scene_name: {
+                        "metadata_index": 0,
+                        "views": {
+                            str(view): {"media_index": view + 1}
+                            for view in range(10)
+                        },
+                    }
+                },
             }
         ),
         encoding="utf-8",
     )
-    return scene_root.parent, index_root, web_root.parent
+    return web_root.parent
 
 
 class _TensorList:
@@ -635,13 +608,9 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
     def test_metadata_only_recipe_plan_matches_live_dali_plan(self):
         bundle = _training_bundle("scene-a")
         with tempfile.TemporaryDirectory() as temporary:
-            native_root, index_root, web_root = _native_recipe_fixture(
-                Path(temporary), bundle
-            )
+            web_root = _recipe_web_fixture(Path(temporary), bundle)
             planner = DaliKubricRecipePlanner(
                 webdataset_root=str(web_root),
-                native_data_root=str(native_root),
-                metadata_index_root=str(index_root),
                 stream_world_size=2,
                 stream_seed=72,
                 seq_len=24,

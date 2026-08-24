@@ -20,8 +20,11 @@ from mvtracker.datasets.kubric_dali_stream import (
     KubricDaliSceneStream,
     KubricDaliSceneOrder,
 )
-from mvtracker.datasets.kubric_metadata_index import KubricMetadataIndex
 from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
+from mvtracker.preprocessing.mvkubric_webdataset import (
+    META_COMPONENT,
+    parse_dali_index,
+)
 from mvtracker.datasets.tapvid3d_multiview_dataset import (
     EncodedTapVid3DSample,
     SamplePlan,
@@ -98,7 +101,7 @@ class KubricWebDatasetCatalog:
 def _scene_metadata(bundle: KubricDaliSceneBundle) -> KubricSceneMetadata:
     meta = _npz_bytes(bundle.metadata_npz)
     return KubricSceneMetadata(
-        name=bundle.scene_name,
+        name=bundle.scene_name or str(np.asarray(meta["scene_name"]).item()),
         tracks_3d=np.asarray(meta["tracks_3d"], dtype=np.float32),
         visibility=np.asarray(meta["visibility"], dtype=np.bool_),
         intrinsics=np.asarray(meta["intrinsics"], dtype=np.float32),
@@ -110,39 +113,6 @@ def _scene_metadata(bundle: KubricDaliSceneBundle) -> KubricSceneMetadata:
             for value in np.asarray(meta.get("invalid_frame_indices", ())).reshape(-1)
         ),
         resolution_hw=tuple(int(value) for value in np.asarray(meta["resolution_hw"]).reshape(-1)),
-    )
-
-
-def _native_scene_metadata(
-    data_root: Path,
-    metadata_index: KubricMetadataIndex,
-    scene_name: str,
-) -> KubricSceneMetadata:
-    """Load compact tracks/cameras only; never open RGB or depth frames."""
-    entry, arrays = metadata_index.scene(scene_name)
-    scene_root = data_root / scene_name
-    with np.load(scene_root / "tracks_3d.npz", allow_pickle=False) as payload:
-        tracks_3d = np.asarray(payload["tracks_3d"], dtype=np.float32)
-    visibility = []
-    for view_name in entry["view_names"]:
-        with np.load(
-            scene_root / view_name / "tracks_2d.npz", allow_pickle=False
-        ) as payload:
-            visibility.append(~np.asarray(payload["occlusion"], dtype=np.bool_))
-    with (scene_root / entry["view_names"][0] / "metadata.json").open(
-        encoding="utf-8"
-    ) as handle:
-        width, height = json.load(handle)["metadata"]["resolution"]
-    return KubricSceneMetadata(
-        name=scene_name,
-        tracks_3d=tracks_3d,
-        visibility=np.stack(visibility),
-        intrinsics=np.asarray(arrays["intrinsics"], dtype=np.float32),
-        extrinsics=np.asarray(arrays["extrinsics"], dtype=np.float32),
-        sensor_widths=np.asarray(arrays["sensor_widths"], dtype=np.float32),
-        focal_lengths=np.asarray(arrays["focal_lengths"], dtype=np.float32),
-        invalid_frame_indices=tuple(map(int, entry["invalid_frame_indices"])),
-        resolution_hw=(int(height), int(width)),
     )
 
 
@@ -515,8 +485,6 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
         self,
         *args,
         webdataset_root: str,
-        native_data_root: str,
-        metadata_index_root: str,
         webdataset_split: str = "train",
         stream_world_size: int = 1,
         stream_seed: int | None = None,
@@ -529,9 +497,10 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
         **kwargs,
     ):
         manifest_path = Path(webdataset_root) / webdataset_split / "manifest.json"
-        kwargs["data_root"] = str(native_data_root)
-        kwargs["metadata_index_root"] = str(metadata_index_root)
-        kwargs["metadata_catalog"] = None
+        self.catalog = KubricWebDatasetCatalog(manifest_path)
+        kwargs["data_root"] = str(Path(webdataset_root))
+        kwargs["metadata_index_root"] = None
+        kwargs["metadata_catalog"] = self.catalog
         KubricMultiViewDataset.__init__(self, *args, **kwargs)
         resolved_seed = self.seed if stream_seed is None else stream_seed
         self._recipe_world_size = int(stream_world_size)
@@ -548,44 +517,64 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
             )
             for rank in range(self._recipe_world_size)
         )
-        self._native_data_root = Path(native_data_root)
         self._recipe_metadata = {}
         self._fixed_views = fixed_views
         self._seed_by_scene = bool(seed_by_scene)
 
     def preload_recipe_metadata(self, workers: int = 16) -> None:
-        scene_names = tuple(
+        shards = tuple(
             dict.fromkeys(
-                scene
+                shard
                 for order in self._recipe_orders
                 for shard in order.assigned
-                for scene in shard.selected_scene_names
             )
         )
+        selected = set(self.seq_names)
+
+        def load_shard(shard):
+            records = parse_dali_index(shard.index)
+            scenes = {}
+            with shard.archive.open("rb") as archive:
+                for record in records:
+                    component = next(
+                        (
+                            item
+                            for item in record.components
+                            if item.extension == META_COMPONENT
+                        ),
+                        None,
+                    )
+                    if component is None:
+                        continue
+                    archive.seek(component.offset)
+                    payload = archive.read(component.size)
+                    scene = _scene_metadata(
+                        KubricDaliSceneBundle("", payload, (), ())
+                    )
+                    if scene.name in selected:
+                        scenes[scene.name] = scene
+            return scenes
+
         started = time.perf_counter()
         print(
-            f"RECIPE_METADATA event=start scenes={len(scene_names)} workers={workers}",
+            "RECIPE_METADATA event=start "
+            f"scenes={len(selected)} shards={len(shards)} workers={workers}",
             flush=True,
         )
         with ThreadPoolExecutor(max_workers=int(workers)) as executor:
             futures = {
-                executor.submit(
-                    _native_scene_metadata,
-                    self._native_data_root,
-                    self.metadata_index,
-                    scene,
-                ): scene
-                for scene in scene_names
+                executor.submit(load_shard, shard): shard
+                for shard in shards
             }
             for completed, future in enumerate(as_completed(futures), start=1):
-                scene = futures[future]
-                self._recipe_metadata[scene] = future.result()
-                if completed % 100 == 0 or completed == len(scene_names):
+                self._recipe_metadata.update(future.result())
+                if completed % 25 == 0 or completed == len(shards):
                     elapsed = time.perf_counter() - started
                     print(
                         "RECIPE_METADATA event=progress "
-                        f"completed={completed}/{len(scene_names)} "
-                        f"rate={completed / max(elapsed, 1e-9):.1f}_scenes_per_second",
+                        f"shards={completed}/{len(shards)} "
+                        f"scenes={len(self._recipe_metadata)}/{len(selected)} "
+                        f"rate={len(self._recipe_metadata) / max(elapsed, 1e-9):.1f}_scenes_per_second",
                         flush=True,
                     )
 
@@ -611,14 +600,7 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
 
     def plan_sample(self, request) -> SamplePlan | None:
         resolved = self.resolve_recipe_request(request)
-        scene = self._recipe_metadata.get(resolved.expected_scene)
-        if scene is None:
-            scene = _native_scene_metadata(
-                self._native_data_root,
-                self.metadata_index,
-                resolved.expected_scene,
-            )
-            self._recipe_metadata[resolved.expected_scene] = scene
+        scene = self._recipe_metadata[resolved.expected_scene]
         return self._plan_scene_metadata(resolved, scene)
 
 
