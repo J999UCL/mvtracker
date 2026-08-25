@@ -47,6 +47,15 @@ def _decode(encoded: bytes) -> Image.Image:
         return image.convert("RGB")
 
 
+def _homogeneous_extrinsics(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if values.shape[-2:] == (4, 4):
+        return values
+    bottom = np.zeros((*values.shape[:-2], 1, 4), dtype=np.float32)
+    bottom[..., 0, 3] = 1.0
+    return np.concatenate((values, bottom), axis=-2)
+
+
 class _PackedScenes:
     def __init__(self, data_root: Path):
         self.data_root = data_root
@@ -100,7 +109,7 @@ class _PackedScenes:
         return (
             inference_views,
             [[_decode(encoded_by_view[view][position]) for view in inference_views] for position in range(len(frames))],
-            np.stack(extrinsics, axis=1).astype(np.float32),
+            _homogeneous_extrinsics(np.stack(extrinsics, axis=1)),
             np.stack(intrinsics, axis=1).astype(np.float32),
             (first.height, first.width),
         )
@@ -140,11 +149,18 @@ class _MVKubricScenes:
             [_decode(encoded_by_view[view][frame]) for view in inference_views]
             for frame in frames
         ]
-        extrinsics = np.stack(
-            [scene.extrinsics[view, frames] for view in inference_views], axis=1
-        ).astype(np.float32)
+        extrinsics = _homogeneous_extrinsics(
+            np.stack(
+                [scene.extrinsics[view, frames] for view in inference_views],
+                axis=1,
+            )
+        )
         intrinsics = np.stack(
-            [scene.intrinsics[view, frames] for view in inference_views], axis=1
+            [
+                np.repeat(scene.intrinsics[view][None], len(frames), axis=0)
+                for view in inference_views
+            ],
+            axis=1,
         ).astype(np.float32)
         return inference_views, images, extrinsics, intrinsics, scene.resolution_hw
 
