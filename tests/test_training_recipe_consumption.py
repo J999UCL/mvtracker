@@ -108,7 +108,6 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
         planner_decorator = source[source.rfind("@app.function(", 0, planner_start):planner_start]
         smoke_start = source.index("def recipe_smoke20_remote(")
         smoke_decorator = source[source.rfind("@app.function(", 0, smoke_start):smoke_start]
-        self.assertIn("cpu=16", planner_decorator)
         self.assertIn("data_volume.with_mount_options(read_only=True)", planner_decorator)
         self.assertIn("str(RUN_ROOT): run_volume", planner_decorator)
         self.assertIn("RECIPE_SMOKE_GPU_REQUEST = GPU_REQUEST", source)

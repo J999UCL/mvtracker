@@ -58,6 +58,7 @@ LOADER_PROFILE_WARMUP = 4
 LOADER_PROFILE_MEASURED = 32
 H100_LOADER_PROFILE_WARMUP = 20
 H100_LOADER_PROFILE_MEASURED = 100
+RECIPE_PLANNER_CPUS = 32
 EXPERIMENT_PHASES = {
     "smoke": (
         {
@@ -358,7 +359,7 @@ def profile_h100_loader_remote() -> dict:
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
-    cpu=16,
+    cpu=RECIPE_PLANNER_CPUS,
     memory=65536,
     timeout=6 * 60 * 60,
     max_containers=1,
@@ -366,7 +367,7 @@ def profile_h100_loader_remote() -> dict:
     include_source=False,
 )
 def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
-    """Plan the mixed-source recipe using metadata only on sixteen CPU cores."""
+    """Plan the mixed-source recipe using metadata only."""
     from functools import partial
     from types import SimpleNamespace
 
@@ -387,7 +388,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     local_output_dir = Path("/tmp/mvtracker-training-recipes") / recipe_name
     print(
         "recipe startup "
-        f"commit={_source_commit()} cpus=16 steps={step_count} "
+        f"commit={_source_commit()} cpus={RECIPE_PLANNER_CPUS} steps={step_count} "
         f"data_root={DATA_VOLUME_ROOT} local_output={local_output_dir} "
         f"volume_output={output_dir}",
         flush=True,
@@ -483,7 +484,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 stream_include_scene_ids=source_cfg.get("include_scene_ids"),
             )
             phase["name"] = "mvkubric_metadata_preload"
-            datasets[source].preload_recipe_metadata(workers=16)
+            datasets[source].preload_recipe_metadata(workers=RECIPE_PLANNER_CPUS)
         schedule = BalancedMixedSourceSchedule(
             {source: dataset.real_len for source, dataset in datasets.items()},
             source_pattern,
@@ -507,7 +508,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                     for source, dataset in datasets.items()
                 },
             },
-            worker_count=16,
+            worker_count=RECIPE_PLANNER_CPUS,
             block_steps=25,
             heartbeat_seconds=10,
             physical_scheduler=partial(
@@ -524,11 +525,11 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
         group="training-recipe-planning",
         job_type="recipe-planning",
         name=recipe_name,
-        tags=["modal", "recipe", "cpu16", "training"],
+        tags=["modal", "recipe", f"cpu{RECIPE_PLANNER_CPUS}", "training"],
         config={
             "source_commit": _source_commit(),
             "step_count": int(step_count),
-            "cpu_cores": 16,
+            "cpu_cores": RECIPE_PLANNER_CPUS,
             **MODAL_TAGS,
         },
     )
