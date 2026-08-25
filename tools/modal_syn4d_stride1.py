@@ -119,18 +119,10 @@ class _Progress:
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.cpu_count = os.cpu_count() or 1
-        self.last_cpu_usage_usec = self._cpu_usage_usec()
+        self.last_cpu_seconds = time.process_time()
         self.last_cpu_sample = time.perf_counter()
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.thread.start()
-
-    @staticmethod
-    def _cpu_usage_usec() -> int:
-        for line in Path("/sys/fs/cgroup/cpu.stat").read_text(encoding="utf-8").splitlines():
-            key, value = line.split()
-            if key == "usage_usec":
-                return int(value)
-        raise RuntimeError("cgroup cpu.stat did not report usage_usec")
 
     def emit(self, event: str, **fields: object) -> None:
         with self.lock:
@@ -157,10 +149,10 @@ class _Progress:
         while not self.stop.wait(15):
             usage = shutil.disk_usage("/tmp")
             now = time.perf_counter()
-            cpu_usage_usec = self._cpu_usage_usec()
+            cpu_seconds = time.process_time()
             interval = now - self.last_cpu_sample
-            cpu_percent = 100 * (cpu_usage_usec - self.last_cpu_usage_usec) / (1_000_000 * interval * self.cpu_count)
-            self.last_cpu_usage_usec = cpu_usage_usec
+            cpu_percent = 100 * (cpu_seconds - self.last_cpu_seconds) / (interval * self.cpu_count)
+            self.last_cpu_seconds = cpu_seconds
             self.last_cpu_sample = now
             self.emit(
                 "heartbeat",
