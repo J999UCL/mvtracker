@@ -53,7 +53,7 @@ def _image() -> modal.Image:
             index_url="https://download.pytorch.org/whl/cpu",
         )
         .pip_install(
-            "hf-xet==1.6.0", "huggingface-hub==1.28.0", "OpenEXR==3.3.5",
+            "hf-xet==1.6.0", "huggingface-hub==1.28.0", "OpenEXR==3.3.5", "safetensors==0.5.3",
             "opencv-python-headless==4.11.0.86", "numpy==2.2.4", "scipy==1.15.2",
             "pandas==2.2.3", "Pillow==11.1.0", "kornia==0.7.3",
             "mediapy==1.2.0", "pypng==0.20220715.0", "rerun-sdk==0.21.0",
