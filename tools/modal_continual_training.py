@@ -201,9 +201,9 @@ da3_training_image = _source_image(
         "pycolmap",
         "imageio",
         "pillow-heif",
-        "e3nn",
-        "evo",
         "plyfile",
+        "numpy==1.24.3",
+        "matplotlib==3.8.3",
     )
     .run_commands(
         "python -m pip install --no-deps "
