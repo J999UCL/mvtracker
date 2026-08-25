@@ -87,6 +87,24 @@ def _rows(manifest: dict[str, object]) -> list[dict[str, str]]:
             continue
         seen.add(key)
         result.append({"environment": environment, "sequence": sequence, "split": split})
+    for item in manifest.get("sequence_ranges", []):
+        if not isinstance(item, dict):
+            continue
+        environment = str(item.get("environment", ""))
+        split = str(item.get("split", "train"))
+        try:
+            start = int(item["start"])
+            end = int(item["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not environment or split not in OUTPUT_ROOTS:
+            continue
+        for index in range(start, end + 1):
+            sequence = f"seq_{index:06d}"
+            key = environment, sequence, split
+            if key not in seen:
+                seen.add(key)
+                result.append({"environment": environment, "sequence": sequence, "split": split})
     return result
 
 

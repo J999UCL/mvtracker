@@ -1,10 +1,25 @@
 {
   "name": "syn4d-stride1-backfill",
-  "sequences": [
-    {
-      "environment": "countryside",
-      "sequence": "seq_000000",
-      "split": "train"
-    }
+  "sequence_ranges": [
+    {"environment": "bigoffice_v1", "start": 0, "end": 19, "split": "train"},
+    {"environment": "scifiroom_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "cave_group", "start": 0, "end": 19, "split": "train"},
+    {"environment": "flying_group", "start": 0, "end": 19, "split": "train"},
+    {"environment": "desert_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "space_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "brushify_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "countryside", "start": 0, "end": 19, "split": "train"},
+    {"environment": "lab_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "post_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "castle", "start": 0, "end": 19, "split": "train"},
+    {"environment": "winter", "start": 0, "end": 19, "split": "train"},
+    {"environment": "hospital", "start": 0, "end": 19, "split": "train"},
+    {"environment": "temple_group", "start": 0, "end": 19, "split": "train"},
+    {"environment": "planet_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "cyber_bald", "start": 0, "end": 19, "split": "train"},
+    {"environment": "warehouse_group_static", "start": 0, "end": 19, "split": "validation"},
+    {"environment": "winter_group_static", "start": 0, "end": 19, "split": "validation"},
+    {"environment": "middleeast_bald", "start": 0, "end": 19, "split": "validation"},
+    {"environment": "japenese_bald", "start": 0, "end": 19, "split": "validation"}
   ]
 }
