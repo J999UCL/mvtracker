@@ -186,6 +186,7 @@ class RecipeWriter:
         }
         self._steps.write(json.dumps(payload, separators=(",", ":")) + "\n")
         self._pending_records = []
+        self._pending_step = None
 
     def finalize(
         self,
