@@ -2031,6 +2031,20 @@ Raw delta1 rose from 0.8710 to 0.9579 and foreground delta1 from 0.8108 to
 - Report: `jeet-mvtracker-runs-v2/da3-giant-h100/da3-giant-1.1-diningroom02-20260825T110038Z/report.json`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
 
+## 2026-08-25 — Syn4D far-field trajectory spike diagnosis
+
+Three Syn4D samples accounted for 61.1% of all logged Syn4D trajectory loss in
+the stopped expanded mixed-depth run. Their tracks were finite, valid and
+temporally smooth, but the sampled windows contained static environment points
+between 100 m and 374 m from the frame-zero camera-rig centre. A normal
+`planet_bald` control contained only four tracks beyond 50 m. The outliers
+occurred with both GT and estimated depth, ruling out DA3 as the common cause.
+
+Syn4D recipe planning now rejects tracks whose maximum camera-centred radius in
+the sampled window exceeds 65 m. The filter runs after world recentering and
+before projection, augmentation and final track sampling. Existing recipes
+must be regenerated; media and depth artifacts are unchanged.
+
 ## 2026-08-25 — Expanded Syn4D training inventory enabled
 
 The Modal data Volume contains 303 completed Syn4D training scenes across 16

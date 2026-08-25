@@ -126,6 +126,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         data_root: str,
         view_count_probabilities: Sequence[float] | None = None,
         mmap_cache_sequences: int = 4,
+        max_track_radius: float = 65.0,
         **kwargs,
     ):
         probabilities = tuple(view_count_probabilities or (1 / 6,) * 6)
@@ -140,6 +141,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             Path(data_root), mmap_cache_sequences
         )
         self._mmap_cache_sequences = int(mmap_cache_sequences)
+        self.max_track_radius = float(max_track_radius)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -213,6 +215,9 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             ),
             mmap_cache_sequences=int(datasets_cfg.get("syn4d_mmap_cache_sequences", 4)),
             max_depth=float(datasets_cfg.get("syn4d_max_depth", 300.0)),
+            max_track_radius=float(
+                datasets_cfg.get("syn4d_max_track_radius", 65.0)
+            ),
             enable_variable_depth_type_augs=bool(
                 requested == "training"
                 and kwargs.get("enable_variable_depth_type_augs")
@@ -316,6 +321,15 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             extrinsics,
             world_anchor,
         )
+        within_radius = (
+            np.linalg.norm(tracks, axis=-1).max(axis=0) <= self.max_track_radius
+        )
+        preselected = preselected[within_radius]
+        tracks = tracks[:, within_radius]
+        selected_valid = selected_valid[:, within_radius]
+        selected_visibility = selected_visibility[:, :, within_radius]
+        if not len(preselected):
+            return None
 
         xy, camera_z = _project(tracks, extrinsics, intrinsics)
         selected_visibility &= (
