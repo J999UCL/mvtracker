@@ -2222,3 +2222,54 @@ have maximum camera-centred track radii of 64.35 m, 18.12 m and 17.40 m.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/80gqjdz5
 - Implementation: `118bcf8`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 2026-08-26 — Fresh mixed-depth recipe launch stopped for container RAM growth
+
+The canonical 1,000-step recipe
+`fresh-mixed-da3-r65-singleton-1000-20260825` was launched with two H200
+training ranks and one asynchronous H200 DA3-Giant producer. The recipe used
+8,000 fresh logical samples, singleton physical groups, the 25% DIEGESIS / 50%
+MV-Kubric / 25% Syn4D source mixture, and the planned 70% GT / 20% estimated /
+10% estimated-cleaned depth mixture.
+
+The first attempt reached optimizer step 94 with finite losses, stable
+67--70 GiB training-GPU VRAM and approximately 8.5 seconds per warm step. It
+was stopped after the container's cgroup usage reached approximately 232 GiB.
+The DA3 producer had advanced roughly forty recipe steps ahead. The runtime
+depth consumer was already deleting samples after loading them, so the next
+implementation flushed and evicted each newly written depth sidecar and capped
+the producer at 32 pending samples.
+
+The corrected detached run confirmed that producer backpressure worked, but
+container memory still rose throughout training:
+
+| Optimizer step | Total cgroup RAM |
+|---:|---:|
+| 1 | 73.8 GiB |
+| 10 | 107.8 GiB |
+| 20 | 135.3 GiB |
+| 30 | 146.3 GiB |
+| 40 | 162.8 GiB |
+| 50 | 182.7 GiB |
+| 60 | 193.3 GiB |
+| 70 | 211.0 GiB |
+| 80 | 227.6 GiB |
+| 90 | 245.1 GiB |
+| 100 | 262.5 GiB |
+
+The run was deliberately stopped at step 103. Model compute did not degrade:
+warm steps remained roughly 6--9 seconds, ordinary data wait was generally
+below 0.5 seconds, training VRAM stabilized near 70 GiB, and no model, DDP,
+depth or numerical errors occurred. The remaining problem is container-side
+memory retention associated with the data path. The existing metric cannot yet
+separate anonymous/pinned process memory from filesystem cache, so another
+full launch should wait for per-process RSS and cache attribution. No
+checkpoint was written because the first scheduled save was step 250.
+
+- Stopped run: `fresh-r65-da3-cachefix2-1000-20260826T0037BST`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/f980fa194492
+- Modal FunctionCall: `fc-01M0XMHDF6Z59KN2QSWR86H6Q2`
+- Run Volume: `continual-training/fresh-r65-da3-cachefix2-1000-20260826T0037BST`
+- Runtime cache changes: `24c2e90`
+- Correct total-cgroup telemetry: `58c58ad`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
