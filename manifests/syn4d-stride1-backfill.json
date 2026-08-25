@@ -1,7 +1,7 @@
 {
   "name": "syn4d-stride1-backfill",
   "sequence_ranges": [
-    {"environment": "bigoffice_v1", "start": 0, "end": 19, "split": "train"},
+    {"environment": "bigoffice_v1", "start": 0, "end": 4, "split": "train"},
     {"environment": "scifiroom_bald", "start": 0, "end": 19, "split": "train"},
     {"environment": "cave_group", "start": 0, "end": 19, "split": "train"},
     {"environment": "flying_group", "start": 0, "end": 19, "split": "train"},
