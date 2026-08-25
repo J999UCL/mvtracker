@@ -690,12 +690,19 @@ def recipe_smoke20_remote(run_name: str, recipe_name: str) -> dict:
     gpu="H200:3",
     cpu=32,
     memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
-    timeout=30 * 60,
+    timeout=12 * 60 * 60,
     max_containers=1,
     retries=0,
     include_source=False,
 )
-def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
+def recipe_da3_remote(
+    run_name: str,
+    recipe_name: str,
+    experiment_name: str,
+    expected_steps: int,
+    wandb_group: str,
+    prefill_steps: int = 4,
+) -> dict:
     validate_run_name(run_name)
     validate_run_name(recipe_name)
     commit = _source_commit()
@@ -709,21 +716,25 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
     recipe_summary = json.loads(
         (recipe_path / "summary.json").read_text(encoding="utf-8")
     )
+    if int(recipe_manifest["step_count"]) != int(expected_steps):
+        raise ValueError(
+            f"recipe has {recipe_manifest['step_count']} steps, expected {expected_steps}"
+        )
     seed = int(recipe_manifest["seed"])
     runtime_root = Path("/tmp/mvtracker-da3-depth")
     producer_log = run_dir / "depth-producer.log"
     training_log = run_dir / "training.log"
     manifest = {
-        "mode": "recipe_da3_smoke20",
+        "mode": "recipe_da3",
         "run_name": run_name,
         "recipe": recipe_name,
         "source_commit": commit,
         "gpu": "H200:3",
         "training_devices": [0, 1],
         "depth_device": 2,
-        "steps": 20,
+        "steps": int(expected_steps),
         "depth_counts": recipe_summary["planned_depth_counts"],
-        "validation": False,
+        "validation": "smoke20" not in experiment_name,
         "modal_tags": MODAL_TAGS,
     }
     (run_dir / "modal-run-manifest.json").write_text(
@@ -731,7 +742,7 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
     )
     run_volume.commit()
     print(
-        "DA3 recipe smoke startup "
+        "DA3 recipe training startup "
         f"commit={commit} run={run_name} recipe={recipe_path} "
         f"depth_counts={recipe_summary['planned_depth_counts']}",
         flush=True,
@@ -753,7 +764,7 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
             "MVTRACKER_RUNTIME_DEPTH_METRICS": str(runtime_root / "metrics.jsonl"),
             "WANDB_ENTITY": WANDB_ENTITY,
             "WANDB_PROJECT": WANDB_PROJECT,
-            "WANDB_RUN_GROUP": "da3-runtime-depth-smoke20",
+            "WANDB_RUN_GROUP": wandb_group,
             "WANDB_RUN_ID": wandb_run_id,
             "WANDB_RESUME": "allow",
             "PYTHONUNBUFFERED": "1",
@@ -775,7 +786,7 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
         "--output-root",
         str(runtime_root),
         "--prefill-steps",
-        "4",
+        str(prefill_steps),
     ]
     producer, producer_thread = _start_logged_process(
         producer_command,
@@ -812,12 +823,12 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
             sys.executable,
             "-m",
             "mvtracker.cli.train",
-            "+experiment=diegesis_syn4d_mvkubric_recipe_da3_ddp_smoke20",
+            f"+experiment={experiment_name}",
         ],
         cwd=SOURCE_ROOT,
         environment=training_environment,
         log_path=training_log,
-        label="recipe-da3-smoke20",
+        label="recipe-da3-training",
     )
     if return_code != 0:
         producer.terminate()
@@ -825,9 +836,9 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
         producer_thread.join()
         run_volume.commit()
         raise RuntimeError(
-            f"DA3 recipe smoke exited {return_code}; see {training_log}"
+            f"DA3 recipe training exited {return_code}; see {training_log}"
         )
-    producer_return_code = producer.wait(timeout=5 * 60)
+    producer_return_code = producer.wait(timeout=30 * 60)
     producer_thread.join()
     if producer_return_code != 0:
         run_volume.commit()
@@ -848,7 +859,7 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
         json.dumps(result, indent=2) + "\n", encoding="utf-8"
     )
     run_volume.commit()
-    print(f"DA3 recipe smoke complete result={result}", flush=True)
+    print(f"DA3 recipe training complete result={result}", flush=True)
     return result
 
 
@@ -1165,8 +1176,37 @@ def recipe_da3_smoke20(run_name: str, recipe_name: str) -> None:
     app.set_tags(
         {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x3"}
     )
-    deployed = modal.Function.from_name(APP_NAME, "recipe_da3_smoke20_remote")
-    call = deployed.spawn(run_name, recipe_name)
+    deployed = modal.Function.from_name(APP_NAME, "recipe_da3_remote")
+    call = deployed.spawn(
+        run_name,
+        recipe_name,
+        "diegesis_syn4d_mvkubric_recipe_da3_ddp_smoke20",
+        20,
+        "da3-runtime-depth-smoke20",
+        4,
+    )
+    print(json.dumps({"run_name": run_name, "function_call_id": call.object_id}, indent=2))
+
+
+@app.local_entrypoint(name="recipe-da3-train1000")
+def recipe_da3_train1000(run_name: str, recipe_name: str) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=3)
+    validate_run_name(run_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x3"}
+    )
+    deployed = modal.Function.from_name(APP_NAME, "recipe_da3_remote")
+    call = deployed.spawn(
+        run_name,
+        recipe_name,
+        "diegesis_syn4d_mvkubric_recipe_da3_ddp_1000",
+        1000,
+        "expanded-syn4d-da3-1000",
+        4,
+    )
     print(json.dumps({"run_name": run_name, "function_call_id": call.object_id}, indent=2))
 
 
