@@ -41,7 +41,7 @@ wandb_secret = modal.Secret.from_name(
     max_containers=1,
     retries=0,
 )
-def audit_recipe(recipe_name: str) -> dict:
+def audit_recipe(recipe_name: str, source_commit: str) -> dict:
     import numpy as np
     import wandb
 
@@ -146,7 +146,7 @@ def audit_recipe(recipe_name: str) -> dict:
         job_type="recipe-radius-audit",
         name=f"radius-audit-{recipe_name}",
         tags=["modal", "recipe", "syn4d", "radius-audit"],
-        config={"recipe": recipe_name, "source_commit": os.environ["MVTRACKER_MODAL_COMMIT"], **TAGS},
+        config={"recipe": recipe_name, "source_commit": source_commit, **TAGS},
     )
     run.summary.update(
         {
@@ -166,4 +166,10 @@ def audit_recipe(recipe_name: str) -> dict:
 
 @app.local_entrypoint()
 def main(recipe_name: str = "fresh-mixed-da3-r65-singleton-1000-20260825") -> None:
-    print(json.dumps(audit_recipe.remote(recipe_name), indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            audit_recipe.remote(recipe_name, os.environ["MVTRACKER_MODAL_COMMIT"]),
+            indent=2,
+            sort_keys=True,
+        )
+    )
