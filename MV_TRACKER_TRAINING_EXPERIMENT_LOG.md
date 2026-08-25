@@ -2164,3 +2164,24 @@ depth-producer requirement.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-depth-evaluation/runs/b2z3zx5c
 - Report: `jeet-mvtracker-runs-v2/da3-giant-benchmark/da3-giant-1.1-h200-diningroom02-20260825T111136Z/report.json`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
+
+## 2026-08-25 — Incremental Syn4D radius-filtered recipe
+
+The existing 1,000-step mixed-depth recipe was reused as a compact cache for
+the unchanged DIEGESIS and MV-Kubric logical samples. Only its 2,000 Syn4D
+records were replayed through the current planner with the 65 m camera-centred
+radius filter, using the original recipe's embedded configuration. Manifest
+loading was parallelized across 16 threads and source replanning across 32 CPU
+processes.
+
+The 303 Syn4D manifests loaded in 20 seconds on the successful warm run. The
+2,000 source records then planned in approximately 53 seconds; complete recipe
+serialization and validation brought the source-replan helper to 271.7
+seconds. The resulting recipe retained all 6,000 non-Syn4D records unchanged
+and changed 137 of 2,000 Syn4D track selections. The former spike samples now
+have maximum camera-centred track radii of 64.35 m, 18.12 m and 17.40 m.
+
+- Recipe: `training-recipes/global-smartbatch-expanded-syn4d-da3-radius65-1000-20260825`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/80gqjdz5
+- Implementation: `118bcf8`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
