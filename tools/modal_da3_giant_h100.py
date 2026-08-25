@@ -11,9 +11,9 @@ import time
 import modal
 
 
-APP_NAME = "jeet-mvtracker-da3-giant-h100"
+APP_NAME = "jeet-mvtracker-da3-giant-benchmark"
 DATA_ROOT = Path("/mnt/mvtracker-data")
-RUN_ROOT = Path("/mnt/mvtracker-runs/da3-giant-h100")
+RUN_ROOT = Path("/mnt/mvtracker-runs/da3-giant-benchmark")
 MODEL_ID = "depth-anything/DA3-GIANT-1.1"
 DA3_REVISION = "3d835ec1a5802d64a8b8b15f817a1ab54809bfe4"
 TAGS = {
@@ -21,7 +21,7 @@ TAGS = {
     "project": "mvtracker",
     "purpose": "profiling",
     "experiment": "da3-giant-1.1-diegesis",
-    "gpu": "h100",
+    "gpu": "h100-h200",
 }
 
 
@@ -94,7 +94,11 @@ def _metrics(prediction, target, mask):
     volumes={DATA_ROOT: data_volume, Path("/mnt/mvtracker-runs"): run_volume},
     secrets=[hf_secret, wandb_secret],
 )
-def benchmark(scene: str = "diningroom02"):
+def benchmark(
+    scene: str = "diningroom02",
+    timestamp_count: int = 24,
+    gpu_label: str = "h100",
+):
     import numpy as np
     from PIL import Image
     import torch
@@ -103,23 +107,35 @@ def benchmark(scene: str = "diningroom02"):
     from depth_anything_3.api import DepthAnything3
     from depth_anything_3.utils.pose_align import align_poses_umeyama
 
-    run_name = f"da3-giant-1.1-{scene}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    run_name = (
+        f"da3-giant-1.1-{gpu_label}-{scene}-"
+        f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    )
     output_root = RUN_ROOT / run_name
     output_root.mkdir(parents=True, exist_ok=False)
     run = wandb.init(
         project="mvtracker-depth-evaluation",
         name=run_name,
-        tags=["modal", "diegesis", "da3-giant-1.1", "pose-conditioned", "h100"],
-        config={**TAGS, "model": MODEL_ID, "scene": scene},
+        tags=["modal", "diegesis", "da3-giant-1.1", "pose-conditioned", gpu_label],
+        config={
+            **TAGS,
+            "runtime_gpu": gpu_label,
+            "model": MODEL_ID,
+            "scene": scene,
+            "timestamp_count": timestamp_count,
+        },
     )
     _log("job_started", run_name=run_name, gpu=torch.cuda.get_device_name(0))
 
     scene_root = DATA_ROOT / "source/diegesis/scenes" / scene / "tracking/sequence"
     frame_count = int(np.load(scene_root / "tracks_xyz.npy", mmap_mode="r").shape[0])
     comparison_frames = [0, 34, 68, 102, 136, 170, 204, 239]
-    extra_frames = [int(value) for value in np.linspace(0, frame_count - 1, 32)]
+    extra_frames = [
+        int(value)
+        for value in np.linspace(0, frame_count - 1, max(timestamp_count * 2, 32))
+    ]
     frame_indices = comparison_frames + [value for value in extra_frames if value not in comparison_frames]
-    frame_indices = frame_indices[:24]
+    frame_indices = frame_indices[:timestamp_count]
     views = tuple(
         sorted(int(path.name) for path in scene_root.iterdir() if path.is_dir() and path.name.isdigit())
     )
@@ -192,7 +208,8 @@ def benchmark(scene: str = "diningroom02"):
     total_vram = torch.cuda.get_device_properties(0).total_memory
     trials = []
 
-    for batch_size in (1, 4, 8, 12, 16, 20, 24):
+    batch_sizes = (20, 40, 44, 48) if gpu_label == "h200" else (1, 4, 8, 12, 16, 20, 24)
+    for batch_size in (size for size in batch_sizes if size <= len(frame_indices)):
         _log("trial_started", batch_size=batch_size, images=batch_size * len(views))
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -319,5 +336,14 @@ def benchmark(scene: str = "diningroom02"):
 
 
 @app.local_entrypoint()
-def main(scene: str = "diningroom02"):
-    print(json.dumps(benchmark.remote(scene=scene), indent=2))
+def main(
+    scene: str = "diningroom02",
+    gpu: str = "H100!",
+    timestamp_count: int = 24,
+):
+    result = benchmark.with_options(gpu=gpu).remote(
+        scene=scene,
+        timestamp_count=timestamp_count,
+        gpu_label=gpu.lower().removesuffix("!"),
+    )
+    print(json.dumps(result, indent=2))
