@@ -553,7 +553,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
-    cpu=16,
+    cpu=32,
     memory=65536,
     timeout=3 * 60 * 60,
     max_containers=1,
@@ -578,7 +578,7 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
     local_output_dir = Path("/tmp/mvtracker-training-recipes") / recipe_name
     print(
         "syn4d source-replan startup "
-        f"source={source_dir} output={output_dir} workers=16",
+        f"source={source_dir} output={output_dir} workers=32",
         flush=True,
     )
     source_manifest = json.loads(
@@ -586,7 +586,7 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
     )
     cfg = OmegaConf.create(source_manifest["config"])
     cfg.datasets.syn4d_max_track_radius = 65.0
-    cfg.datasets.syn4d_mmap_cache_sequences = 16
+    cfg.datasets.syn4d_mmap_cache_sequences = 32
     cfg.datasets.syn4d_manifest_load_workers = 16
     source_cfg = cfg.datasets.train.sources.syn4d
     dataset = _build_training_dataset(
@@ -602,7 +602,7 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
         source="syn4d",
         dataset=dataset,
         request_factory=ScheduledSampleRequest,
-        worker_count=16,
+        worker_count=32,
         heartbeat_seconds=10,
     )
     run = wandb.init(
@@ -611,7 +611,7 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
         group="training-recipe-planning",
         job_type="syn4d-recipe-replan",
         name=recipe_name,
-        tags=["modal", "recipe", "syn4d", "source-replan", "cpu16"],
+        tags=["modal", "recipe", "syn4d", "source-replan", "cpu32"],
         config={
             "source_commit": _source_commit(),
             "source_recipe": source_name,
@@ -1209,7 +1209,7 @@ def plan_recipe(recipe_name: str, step_count: int = 2000) -> None:
     preflight_active_containers(required_free_slots=1)
     validate_run_name(recipe_name)
     app.set_tags(
-        {**MODAL_TAGS, "experiment": recipe_name, "gpu": "cpu", "cpu": "16"}
+        {**MODAL_TAGS, "experiment": recipe_name, "gpu": "cpu", "cpu": "32"}
     )
     deployed = modal.Function.from_name(APP_NAME, "plan_recipe_remote")
     call = deployed.spawn(recipe_name, step_count)
