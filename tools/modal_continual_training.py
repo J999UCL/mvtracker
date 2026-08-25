@@ -549,6 +549,95 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
 @app.function(
     image=training_image,
     secrets=[wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    cpu=16,
+    memory=65536,
+    timeout=3 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
+    """Regenerate Syn4D logical samples without loading unchanged sources."""
+    from types import SimpleNamespace
+
+    import wandb
+    from hydra import compose, initialize_config_dir
+
+    from mvtracker.cli.train import _build_training_dataset
+    from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
+    from mvtracker.datasets.training_recipe import replan_recipe_source
+
+    validate_run_name(source_name)
+    validate_run_name(recipe_name)
+    source_dir = RECIPE_ROOT / source_name
+    output_dir = RECIPE_ROOT / recipe_name
+    local_output_dir = Path("/tmp/mvtracker-training-recipes") / recipe_name
+    print(
+        "syn4d source-replan startup "
+        f"source={source_dir} output={output_dir} workers=16",
+        flush=True,
+    )
+    with initialize_config_dir(
+        config_dir=str(SOURCE_ROOT / "configs"), version_base="1.3"
+    ):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "+experiment=diegesis_syn4d_mvkubric_gt_ddp",
+                "datasets.train.recipe_path=null",
+                "datasets.syn4d_mmap_cache_sequences=16",
+            ],
+        )
+    source_cfg = cfg.datasets.train.sources.syn4d
+    dataset = _build_training_dataset(
+        source_cfg.name,
+        source_cfg.root,
+        cfg,
+        SimpleNamespace(world_size=2, global_rank=0),
+        source_cfg,
+    )
+    summary = replan_recipe_source(
+        source_dir,
+        local_output_dir,
+        source="syn4d",
+        dataset=dataset,
+        request_factory=ScheduledSampleRequest,
+        worker_count=16,
+        heartbeat_seconds=10,
+    )
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group="training-recipe-planning",
+        job_type="syn4d-recipe-replan",
+        name=recipe_name,
+        tags=["modal", "recipe", "syn4d", "source-replan", "cpu16"],
+        config={
+            "source_commit": _source_commit(),
+            "source_recipe": source_name,
+            "recipe": recipe_name,
+            **MODAL_TAGS,
+        },
+    )
+    run.summary.update(summary)
+    run.finish()
+    print(
+        f"syn4d source-replan publish source={local_output_dir} output={output_dir}",
+        flush=True,
+    )
+    shutil.copytree(local_output_dir, output_dir)
+    run_volume.commit()
+    print(f"syn4d source-replan committed output={output_dir}", flush=True)
+    return summary
+
+
+@app.function(
+    image=training_image,
+    secrets=[wandb_secret],
     volumes={str(RUN_ROOT): run_volume},
     cpu=2,
     memory=4096,
@@ -1129,6 +1218,26 @@ def plan_recipe(recipe_name: str, step_count: int = 2000) -> None:
     deployed = modal.Function.from_name(APP_NAME, "plan_recipe_remote")
     call = deployed.spawn(recipe_name, step_count)
     print(json.dumps({"recipe_name": recipe_name, "function_call_id": call.object_id}, indent=2))
+
+
+@app.local_entrypoint(name="replan-syn4d-recipe")
+def replan_syn4d_recipe(source_name: str, recipe_name: str) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    validate_run_name(source_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {**MODAL_TAGS, "experiment": recipe_name, "gpu": "cpu", "cpu": "16"}
+    )
+    deployed = modal.Function.from_name(APP_NAME, "replan_syn4d_recipe_remote")
+    call = deployed.spawn(source_name, recipe_name)
+    print(
+        json.dumps(
+            {"recipe_name": recipe_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint(name="recipe-smoke20")

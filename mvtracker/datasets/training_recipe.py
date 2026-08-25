@@ -1044,6 +1044,154 @@ def plan_training_recipe_parallel(
         _PROCESS_SCHEDULE = None
 
 
+def replan_recipe_source(
+    source_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    source: str,
+    dataset: Any,
+    request_factory: Callable[..., Any],
+    worker_count: int = 16,
+    heartbeat_seconds: float = 10.0,
+    log: LogFunction = _print_log,
+) -> dict[str, Any]:
+    """Replan one source while preserving every other logical recipe record."""
+
+    reader = RecipeReader(source_dir)
+    steps = list(reader.steps())
+    targets = [
+        RecipeRecord.from_dict(sample)
+        for step in steps
+        for sample in step["logical_samples"]
+        if sample["source"] == source
+    ]
+    started = time.perf_counter()
+    progress = {"completed": 0, "scene": "-"}
+    progress_lock = threading.Lock()
+
+    def status() -> str:
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        rate = progress["completed"] / elapsed
+        remaining = len(targets) - progress["completed"]
+        eta = remaining / rate if rate else 0.0
+        return (
+            "recipe source-replan heartbeat "
+            f"source={source} completed={progress['completed']}/{len(targets)} "
+            f"scene={progress['scene']} rate={rate:.1f}/s eta={eta:.1f}s"
+        )
+
+    def replan(record: RecipeRecord) -> RecipeRecord:
+        request = record.replay_request(request_factory)
+        plan = dataset.plan_sample(request)
+        if plan is None:
+            raise RuntimeError(
+                f"{source} recipe record became invalid: step={record.step} "
+                f"logical_index={record.logical_index} scene={record.scene}"
+            )
+        compact = _compact_plan(request, plan)
+        expected = {
+            "scene": record.scene,
+            "seed": record.seed,
+            "frames": record.frames,
+            "views": record.views,
+            "resolution": record.resolution,
+            "depth_source": record.depth_source,
+        }
+        actual = {key: compact[key] for key in expected}
+        if actual != expected:
+            raise RuntimeError(
+                f"{source} replay changed non-track sampling at step={record.step}: "
+                f"expected={expected} actual={actual}"
+            )
+        updated = replace(
+            record,
+            track_count=int(compact["track_count"]),
+            tracks=tuple(compact["tracks"]),
+            augmentation=compact["augmentation"],
+        )
+        with progress_lock:
+            progress.update(completed=progress["completed"] + 1, scene=record.scene)
+        return updated
+
+    log(
+        "recipe source-replan start "
+        f"source={source} records={len(targets)} workers={worker_count}"
+    )
+    with _Heartbeat(heartbeat_seconds, log, status), ThreadPoolExecutor(
+        max_workers=int(worker_count)
+    ) as executor:
+        replanned = list(executor.map(replan, targets))
+    replacements = {
+        (record.step, record.logical_index): record for record in replanned
+    }
+
+    output = Path(output_dir)
+    manifest = {
+        **reader.manifest,
+        "derived_from": str(source_dir),
+        "replanned_source": source,
+    }
+    writer = RecipeWriter(
+        output,
+        manifest=manifest,
+        world_size=int(reader.manifest["world_size"]),
+        step_count=int(reader.manifest["step_count"]),
+        records_per_step=int(reader.manifest["logical_samples_per_step"]),
+    )
+    all_records = []
+    for step in steps:
+        records = []
+        for sample in step["logical_samples"]:
+            record = RecipeRecord.from_dict(sample)
+            record = replacements.get((record.step, record.logical_index), record)
+            records.append(record)
+        for record in sorted(records, key=lambda item: item.logical_index):
+            writer.write(record)
+            all_records.append(record)
+
+    source_counts = Counter(record.source for record in all_records)
+    view_counts = Counter(str(len(record.views)) for record in all_records)
+    track_counts = Counter(str(record.track_count) for record in all_records)
+    depth_counts = Counter(record.depth_source for record in all_records)
+    estimated: dict[tuple[str, str], set[str]] = {}
+    for record in all_records:
+        if record.depth_source != "gt":
+            estimated.setdefault((record.source, record.scene), set()).add(
+                record.depth_source
+            )
+    elapsed = time.perf_counter() - started
+    summary = {
+        **json.loads((Path(source_dir) / "summary.json").read_text(encoding="utf-8")),
+        "elapsed_seconds": elapsed,
+        "records": len(all_records),
+        "source_counts": dict(source_counts),
+        "view_counts": dict(view_counts),
+        "track_counts": dict(track_counts),
+        "planned_depth_counts": dict(depth_counts),
+        "unique_estimated_depth_scenes": len(estimated),
+        "derived_from": str(source_dir),
+        "replanned_source": source,
+        "replanned_records": len(replanned),
+    }
+    writer.finalize(
+        summary=summary,
+        estimated_depth_requests=[
+            {
+                "source": candidate_source,
+                "scene": scene,
+                "planned_depth_sources": sorted(depth_sources),
+            }
+            for (candidate_source, scene), depth_sources in sorted(estimated.items())
+        ],
+    )
+    RecipeReader(output).validate()
+    log(
+        "recipe source-replan complete "
+        f"source={source} records={len(replanned)} elapsed={elapsed:.1f}s"
+    )
+    return summary
+
+
 def derive_mixed_depth_smoke_recipe(
     source_dir: str | Path,
     output_dir: str | Path,
@@ -1162,4 +1310,5 @@ __all__ = [
     "derive_mixed_depth_smoke_recipe",
     "plan_training_recipe",
     "plan_training_recipe_parallel",
+    "replan_recipe_source",
 ]
