@@ -181,47 +181,27 @@ def _official_sequence_items(
     metadata_root: Path,
     sequence_base: str,
     frame_count: int,
-) -> list[Mapping[str, Any]]:
+) -> tuple[list[Mapping[str, Any]], int]:
     """Load one dense query-camera trajectory using the pinned reader."""
 
-    dataset = official_module.Syn4D_Track(
-        dataset_root=str(scene_root.parent),
-        metadata_root=str(metadata_root),
-        fallback_metadata_root=None,
-        scene_name_list=[scene_root.name],
-        track_query_idx=0,
-        use_augs=False,
-        S=frame_count,
-        N=TRACK_COUNT,
-        strides=[1],
-        min_interval=1,
-        max_interval=1,
-        rgb_source="mp4",
-        tracking_format="safetensor",
-        resolution=((TRACK_SOURCE_WIDTH, TRACK_SOURCE_HEIGHT), frame_count),
-        seed=int(sequence_base.removeprefix("seq_")),
-        allow_repeat=False,
-    )
     wanted = f"{sequence_base}_0"
-    matching = [
-        index
-        for index, path in enumerate(dataset.annotation_paths)
-        if _camera_sequence_name(path) == wanted
-    ]
-    if len(matching) != 1:
-        raise ValueError(f"official reader found {len(matching)} entries for {wanted}")
-    requested_index = matching[0]
-    items = dataset[requested_index]
-    if len(items) != frame_count:
-        raise ValueError(
-            f"official reader returned {len(items)} frames for {wanted}; expected {frame_count}"
+    for track_query_idx in range(min(8, frame_count)):
+        dataset = official_module.Syn4D_Track(
+            dataset_root=str(scene_root.parent), metadata_root=str(metadata_root), fallback_metadata_root=None,
+            scene_name_list=[scene_root.name], track_query_idx=track_query_idx, use_augs=False,
+            S=frame_count, N=TRACK_COUNT, strides=[1], min_interval=1, max_interval=1,
+            rgb_source="mp4", tracking_format="safetensor",
+            resolution=((TRACK_SOURCE_WIDTH, TRACK_SOURCE_HEIGHT), frame_count),
+            seed=int(sequence_base.removeprefix("seq_")), allow_repeat=False,
         )
-    returned_index = int(np.asarray(items[0]["idx"]).reshape(-1)[0])
-    if returned_index != requested_index:
-        raise RuntimeError(
-            f"official reader skipped {wanted}: requested index {requested_index}, got {returned_index}"
-        )
-    return list(items)
+        matching = [index for index, path in enumerate(dataset.annotation_paths) if _camera_sequence_name(path) == wanted]
+        if len(matching) != 1:
+            raise ValueError(f"official reader found {len(matching)} entries for {wanted}")
+        requested_index = matching[0]
+        items = dataset[requested_index]
+        if len(items) == frame_count and int(np.asarray(items[0]["idx"]).reshape(-1)[0]) == requested_index:
+            return list(items), track_query_idx
+    raise RuntimeError(f"official reader skipped every query frame for {wanted}")
 
 
 def _quarter_query_pixels(
@@ -246,10 +226,10 @@ def _quarter_query_pixels(
 
 
 def _explicit_world_tracks(
-    items: Sequence[Mapping[str, Any]], *, sequence_base: str
+    items: Sequence[Mapping[str, Any]], *, sequence_base: str, query_frame: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    first_track = np.asarray(items[0]["track"], dtype=np.float32)
-    first_valid = np.asarray(items[0]["track_valid_mask"], dtype=bool)
+    first_track = np.asarray(items[query_frame]["track"], dtype=np.float32)
+    first_valid = np.asarray(items[query_frame]["track_valid_mask"], dtype=bool)
     if first_track.shape != (TRACK_SOURCE_HEIGHT, TRACK_SOURCE_WIDTH, 3):
         raise ValueError(
             f"official query track has shape {first_track.shape}; "
@@ -283,7 +263,7 @@ def _explicit_world_tracks(
         [
             xs.astype(np.float32),
             ys.astype(np.float32),
-            np.zeros(track_count, dtype=np.float32),
+            np.full(track_count, query_frame, dtype=np.float32),
             np.zeros(track_count, dtype=np.float32),
         ],
         axis=-1,
@@ -434,7 +414,7 @@ def _convert_sequence(
     source_width = int(video_metadata["width"])
     source_height = int(video_metadata["height"])
 
-    items = _official_sequence_items(
+    items, query_frame = _official_sequence_items(
         official_module,
         scene_root=scene_root,
         metadata_root=metadata_root,
@@ -442,7 +422,7 @@ def _convert_sequence(
         frame_count=frame_count,
     )
     tracks, track_valid, queries, quarter_count = _explicit_world_tracks(
-        items, sequence_base=sequence_base
+        items, sequence_base=sequence_base, query_frame=query_frame
     )
     queries[:, 0] *= np.float32(CACHE_WIDTH / TRACK_SOURCE_WIDTH)
     queries[:, 1] *= np.float32(CACHE_HEIGHT / TRACK_SOURCE_HEIGHT)

@@ -38,6 +38,11 @@ INTERRUPTED_RESUME = {
         for index in range(16, 20)
     ],
 }
+READER_REPAIR = {
+    "cyber_bald": [{"environment": "cyber_bald", "sequence": "seq_000010", "split": "train"}],
+    "hospital": [{"environment": "hospital", "sequence": "seq_000018", "split": "train"}],
+    "winter": [{"environment": "winter", "sequence": "seq_000006", "split": "train"}],
+}
 
 
 def _clone(image: modal.Image) -> modal.Image:
@@ -457,4 +462,12 @@ def resume_interrupted() -> None:
         environment: deployed.spawn(environment, rows, name)
         for environment, rows in INTERRUPTED_RESUME.items()
     }
+    print(json.dumps({"function_call_ids": {environment: call.object_id for environment, call in calls.items()}}, indent=2, sort_keys=True))
+
+
+@app.local_entrypoint(name="repair-reader-skips")
+def repair_reader_skips() -> None:
+    name = "syn4d-stride1-reader-repair"
+    deployed = modal.Function.from_name(APP_NAME, "preprocess_environment_remote")
+    calls = {environment: deployed.spawn(environment, rows, name) for environment, rows in READER_REPAIR.items()}
     print(json.dumps({"function_call_ids": {environment: call.object_id for environment, call in calls.items()}}, indent=2, sort_keys=True))
