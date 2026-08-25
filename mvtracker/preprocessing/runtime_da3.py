@@ -26,6 +26,7 @@ from mvtracker.preprocessing.mvkubric_webdataset import META_COMPONENT, RGB_COMP
 
 MODEL_ID = "depth-anything/DA3-GIANT-1.1"
 IMAGE_CAPACITY = 80
+MIN_ALIGNMENT_VIEWS = 4
 
 
 def _log(event: str, **fields) -> None:
@@ -56,6 +57,12 @@ def _homogeneous_extrinsics(values: np.ndarray) -> np.ndarray:
     return np.concatenate((values, bottom), axis=-2)
 
 
+def _inference_views(selected: tuple[int, ...], available: list[int]) -> list[int]:
+    views = list(selected)
+    views.extend(view for view in available if view not in views)
+    return views[: max(len(selected), MIN_ALIGNMENT_VIEWS)]
+
+
 class _PackedScenes:
     def __init__(self, data_root: Path):
         self.data_root = data_root
@@ -79,9 +86,7 @@ class _PackedScenes:
             for path in cache_root.glob("view_*")
             if path.is_dir()
         )
-        inference_views = list(record.views)
-        if len(inference_views) == 1:
-            inference_views.append(next(view for view in available if view not in inference_views))
+        inference_views = _inference_views(record.views, available)
         frames = list(record.frames)
         encoded_by_view = {}
         extrinsics = []
@@ -135,9 +140,7 @@ class _MVKubricScenes:
         scene = self._scene(record.scene)
         entry = self.catalog.scenes[record.scene]
         available = sorted(int(view) for view in entry["views"])
-        inference_views = list(record.views)
-        if len(inference_views) == 1:
-            inference_views.append(next(view for view in available if view not in inference_views))
+        inference_views = _inference_views(record.views, available)
         indices = [int(entry["views"][str(view)]["media_index"]) for view in inference_views]
         media, _ = self.records.read_many(indices, components={RGB_COMPONENT})
         frames = list(record.frames)
