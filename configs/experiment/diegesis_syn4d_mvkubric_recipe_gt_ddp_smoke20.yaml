@@ -32,6 +32,6 @@ logging:
     - diegesis-syn4d-mvkubric-25-25-50
     - recipe
     - forced-gt-depth
-    - ddp2-h100
+    - ddp2-h200
     - continual-training
     - smoke20
