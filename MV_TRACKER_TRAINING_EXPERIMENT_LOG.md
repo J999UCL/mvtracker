@@ -2004,3 +2004,27 @@ Raw delta1 rose from 0.8710 to 0.9579 and foreground delta1 from 0.8108 to
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-depth-evaluation/runs/i13g8zhy
 - Report: `jeet-mvtracker-runs-v2/da3-giant-h100/da3-giant-1.1-diningroom02-20260825T110038Z/report.json`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
+
+### Matched H200 follow-up
+
+The same native-batch Giant path was run on the H200 intended for the depth
+producer. It reused the H100 maximum as its starting point and only measured
+batches 20, 40 and 44; batch 48 was skipped after batch 44 reached 99% VRAM.
+
+| Timestamp batch | Images | Median model time | Images/s | Peak reserved | Status |
+|---:|---:|---:|---:|---:|---|
+| 20 | 80 | 1.778 s | 45.00 | 101.39 GiB / 72.5% | safe |
+| 40 | 160 | 3.600 s | 44.45 | 128.61 GiB / 92.0% | safe |
+| 44 | 176 | 4.023 s | 43.75 | 138.42 GiB / 99.0% | above 92% limit |
+
+Batch 20 is the operational choice: it has the highest measured throughput,
+comfortable memory headroom and is 6.7% faster than the matched H100 batch-20
+result. Batch 40 doubles queue capacity without improving throughput. The H200
+therefore sustains more than twice the approximately 21 images/s estimated
+depth-producer requirement.
+
+- Implementation: `f9d8dc6`
+- Modal app: https://modal.com/apps/ucl-prism/main/ap-7yjJlVtfskAW8eULVSS7KC
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-depth-evaluation/runs/b2z3zx5c
+- Report: `jeet-mvtracker-runs-v2/da3-giant-benchmark/da3-giant-1.1-h200-diningroom02-20260825T111136Z/report.json`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
