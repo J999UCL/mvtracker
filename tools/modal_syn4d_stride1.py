@@ -27,6 +27,7 @@ OUTPUT_ROOTS = {
 REPORT_ROOT = DATA_ROOT / "datasets/materialization-reports/syn4d"
 DEFAULT_MANIFEST = "manifests/syn4d-stride1-backfill.json"
 TAGS = {**BASE_TAGS, "experiment": "syn4d-stride1", "gpu": "cpu"}
+CPU_WORKER_COUNT = 8
 
 
 def _clone(image: modal.Image) -> modal.Image:
@@ -118,7 +119,7 @@ class _Progress:
         self.fields: dict[str, object] = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
-        self.cpu_count = os.cpu_count() or 1
+        self.cpu_count = CPU_WORKER_COUNT
         self.last_cpu_seconds = time.process_time()
         self.last_cpu_sample = time.perf_counter()
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
@@ -345,7 +346,7 @@ def prepare_mapping_remote(manifest_name: str) -> dict[str, object]:
     image=image,
     secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume},
-    cpu=8,
+    cpu=CPU_WORKER_COUNT,
     memory=32 * 1024,
     ephemeral_disk=1024 * 1024,
     timeout=24 * 60 * 60,
@@ -361,13 +362,13 @@ def preprocess_environment_remote(
     import torch
     from mvtracker.preprocessing.syn4d import convert_syn4d_sequence
 
-    torch.set_num_threads(os.cpu_count() or 1)
+    torch.set_num_threads(CPU_WORKER_COUNT)
     run = wandb.init(
         project="mvtracker-modal-profiling",
         job_type="syn4d-preprocess",
         name=f"{manifest_name}-{environment}",
         tags=["modal", "cpu", "syn4d", "stride1", "environment"],
-        config={**TAGS, "environment": environment, "sequences": len(rows), "allocated_cpus": os.cpu_count() or 1},
+        config={**TAGS, "environment": environment, "sequences": len(rows), "allocated_cpus": CPU_WORKER_COUNT},
     )
     progress = _Progress(run, REPORT_ROOT / manifest_name / f"{environment}.ndjson", manifest_name)
     results = []
