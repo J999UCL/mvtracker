@@ -28,6 +28,16 @@ REPORT_ROOT = DATA_ROOT / "datasets/materialization-reports/syn4d"
 DEFAULT_MANIFEST = "manifests/syn4d-stride1-backfill.json"
 TAGS = {**BASE_TAGS, "experiment": "syn4d-stride1", "gpu": "cpu"}
 CPU_WORKER_COUNT = 8
+INTERRUPTED_RESUME = {
+    "winter": [
+        {"environment": "winter", "sequence": "seq_000018", "split": "train"},
+        {"environment": "winter", "sequence": "seq_000019", "split": "train"},
+    ],
+    "winter_group_static": [
+        {"environment": "winter_group_static", "sequence": f"seq_{index:06d}", "split": "validation"}
+        for index in range(16, 20)
+    ],
+}
 
 
 def _clone(image: modal.Image) -> modal.Image:
@@ -437,3 +447,13 @@ def preprocess(manifest: str = DEFAULT_MANIFEST) -> None:
     environments = sorted(grouped)
     results = list(preprocess_environment_remote.map(environments, [grouped[environment] for environment in environments], [name] * len(environments)))
     print(json.dumps({"environments": results}, indent=2, sort_keys=True))
+
+
+@app.local_entrypoint(name="resume-interrupted")
+def resume_interrupted() -> None:
+    name = "syn4d-stride1-resume-interrupted"
+    calls = {
+        environment: preprocess_environment_remote.spawn(environment, rows, name)
+        for environment, rows in INTERRUPTED_RESUME.items()
+    }
+    print(json.dumps({"function_call_ids": {environment: call.object_id for environment, call in calls.items()}}, indent=2, sort_keys=True))
