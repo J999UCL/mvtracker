@@ -952,6 +952,18 @@ radius was 64.35 m.
 - Earlier incrementally derived recipes are retained only as diagnostics and
   must not be used for canonical training.
 
+### Syn4D sampled-radius audit
+
+The canonical recipe contains 2,827,502 sampled Syn4D track instances. Of
+these, 24,308 (0.860%) exceed a 24 m maximum camera-centred radius within their
+sampled window. They occur in 349 of 2,000 Syn4D samples (17.45%) and represent
+22,931 unique scene/track pairs. Radius quantiles are p95 10.83 m, p99 22.61 m,
+p99.5 29.02 m and maximum 65.00 m. For comparison, 10,756 instances exceed
+32 m, 4,840 exceed 40 m and 2,066 exceed 50 m.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/s68db8ac
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
+
 The run was manually stopped shortly after step 299. Two issues motivated the
 termination. First, the `/tmp` depth-file handoff accumulated approximately
 410 GiB of Linux page cache, making reported container memory rise roughly
