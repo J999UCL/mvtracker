@@ -2015,6 +2015,34 @@ Validation remains pinned to the same four held-out scenes used by the existing
 evaluation schedule. `hospital__seq_000018` and `winter__seq_000006` are absent
 because the official Syn4D reader found no usable query frames.
 
+### 1,000-step preplanned mixed-depth recipe
+
+The expanded inventory was used to prepare a complete 1,000-step recipe with
+8,000 logical samples: 2,000 DIEGESIS, 2,000 Syn4D and 4,000 MV-Kubric. Its
+manifest records 17 DIEGESIS, 303 Syn4D and 2,935 MV-Kubric eligible scenes.
+The balanced shuffled-cycle sampler required 67 deterministic replacement
+attempts. Global physical scheduling assigned 4,145 logical records to rank 0
+and 3,855 to rank 1 while preserving synchronized physical-group counts.
+
+The first attempt used 32 simultaneous MV-Kubric metadata readers and was
+stopped after Volume contention reduced throughput below 2 scenes/s. The
+successful configuration kept 32 CPU processes for sample planning but bounded
+metadata I/O to 16 readers. Cold dataset construction plus metadata preload took
+about 11 minutes; planning the 8,000 records took 1,104.1 seconds, and the base
+recipe was published roughly 30 minutes after startup.
+
+A second CPU pass retained every scene, frame, view, track, augmentation and
+physical assignment while imposing an exact depth mixture: 5,600 GT, 1,600
+estimated and 800 confidence-cleaned estimated samples. The final recipe has
+1,000 step records, is marked complete, and references 1,380 unique scenes that
+need estimated depth.
+
+- Base recipe: `training-recipes/global-smartbatch-expanded-syn4d-base1000-20260825`
+- Final recipe: `training-recipes/global-smartbatch-expanded-syn4d-da3-1000-20260825`
+- Base W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/kxc7mow9
+- Depth-assignment W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/pzf4vlnm
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
 ## 2026-08-25 — Asynchronous DA3-Giant mixed-depth training smoke
 
 A preplanned 20-step continual-training recipe was replayed on three H200s:
