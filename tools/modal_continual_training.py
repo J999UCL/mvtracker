@@ -206,6 +206,7 @@ da3_training_image = _source_image(
         "matplotlib==3.8.3",
     )
     .run_commands(
+        "python -m pip install --no-deps evo==1.37.0",
         "python -m pip install --no-deps "
         f"git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@{DA3_REVISION}"
     )
