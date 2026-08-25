@@ -675,6 +675,44 @@ def fabricate_depth_recipe_remote(source_name: str, recipe_name: str) -> dict:
 @app.function(
     image=training_image,
     secrets=[wandb_secret],
+    volumes={str(RUN_ROOT): run_volume},
+    cpu=2,
+    memory=4096,
+    timeout=15 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def fabricate_singleton_recipe_remote(source_name: str, recipe_name: str) -> dict:
+    import wandb
+
+    from mvtracker.datasets.training_recipe import derive_singleton_recipe
+
+    validate_run_name(source_name)
+    validate_run_name(recipe_name)
+    source = RECIPE_ROOT / source_name
+    output = RECIPE_ROOT / recipe_name
+    print(f"singleton recipe source={source} output={output}", flush=True)
+    counts = derive_singleton_recipe(source, output)
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group="training-recipe-planning",
+        job_type="singleton-recipe-fabrication",
+        name=recipe_name,
+        tags=["modal", "recipe", "singleton", "no-scene-batching"],
+        config={"source_recipe": source_name, "recipe": recipe_name, **MODAL_TAGS},
+    )
+    run.summary.update({f"rank/{rank}/records": count for rank, count in counts.items()})
+    run.finish()
+    run_volume.commit()
+    print(f"singleton recipe ready rank_counts={counts}", flush=True)
+    return counts
+
+
+@app.function(
+    image=training_image,
+    secrets=[wandb_secret],
     volumes={
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
@@ -1262,6 +1300,26 @@ def fabricate_depth_recipe(source_name: str, recipe_name: str) -> None:
         {**MODAL_TAGS, "experiment": recipe_name, "gpu": "cpu"}
     )
     deployed = modal.Function.from_name(APP_NAME, "fabricate_depth_recipe_remote")
+    call = deployed.spawn(source_name, recipe_name)
+    print(
+        json.dumps(
+            {"recipe_name": recipe_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint(name="fabricate-singleton-recipe")
+def fabricate_singleton_recipe(source_name: str, recipe_name: str) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    validate_run_name(source_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {**MODAL_TAGS, "experiment": recipe_name, "gpu": "cpu", "cpu": "2"}
+    )
+    deployed = modal.Function.from_name(APP_NAME, "fabricate_singleton_recipe_remote")
     call = deployed.spawn(source_name, recipe_name)
     print(
         json.dumps(

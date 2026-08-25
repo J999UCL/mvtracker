@@ -1334,12 +1334,71 @@ def derive_mixed_depth_smoke_recipe(
     return dict(depth_counts)
 
 
+def derive_singleton_recipe(
+    source_dir: str | Path,
+    output_dir: str | Path,
+) -> dict[str, int]:
+    """Preserve logical samples while assigning four singleton groups per rank."""
+
+    reader = RecipeReader(source_dir)
+    output = Path(output_dir)
+    writer = RecipeWriter(
+        output,
+        manifest={
+            **reader.manifest,
+            "derived_from": str(source_dir),
+            "physical_batching": "singleton",
+        },
+        world_size=int(reader.manifest["world_size"]),
+        step_count=int(reader.manifest["step_count"]),
+        records_per_step=int(reader.manifest["logical_samples_per_step"]),
+    )
+    rank_counts = Counter()
+    for step in reader.steps():
+        for sample in step["logical_samples"]:
+            record = RecipeRecord.from_dict(sample)
+            rank = int(record.scheduled_rank)
+            writer.write(
+                replace(
+                    record,
+                    rank=rank,
+                    physical=PhysicalAssignment(
+                        rank=rank,
+                        group=int(record.microbatch),
+                        position=0,
+                    ),
+                )
+            )
+            rank_counts[rank] += 1
+
+    estimated_depth_requests = [
+        json.loads(line)
+        for line in (Path(source_dir) / "estimated-depth-requests.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    summary = {
+        **json.loads((Path(source_dir) / "summary.json").read_text(encoding="utf-8")),
+        "derived_from": str(source_dir),
+        "physical_batching": "singleton",
+        "physical_pairs": 0,
+        "physical_groups_per_rank_per_step": 4,
+    }
+    writer.finalize(
+        summary=summary,
+        estimated_depth_requests=estimated_depth_requests,
+    )
+    RecipeReader(output).validate()
+    return {str(rank): count for rank, count in sorted(rank_counts.items())}
+
+
 __all__ = [
     "PhysicalAssignment",
     "RecipeReader",
     "RecipeRecord",
     "RecipeWriter",
     "derive_mixed_depth_smoke_recipe",
+    "derive_singleton_recipe",
     "plan_training_recipe",
     "plan_training_recipe_parallel",
     "replan_recipe_source",
