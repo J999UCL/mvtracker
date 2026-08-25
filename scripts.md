@@ -556,6 +556,18 @@ modal run --timestamps tools/modal_vggt_omega_long_inference.py::burst_readback 
   --run-name vggt-omega-bursts-20260824 --dataset diegesis
 ```
 
+### Run the bounded VGGT-Omega H200 burst frontier
+
+This runs one 24-frame four-view timing baseline, then probes only the
+H100-derived H200 memory frontiers for four- and six-view batches. Unsafe
+warm-ups stop before measured repetitions.
+
+```bash
+MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) \
+  modal run --timestamps tools/modal_vggt_omega_long_inference.py::run_h200_burst \
+  --run-name <run-name>
+```
+
 ### Plan and smoke-test a continual-training recipe
 
 The planner uses exactly 16 CPU cores and writes a complete 2,000-step recipe

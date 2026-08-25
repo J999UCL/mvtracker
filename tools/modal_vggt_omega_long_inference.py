@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 import time
 
 import modal
@@ -332,6 +333,302 @@ def _save_burst(result, source, output_root: Path, start: int, end: int) -> dict
         shutil.rmtree(burst_root)
     os.replace(staging, burst_root)
     return manifest
+
+
+def _h200_sources(dataset: str):
+    from mvtracker.preprocessing.vggt_omega import PackedJpegSceneSource
+
+    if dataset == "diegesis":
+        scene = SCENES[dataset][0]
+        cache = DATA_ROOT / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache/train" / scene
+        camera_root = DATA_ROOT / "source/diegesis/scenes" / scene / "tracking/sequence"
+        return (PackedJpegSceneSource(cache, camera_root=camera_root, view_ids=(0, 1, 2, 3)),)
+    if dataset == "syn4d":
+        return tuple(
+            PackedJpegSceneSource(
+                DATA_ROOT / "datasets/syn4d-mvtracker/train" / scene,
+                view_ids=tuple(range(6)),
+            )
+            for scene in SCENES[dataset]
+        )
+    raise ValueError(f"unsupported H200 benchmark dataset {dataset!r}")
+
+
+def _h200_iteration(
+    *,
+    dataset: str,
+    batch_size: int,
+    iteration: int,
+    phase: str,
+    sources,
+    model,
+    device,
+    infer_temporal_chunks,
+    scratch_root: Path,
+) -> dict:
+    import numpy as np
+    import torch
+
+    selected = tuple(sources[index % len(sources)] for index in range(batch_size))
+    frame_indices = range(24)
+    total_memory = int(torch.cuda.get_device_properties(device).total_memory)
+    _emit(
+        "h200_iteration_start",
+        dataset=dataset,
+        batch_size=batch_size,
+        phase=phase,
+        iteration=iteration,
+        scenes=[source.description.name for source in selected],
+    )
+    torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    result = infer_temporal_chunks(
+        selected,
+        frame_indices,
+        model,
+        device=device,
+        image_resolution=512,
+        loader_workers=8,
+    )
+    torch.cuda.synchronize(device)
+    write_started = time.perf_counter()
+    prefix = f"{dataset}-b{batch_size}-{phase}-{iteration}-"
+    _emit(
+        "h200_local_write_start",
+        dataset=dataset,
+        batch_size=batch_size,
+        phase=phase,
+        iteration=iteration,
+    )
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=scratch_root) as iteration_dir:
+        iteration_root = Path(iteration_dir)
+        for scene_index, scene in enumerate(result.scenes):
+            np.save(
+                iteration_root / f"scene-{scene_index:02d}-depth.npy",
+                np.asarray(scene.depth, dtype=np.float32),
+            )
+            np.save(
+                iteration_root / f"scene-{scene_index:02d}-cleaned-mask.npy",
+                np.asarray(scene.cleaned_mask, dtype=np.bool_),
+            )
+        write_seconds = time.perf_counter() - write_started
+        total_seconds = time.perf_counter() - started
+        _emit(
+            "h200_local_write_complete",
+            dataset=dataset,
+            batch_size=batch_size,
+            phase=phase,
+            iteration=iteration,
+            seconds=write_seconds,
+        )
+    peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    timings = result.timings
+    record = {
+        "phase": phase,
+        "iteration": iteration,
+        "load_preprocess_seconds": float(timings.load_preprocess_seconds),
+        "model_seconds": float(timings.model_seconds),
+        "postprocess_seconds": float(timings.postprocess_seconds),
+        "local_write_seconds": write_seconds,
+        "total_end_to_end_seconds": total_seconds,
+        "scenes_per_second": batch_size / total_seconds,
+        "images_per_second": int(timings.image_count) / total_seconds,
+        "image_count": int(timings.image_count),
+        "peak_reserved_bytes": peak_reserved,
+        "peak_vram_fraction": peak_reserved / total_memory,
+    }
+    del result
+    _emit("h200_iteration_complete", dataset=dataset, batch_size=batch_size, **record)
+    return record
+
+
+def _mean_measured(records: list[dict]) -> dict:
+    keys = (
+        "load_preprocess_seconds",
+        "model_seconds",
+        "postprocess_seconds",
+        "local_write_seconds",
+        "total_end_to_end_seconds",
+        "scenes_per_second",
+        "images_per_second",
+    )
+    return {
+        **{key: sum(float(record[key]) for record in records) / len(records) for key in keys},
+        "peak_reserved_bytes": max(int(record["peak_reserved_bytes"]) for record in records),
+        "peak_vram_fraction": max(float(record["peak_vram_fraction"]) for record in records),
+    }
+
+
+@app.function(
+    image=image,
+    gpu="H200",
+    secrets=[hf_secret, wandb_secret],
+    volumes={str(DATA_ROOT): data_volume.with_mount_options(read_only=True), str(RUN_ROOT): run_volume},
+    cpu=8,
+    memory=65536,
+    ephemeral_disk=512 * 1024,
+    timeout=30 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def h200_burst(run_name: str = "vggt-omega-h200-burst") -> dict:
+    """Run the bounded 24-frame H200 throughput and VRAM benchmark."""
+    import torch
+    import wandb
+    from mvtracker.preprocessing.vggt_omega import infer_temporal_chunks, load_model
+
+    run = wandb.init(
+        project="mvtracker-modal-profiling",
+        job_type="vggt-omega-h200-burst",
+        name=run_name,
+        tags=["modal", "h200", "vggt-omega", "burst"],
+        config={
+            **BASE_TAGS,
+            "gpu": "H200",
+            "window_frames": 24,
+            "warmup_iterations": 1,
+            "measured_iterations": 2,
+            "frontier_basis": "H100 four-view DIEGESIS batch 6 reserved approximately 79 GB",
+            "diegesis": {"views": 4, "baseline_batch": 1, "frontier_batches": [10, 9, 11]},
+            "syn4d": {"views": 6, "frontier_batches": [6, 5, 7]},
+            "vram_stop_fraction": 0.90,
+        },
+    )
+    report = {
+        "format": "mvtracker_vggt_omega_h200_burst",
+        "run_name": run_name,
+        "gpu": {},
+        "startup": {},
+        "trials": [],
+        "stopped": None,
+    }
+    try:
+        _emit("h200_benchmark_start", run_name=run_name)
+        startup_started = time.perf_counter()
+        checkpoint_started = time.perf_counter()
+        checkpoint = _download_checkpoint(os.environ["HF_TOKEN"])
+        checkpoint_seconds = time.perf_counter() - checkpoint_started
+        device = torch.device("cuda")
+        model_started = time.perf_counter()
+        model = load_model(checkpoint, device)
+        torch.cuda.synchronize(device)
+        model_seconds = time.perf_counter() - model_started
+        properties = torch.cuda.get_device_properties(device)
+        report["gpu"] = {
+            "name": properties.name,
+            "total_memory_bytes": int(properties.total_memory),
+        }
+        report["startup"] = {
+            "checkpoint_seconds": checkpoint_seconds,
+            "model_seconds": model_seconds,
+            "total_seconds": time.perf_counter() - startup_started,
+        }
+        _emit("h200_startup_complete", gpu=report["gpu"], **report["startup"])
+
+        with tempfile.TemporaryDirectory(prefix="vggt-omega-h200-", dir="/tmp") as scratch:
+            scratch_root = Path(scratch)
+
+            def run_trial(dataset: str, batch_size: int, *, baseline: bool = False) -> dict:
+                sources = _h200_sources(dataset)
+                torch.cuda.empty_cache()
+                _emit("h200_trial_start", dataset=dataset, batch_size=batch_size, frames=24, baseline=baseline)
+                trial = {
+                    "dataset": dataset,
+                    "view_count": len(sources[0].description.view_ids),
+                    "batch_size": batch_size,
+                    "scene_replication": batch_size > len(sources),
+                    "baseline": baseline,
+                    "iterations": [],
+                }
+                phases = (("warmup", 1), ("measured", 2))
+                try:
+                    for phase, count in phases:
+                        for iteration in range(count):
+                            record = _h200_iteration(
+                                dataset=dataset,
+                                batch_size=batch_size,
+                                iteration=iteration,
+                                phase=phase,
+                                sources=sources,
+                                model=model,
+                                device=device,
+                                infer_temporal_chunks=infer_temporal_chunks,
+                                scratch_root=scratch_root,
+                            )
+                            trial["iterations"].append(record)
+                            run.log(
+                                {
+                                    f"{dataset}/batch_{batch_size}/{phase}/{key}": value
+                                    for key, value in record.items()
+                                    if isinstance(value, (int, float))
+                                }
+                            )
+                            if record["peak_vram_fraction"] > 0.90:
+                                trial["status"] = "unsafe_vram"
+                                trial["stop"] = {
+                                    "reason": "peak_vram_fraction_exceeded_0.90",
+                                    "phase": phase,
+                                    "iteration": iteration,
+                                }
+                                break
+                        if trial.get("status") == "unsafe_vram":
+                            break
+                except torch.cuda.OutOfMemoryError as error:
+                    torch.cuda.empty_cache()
+                    trial["status"] = "oom"
+                    trial["error"] = repr(error)
+                    _emit("h200_trial_oom", dataset=dataset, batch_size=batch_size, error=repr(error))
+                measured = [record for record in trial["iterations"] if record["phase"] == "measured"]
+                if len(measured) == 2:
+                    trial["measured_mean"] = _mean_measured(measured)
+                    trial.setdefault("status", "complete")
+                report["trials"].append(trial)
+                _emit("h200_trial_complete", dataset=dataset, batch_size=batch_size, status=trial["status"])
+                return trial
+
+            run_trial("diegesis", 1, baseline=True)
+            diegesis_10 = run_trial("diegesis", 10)
+            if diegesis_10["status"] == "complete":
+                run_trial("diegesis", 11)
+            else:
+                run_trial("diegesis", 9)
+
+            syn4d_6 = run_trial("syn4d", 6)
+            if syn4d_6["status"] == "complete":
+                run_trial("syn4d", 7)
+            else:
+                run_trial("syn4d", 5)
+
+        stopped_trials = [trial for trial in report["trials"] if trial["status"] != "complete"]
+        report["stopped"] = [
+            {
+                "dataset": trial["dataset"],
+                "batch_size": trial["batch_size"],
+                "status": trial["status"],
+                **trial.get("stop", {}),
+            }
+            for trial in stopped_trials
+        ] or None
+
+        report_path = RUN_ROOT / run_name / "h200-burst-report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        run.summary.update(
+            {
+                "report_path": str(report_path),
+                "gpu_name": report["gpu"]["name"],
+                "trial_count": len(report["trials"]),
+                "stopped": report["stopped"],
+            }
+        )
+        run.finish()
+        run_volume.commit()
+        _emit("h200_benchmark_complete", report_path=str(report_path), trial_count=len(report["trials"]))
+        return report
+    except Exception as error:
+        _emit("h200_benchmark_failed", error=repr(error))
+        run.finish(exit_code=1)
+        raise
 
 
 @app.function(
@@ -749,5 +1046,11 @@ def _packed_frames(payload: bytes) -> tuple[bytes, ...]:
     return tuple(bytes(encoded[start:end]) for start, end in zip(offsets[:-1], offsets[1:]))
 
 
+@app.local_entrypoint(name="h200-burst")
+def run_h200_burst(run_name: str = "vggt-omega-h200-burst") -> None:
+    app.set_tags({**BASE_TAGS, "experiment": run_name, "gpu": "h200"})
+    print(json.dumps(h200_burst.remote(run_name), indent=2, sort_keys=True))
+
+
 if __name__ == "__main__":
-    print("Use: modal run --timestamps tools/modal_vggt_omega_long_inference.py::infer")
+    print("Use: modal run --timestamps tools/modal_vggt_omega_long_inference.py::run_h200_burst")
