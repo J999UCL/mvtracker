@@ -257,16 +257,25 @@ class _ContainerHardwareMonitor:
         memory_limit = int(
             (self.cgroup_root / "memory/memory.limit_in_bytes").read_text()
         )
+        meminfo = {
+            name.rstrip(":"): int(value) * 1024
+            for name, value, *_ in (
+                line.split() for line in Path("/proc/meminfo").read_text().splitlines()
+            )
+        }
+        memory_cache = min(memory_used, meminfo["Cached"])
+        memory_working_set = memory_used - memory_cache
         available_cpus = self._cpu_limit()
         return {
             "hardware/container/cpu_cores_used": cpu_cores,
             "hardware/container/cpu_utilization_percent": (
                 100.0 * cpu_cores / available_cpus
             ),
-            "hardware/container/memory_used_gib": memory_used / (1024 ** 3),
+            "hardware/container/memory_used_gib": memory_working_set / (1024 ** 3),
+            "hardware/container/memory_cache_gib": memory_cache / (1024 ** 3),
             "hardware/container/memory_limit_gib": memory_limit / (1024 ** 3),
             "hardware/container/memory_utilization_percent": (
-                100.0 * memory_used / memory_limit
+                100.0 * memory_working_set / memory_limit
             ),
         }
 

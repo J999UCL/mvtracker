@@ -10,6 +10,8 @@ from typing import Sequence
 
 import numpy as np
 
+from mvtracker.datasets.io_cache import flush_and_discard_file
+
 
 ESTIMATED_DEPTH_FORMAT = "mvtracker_estimated_depth"
 ESTIMATED_DEPTH_SCHEMA_VERSION = 2
@@ -179,5 +181,7 @@ class RuntimeRecipeDepthStore:
         depth = np.load(depth_path, allow_pickle=False).astype(np.float32, copy=True)
         mask = np.load(mask_path, allow_pickle=False).astype(np.bool_, copy=True)
         byte_count = depth.nbytes + mask.nbytes
+        flush_and_discard_file(depth_path)
+        flush_and_discard_file(mask_path)
         shutil.rmtree(sample_root)
         return depth, mask, time.perf_counter() - started, byte_count

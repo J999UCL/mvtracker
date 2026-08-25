@@ -20,6 +20,7 @@ from mvtracker.datasets.kubric_dali_dataset import (
     _scene_metadata,
 )
 from mvtracker.datasets.kubric_dali_stream import KubricDaliSceneBundle
+from mvtracker.datasets.io_cache import discard_file_range
 from mvtracker.datasets.training_recipe import RecipeReader, RecipeRecord
 from mvtracker.preprocessing.mvkubric_webdataset import META_COMPONENT, RGB_COMPONENT
 
@@ -104,6 +105,9 @@ class _PackedScenes:
                     )
                     for frame in frames
                 ]
+                start = int(offsets[frames[0]])
+                stop = int(offsets[frames[-1] + 1])
+                discard_file_range(descriptor, start, stop - start)
             finally:
                 os.close(descriptor)
             exts = np.load(camera_root / str(view) / "extrinsics_w2c.npy", mmap_mode="r")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import threading
 from collections import OrderedDict
@@ -48,7 +49,9 @@ class _MappedSequence:
             if array is None:
                 array = np.load(path, mmap_mode="r", allow_pickle=False)
                 self.arrays[path] = array
-        return np.array(array[index], copy=True)
+            result = np.array(array[index], copy=True)
+            array._mmap.madvise(mmap.MADV_DONTNEED)
+            return result
 
     def close(self) -> None:
         for array in self.arrays.values():

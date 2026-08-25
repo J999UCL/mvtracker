@@ -938,6 +938,7 @@ class TrainingDashboardState:
                     "cpu_cores_used",
                     "cpu_utilization_percent",
                     "memory_used_gib",
+                    "memory_cache_gib",
                     "memory_limit_gib",
                     "memory_utilization_percent",
                 )
@@ -1248,7 +1249,7 @@ const charts={
   gpuThermal:new Chart(document.getElementById('gpu-thermal'),{type:'line',data:{datasets:[line('Power',palette.s3),line('Temperature',palette.s4,{yAxisID:'temp'})]},options:options('Elapsed time (min)','Power (W)',{scales:{temp:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Temperature (°C)',color:palette.muted}}}})}),
   throughput:new Chart(document.getElementById('training-throughput'),{type:'line',data:{datasets:[line('Samples/s',palette.s1),line('Trajectories/s',palette.s3,{yAxisID:'trajectories'})]},options:options('Optimizer step','Samples/s',{scales:{trajectories:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Trajectories/s',color:palette.muted}}}})}),
   containerCpu:new Chart(document.getElementById('container-cpu'),{type:'line',data:{datasets:[line('CPU utilization',palette.s1),line('Cores used',palette.s3,{yAxisID:'cores'})]},options:options('Optimizer step','Utilization (%)',{min:0,scales:{cores:{position:'right',grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'CPU cores',color:palette.muted}}}})}),
-  containerMemory:new Chart(document.getElementById('container-memory'),{type:'line',data:{datasets:[line('Memory used',palette.s2),line('Memory utilization',palette.s4,{yAxisID:'percent'})]},options:options('Optimizer step','Memory (GiB)',{min:0,scales:{percent:{position:'right',min:0,max:100,grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Utilization (%)',color:palette.muted}}}})})
+  containerMemory:new Chart(document.getElementById('container-memory'),{type:'line',data:{datasets:[line('Working memory',palette.s2),line('File cache',palette.s3),line('Memory utilization',palette.s4,{yAxisID:'percent'})]},options:options('Optimizer step','Memory (GiB)',{min:0,scales:{percent:{position:'right',min:0,max:100,grid:{drawOnChartArea:false},ticks:{color:palette.muted},title:{display:true,text:'Utilization (%)',color:palette.muted}}}})})
 };
 const rawOpacity=document.getElementById('raw-opacity');
 const rawOpacityValue=document.getElementById('raw-opacity-value');
@@ -1350,7 +1351,7 @@ function render(state){
   const performance=state.series?.performance||{}, hardware=state.series?.hardware||{};
   update(charts.throughput,[points(performance.samples_per_second),points(performance.trajectories_per_second)]);
   update(charts.containerCpu,[points(hardware.cpu_utilization_percent),points(hardware.cpu_cores_used)]);
-  update(charts.containerMemory,[points(hardware.memory_used_gib),points(hardware.memory_utilization_percent)]);
+  update(charts.containerMemory,[points(hardware.memory_used_gib),points(hardware.memory_cache_gib),points(hardware.memory_utilization_percent)]);
 
   const validation=state.series?.validation||{}, tags=[...new Set(Object.values(validation).flatMap(metrics=>Object.keys(metrics)))].sort(), select=document.getElementById('validation-select');
   const previous=select.value;

@@ -939,6 +939,20 @@ depth pages and apply scale-aware scene normalization.
 
 The durable `model_000250.pth` checkpoint and all logs remain on the run Volume.
 
+#### Runtime memory correction
+
+Inspection showed that the stopped run's apparent memory growth was dominated
+by streamed file pages: cgroup usage was about 468 GiB while `/proc/meminfo`
+reported roughly 410 GiB as cache. The runtime-depth consumer now flushes and
+evicts each depth/mask sidecar before deleting it. One-pass indexed TAR ranges,
+packed JPEG ranges, GT depth maps and released Syn4D mmap pages likewise receive
+Linux `DONTNEED` hints after their contents have been copied. This prevents the
+RGB/depth stream from leaving its complete history resident in page cache.
+
+Container monitoring now reports working memory (`cgroup usage - file cache`)
+as memory used and logs file cache separately. The dashboard displays both
+series instead of presenting reclaimable cache as model RAM.
+
 ## 23 August 2026: centered three-source final external evaluation
 
 The completed 2,000-step singleton-batch checkpoint was transferred from the

@@ -19,6 +19,7 @@ from torchvision.io import ImageReadMode, decode_jpeg
 from torchvision.transforms import functional as TF
 
 from mvtracker.datasets.estimated_depth import sample_depth_source
+from mvtracker.datasets.io_cache import discard_file_range
 from mvtracker.datasets.kubric_multiview_dataset import (
     KubricMultiViewDataset,
     _legal_contiguous_window_starts,
@@ -477,6 +478,7 @@ def _read_encoded_frames(
         if len(encoded) != end - start:
             raise ValueError(f"{label}: truncated JPEG byte store")
         result.append(torch.frombuffer(bytearray(encoded), dtype=torch.uint8))
+        discard_file_range(descriptor, start, end - start)
     return tuple(result)
 
 
@@ -1405,6 +1407,11 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             if plan.depth_source == "gt":
                 depth = self._mmap(depth_path)[plan.frame_indices]
                 depths.append(torch.from_numpy(np.asarray(depth, dtype=np.float32).copy()))
+                descriptor = os.open(depth_path, os.O_RDONLY)
+                try:
+                    discard_file_range(descriptor)
+                finally:
+                    os.close(descriptor)
         if plan.depth_source != "gt":
             if runtime_depth is None:
                 estimated_depths, cleaned_mask = self.estimated_depth_store.load(

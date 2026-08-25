@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from mvtracker.datasets.estimated_depth import sample_depth_source
+from mvtracker.datasets.io_cache import discard_file_range
 from mvtracker.datasets.kubric_dali_stream import (
     KubricDaliSceneBundle,
     KubricDaliSceneGroup,
@@ -152,6 +153,7 @@ class _IndexedRecordStore:
                 )
             records[position][f".{component}"] = payload
             read_bytes += len(payload)
+            discard_file_range(self._fd(shard), offset, size)
         return tuple(records), IndexedReadStats(
             requested_bytes=requested_bytes,
             read_bytes=read_bytes,
