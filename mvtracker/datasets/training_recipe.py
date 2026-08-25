@@ -1044,11 +1044,122 @@ def plan_training_recipe_parallel(
         _PROCESS_SCHEDULE = None
 
 
+def derive_mixed_depth_smoke_recipe(
+    source_dir: str | Path,
+    output_dir: str | Path,
+) -> dict[str, int]:
+    """Keep a planned schedule intact while assigning exact 70/20/10 depth draws."""
+
+    reader = RecipeReader(source_dir)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=False)
+    steps = list(reader.steps())
+    samples = [sample for step in steps for sample in step["logical_samples"]]
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for sample in samples:
+        by_source.setdefault(str(sample["source"]), []).append(sample)
+
+    for source_samples in by_source.values():
+        source_samples.sort(key=lambda item: (int(item["step"]), int(item["logical_index"])))
+        count = len(source_samples)
+        if count % 10:
+            raise ValueError("exact 70/20/10 smoke assignment requires source counts divisible by 10")
+        estimated_count = count * 3 // 10
+        cleaned_count = count // 10
+        selected = np.floor(
+            (np.arange(estimated_count, dtype=np.float64) + 0.5)
+            * count
+            / estimated_count
+        ).astype(np.int64)
+        cleaned_positions = set(
+            np.floor(
+                (np.arange(cleaned_count, dtype=np.float64) + 0.5)
+                * estimated_count
+                / cleaned_count
+            ).astype(np.int64).tolist()
+        )
+        for sample in source_samples:
+            sample["depth_source"] = "gt"
+        for position, sample_index in enumerate(selected):
+            source_samples[int(sample_index)]["depth_source"] = (
+                "estimated_cleaned" if position in cleaned_positions else "estimated"
+            )
+
+    with (output / "steps.jsonl").open("w", encoding="utf-8") as handle:
+        for step in steps:
+            handle.write(json.dumps(step, separators=(",", ":")) + "\n")
+
+    world_size = int(reader.manifest["world_size"])
+    rank_counts = []
+    for rank in range(world_size):
+        rank_samples = sorted(
+            (sample for sample in samples if int(sample["rank"]) == rank),
+            key=lambda item: (int(item["step"]), int(item["logical_index"])),
+        )
+        rank_counts.append(len(rank_samples))
+        with (output / f"rank-{rank}.jsonl").open("w", encoding="utf-8") as handle:
+            for sample in rank_samples:
+                handle.write(json.dumps(sample, separators=(",", ":")) + "\n")
+
+    depth_counts = Counter(str(sample["depth_source"]) for sample in samples)
+    source_counts = Counter(str(sample["source"]) for sample in samples)
+    estimated = {}
+    for sample in samples:
+        if sample["depth_source"] != "gt":
+            estimated.setdefault((sample["source"], sample["scene"]), set()).add(
+                sample["depth_source"]
+            )
+    with (output / "estimated-depth-requests.jsonl").open("w", encoding="utf-8") as handle:
+        for (source, scene), depth_sources in sorted(estimated.items()):
+            handle.write(
+                json.dumps(
+                    {
+                        "source": source,
+                        "scene": scene,
+                        "planned_depth_sources": sorted(depth_sources),
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+    source_summary = json.loads(
+        (Path(source_dir) / "summary.json").read_text(encoding="utf-8")
+    )
+    summary = {
+        **source_summary,
+        "records": len(samples),
+        "source_counts": dict(source_counts),
+        "planned_depth_counts": dict(depth_counts),
+        "unique_estimated_depth_scenes": len(estimated),
+        "derived_from": str(source_dir),
+    }
+    (output / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        **reader.manifest,
+        "rank_record_counts": rank_counts,
+        "actual_records": len(samples),
+        "complete": True,
+        "derived_from": str(source_dir),
+        "depth_distribution": {"gt": 0.70, "estimated": 0.20, "estimated_cleaned": 0.10},
+    }
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    RecipeReader(output).validate()
+    return dict(depth_counts)
+
+
 __all__ = [
     "PhysicalAssignment",
     "RecipeReader",
     "RecipeRecord",
     "RecipeWriter",
+    "derive_mixed_depth_smoke_recipe",
     "plan_training_recipe",
     "plan_training_recipe_parallel",
 ]

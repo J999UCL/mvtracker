@@ -1,0 +1,43 @@
+# @package _global_
+defaults:
+  - diegesis_syn4d_mvkubric_gt_ddp
+  - _self_
+
+datasets:
+  train:
+    recipe_path: ${oc.env:MVTRACKER_TRAINING_RECIPE}
+    force_gt_depth: false
+    runtime_depth_root: ${oc.env:MVTRACKER_RUNTIME_DEPTH_ROOT}
+    runtime_depth_metrics_path: ${oc.env:MVTRACKER_RUNTIME_DEPTH_METRICS}
+    physical_batching:
+      lookahead_steps: 8
+      cpu_cache_gib_per_rank: 24
+      max_scenes: 2
+      rank_local: false
+  eval:
+    names: []
+
+trainer:
+  num_steps: 20
+  lr_schedule_steps: 2000
+  eval_freq: 10000
+  viz_freq: 10000
+  save_ckpt_freq: 20
+  hardware_metrics_interval: 1
+
+modes:
+  validate_at_start: false
+
+augmentations:
+  variable_depth_type: true
+
+logging:
+  wandb_group: da3-runtime-depth-smoke20
+  tags:
+    - diegesis-syn4d-mvkubric-25-25-50
+    - recipe
+    - da3-giant-1.1
+    - mixed-depth-70-20-10
+    - ddp2-h200-plus-producer
+    - continual-training
+    - smoke20

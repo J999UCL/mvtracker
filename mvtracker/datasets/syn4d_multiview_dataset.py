@@ -471,5 +471,5 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             track_validity=validity,
         )
 
-    def materialize_sample(self, plan: SamplePlan):
-        return super().materialize_sample(plan)
+    def materialize_sample(self, plan: SamplePlan, runtime_depth=None):
+        return super().materialize_sample(plan, runtime_depth=runtime_depth)

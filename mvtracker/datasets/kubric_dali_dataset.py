@@ -26,6 +26,7 @@ from mvtracker.datasets.kubric_dali_stream import (
 from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
 from mvtracker.preprocessing.mvkubric_webdataset import (
     META_COMPONENT,
+    RGB_COMPONENT,
     RECORD_LOCATOR_FORMAT,
     parse_dali_index,
 )
@@ -121,7 +122,9 @@ class _IndexedRecordStore:
             return descriptor
 
     def read_many(
-        self, indices: tuple[int, ...] | list[int]
+        self,
+        indices: tuple[int, ...] | list[int],
+        components: set[str] | None = None,
     ) -> tuple[tuple[Mapping[str, Any], ...], IndexedReadStats]:
         started = time.perf_counter()
         requested = tuple(int(index) for index in indices)
@@ -136,7 +139,7 @@ class _IndexedRecordStore:
             for component, offset, size in zip(
                 self.component_names, self.offsets[index], self.sizes[index]
             ):
-                if offset >= 0:
+                if offset >= 0 and (components is None or component in components):
                     reads.append((shard, int(offset), int(size), position, component))
                     requested_bytes += int(size)
         read_bytes = 0
@@ -614,9 +617,9 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             metadata=metadata,
         )
 
-    def materialize_sample(self, plan: SamplePlan):
+    def materialize_sample(self, plan: SamplePlan, runtime_depth=None):
         payload_depth_source = "gt" if self.depth_provider == "gt" else "estimated"
-        if plan.depth_source != payload_depth_source:
+        if runtime_depth is None and plan.depth_source != payload_depth_source:
             raise RuntimeError(
                 f"planned {plan.depth_source} depth but DALI payload contains "
                 f"{payload_depth_source} depth"
@@ -628,7 +631,10 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         if plan.media_record_indices:
             if len(plan.media_record_indices) != len(plan.views):
                 raise ValueError("media record count does not match selected views")
-            records, media_read = self._records.read_many(plan.media_record_indices)
+            records, media_read = self._records.read_many(
+                plan.media_record_indices,
+                components={RGB_COMPONENT} if runtime_depth is not None else None,
+            )
             rgb_payloads: list[bytes] = []
             depth_payloads: list[bytes] = []
             for view, record in zip(plan.views, records):
@@ -639,7 +645,8 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
                         f"got {record['__key__']!r}"
                     )
                 rgb_payloads.extend(_packed_frames(record[".rgb.npz"]))
-                depth_payloads.extend(_packed_frames(record[".depth.npz"]))
+                if runtime_depth is None:
+                    depth_payloads.extend(_packed_frames(record[".depth.npz"]))
             rgb_sources = tuple(rgb_payloads)
             depth_sources = tuple(depth_payloads)
             metadata.update(
@@ -661,9 +668,24 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             )
         metadata["worker_prepare_seconds"] = time.perf_counter() - started
         metadata["encoded_bytes"] = sum(map(len, rgb_sources)) + sum(map(len, depth_sources))
+        runtime_depth_tensor = None
+        if runtime_depth is not None:
+            estimated_depths, cleaned_mask, runtime_wait_seconds, runtime_bytes = runtime_depth
+            expected = (len(plan.views), len(plan.frame_indices), *plan.source_size)
+            if estimated_depths.shape != expected:
+                raise ValueError(
+                    f"runtime depth shape {estimated_depths.shape} does not match {expected}"
+                )
+            if plan.depth_source == "estimated_cleaned":
+                estimated_depths = estimated_depths * cleaned_mask
+            runtime_depth_tensor = torch.from_numpy(
+                np.asarray(estimated_depths, dtype=np.float32).copy()
+            )[:, :, None]
+            metadata["runtime_depth_wait_seconds"] = float(runtime_wait_seconds)
+            metadata["runtime_depth_bytes"] = int(runtime_bytes)
         sample = EncodedTapVid3DSample(
             jpeg_bytes=rgb_sources,
-            depth=None,
+            depth=runtime_depth_tensor,
             theta=torch.from_numpy(plan.theta),
             intrs=torch.from_numpy(plan.intrinsics),
             extrs=torch.from_numpy(plan.extrinsics),

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -145,3 +147,37 @@ class EstimatedDepthStore:
             selected_depth = depth[selected_views]
             selected_mask = cleaned_mask[selected_views]
         return np.asarray(selected_depth), np.asarray(selected_mask)
+
+
+class RuntimeRecipeDepthStore:
+    """Consume recipe-keyed DA3 depth produced on the container's local SSD."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+
+    def load(self, step: int, logical_index: int) -> tuple[np.ndarray, np.ndarray, float, int]:
+        sample_root = self.root / f"step-{int(step):06d}" / f"sample-{int(logical_index):02d}"
+        ready = sample_root / "ready"
+        failed = self.root / "failed"
+        started = time.perf_counter()
+        last_log = started
+        while not ready.is_file():
+            if failed.is_file():
+                raise RuntimeError(failed.read_text(encoding="utf-8").strip())
+            now = time.perf_counter()
+            if now - last_log >= 10:
+                print(
+                    "RUNTIME_DEPTH event=waiting "
+                    f"step={step} logical_index={logical_index} "
+                    f"elapsed_seconds={now - started:.1f}",
+                    flush=True,
+                )
+                last_log = now
+            time.sleep(0.05)
+        depth_path = sample_root / "depth.npy"
+        mask_path = sample_root / "cleaned_mask.npy"
+        depth = np.load(depth_path, allow_pickle=False).astype(np.float32, copy=True)
+        mask = np.load(mask_path, allow_pickle=False).astype(np.bool_, copy=True)
+        byte_count = depth.nbytes + mask.nbytes
+        shutil.rmtree(sample_root)
+        return depth, mask, time.perf_counter() - started, byte_count

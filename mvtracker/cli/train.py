@@ -49,6 +49,7 @@ from mvtracker.datasets.mixed_physical_loader import (
     MixedStepLookahead,
     PhysicalBatchDecoder,
     PhysicalGroupPrefetchIterator,
+    PhysicalStepPrefetchIterator,
     singleton_prepared_groups,
 )
 from mvtracker.datasets.physical_batch_scheduler import BatchCapacity
@@ -147,11 +148,17 @@ class _RecipeMixedSourceSchedule:
 class _RecipeDataset:
     """Validate replayed plans and optionally substitute GT depth."""
 
-    def __init__(self, source, dataset, schedule, force_gt_depth):
+    def __init__(self, source, dataset, schedule, force_gt_depth, runtime_depth_root=None):
         self.source = str(source)
         self.dataset = dataset
         self.schedule = schedule
         self.force_gt_depth = bool(force_gt_depth)
+        if runtime_depth_root:
+            from mvtracker.datasets.estimated_depth import RuntimeRecipeDepthStore
+
+            self.runtime_depth_store = RuntimeRecipeDepthStore(runtime_depth_root)
+        else:
+            self.runtime_depth_store = None
 
     def __getattr__(self, name):
         return getattr(self.dataset, name)
@@ -189,6 +196,7 @@ class _RecipeDataset:
         metadata["recipe_microbatch"] = int(record.microbatch)
         metadata["recipe_source_cursor"] = int(record.source_cursor)
         metadata["recipe_retry_count"] = int(record.retry_count)
+        metadata["recipe_logical_index"] = int(record.logical_index)
         metadata["planned_depth_source"] = record.depth_source
         metadata["effective_depth_source"] = (
             "gt" if self.force_gt_depth else record.depth_source
@@ -200,7 +208,18 @@ class _RecipeDataset:
         )
 
     def materialize_sample(self, plan):
-        return self.dataset.materialize_sample(plan)
+        if plan.depth_source == "gt":
+            return self.dataset.materialize_sample(plan)
+        if self.runtime_depth_store is None:
+            return self.dataset.materialize_sample(plan)
+        depth, mask, wait_seconds, byte_count = self.runtime_depth_store.load(
+            plan.metadata["recipe_step"],
+            plan.metadata["recipe_logical_index"],
+        )
+        return self.dataset.materialize_sample(
+            plan,
+            runtime_depth=(depth, mask, wait_seconds, byte_count),
+        )
 
 
 class _ContainerHardwareMonitor:
@@ -2591,6 +2610,7 @@ def main(cfg: DictConfig):
                     dataset,
                     mixed_schedule,
                     force_gt_depth,
+                    cfg.datasets.train.get("runtime_depth_root"),
                 )
                 for source, dataset in train_datasets.items()
             }
@@ -2898,6 +2918,7 @@ def main(cfg: DictConfig):
 
     physical_lookahead = None
     physical_decoder = None
+    physical_pipeline = None
     if planned_physical_batching:
         settings = cfg.datasets.train.physical_batching
         physical_lookahead = MixedStepLookahead(
@@ -2926,6 +2947,11 @@ def main(cfg: DictConfig):
                 cfg.datasets.train.dali.prefetch_queue_depth
             ),
         )
+        if recipe_path:
+            physical_pipeline = PhysicalStepPrefetchIterator(
+                physical_lookahead,
+                physical_decoder,
+            )
 
     dali_stream_batches_seen = set()
 
@@ -3069,6 +3095,11 @@ def main(cfg: DictConfig):
             "read_bytes": 0.0,
             "read_seconds": 0.0,
         }
+        accumulated_runtime_depth_metrics = {
+            "sample_count": 0.0,
+            "read_bytes": 0.0,
+            "wait_seconds": 0.0,
+        }
         accumulated_loss_value = None
         accumulated_component_losses = {}
         accumulated_metrics = {}
@@ -3111,7 +3142,12 @@ def main(cfg: DictConfig):
             if mixed_training:
                 if planned_physical_batching:
                     if microbatches_accumulated == 0:
-                        physical_step = next(physical_lookahead)
+                        if physical_pipeline is not None:
+                            physical_step, physical_group_iterator = (
+                                physical_pipeline.next_step()
+                            )
+                        else:
+                            physical_step = next(physical_lookahead)
                         if (
                             not recipe_path
                             and physical_step.start_cursors != source_cursors
@@ -3138,7 +3174,9 @@ def main(cfg: DictConfig):
                             raise RuntimeError(
                                 f"physical step materialization failed: {detail}"
                             )
-                        if run_gradient_diagnostics:
+                        if physical_pipeline is not None:
+                            groups_for_step = physical_step.groups
+                        elif run_gradient_diagnostics:
                             groups_for_step = (
                                 physical_step.groups
                                 if physical_step.diagnostic_singletons
@@ -3165,11 +3203,12 @@ def main(cfg: DictConfig):
                                 for group in groups_for_step
                             ],
                         )
-                        physical_group_iterator = iter(
-                            PhysicalGroupPrefetchIterator(
-                                groups_for_step, physical_decoder
+                        if physical_pipeline is None:
+                            physical_group_iterator = iter(
+                                PhysicalGroupPrefetchIterator(
+                                    groups_for_step, physical_decoder
+                                )
                             )
-                        )
                         total_batches_loaded += physical_step.logical_scene_count
                         total_batches_failed += physical_step.retry_count
                         physical_batching_metrics = {
@@ -3356,6 +3395,14 @@ def main(cfg: DictConfig):
                             + float(np.mean([item[name] for item in metadata]))
                         )
                 for item in metadata:
+                    if "runtime_depth_wait_seconds" in item:
+                        accumulated_runtime_depth_metrics["sample_count"] += 1.0
+                        accumulated_runtime_depth_metrics["read_bytes"] += float(
+                            item.get("runtime_depth_bytes", 0)
+                        )
+                        accumulated_runtime_depth_metrics["wait_seconds"] += float(
+                            item["runtime_depth_wait_seconds"]
+                        )
                     if item.get("record_store") == "indexed-webdataset":
                         accumulated_indexed_read_metrics["sample_count"] += 1.0
                         accumulated_indexed_read_metrics["read_bytes"] += float(
@@ -4235,6 +4282,23 @@ def main(cfg: DictConfig):
                 else 0.0
             )
             reduced_physical_batching_metrics = None
+            reduced_runtime_depth_metrics = {
+                "sample_count": _reduce_scalar(
+                    fabric,
+                    accumulated_runtime_depth_metrics["sample_count"],
+                    reduce_op="sum",
+                ),
+                "read_bytes": _reduce_scalar(
+                    fabric,
+                    accumulated_runtime_depth_metrics["read_bytes"],
+                    reduce_op="sum",
+                ),
+                "wait_seconds": _reduce_scalar(
+                    fabric,
+                    accumulated_runtime_depth_metrics["wait_seconds"],
+                    reduce_op="max",
+                ),
+            }
             if physical_batching_metrics is not None:
                 reduced_physical_batching_metrics = {
                     "planning_seconds": _reduce_scalar(
@@ -4323,6 +4387,35 @@ def main(cfg: DictConfig):
                 for name, value in reduced_indexed_read_metrics.items():
                     tb_writer.add_scalar(
                         f"io/mvkubric_indexed/{name}", value, total_steps
+                    )
+                for name, value in reduced_runtime_depth_metrics.items():
+                    tb_writer.add_scalar(
+                        f"io/runtime_depth/{name}", value, total_steps
+                    )
+                producer_metrics_path = cfg.datasets.train.get(
+                    "runtime_depth_metrics_path"
+                )
+                if producer_metrics_path and Path(producer_metrics_path).is_file():
+                    last_line = Path(producer_metrics_path).read_text(
+                        encoding="utf-8"
+                    ).splitlines()[-1]
+                    producer_metrics = json.loads(last_line)
+                    for name in (
+                        "generated_samples",
+                        "generated_images",
+                        "model_seconds",
+                        "model_images_per_second",
+                        "sample_seconds",
+                    ):
+                        tb_writer.add_scalar(
+                            f"depth_producer/{name}",
+                            float(producer_metrics[name]),
+                            total_steps,
+                        )
+                    tb_writer.add_scalar(
+                        "depth_producer/step_lead",
+                        float(producer_metrics["step"]) - total_steps,
+                        total_steps,
                     )
                 if sampling_metrics:
                     for name, value in sampling_metrics.items():
@@ -4427,6 +4520,11 @@ def main(cfg: DictConfig):
                 "sample_count": 0.0,
                 "read_bytes": 0.0,
                 "read_seconds": 0.0,
+            }
+            accumulated_runtime_depth_metrics = {
+                "sample_count": 0.0,
+                "read_bytes": 0.0,
+                "wait_seconds": 0.0,
             }
             accumulated_loss_value = None
             accumulated_component_losses = {}

@@ -389,8 +389,33 @@ class DaliEncodedImageDecoder:
                 ).gpu()
                 return rgb, depth
 
+        class _RgbPipeline(Pipeline):
+            def __init__(self):
+                super().__init__(
+                    batch_size=max_encoded_images,
+                    num_threads=num_threads,
+                    device_id=device_id,
+                    seed=0,
+                    exec_pipelined=False,
+                    exec_dynamic=False,
+                    prefetch_queue_depth=prefetch_queue_depth,
+                )
+
+            def define_graph(self):
+                rgb_input = fn.external_source(
+                    name="mvtracker_rgb_only_encoded", device="cpu", batch=True
+                )
+                return fn.experimental.decoders.image(
+                    rgb_input,
+                    device="mixed",
+                    output_type=types.RGB,
+                    dtype=types.UINT8,
+                )
+
         self._pipeline = _Pipeline()
         self._pipeline.build()
+        self._rgb_pipeline = _RgbPipeline()
+        self._rgb_pipeline.build()
 
     def _as_torch(self, output) -> list[torch.Tensor]:
         """Convert a DALI TensorListGPU without staging it through the CPU."""
@@ -426,6 +451,16 @@ class DaliEncodedImageDecoder:
         self._pipeline.feed_input("mvtracker_depth_encoded", depth_inputs)
         rgb_output, depth_output = self._pipeline.run()
         return self._as_torch(rgb_output), self._as_torch(depth_output)
+
+    def decode_rgb(
+        self,
+        rgb_encoded: Sequence[bytes | bytearray | memoryview],
+    ) -> list[torch.Tensor]:
+        if not rgb_encoded or len(rgb_encoded) > self._max_encoded_images:
+            raise ValueError("DALI RGB batch is empty or exceeds its configured maximum")
+        rgb_inputs = [np.frombuffer(bytes(value), dtype=np.uint8) for value in rgb_encoded]
+        self._rgb_pipeline.feed_input("mvtracker_rgb_only_encoded", rgb_inputs)
+        return self._as_torch(self._rgb_pipeline.run()[0])
 
 
 def _read_encoded_frames(
@@ -1356,7 +1391,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             },
         )
 
-    def materialize_sample(self, plan: SamplePlan):
+    def materialize_sample(self, plan: SamplePlan, runtime_depth=None):
         load_started = time.perf_counter()
         encoded = []
         depths = []
@@ -1371,9 +1406,14 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 depth = self._mmap(depth_path)[plan.frame_indices]
                 depths.append(torch.from_numpy(np.asarray(depth, dtype=np.float32).copy()))
         if plan.depth_source != "gt":
-            estimated_depths, cleaned_mask = self.estimated_depth_store.load(
-                plan.sequence, plan.views, plan.frame_indices
-            )
+            if runtime_depth is None:
+                estimated_depths, cleaned_mask = self.estimated_depth_store.load(
+                    plan.sequence, plan.views, plan.frame_indices
+                )
+                runtime_wait_seconds = 0.0
+                runtime_bytes = 0
+            else:
+                estimated_depths, cleaned_mask, runtime_wait_seconds, runtime_bytes = runtime_depth
             expected = (len(plan.views), self.seq_len, *plan.source_size)
             if estimated_depths.shape != expected:
                 raise ValueError(
@@ -1390,6 +1430,9 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             ]
         metadata = dict(plan.metadata)
         metadata["gotit"] = True
+        if runtime_depth is not None:
+            metadata["runtime_depth_wait_seconds"] = float(runtime_wait_seconds)
+            metadata["runtime_depth_bytes"] = int(runtime_bytes)
         metadata["worker_prepare_seconds"] = time.perf_counter() - load_started
         sample = EncodedTapVid3DSample(
             jpeg_bytes=tuple(encoded),
@@ -1448,6 +1491,10 @@ def decode_tapvid3d_batch(
     if len(codecs) != 1:
         raise ValueError(f"encoded batches cannot mix image codecs: {sorted(codecs)}")
     codec = codecs.pop()
+    has_tensor_depth = {sample.depth is not None for sample in batch.samples}
+    if len(has_tensor_depth) != 1:
+        raise ValueError("encoded batches cannot mix tensor and encoded depth")
+    tensor_depth = has_tensor_depth.pop()
     flat_encoded = [encoded for sample in batch.samples for encoded in sample.jpeg_bytes]
     decoded_depths = None
     if codec == "jpeg":
@@ -1468,8 +1515,10 @@ def decode_tapvid3d_batch(
             ]
         prepare_stream.wait_stream(rgb_stream)
     elif codec == "nvimagecodec":
-        if nvimagecodec_rgb_decoder is None or nvimagecodec_depth_decoder is None:
-            raise RuntimeError("MV-Kubric GPU decode requires RGB and depth decoders")
+        if nvimagecodec_rgb_decoder is None or (
+            not tensor_depth and nvimagecodec_depth_decoder is None
+        ):
+            raise RuntimeError("MV-Kubric GPU decode requires its configured decoders")
         if rgb_stream is None or depth_stream is None or prepare_stream is None:
             raise RuntimeError("MV-Kubric GPU decode requires explicit CUDA streams")
         def decode_chunks(decoder, encoded, stream):
@@ -1489,24 +1538,29 @@ def decode_tapvid3d_batch(
         rgb_images = decode_chunks(
             nvimagecodec_rgb_decoder, flat_encoded, rgb_stream
         )
-        depth_images = decode_chunks(
-            nvimagecodec_depth_decoder,
-            [encoded for sample in batch.samples for encoded in sample.depth_bytes],
-            depth_stream,
-        )
         decoded_all = [torch.from_dlpack(image.to_dlpack()) for image in rgb_images]
-        decoded_depths = [torch.from_dlpack(image.to_dlpack()) for image in depth_images]
+        if not tensor_depth:
+            depth_images = decode_chunks(
+                nvimagecodec_depth_decoder,
+                [encoded for sample in batch.samples for encoded in sample.depth_bytes],
+                depth_stream,
+            )
+            decoded_depths = [torch.from_dlpack(image.to_dlpack()) for image in depth_images]
         prepare_stream.wait_stream(rgb_stream)
-        prepare_stream.wait_stream(depth_stream)
+        if not tensor_depth:
+            prepare_stream.wait_stream(depth_stream)
     elif codec == "dali":
         if dali_decoder is None:
             raise RuntimeError("DALI MV-Kubric batches require a persistent DALI decoder")
         if rgb_stream is None or depth_stream is None or prepare_stream is None:
             raise RuntimeError("DALI MV-Kubric decoding requires explicit CUDA streams")
-        decoded_all, decoded_depths = dali_decoder.decode(
-            flat_encoded,
-            [encoded for sample in batch.samples for encoded in sample.depth_bytes],
-        )
+        if tensor_depth:
+            decoded_all = dali_decoder.decode_rgb(flat_encoded)
+        else:
+            decoded_all, decoded_depths = dali_decoder.decode(
+                flat_encoded,
+                [encoded for sample in batch.samples for encoded in sample.depth_bytes],
+            )
     else:
         raise ValueError(f"unsupported encoded image codec: {codec}")
     if timing_events is not None:

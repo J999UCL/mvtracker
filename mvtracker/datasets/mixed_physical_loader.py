@@ -646,10 +646,11 @@ class PhysicalBatchDecoder:
         with CUDA_CAPTURE_LOCK:
             codec_groups = {}
             for position, sample in enumerate(group.samples):
-                codec_groups.setdefault(sample.image_codec, []).append((position, sample))
-            if "nvimagecodec" in codec_groups:
+                key = (sample.image_codec, sample.depth is not None)
+                codec_groups.setdefault(key, []).append((position, sample))
+            if any(codec == "nvimagecodec" for codec, _ in codec_groups):
                 self._ensure_nvimagecodec()
-            if "dali" in codec_groups:
+            if any(codec == "dali" for codec, _ in codec_groups):
                 self._ensure_dali()
             decoded = [None] * len(group.samples)
             with torch.cuda.stream(self.prepare_stream):
@@ -727,10 +728,89 @@ class PhysicalGroupPrefetchIterator:
         return group, datapoint
 
 
+class PhysicalStepPrefetchIterator:
+    """Carry one decoded group continuously across recipe step boundaries."""
+
+    def __init__(self, steps, decoder):
+        self.steps = iter(steps)
+        self.decoder = decoder
+        self.ready = queue.Queue(maxsize=1)
+        self.finished = object()
+        self.thread = threading.Thread(target=self._produce, daemon=True)
+        self.thread.start()
+
+    def _produce(self):
+        try:
+            torch.cuda.set_device(self.decoder.device)
+            for step in self.steps:
+                if step.materialization_error is not None:
+                    raise RuntimeError(step.materialization_error)
+                groups = tuple(step.groups)
+                first_group = groups[0]
+                first_batch, first_event = self.decoder.decode_async(first_group)
+                self.ready.put(("step", step, first_group, first_batch, first_event))
+                self.ready.join()
+                for group in groups[1:]:
+                    datapoint, event = self.decoder.decode_async(group)
+                    self.ready.put(("group", group, datapoint, event))
+                    self.ready.join()
+        except BaseException as error:
+            self.ready.put(error)
+        else:
+            self.ready.put(self.finished)
+
+    def next_step(self):
+        item = self.ready.get()
+        if item is self.finished:
+            raise StopIteration
+        if isinstance(item, BaseException):
+            raise item
+        self.ready.task_done()
+        kind, step, group, datapoint, event = item
+        if kind != "step":
+            raise RuntimeError("physical prefetch stream lost its step boundary")
+        return step, _PrefetchedStepGroups(
+            self,
+            len(step.groups),
+            (group, datapoint, event),
+        )
+
+
+class _PrefetchedStepGroups:
+    def __init__(self, parent, count, first):
+        self.parent = parent
+        self.remaining = int(count)
+        self.first = first
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.remaining == 0:
+            raise StopIteration
+        if self.first is not None:
+            group, datapoint, event = self.first
+            self.first = None
+        else:
+            item = self.parent.ready.get()
+            if isinstance(item, BaseException):
+                raise item
+            self.parent.ready.task_done()
+            kind, group, datapoint, event = item
+            if kind != "group":
+                raise RuntimeError("physical prefetch stream crossed a step early")
+        self.remaining -= 1
+        current = torch.cuda.current_stream(self.parent.decoder.device)
+        current.wait_event(event)
+        _record_stream(datapoint, current)
+        return group, datapoint
+
+
 __all__ = [
     "MixedStepLookahead",
     "PhysicalBatchDecoder",
     "PhysicalGroupPrefetchIterator",
+    "PhysicalStepPrefetchIterator",
     "PreparedMixedStep",
     "PreparedPhysicalGroup",
     "merge_decoded_datapoints",
