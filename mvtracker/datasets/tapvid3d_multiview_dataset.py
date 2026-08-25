@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -1008,6 +1009,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         *args,
         raw_root: str,
         view_count_probabilities: Sequence[float] | None = None,
+        manifest_load_workers: int = 1,
         **kwargs,
     ):
         self.raw_root = Path(raw_root)
@@ -1016,8 +1018,28 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         self._manifests: dict[str, dict[str, Any]] = {}
         self._arrays: dict[Path, np.ndarray] = {}
         self._jpeg_descriptors: dict[Path, int] = {}
-        for sequence in self.seq_names:
-            self._manifests[sequence] = self._load_manifest(sequence)
+        started = time.perf_counter()
+        print(
+            "MANIFEST_LOAD event=start "
+            f"scenes={len(self.seq_names)} workers={manifest_load_workers}",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=int(manifest_load_workers)) as executor:
+            futures = {
+                executor.submit(self._load_manifest, sequence): sequence
+                for sequence in self.seq_names
+            }
+            for completed, future in enumerate(as_completed(futures), start=1):
+                sequence = futures[future]
+                self._manifests[sequence] = future.result()
+                if completed % 25 == 0 or completed == len(futures):
+                    elapsed = time.perf_counter() - started
+                    print(
+                        "MANIFEST_LOAD event=progress "
+                        f"completed={completed}/{len(futures)} "
+                        f"rate={completed / max(elapsed, 1e-9):.1f}_scenes_per_second",
+                        flush=True,
+                    )
 
     def _load_manifest(self, sequence: str) -> dict[str, Any]:
         cache_root = Path(self.data_root) / sequence

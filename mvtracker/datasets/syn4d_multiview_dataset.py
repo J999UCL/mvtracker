@@ -126,6 +126,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         data_root: str,
         view_count_probabilities: Sequence[float] | None = None,
         mmap_cache_sequences: int = 4,
+        manifest_load_workers: int = 1,
         max_track_radius: float = 65.0,
         **kwargs,
     ):
@@ -135,6 +136,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             data_root=data_root,
             raw_root=data_root,
             view_count_probabilities=probabilities,
+            manifest_load_workers=manifest_load_workers,
             **kwargs,
         )
         self._sequence_cache = _SequenceMmapCache(
@@ -214,6 +216,9 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
                 datasets_cfg.get("syn4d_view_count_probabilities", (1 / 6,) * 6)
             ),
             mmap_cache_sequences=int(datasets_cfg.get("syn4d_mmap_cache_sequences", 4)),
+            manifest_load_workers=int(
+                datasets_cfg.get("syn4d_manifest_load_workers", 1)
+            ),
             max_depth=float(datasets_cfg.get("syn4d_max_depth", 300.0)),
             max_track_radius=float(
                 datasets_cfg.get("syn4d_max_track_radius", 65.0)
