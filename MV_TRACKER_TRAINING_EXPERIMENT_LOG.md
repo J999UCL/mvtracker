@@ -1888,3 +1888,56 @@ took 368.8 seconds in this run, so an end-to-end full recipe remains roughly
 
 - Recipe: `training-recipes/diegesis-syn4d-mvkubric-recipe-profile100-20260825T055311Z`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/4rezmpfn
+
+## 2026-08-25 — Global recipe scheduling and indexed MV-Kubric H200 smoke
+
+Recipe sampling and hardware assignment were separated. Each optimizer step
+first records the same eight logical draws as the existing two-lane sampler
+(2 DIEGESIS / 2 Syn4D / 4 MV-Kubric), then globally pairs same-view scenes and
+assigns synchronized physical groups to the two DDP ranks. Trajectory counts
+may differ inside a pair and are padded/masked. Both ranks always execute the
+same number of backward calls; loss scaling preserves equal weight for all
+eight logical scenes.
+
+MV-Kubric training was changed from rank-owned sequential streams to the
+existing indexed TAR-range design. The loader uses `record-locator.npz` to
+read only the recipe-selected scene metadata and view payloads, while DALI
+continues to own CUDA RGB/depth decoding. Validation retains its sequential
+DALI stream.
+
+The corrected 20-step recipe contained exactly 20 contiguous global steps and
+160 logical samples with zero retries. Every step scheduled two pairs and four
+singletons: three physical groups per rank. Thirty of the forty pairs crossed
+dataset sources. Warm metadata preload covered 2,935 MV-Kubric scenes; actual
+planning took 27.32 seconds.
+
+- Implementation: `bd7deac` plus final-step writer fix `19f16f6`
+- Recipe: `training-recipes/global-smartbatch-smoke20-19f16f6`
+- Recipe W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/zg1gbwfd
+
+The first H200 attempt stopped before training because the already-existing
+record locator had not been published in the WebDataset manifest. The
+repository's existing index publisher reused all 742 `.idx` files, rewrote no
+TARs, and atomically published locator references for train and validation.
+
+- Failed-start W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/7b0795bedfe2
+- Locator publication W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/6egz3ejp
+
+The clean retry completed all 20 optimizer steps on two H200s with validation
+disabled and recipe-selected estimated-depth draws forced to GT. Step 0 used
+four singletons per rank for gradient diagnostics; steps 1--19 replayed the
+stored three-group schedules, including mixed-source pairs. No DDP hang, OOM,
+recipe divergence or rejected materialization occurred.
+
+Cold step 0 took 73.02 seconds. Across the 20 reduced timing records, median
+optimizer-step time was 9.47 seconds and median exposed data time was 1.15
+seconds; the final step took 5.99 seconds with 0.63 seconds of data time.
+Across 122 physical-group waits, median was 0.05 seconds, p90 was 1.40 seconds,
+and the 30.36-second maximum was cold startup. Observed GPU memory peaked near
+122.1/143.8 GiB on rank 0 and 48.1/143.8 GiB on rank 1. Final container RAM was
+72.1/256 GiB. The durable checkpoint records 20 completed steps.
+
+- Run: `global-smartbatch-h200-smoke20-v2-19f16f6`
+- Run Volume: `continual-training/global-smartbatch-h200-smoke20-v2-19f16f6`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/a806c5c07a36
+- Checkpoints: `model_000020.pth`, `model_final.pth`
