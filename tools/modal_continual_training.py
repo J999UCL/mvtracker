@@ -589,7 +589,7 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
             overrides=[
                 "+experiment=diegesis_syn4d_mvkubric_gt_ddp",
                 "datasets.train.recipe_path=null",
-                "datasets.syn4d_mmap_cache_sequences=16",
+                "+datasets.syn4d_mmap_cache_sequences=16",
             ],
         )
     source_cfg = cfg.datasets.train.sources.syn4d
