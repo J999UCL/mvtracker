@@ -59,6 +59,7 @@ LOADER_PROFILE_MEASURED = 32
 H100_LOADER_PROFILE_WARMUP = 20
 H100_LOADER_PROFILE_MEASURED = 100
 RECIPE_PLANNER_CPUS = 32
+RECIPE_METADATA_WORKERS = 16
 EXPERIMENT_PHASES = {
     "smoke": (
         {
@@ -484,7 +485,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 stream_include_scene_ids=source_cfg.get("include_scene_ids"),
             )
             phase["name"] = "mvkubric_metadata_preload"
-            datasets[source].preload_recipe_metadata(workers=RECIPE_PLANNER_CPUS)
+            datasets[source].preload_recipe_metadata(workers=RECIPE_METADATA_WORKERS)
         schedule = BalancedMixedSourceSchedule(
             {source: dataset.real_len for source, dataset in datasets.items()},
             source_pattern,
