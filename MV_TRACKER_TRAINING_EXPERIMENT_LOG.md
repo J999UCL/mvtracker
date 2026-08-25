@@ -1967,3 +1967,40 @@ needed to keep up with the intended asynchronous training-depth producer.
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-depth-evaluation/runs/zpzuvbhy
 - Report: `jeet-mvtracker-runs-v2/da3-diegesis-eval/da3-large-1.1-diningroom02-20260825T103512Z/metrics.json`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
+
+## 2026-08-25 — DA3-Giant-1.1 native-batch H100 frontier
+
+DA3-Giant-1.1 was profiled on one exact H100 80GB using native model batches
+of independent four-view DIEGESIS timestamps. Every batch element retained its
+own camera normalization and metric alignment, so batching did not combine
+different timestamps into one reconstruction. The first invocation exposed an
+upstream API default bug (`export_feat_layers=None`) before model inference;
+the corrected invocation passed the empty list used by DA3's public API.
+
+| Timestamp batch | Images | Median model time | Images/s | Peak reserved | Status |
+|---:|---:|---:|---:|---:|---|
+| 1 | 4 | 0.212 s | 18.83 | 9.92 GiB / 12.5% | safe |
+| 4 | 16 | 0.379 s | 42.19 | 20.31 GiB / 25.7% | safe |
+| 8 | 32 | 0.726 s | 44.05 | 34.25 GiB / 43.3% | safe |
+| 12 | 48 | 1.073 s | 44.73 | 48.39 GiB / 61.1% | safe |
+| 16 | 64 | 1.477 s | 43.33 | 71.20 GiB / 89.9% | safe |
+| 20 | 80 | 1.896 s | 42.18 | 72.01 GiB / 91.0% | safe |
+| 24 | 96 | 2.265 s | 42.38 | 75.41 GiB / 95.2% | above 92% limit |
+
+Batch 12 is the throughput choice; batch 20 is the largest safe capacity. A
+24-frame, four-view sample can be produced as batches 20+4 in about 2.28
+seconds of model time. The measured 42--45 images/s is more than twice the
+approximately 21 images/s sustained requirement from the preplanned 30%
+estimated-depth training mixture.
+
+The batch-8 trial used the exact same eight timestamps as the prior Large-1.1
+evaluation. Giant reduced raw AbsRel from 0.1187 to 0.0555, foreground AbsRel
+from 0.1393 to 0.0902, and top-60%-confidence AbsRel from 0.0909 to 0.0232.
+Raw delta1 rose from 0.8710 to 0.9579 and foreground delta1 from 0.8108 to
+0.9003. Median metric scale remained accurate at 0.997 overall.
+
+- Implementation: `9ce5ed9`, invocation fix `8cd8ef3`
+- Successful Modal app: https://modal.com/apps/ucl-prism/main/ap-U6RPBVB7E0l3MYlvWapgcI
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-depth-evaluation/runs/i13g8zhy
+- Report: `jeet-mvtracker-runs-v2/da3-giant-h100/da3-giant-1.1-diningroom02-20260825T110038Z/report.json`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
