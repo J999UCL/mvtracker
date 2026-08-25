@@ -2005,6 +2005,16 @@ Raw delta1 rose from 0.8710 to 0.9579 and foreground delta1 from 0.8108 to
 - Report: `jeet-mvtracker-runs-v2/da3-giant-h100/da3-giant-1.1-diningroom02-20260825T110038Z/report.json`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
 
+## 2026-08-25 — Expanded Syn4D training inventory enabled
+
+The Modal data Volume contains 303 completed Syn4D training scenes across 16
+environments and 80 validation scenes across four held-out environments. The
+mixed training configuration no longer pins Syn4D to the original 16-scene
+pilot and now discovers every completed scene in the `train` storage split.
+Validation remains pinned to the same four held-out scenes used by the existing
+evaluation schedule. `hospital__seq_000018` and `winter__seq_000006` are absent
+because the official Syn4D reader found no usable query frames.
+
 ## 2026-08-25 — Asynchronous DA3-Giant mixed-depth training smoke
 
 A preplanned 20-step continual-training recipe was replayed on three H200s:

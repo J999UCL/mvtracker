@@ -56,23 +56,7 @@ datasets:
       syn4d:
         name: syn4d-multiview-training
         root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/syn4d-mvtracker
-        include_scene_ids:
-          - bigoffice_v1__seq_000004
-          - scifiroom_bald__seq_000010
-          - cave_group__seq_000008
-          - flying_group__seq_000015
-          - desert_bald__seq_000012
-          - space_bald__seq_000003
-          - brushify_bald__seq_000005
-          - countryside__seq_000019
-          - lab_bald__seq_000017
-          - post_bald__seq_000002
-          - castle__seq_000007
-          - winter__seq_000015
-          - hospital__seq_000003
-          - temple_group__seq_000011
-          - planet_bald__seq_000018
-          - cyber_bald__seq_000001
+        include_scene_ids: null
         view_count_probabilities: [0.20, 0.10, 0.10, 0.25, 0.10, 0.25]
       mvkubric:
         name: kubric-multiview-v3-training
@@ -162,7 +146,7 @@ logging:
   wandb_run_id: ${oc.env:MVTRACKER_WANDB_RUN_ID}
   tags:
     - diegesis-syn4d-mvkubric-25-25-50
-    - syn4d-environment-split-v1
+    - syn4d-expanded-train-v1
     - gt-depth
     - ddp2-h200
     - full-model
