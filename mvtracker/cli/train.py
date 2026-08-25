@@ -257,13 +257,16 @@ class _ContainerHardwareMonitor:
         memory_limit = int(
             (self.cgroup_root / "memory/memory.limit_in_bytes").read_text()
         )
-        meminfo = {
-            name.rstrip(":"): int(value) * 1024
-            for name, value, *_ in (
-                line.split() for line in Path("/proc/meminfo").read_text().splitlines()
+        memory_stats = {
+            name: int(value)
+            for name, value in (
+                line.split()
+                for line in (
+                    self.cgroup_root / "memory/memory.stat"
+                ).read_text().splitlines()
             )
         }
-        memory_cache = min(memory_used, meminfo["Cached"])
+        memory_cache = memory_stats["total_cache"]
         memory_working_set = memory_used - memory_cache
         available_cpus = self._cpu_limit()
         return {

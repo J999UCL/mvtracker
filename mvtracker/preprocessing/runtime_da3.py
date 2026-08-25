@@ -20,7 +20,7 @@ from mvtracker.datasets.kubric_dali_dataset import (
     _scene_metadata,
 )
 from mvtracker.datasets.kubric_dali_stream import KubricDaliSceneBundle
-from mvtracker.datasets.io_cache import discard_file_range
+from mvtracker.datasets.io_cache import discard_file_range, flush_and_discard_file
 from mvtracker.datasets.training_recipe import RecipeReader, RecipeRecord
 from mvtracker.preprocessing.mvkubric_webdataset import META_COMPONENT, RGB_COMPONENT
 
@@ -28,6 +28,7 @@ from mvtracker.preprocessing.mvkubric_webdataset import META_COMPONENT, RGB_COMP
 MODEL_ID = "depth-anything/DA3-GIANT-1.1"
 IMAGE_CAPACITY = 80
 MIN_ALIGNMENT_VIEWS = 4
+MAX_PENDING_SAMPLES = 32
 
 
 def _log(event: str, **fields) -> None:
@@ -178,10 +179,33 @@ def _write_sample(root: Path, record: RecipeRecord, depth: np.ndarray, mask: np.
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
-    np.save(staging / "depth.npy", depth.astype(np.float32, copy=False), allow_pickle=False)
-    np.save(staging / "cleaned_mask.npy", mask.astype(np.bool_, copy=False), allow_pickle=False)
+    depth_path = staging / "depth.npy"
+    mask_path = staging / "cleaned_mask.npy"
+    np.save(depth_path, depth.astype(np.float32, copy=False), allow_pickle=False)
+    np.save(mask_path, mask.astype(np.bool_, copy=False), allow_pickle=False)
+    flush_and_discard_file(depth_path)
+    flush_and_discard_file(mask_path)
     staging.rename(sample_root)
     (sample_root / "ready").touch()
+
+
+def _wait_for_consumer(output_root: Path, max_pending_samples: int) -> None:
+    started = time.perf_counter()
+    last_log = started
+    while True:
+        pending = sum(1 for _ in output_root.glob("step-*/sample-*/ready"))
+        if pending < max_pending_samples:
+            return
+        now = time.perf_counter()
+        if now - last_log >= 10:
+            _log(
+                "consumer_backpressure",
+                pending_samples=pending,
+                max_pending_samples=max_pending_samples,
+                elapsed_seconds=round(now - started, 1),
+            )
+            last_log = now
+        time.sleep(0.1)
 
 
 def _produce_record(model, reader, record: RecipeRecord, output_root: Path):
@@ -261,7 +285,13 @@ def _produce_record(model, reader, record: RecipeRecord, output_root: Path):
     return model_seconds, len(record.frames) * len(inference_views)
 
 
-def run(recipe_path: Path, data_root: Path, output_root: Path, prefill_steps: int) -> None:
+def run(
+    recipe_path: Path,
+    data_root: Path,
+    output_root: Path,
+    prefill_steps: int,
+    max_pending_samples: int,
+) -> None:
     import torch
     from depth_anything_3.api import DepthAnything3
 
@@ -290,6 +320,7 @@ def run(recipe_path: Path, data_root: Path, output_root: Path, prefill_steps: in
                 record = RecipeRecord.from_dict(sample)
                 if record.depth_source == "gt":
                     continue
+                _wait_for_consumer(output_root, max_pending_samples)
                 reader = mvkubric if record.source == "mvkubric" else packed
                 sample_started = time.perf_counter()
                 seconds, image_count = _produce_record(model, reader, record, output_root)
@@ -334,8 +365,15 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--prefill-steps", type=int, default=4)
+    parser.add_argument("--max-pending-samples", type=int, default=MAX_PENDING_SAMPLES)
     args = parser.parse_args()
-    run(args.recipe, args.data_root, args.output_root, args.prefill_steps)
+    run(
+        args.recipe,
+        args.data_root,
+        args.output_root,
+        args.prefill_steps,
+        args.max_pending_samples,
+    )
 
 
 if __name__ == "__main__":
