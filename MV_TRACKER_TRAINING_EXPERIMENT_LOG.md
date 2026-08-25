@@ -1941,3 +1941,29 @@ and the 30.36-second maximum was cold startup. Observed GPU memory peaked near
 - Run Volume: `continual-training/global-smartbatch-h200-smoke20-v2-19f16f6`
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/a806c5c07a36
 - Checkpoints: `model_000020.pth`, `model_final.pth`
+
+## 2026-08-25 — DA3-Large-1.1 pose-conditioned DIEGESIS evaluation
+
+DA3-Large-1.1 was evaluated on held-out DIEGESIS scene `diningroom02` using
+eight evenly spaced synchronized timestamps and all four cameras. Ground-truth
+world-to-camera extrinsics and intrinsics were supplied to DA3 with metric
+scale alignment enabled. Predictions were resized back to the 384x512 source
+depth resolution and scored without any scale or shift fitting.
+
+Across 7.73 million valid pixels, raw AbsRel was 0.1187, RMSE was 0.681 m and
+delta1 was 0.8710. On the DIEGESIS foreground mask, raw AbsRel was 0.1393,
+RMSE was 0.391 m and delta1 was 0.8108. Median predicted/GT depth scale was
+0.970 overall and 1.012 on foreground, so the principal error was local depth
+shape rather than a large global scale failure. Keeping the top 60% of DA3
+confidence improved AbsRel to 0.0909 and delta1 to 0.9203.
+
+The L4 used 5.57 GiB peak reserved VRAM. After the first-call compile/warmup,
+four-view timestamps took a median 0.470 seconds, or 8.52 depth images/s. That
+is adequate for a cheap quality check but below the estimated 20--40 images/s
+needed to keep up with the intended asynchronous training-depth producer.
+
+- Implementation: `3dfcfe1`
+- Modal app: https://modal.com/apps/ucl-prism/main/ap-OS8bz2iR9REojWRjR9BQ2h
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-depth-evaluation/runs/zpzuvbhy
+- Report: `jeet-mvtracker-runs-v2/da3-diegesis-eval/da3-large-1.1-diningroom02-20260825T103512Z/metrics.json`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
