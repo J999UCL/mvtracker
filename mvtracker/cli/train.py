@@ -44,7 +44,7 @@ from mvtracker.datasets import (
 from mvtracker.datasets.tapvid3d_multiview_dataset import CudaPrefetchLoader
 from mvtracker.datasets.kubric_dali_dataset import DaliKubricValidationDataset
 from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
-from mvtracker.datasets.mixed_source_schedule import MixedSourceSample, ScheduledSampleRequest
+from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
 from mvtracker.datasets.mixed_physical_loader import (
     MixedStepLookahead,
     PhysicalBatchDecoder,
@@ -83,61 +83,58 @@ WANDB_RUN_ID_FILE = "wandb_run_id.txt"
 
 
 class _RecipeMixedSourceSchedule:
-    """Expose recorded requests through the existing physical lookahead API."""
+    """Expose globally planned optimizer steps to the physical lookahead."""
 
     def __init__(self, recipe_path, rank, world_size):
-        from mvtracker.datasets.training_recipe import RecipeReader
+        from mvtracker.datasets.training_recipe import RecipeReader, RecipeRecord
 
         self.reader = RecipeReader(recipe_path)
+        self._record_type = RecipeRecord
         self.rank = int(rank)
         self.world_size = int(world_size)
+        if int(self.reader.manifest["world_size"]) != self.world_size:
+            raise ValueError("recipe world size does not match the DDP world size")
         self.scene_counts = {
             source: len(scenes)
             for source, scenes in self.reader.manifest.get(
                 "scene_lists", {}
             ).items()
         }
-        records = tuple(self.reader.records(self.rank))
-        if not records:
-            raise ValueError(f"training recipe has no records for rank {self.rank}")
-        self.source_pattern = tuple(
-            record.source
-            for record in sorted(
-                (record for record in records if int(record.step) == 0),
-                key=lambda record: int(record.microbatch),
+        self.source_pattern = tuple(self.reader.manifest["source_pattern"])
+        self._step_iterator = None
+        self._next_step = None
+        self._records_by_request = {}
+
+    def recipe_step(self, step):
+        step = int(step)
+        if self._step_iterator is None:
+            self._step_iterator = self.reader.steps(start_step=step)
+            self._next_step = step
+        if step != self._next_step:
+            raise RuntimeError(
+                f"recipe requested step {step} after {self._next_step - 1}"
             )
+        try:
+            payload = next(self._step_iterator)
+        except StopIteration as error:
+            raise RuntimeError(f"recipe has no optimizer step {step}") from error
+        records = tuple(
+            self._record_type.from_dict(sample)
+            for sample in payload["logical_samples"]
         )
-        sources = tuple(dict.fromkeys(record.source for record in records))
-        self._records_by_source = {
-            source: tuple(
-                sorted(
-                    (record for record in records if record.source == source),
-                    key=lambda record: (int(record.step), int(record.microbatch)),
-                )
-            )
-            for source in sources
-        }
         self._records_by_request = {
             (str(record.source), int(record.request["virtual_index"])): record
             for record in records
         }
-
-    def sample_source(self, source, local_cursor, rank):
-        if int(rank) != self.rank:
-            raise ValueError("recipe schedule only serves its local DDP rank")
-        try:
-            record = self._records_by_source[str(source)][int(local_cursor)]
-        except (KeyError, IndexError) as error:
-            raise RuntimeError(
-                f"recipe has no {source} record at logical cursor {local_cursor}"
-            ) from error
-        return MixedSourceSample(
-            source=str(source),
-            request=record.replay_request(ScheduledSampleRequest),
-        )
+        self._next_step += 1
+        return records, tuple(payload["physical_groups"])
 
     def record_for_request(self, source, request):
         return self._records_by_request[(str(source), int(request.virtual_index))]
+
+    @staticmethod
+    def replay_request(record):
+        return record.replay_request(ScheduledSampleRequest)
 
     def state_dict(self):
         return {}
@@ -1177,6 +1174,13 @@ def _assert_matching_step_fingerprint(fabric, fingerprint):
         gathered = gathered[None]
     if not torch.equal(gathered, gathered[0:1].expand_as(gathered)):
         raise RuntimeError("planned physical step differs between DDP ranks")
+
+
+def _assert_matching_recipe_step(fabric, step):
+    value = torch.tensor(int(step), dtype=torch.int64, device=fabric.device)
+    gathered = fabric.all_gather(value)
+    if not torch.equal(gathered, gathered.new_full(gathered.shape, int(step))):
+        raise RuntimeError("DDP ranks loaded different recipe steps")
 
 
 def _build_training_dataset(
@@ -2543,7 +2547,7 @@ def main(cfg: DictConfig):
                 train_datasets["mvkubric"].stream.build_seconds
             )
             logging.info(
-                "MV-Kubric DALI stream built in %.3fs (rank=%d)",
+                "MV-Kubric indexed reader built in %.3fs (rank=%d)",
                 local_stream_build_seconds,
                 fabric.global_rank,
             )
@@ -2556,10 +2560,10 @@ def main(cfg: DictConfig):
             if wandb_run_id is not None and fabric.global_rank == 0:
                 wandb.log(
                     {
-                        "startup/dali_stream_build_seconds_max": (
+                        "startup/mvkubric_reader_build_seconds_max": (
                             stream_build_seconds_max
                         ),
-                        "startup/dali_stream_build_seconds_mean": (
+                        "startup/mvkubric_reader_build_seconds_mean": (
                             stream_build_seconds_mean
                         ),
                     },
@@ -2597,19 +2601,13 @@ def main(cfg: DictConfig):
                 raise ValueError(
                     "mvkubric_storage=dali_stream requires physical batching"
                 )
-            if not bool(
-                cfg.datasets.train.physical_batching.get("rank_local", False)
-            ):
-                raise ValueError(
-                    "mvkubric_storage=dali_stream requires rank-local batching"
-                )
         if planned_physical_batching:
             capacity = _physical_batch_capacity(cfg)
             rank_local = bool(
                 cfg.datasets.train.physical_batching.get("rank_local", False)
             )
-            if recipe_path and not rank_local:
-                raise ValueError("recipe training requires rank-local physical batching")
+            if recipe_path and rank_local:
+                raise ValueError("global recipe training requires global physical batching")
             if not rank_local and fabric.world_size != capacity.rank_count:
                 raise ValueError(
                     "global physical batching requires exactly "
@@ -2913,6 +2911,12 @@ def main(cfg: DictConfig):
             max_cache_bytes=int(float(settings.cpu_cache_gib_per_rank) * 1024**3),
             capacity=_physical_batch_capacity(cfg),
             rank_local=bool(settings.get("rank_local", False)),
+            recipe_position=total_steps if recipe_path else 0,
+            gradient_diagnostics_interval=(
+                int(cfg.trainer.gradient_diagnostics_interval)
+                if gradient_diagnostics_enabled
+                else 0
+            ),
         )
         physical_decoder = PhysicalBatchDecoder(
             fabric.device,
@@ -3060,6 +3064,11 @@ def main(cfg: DictConfig):
             "payload_bytes": 0.0,
             "batch_wait_seconds": 0.0,
         }
+        accumulated_indexed_read_metrics = {
+            "sample_count": 0.0,
+            "read_bytes": 0.0,
+            "read_seconds": 0.0,
+        }
         accumulated_loss_value = None
         accumulated_component_losses = {}
         accumulated_metrics = {}
@@ -3103,11 +3112,18 @@ def main(cfg: DictConfig):
                 if planned_physical_batching:
                     if microbatches_accumulated == 0:
                         physical_step = next(physical_lookahead)
-                        if physical_step.start_cursors != source_cursors:
+                        if (
+                            not recipe_path
+                            and physical_step.start_cursors != source_cursors
+                        ):
                             raise RuntimeError(
                                 "physical lookahead cursor does not match committed state"
                             )
-                        if not bool(settings.get("rank_local", False)):
+                        if physical_step.recipe_step is not None:
+                            _assert_matching_recipe_step(
+                                fabric, physical_step.recipe_step
+                            )
+                        elif not bool(settings.get("rank_local", False)):
                             _assert_matching_step_fingerprint(
                                 fabric, physical_step.fingerprint
                             )
@@ -3122,12 +3138,33 @@ def main(cfg: DictConfig):
                             raise RuntimeError(
                                 f"physical step materialization failed: {detail}"
                             )
-                        groups_for_step = (
-                            singleton_prepared_groups(physical_step.groups)
-                            if run_gradient_diagnostics
-                            else physical_step.groups
-                        )
+                        if run_gradient_diagnostics:
+                            groups_for_step = (
+                                physical_step.groups
+                                if physical_step.diagnostic_singletons
+                                else singleton_prepared_groups(physical_step.groups)
+                            )
+                        else:
+                            groups_for_step = physical_step.groups
                         physical_group_count = len(groups_for_step)
+                        logging.info(
+                            "[physical_step rank=%d step=%d] groups=%s",
+                            fabric.global_rank,
+                            total_steps,
+                            [
+                                {
+                                    "sources": list(group.sources),
+                                    "scenes": [
+                                        scene.plan.sequence for scene in group.scenes
+                                    ],
+                                    "views": len(group.scenes[0].plan.views),
+                                    "tracks": [
+                                        scene.plan.track_count for scene in group.scenes
+                                    ],
+                                }
+                                for group in groups_for_step
+                            ],
+                        )
                         physical_group_iterator = iter(
                             PhysicalGroupPrefetchIterator(
                                 groups_for_step, physical_decoder
@@ -3319,6 +3356,14 @@ def main(cfg: DictConfig):
                             + float(np.mean([item[name] for item in metadata]))
                         )
                 for item in metadata:
+                    if item.get("record_store") == "indexed-webdataset":
+                        accumulated_indexed_read_metrics["sample_count"] += 1.0
+                        accumulated_indexed_read_metrics["read_bytes"] += float(
+                            item.get("indexed_read_bytes", 0.0)
+                        )
+                        accumulated_indexed_read_metrics["read_seconds"] += float(
+                            item.get("indexed_read_seconds", 0.0)
+                        )
                     if item.get("record_store") != "dali-webdataset":
                         continue
                     batch_index = int(item["dali_batch_index"])
@@ -3352,10 +3397,8 @@ def main(cfg: DictConfig):
                 microbatches_accumulated + 1
                 == (physical_group_count or gradient_accumulation_steps)
             )
-            # Rank-local physical plans may contain different numbers of
-            # groups.  Each rank still enables DDP synchronization exactly
-            # once, on its final group; the collective is matched by order,
-            # while no_backward_sync suppresses all earlier groups.
+            # The global scheduler gives both ranks the same number of groups,
+            # so the final backward is the same collective on both ranks.
             run_expensive_diagnostics = (
                 bool(cfg.trainer.get("expensive_diagnostics_enabled", True))
                 and total_steps % expensive_diagnostics_interval == 0
@@ -4166,6 +4209,31 @@ def main(cfg: DictConfig):
                 if dali_wait_seconds > 0
                 else 0.0
             )
+            reduced_indexed_read_metrics = {
+                "sample_count": _reduce_scalar(
+                    fabric,
+                    accumulated_indexed_read_metrics["sample_count"],
+                    reduce_op="sum",
+                ),
+                "read_bytes": _reduce_scalar(
+                    fabric,
+                    accumulated_indexed_read_metrics["read_bytes"],
+                    reduce_op="sum",
+                ),
+                "read_seconds": _reduce_scalar(
+                    fabric,
+                    accumulated_indexed_read_metrics["read_seconds"],
+                    reduce_op="max",
+                ),
+            }
+            indexed_read_seconds = reduced_indexed_read_metrics["read_seconds"]
+            reduced_indexed_read_metrics["effective_mib_per_second"] = (
+                reduced_indexed_read_metrics["read_bytes"]
+                / indexed_read_seconds
+                / 1024**2
+                if indexed_read_seconds > 0
+                else 0.0
+            )
             reduced_physical_batching_metrics = None
             if physical_batching_metrics is not None:
                 reduced_physical_batching_metrics = {
@@ -4251,6 +4319,10 @@ def main(cfg: DictConfig):
                 for name, value in reduced_dali_stream_metrics.items():
                     tb_writer.add_scalar(
                         f"io/dali_stream/{name}", value, total_steps
+                    )
+                for name, value in reduced_indexed_read_metrics.items():
+                    tb_writer.add_scalar(
+                        f"io/mvkubric_indexed/{name}", value, total_steps
                     )
                 if sampling_metrics:
                     for name, value in sampling_metrics.items():
@@ -4350,6 +4422,11 @@ def main(cfg: DictConfig):
                 "batch_count": 0.0,
                 "payload_bytes": 0.0,
                 "batch_wait_seconds": 0.0,
+            }
+            accumulated_indexed_read_metrics = {
+                "sample_count": 0.0,
+                "read_bytes": 0.0,
+                "read_seconds": 0.0,
             }
             accumulated_loss_value = None
             accumulated_component_losses = {}

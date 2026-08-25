@@ -47,9 +47,8 @@ def _identities(wave):
 class PhysicalBatchSchedulerTests(unittest.TestCase):
     def assert_valid_wave(self, wave, summaries):
         self.assertEqual(len(wave.ranks), 2)
-        self.assertEqual(
-            [rank.logical_scene_count for rank in wave.ranks], [4, 4]
-        )
+        self.assertEqual(sum(rank.logical_scene_count for rank in wave.ranks), 8)
+        self.assertEqual(len(wave.ranks[0].groups), len(wave.ranks[1].groups))
         self.assertEqual(sorted(_identities(wave)), sorted(_identities_from(summaries)))
         for rank in wave.ranks:
             for group in rank.groups:
@@ -57,9 +56,6 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
                 self.assertEqual(len({scene.shape_key for scene in group.scenes}), 1)
                 if len(group.scenes) == 2:
                     self.assertNotIn(group.view_count, {5, 6})
-                    capacity = H100_BATCH_CAPACITY.pair_track_capacity(group.view_count)
-                    self.assertIsNotNone(capacity)
-                    self.assertLessEqual(group.max_track_count, capacity)
 
     def test_h100_capacity_table_is_explicit(self):
         self.assertEqual(
@@ -95,7 +91,7 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
                 cursor=i,
                 view_count=1,
                 frame_count=24,
-                resolution=(384, 512 + i // 2),
+                resolution=(384, 512),
                 track_count=(100 + i if i % 2 == 0 else 900 + i),
             )
             for i in range(8)
@@ -103,7 +99,6 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
         wave = schedule_physical_batch(summaries)
         self.assert_valid_wave(wave, summaries)
         self.assertEqual(wave.pair_count, 4)
-        self.assertGreater(wave.total_padding_tracks, 0)
         self.assertTrue(
             any(
                 len(group.scenes) == 2
@@ -113,21 +108,30 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
             )
         )
 
-    def test_pair_over_capacity_becomes_stable_singletons(self):
+    def test_track_counts_are_padded_not_pair_compatibility(self):
         summaries = tuple(
             _scene(i, tracks=(1025 if i < 2 else 512)) for i in range(8)
         )
         wave = schedule_physical_batch(summaries)
         self.assert_valid_wave(wave, summaries)
-        self.assertEqual(wave.pair_count, 3)
-        over_capacity = {summaries[0], summaries[1]}
-        self.assertFalse(
-            any(
-                over_capacity.issubset(group.scenes)
-                for rank in wave.ranks
-                for group in rank.groups
+        self.assertEqual(wave.pair_count, 4)
+
+    def test_query_schedule_start_does_not_prevent_scene_batching(self):
+        summaries = tuple(
+            _MODULE.SceneSummary(
+                source="d",
+                scene=f"scene-{index}",
+                cursor=index,
+                view_count=2,
+                frame_count=24,
+                resolution=(384, 512),
+                track_count=512,
+                schedule_start=index % 3,
             )
+            for index in range(8)
         )
+        wave = schedule_physical_batch(summaries)
+        self.assertEqual(wave.pair_count, 4)
 
     def test_views_five_and_six_are_always_singletons(self):
         for views in (5, 6):
@@ -166,10 +170,8 @@ class PhysicalBatchSchedulerTests(unittest.TestCase):
         )
         wave = schedule_physical_batch(summaries)
         self.assert_valid_wave(wave, summaries)
-        self.assertEqual(wave.pair_count, 1)
-        self.assertEqual(
-            sorted(len(rank.groups) for rank in wave.ranks), [3, 4]
-        )
+        self.assertEqual(wave.pair_count, 0)
+        self.assertEqual([len(rank.groups) for rank in wave.ranks], [4, 4])
 
     def test_exhaustive_two_shape_assignments_preserve_invariants(self):
         # Exhaust all 2^8 assignments of two compatible tensor shapes.  This

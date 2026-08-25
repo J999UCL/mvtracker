@@ -18,7 +18,9 @@ from mvtracker.datasets.physical_batch_scheduler import (
     BatchCapacity,
     H100_BATCH_CAPACITY,
     PhysicalBatchGroup,
+    RankWave,
     SceneSummary,
+    SynchronizedBatchWave,
     schedule_rank_local_batch,
     schedule_physical_batch,
 )
@@ -71,6 +73,8 @@ class PreparedMixedStep:
     materialization_seconds: float
     pair_count: int
     padding_tracks: int
+    recipe_step: int | None = None
+    diagnostic_singletons: bool = False
     materialization_error: str | None = None
 
     @property
@@ -222,6 +226,8 @@ class MixedStepLookahead:
         max_cache_bytes: int = 12 * 1024**3,
         capacity: BatchCapacity = H100_BATCH_CAPACITY,
         rank_local: bool = False,
+        recipe_position: int = 0,
+        gradient_diagnostics_interval: int = 0,
     ):
         if remaining_steps < 0:
             raise ValueError("remaining_steps must be non-negative")
@@ -236,6 +242,8 @@ class MixedStepLookahead:
         self.worker_count = int(worker_count)
         self.capacity = capacity
         self.rank_local = bool(rank_local)
+        self.recipe_position = int(recipe_position)
+        self.gradient_diagnostics_interval = int(gradient_diagnostics_interval)
         self._next_cursors = {name: int(value) for name, value in source_cursors.items()}
         self._queue = _ByteBoundedQueue(lookahead_steps, max_cache_bytes)
         self._finished = object()
@@ -243,6 +251,8 @@ class MixedStepLookahead:
         self._thread.start()
 
     def _plan_step(self):
+        if hasattr(self.schedule, "recipe_step"):
+            return self._plan_recipe_step()
         start_cursors = dict(self._next_cursors)
         scenes = []
         retries = 0
@@ -313,6 +323,86 @@ class MixedStepLookahead:
             tuple(local_physical_groups),
             tuple(local_scenes),
             retries,
+            None,
+            False,
+        )
+
+    def _plan_recipe_step(self):
+        step = self.recipe_position
+        records, assignments = self.schedule.recipe_step(step)
+        self.recipe_position += 1
+        scenes_by_index = {}
+        retries = 0
+        for record in records:
+            request = self.schedule.replay_request(record)
+            plan = self.datasets[record.source].plan_sample(request)
+            if plan is None:
+                raise RuntimeError(
+                    f"accepted recipe sample replayed invalid at step {step} "
+                    f"logical sample {record.logical_index}"
+                )
+            scenes_by_index[int(record.logical_index)] = PlannedScene(
+                record.source, plan
+            )
+            retries += int(record.retry_count)
+
+        summaries = {
+            logical_index: _plan_summary(scene)
+            for logical_index, scene in scenes_by_index.items()
+        }
+        diagnostic_singletons = (
+            self.gradient_diagnostics_interval > 0
+            and (
+                step == 0
+                or (step + 1) % self.gradient_diagnostics_interval == 0
+            )
+        )
+        if diagnostic_singletons:
+            assignments = tuple(
+                {
+                    "rank": int(record.scheduled_rank),
+                    "group": int(record.microbatch),
+                    "logical_indices": [int(record.logical_index)],
+                }
+                for record in records
+            )
+
+        rank_groups = []
+        for rank in range(self.capacity.rank_count):
+            groups = tuple(
+                PhysicalBatchGroup(
+                    tuple(summaries[int(index)] for index in group["logical_indices"])
+                )
+                for group in sorted(
+                    (item for item in assignments if int(item["rank"]) == rank),
+                    key=lambda item: int(item["group"]),
+                )
+            )
+            rank_groups.append(RankWave(rank=rank, groups=groups))
+        physical = SynchronizedBatchWave(
+            ranks=tuple(rank_groups),
+            capacity_name=self.capacity.name,
+        )
+        if len({len(rank.groups) for rank in physical.ranks}) != 1:
+            raise RuntimeError("recipe physical group counts differ across DDP ranks")
+        local_physical_groups = physical.ranks[self.rank].groups
+        by_identity = {scene.identity: scene for scene in scenes_by_index.values()}
+        local_scenes = tuple(
+            by_identity[(summary.source, summary.scene, summary.cursor)]
+            for group in local_physical_groups
+            for summary in group.scenes
+        )
+        cursors = dict(self._next_cursors)
+        return (
+            cursors,
+            cursors,
+            tuple(scenes_by_index[index] for index in sorted(scenes_by_index)),
+            physical,
+            tuple(local_physical_groups),
+            local_scenes,
+            retries,
+            step,
+            diagnostic_singletons,
         )
 
     def _prepare_step(self, executor: ThreadPoolExecutor) -> PreparedMixedStep:
@@ -325,6 +415,8 @@ class MixedStepLookahead:
             physical_groups,
             local_scenes,
             retries,
+            recipe_step,
+            diagnostic_singletons,
         ) = self._plan_step()
         planning_seconds = time.perf_counter() - planning_started
         materialization_started = time.perf_counter()
@@ -407,6 +499,8 @@ class MixedStepLookahead:
             materialization_seconds=materialization_seconds,
             pair_count=pair_count,
             padding_tracks=padding_tracks,
+            recipe_step=recipe_step,
+            diagnostic_singletons=diagnostic_singletons,
             materialization_error=materialization_error,
         )
 

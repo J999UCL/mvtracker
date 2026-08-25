@@ -7,6 +7,9 @@ datasets:
   train:
     recipe_path: ${oc.env:MVTRACKER_TRAINING_RECIPE}
     force_gt_depth: true
+    physical_batching:
+      max_scenes: 2
+      rank_local: false
   eval:
     names: []
 

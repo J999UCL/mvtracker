@@ -57,7 +57,7 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
             recipe_dir = Path(temporary) / "recipe"
             writer = RecipeWriter(
                 recipe_dir,
-                manifest={},
+                manifest={"source_pattern": ["diegesis", "diegesis"]},
                 world_size=1,
                 step_count=1,
                 records_per_step=2,
@@ -82,6 +82,7 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
                         scene="scene",
                         frames=(0,),
                         views=(0,),
+                        resolution=(384, 512),
                         track_count=1,
                         tracks=(0,),
                         augmentation={},
@@ -92,8 +93,9 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
             writer.finalize(summary={}, estimated_depth_requests=[])
 
             schedule = _recipe_schedule_class()(recipe_dir, rank=0, world_size=1)
-            first = schedule.sample_source("diegesis", 0, 0).request
-            second = schedule.sample_source("diegesis", 1, 0).request
+            records, _ = schedule.recipe_step(0)
+            first = schedule.replay_request(records[0])
+            second = schedule.replay_request(records[1])
             self.assertEqual((first.virtual_index, second.virtual_index), (3, 8))
             self.assertEqual(first.depth_source, "estimated")
             self.assertEqual(first.expected_scene, "scene")
@@ -109,7 +111,7 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
         self.assertIn("cpu=16", planner_decorator)
         self.assertIn("data_volume.with_mount_options(read_only=True)", planner_decorator)
         self.assertIn("str(RUN_ROOT): run_volume", planner_decorator)
-        self.assertIn('RECIPE_SMOKE_GPU_REQUEST = "H100!:2"', source)
+        self.assertIn("RECIPE_SMOKE_GPU_REQUEST = GPU_REQUEST", source)
         self.assertIn("gpu=RECIPE_SMOKE_GPU_REQUEST", smoke_decorator)
         self.assertIn('heartbeat_seconds=10', source)
         self.assertIn('"purpose": "training"', (

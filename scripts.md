@@ -570,9 +570,10 @@ MVTRACKER_MODAL_COMMIT=$(git rev-parse HEAD) \
 
 ### Plan and smoke-test a continual-training recipe
 
-The planner uses exactly 16 CPU cores and writes a complete 2,000-step recipe
-to the runs Volume. The smoke consumes its first 20 steps on two H100s with
-explicit GT-depth substitution and no validation.
+The planner uses exactly 16 CPU cores, samples all eight logical scenes before
+hardware assignment, and writes their synchronized physical groups to the
+runs Volume. The smoke consumes its first 20 steps on two H200s with explicit
+GT-depth substitution and no validation.
 
 ```bash
 cd /Users/jeetthakwani/dev/PointTracking/mvtracker

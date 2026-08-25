@@ -8,7 +8,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -60,11 +60,15 @@ class RecipeRecord:
     scene: str
     frames: tuple[int, ...]
     views: tuple[int, ...]
+    resolution: tuple[int, int]
     track_count: int
     tracks: tuple[int, ...]
     augmentation: dict[str, Any]
     depth_source: str
     physical: PhysicalAssignment
+    # Stable lane identity within one optimizer step.  This is deliberately
+    # independent of the physical rank selected by the batch scheduler.
+    logical_index: int = -1
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(asdict(self))
@@ -74,6 +78,7 @@ class RecipeRecord:
         data = dict(value)
         data["frames"] = tuple(int(item) for item in data["frames"])
         data["views"] = tuple(int(item) for item in data["views"])
+        data["resolution"] = tuple(int(item) for item in data["resolution"])
         data["tracks"] = tuple(int(item) for item in data["tracks"])
         data["physical"] = PhysicalAssignment(**data["physical"])
         return cls(**data)
@@ -110,11 +115,15 @@ class RecipeWriter:
             (self.output_dir / f"rank-{rank}.jsonl").open("w", encoding="utf-8")
             for rank in range(self.world_size)
         ]
+        self._steps = (self.output_dir / "steps.jsonl").open("w", encoding="utf-8")
+        self._pending_step: int | None = None
+        self._pending_records: list[RecipeRecord] = []
         self._manifest = {
             **_jsonable(manifest),
             "world_size": self.world_size,
             "step_count": int(step_count),
             "records_per_step": int(records_per_step),
+            "logical_samples_per_step": int(records_per_step),
             "expected_records": self.expected_records,
             "complete": False,
         }
@@ -129,6 +138,54 @@ class RecipeWriter:
         handle = self._files[record.rank]
         handle.write(json.dumps(record.to_dict(), separators=(",", ":")) + "\n")
         self._counts[record.rank] += 1
+        if self._pending_step is None:
+            self._pending_step = int(record.step)
+        if int(record.step) != self._pending_step:
+            self._flush_step()
+            self._pending_step = int(record.step)
+        self._pending_records.append(record)
+
+    def _flush_step(self) -> None:
+        if self._pending_step is None:
+            return
+        records = sorted(
+            self._pending_records,
+            key=lambda item: (int(item.logical_index), int(item.microbatch), int(item.scheduled_rank)),
+        )
+        groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for record in records:
+            if record.logical_index < 0:
+                logical_index = int(record.microbatch) * self.world_size + int(record.scheduled_rank)
+            else:
+                logical_index = int(record.logical_index)
+            groups.setdefault(
+                (int(record.physical.rank), int(record.physical.group)), []
+            ).append((int(record.physical.position), logical_index))
+        logical_samples = []
+        for record in records:
+            item = record.to_dict()
+            item["logical_index"] = (
+                int(record.logical_index)
+                if record.logical_index >= 0
+                else int(record.microbatch) * self.world_size + int(record.scheduled_rank)
+            )
+            logical_samples.append(item)
+        payload = {
+            "step": int(self._pending_step),
+            "logical_samples": logical_samples,
+            "physical_groups": [
+                {
+                    "rank": rank,
+                    "group": group,
+                    "logical_indices": [
+                        logical_index for _, logical_index in sorted(indices)
+                    ],
+                }
+                for (rank, group), indices in sorted(groups.items())
+            ],
+        }
+        self._steps.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        self._pending_records = []
 
     def finalize(
         self,
@@ -136,6 +193,7 @@ class RecipeWriter:
         summary: Mapping[str, Any],
         estimated_depth_requests: Sequence[Mapping[str, Any]],
     ) -> None:
+        self._flush_step()
         self.close()
         actual_records = sum(self._counts)
         if actual_records != self.expected_records:
@@ -156,10 +214,14 @@ class RecipeWriter:
         self._write_json("manifest.json", self._manifest)
 
     def close(self) -> None:
+        self._flush_step()
         for handle in self._files:
             if not handle.closed:
                 handle.flush()
                 handle.close()
+        if not self._steps.closed:
+            self._steps.flush()
+            self._steps.close()
 
 
 class RecipeReader:
@@ -177,6 +239,14 @@ class RecipeReader:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
                 yield RecipeRecord.from_dict(json.loads(line))
+
+    def steps(self, start_step: int = 0) -> Iterator[dict[str, Any]]:
+        """Yield canonical global optimizer-step records."""
+        with (self.recipe_dir / "steps.jsonl").open(encoding="utf-8") as handle:
+            for step, line in enumerate(handle):
+                if step < int(start_step):
+                    continue
+                yield json.loads(line)
 
     def validate(self) -> None:
         positions: set[tuple[int, int, int]] = set()
@@ -196,6 +266,33 @@ class RecipeReader:
             raise ValueError(f"rank record counts differ: {counts}")
         if sum(counts) != int(self.manifest["expected_records"]):
             raise ValueError("recipe record count differs from manifest")
+        expected_per_step = int(self.manifest["logical_samples_per_step"])
+        steps = list(self.steps())
+        if len(steps) != int(self.manifest["step_count"]):
+            raise ValueError("recipe step count differs from manifest")
+        for expected_step, payload in enumerate(steps):
+            if int(payload["step"]) != expected_step:
+                raise ValueError("recipe steps are not contiguous")
+            samples = payload["logical_samples"]
+            if len(samples) != expected_per_step:
+                raise ValueError("recipe logical sample count differs from manifest")
+            logical_indices = [int(sample.get("logical_index", -1)) for sample in samples]
+            if logical_indices != list(range(expected_per_step)):
+                raise ValueError("recipe logical indices are not a complete step")
+            referenced = [
+                int(index)
+                for group in payload["physical_groups"]
+                for index in group["logical_indices"]
+            ]
+            if sorted(referenced) != logical_indices:
+                raise ValueError("physical groups must cover each logical sample once")
+            group_counts = Counter(
+                int(group["rank"]) for group in payload["physical_groups"]
+            )
+            if set(group_counts) != set(range(int(self.manifest["world_size"]))) or len(
+                set(group_counts.values())
+            ) != 1:
+                raise ValueError("physical group counts differ across DDP ranks")
 
 
 class _Heartbeat:
@@ -241,6 +338,7 @@ def _compact_plan(request: Any, plan: Any) -> dict[str, Any]:
         "scene": str(plan.sequence),
         "frames": tuple(int(item) for item in plan.frame_indices),
         "views": tuple(int(item) for item in plan.views),
+        "resolution": tuple(int(item) for item in plan.output_size),
         "track_count": int(plan.track_count),
         "tracks": tuple(int(item) for item in plan.selected_global_track_indices),
         "augmentation": {
@@ -562,6 +660,9 @@ def plan_training_recipe(
                                 scene=str(plan.sequence),
                                 frames=tuple(int(item) for item in plan.frame_indices),
                                 views=tuple(int(item) for item in plan.views),
+                                resolution=tuple(
+                                    int(item) for item in plan.output_size
+                                ),
                                 track_count=int(plan.track_count),
                                 tracks=tuple(
                                     int(item)
@@ -570,6 +671,10 @@ def plan_training_recipe(
                                 augmentation=augmentation,
                                 depth_source=depth_source,
                                 physical=physical_assignment,
+                                logical_index=(
+                                    int(microbatch) * int(schedule.world_size)
+                                    + int(scheduled_rank)
+                                ),
                             )
                             writer.write(record)
                             source_counts[source] += 1
@@ -639,6 +744,7 @@ def plan_training_recipe_parallel(
     block_steps: int = 25,
     heartbeat_seconds: float = 10.0,
     log: LogFunction = _print_log,
+    physical_scheduler: Callable[[Sequence[Any]], Any] | None = None,
 ) -> dict[str, Any]:
     """Plan singleton physical batches in forked CPU workers."""
     if step_count < 1 or worker_count < 1 or block_steps < 1:
@@ -804,6 +910,7 @@ def plan_training_recipe_parallel(
                                     scene=payload["scene"],
                                     frames=payload["frames"],
                                     views=payload["views"],
+                                    resolution=payload["resolution"],
                                     track_count=payload["track_count"],
                                     tracks=payload["tracks"],
                                     augmentation=payload["augmentation"],
@@ -812,6 +919,10 @@ def plan_training_recipe_parallel(
                                         rank=rank,
                                         group=microbatch,
                                         position=0,
+                                    ),
+                                    logical_index=(
+                                        int(microbatch) * int(schedule.world_size)
+                                        + int(rank)
                                     ),
                                 )
                                 block_records.append(record)
@@ -823,9 +934,57 @@ def plan_training_recipe_parallel(
                         cursor += 1
                     cursors[source] = cursor
                     source_planning_seconds[source] += timing_by_source[source]
+                if physical_scheduler is not None:
+                    from .physical_batch_scheduler import SceneSummary
+
+                    scheduled_records = []
+                    for step in range(block_start, block_end):
+                        step_records = [
+                            record for record in block_records if record.step == step
+                        ]
+                        summaries = tuple(
+                            SceneSummary(
+                                source=record.source,
+                                scene=record.scene,
+                                cursor=int(record.request["virtual_index"]),
+                                view_count=len(record.views),
+                                frame_count=len(record.frames),
+                                resolution=record.resolution,
+                                track_count=record.track_count,
+                            )
+                            for record in step_records
+                        )
+                        physical = physical_scheduler(summaries)
+                        by_identity = {
+                            (
+                                record.source,
+                                record.scene,
+                                int(record.request["virtual_index"]),
+                            ): record
+                            for record in step_records
+                        }
+                        for rank_wave in physical.ranks:
+                            for group_index, group in enumerate(rank_wave.groups):
+                                for position, summary in enumerate(group.scenes):
+                                    record = by_identity[
+                                        (summary.source, summary.scene, summary.cursor)
+                                    ]
+                                    scheduled_records.append(
+                                        replace(
+                                            record,
+                                            rank=int(rank_wave.rank),
+                                            physical=PhysicalAssignment(
+                                                rank=int(rank_wave.rank),
+                                                group=group_index,
+                                                position=position,
+                                            ),
+                                        )
+                                    )
+                    block_records = scheduled_records
+
                 for record in sorted(
                     block_records,
-                    key=lambda item: (item.step, item.microbatch, item.rank),
+                    key=lambda item: (item.step, item.logical_index),
                 ):
                     writer.write(record)
                     source_counts[record.source] += 1

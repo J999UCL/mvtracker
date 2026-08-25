@@ -7,8 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from io import BytesIO
 import json
+import os
 from pathlib import Path
+import threading
 import time
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -23,6 +26,7 @@ from mvtracker.datasets.kubric_dali_stream import (
 from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
 from mvtracker.preprocessing.mvkubric_webdataset import (
     META_COMPONENT,
+    RECORD_LOCATOR_FORMAT,
     parse_dali_index,
 )
 from mvtracker.datasets.tapvid3d_multiview_dataset import (
@@ -56,6 +60,108 @@ def _packed_frames(payload: bytes) -> tuple[bytes, ...]:
 
 
 @dataclass(frozen=True)
+class IndexedReadStats:
+    requested_bytes: int
+    read_bytes: int
+    seconds: float
+    record_count: int
+
+
+class _IndexedRecordStore:
+    """Read global WebDataset records directly from indexed TAR byte ranges."""
+
+    local_cache_bytes = 0
+
+    def __init__(self, locator_path: str | Path):
+        started = time.perf_counter()
+        locator_path = Path(locator_path).resolve()
+        self.root = locator_path.parent
+        with np.load(locator_path, allow_pickle=False) as locator:
+            if str(locator["format"].item()) != RECORD_LOCATOR_FORMAT:
+                raise ValueError(f"{locator_path}: unsupported record locator format")
+            self.shard_paths = tuple(self.root / str(path) for path in locator["shards"])
+            self.keys = tuple(str(key) for key in locator["keys"])
+            self.record_shards = np.asarray(locator["record_shards"], dtype=np.int32).copy()
+            self.component_names = tuple(str(name) for name in locator["component_names"])
+            self.offsets = np.asarray(locator["offsets"], dtype=np.int64).copy()
+            self.sizes = np.asarray(locator["sizes"], dtype=np.int64).copy()
+        self._fds: dict[int, int] = {}
+        self._fd_lock = threading.Lock()
+        self._pid = os.getpid()
+        self.build_seconds = time.perf_counter() - started
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_fds"] = {}
+        state["_fd_lock"] = None
+        state["_pid"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._fds = {}
+        self._fd_lock = threading.Lock()
+        self._pid = os.getpid()
+
+    def _fd(self, shard: int) -> int:
+        pid = os.getpid()
+        with self._fd_lock:
+            if pid != self._pid:
+                for descriptor in self._fds.values():
+                    os.close(descriptor)
+                self._fds.clear()
+                self._pid = pid
+            descriptor = self._fds.get(shard)
+            if descriptor is None:
+                descriptor = os.open(self.shard_paths[shard], os.O_RDONLY)
+                self._fds[shard] = descriptor
+            return descriptor
+
+    def read_many(
+        self, indices: tuple[int, ...] | list[int]
+    ) -> tuple[tuple[Mapping[str, Any], ...], IndexedReadStats]:
+        started = time.perf_counter()
+        requested = tuple(int(index) for index in indices)
+        records: list[dict[str, Any]] = []
+        reads: list[tuple[int, int, int, int, str]] = []
+        requested_bytes = 0
+        for position, index in enumerate(requested):
+            if not 0 <= index < len(self):
+                raise IndexError(f"record index {index} is outside [0, {len(self)})")
+            records.append({"__key__": self.keys[index]})
+            shard = int(self.record_shards[index])
+            for component, offset, size in zip(
+                self.component_names, self.offsets[index], self.sizes[index]
+            ):
+                if offset >= 0:
+                    reads.append((shard, int(offset), int(size), position, component))
+                    requested_bytes += int(size)
+        read_bytes = 0
+        for shard, offset, size, position, component in sorted(reads):
+            payload = os.pread(self._fd(shard), size, offset)
+            if len(payload) != size:
+                raise OSError(
+                    f"short indexed read from {self.shard_paths[shard]} at {offset}: "
+                    f"expected {size} bytes, read {len(payload)}"
+                )
+            records[position][f".{component}"] = payload
+            read_bytes += len(payload)
+        return tuple(records), IndexedReadStats(
+            requested_bytes=requested_bytes,
+            read_bytes=read_bytes,
+            seconds=time.perf_counter() - started,
+            record_count=len(requested),
+        )
+
+    def read(self, index: int) -> tuple[Mapping[str, Any], IndexedReadStats]:
+        records, stats = self.read_many((index,))
+        return records[0], stats
+
+
+@dataclass(frozen=True)
 class KubricSceneMetadata:
     name: str
     tracks_3d: np.ndarray
@@ -86,6 +192,10 @@ class KubricWebDatasetCatalog:
             raise ValueError(f"{manifest_path}: unsupported WebDataset format")
         self.scenes = manifest["scenes"]
         self.source_fingerprint = str(manifest.get("source_fingerprint", "webdataset"))
+        locator = manifest.get("record_locator")
+        self.record_locator_path = (
+            None if locator is None else (manifest_path.parent / str(locator)).resolve()
+        )
 
     def scene(self, name: str):
         entry = dict(self.scenes[name])
@@ -117,7 +227,7 @@ def _scene_metadata(bundle: KubricDaliSceneBundle) -> KubricSceneMetadata:
 
 
 class DaliKubricMultiViewDataset(KubricMultiViewDataset):
-    """Apply the existing live sampler to scenes streamed directly by DALI."""
+    """Plan arbitrary scenes and read selected views from indexed TAR ranges."""
 
     collate_fn = staticmethod(collate_encoded_tapvid3d)
     requires_cuda_prefetch = True
@@ -144,6 +254,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         seed_by_scene: bool = False,
         stream_start_request_cursor: int = 0,
         depth_provider: str = "gt",
+        sequential_stream: bool = False,
         **kwargs,
     ):
         manifest_path = Path(webdataset_root) / webdataset_split / "manifest.json"
@@ -152,30 +263,38 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         kwargs["metadata_catalog"] = self.catalog
         kwargs["metadata_index_root"] = None
         super().__init__(*args, **kwargs)
-        resolved_stream_seed = self.seed if stream_seed is None else stream_seed
-        requests_per_group = int(stream_scenes_per_batch) * int(scene_reuse_passes)
-        self.stream = KubricDaliSceneStream(
-            manifest_path,
-            rank=stream_rank,
-            world_size=stream_world_size,
-            seed=int(0 if resolved_stream_seed is None else resolved_stream_seed),
-            scenes_per_batch=stream_scenes_per_batch,
-            repeat=stream_repeat,
-            shuffle_shards=stream_shuffle_shards,
-            include_scene_ids=stream_include_scene_ids,
-            allow_empty=stream_allow_empty,
-            start_group_index=int(stream_start_request_cursor) // requests_per_group,
-        )
         if int(scene_reuse_passes) != 1:
             raise ValueError("MV-Kubric DALI scenes must be consumed once per epoch")
         self._scene_reuse_passes = 1
         self._fixed_views = fixed_views
         self._seed_by_scene = bool(seed_by_scene)
         self.depth_provider = str(depth_provider)
-        self._stream_start_offset = int(stream_start_request_cursor) % requests_per_group
+        self._sequential_stream = bool(sequential_stream)
         self._streamed_scenes: deque[
             tuple[KubricDaliSceneBundle, KubricDaliSceneGroup, int, int]
         ] = deque()
+        if self._sequential_stream:
+            resolved_stream_seed = self.seed if stream_seed is None else stream_seed
+            requests_per_group = int(stream_scenes_per_batch) * int(scene_reuse_passes)
+            self.stream = KubricDaliSceneStream(
+                manifest_path,
+                rank=stream_rank,
+                world_size=stream_world_size,
+                seed=int(0 if resolved_stream_seed is None else resolved_stream_seed),
+                scenes_per_batch=stream_scenes_per_batch,
+                repeat=stream_repeat,
+                shuffle_shards=stream_shuffle_shards,
+                include_scene_ids=stream_include_scene_ids,
+                allow_empty=stream_allow_empty,
+                start_group_index=int(stream_start_request_cursor) // requests_per_group,
+            )
+            self._stream_start_offset = int(stream_start_request_cursor) % requests_per_group
+        else:
+            locator = self.catalog.record_locator_path
+            if locator is None or not locator.is_file():
+                raise FileNotFoundError(f"record locator is missing from {manifest_path}")
+            self._records = _IndexedRecordStore(locator)
+            self.stream = self._records
 
     def _next_scene(self):
         if not self._streamed_scenes:
@@ -191,6 +310,11 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         return self._streamed_scenes.popleft()
 
     def plan_sample(self, index) -> SamplePlan | None:
+        if not getattr(self, "_sequential_stream", True):
+            return self._plan_indexed_sample(index)
+        return self._plan_stream_sample(index)
+
+    def _plan_stream_sample(self, index) -> SamplePlan | None:
         request = index if hasattr(index, "virtual_index") else None
         bundle, group, scene_position, reuse_pass = self._next_scene()
         scene = _scene_metadata(bundle)
@@ -227,6 +351,61 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             depth_sources=depth_sources,
             metadata=metadata,
         )
+
+    def _plan_indexed_sample(self, index) -> SamplePlan | None:
+        request = index if hasattr(index, "virtual_index") else None
+        virtual_index = int(request.virtual_index) if request is not None else int(index)
+        expected_scene = (
+            getattr(request, "expected_scene", None) if request is not None else None
+        )
+        requested_index = (
+            getattr(request, "scene_index", None) if request is not None else None
+        )
+        if expected_scene is not None:
+            scene_name = str(expected_scene)
+            if scene_name not in self.seq_names:
+                raise KeyError(f"planned scene {scene_name!r} is unavailable")
+            scene_index = self.seq_names.index(scene_name)
+            if requested_index is not None and int(requested_index) != scene_index:
+                raise RuntimeError(
+                    f"planned scene/index diverged: {scene_name!r} != {requested_index}"
+                )
+        elif requested_index is not None:
+            scene_index = int(requested_index)
+            if not 0 <= scene_index < self.real_len:
+                raise IndexError(f"scene index {scene_index} is outside [0, {self.real_len})")
+            scene_name = self.seq_names[scene_index]
+        else:
+            scene_index = virtual_index % self.real_len
+            scene_name = self.seq_names[scene_index]
+
+        entry, _ = self.catalog.scene(scene_name)
+        metadata_index = int(entry["metadata_index"])
+        record, metadata_read = self._records.read(metadata_index)
+        expected_key = f"scene-{scene_name}"
+        if record["__key__"] != expected_key:
+            raise RuntimeError(
+                f"metadata locator diverged: expected {expected_key!r}, got {record['__key__']!r}"
+            )
+        scene = _scene_metadata(
+            KubricDaliSceneBundle(scene_name, record[f".{META_COMPONENT}"], (), ())
+        )
+        plan = self._plan_scene_metadata(request or virtual_index, scene)
+        if plan is None:
+            return None
+        media_indices = tuple(
+            int(entry["views"][str(view)]["media_index"])
+            for view in plan.views
+        )
+        metadata = {
+            **plan.metadata,
+            "record_store": "indexed-webdataset",
+            "media_record_indices": list(media_indices),
+            "indexed_metadata_requested_bytes": metadata_read.requested_bytes,
+            "indexed_metadata_read_bytes": metadata_read.read_bytes,
+            "indexed_metadata_read_seconds": metadata_read.seconds,
+        }
+        return replace(plan, media_record_indices=media_indices, metadata=metadata)
 
     def _plan_scene_metadata(self, index, scene: KubricSceneMetadata) -> SamplePlan | None:
         request = index if hasattr(index, "virtual_index") else None
@@ -443,11 +622,47 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
                 f"{payload_depth_source} depth"
             )
         started = time.perf_counter()
+        rgb_sources = plan.rgb_sources
+        depth_sources = plan.depth_sources
         metadata = dict(plan.metadata)
+        if plan.media_record_indices:
+            if len(plan.media_record_indices) != len(plan.views):
+                raise ValueError("media record count does not match selected views")
+            records, media_read = self._records.read_many(plan.media_record_indices)
+            rgb_payloads: list[bytes] = []
+            depth_payloads: list[bytes] = []
+            for view, record in zip(plan.views, records):
+                expected_key = f"scene-{plan.sequence}-view-{view:02d}"
+                if record["__key__"] != expected_key:
+                    raise RuntimeError(
+                        f"media locator diverged: expected {expected_key!r}, "
+                        f"got {record['__key__']!r}"
+                    )
+                rgb_payloads.extend(_packed_frames(record[".rgb.npz"]))
+                depth_payloads.extend(_packed_frames(record[".depth.npz"]))
+            rgb_sources = tuple(rgb_payloads)
+            depth_sources = tuple(depth_payloads)
+            metadata.update(
+                indexed_media_requested_bytes=media_read.requested_bytes,
+                indexed_media_read_bytes=media_read.read_bytes,
+                indexed_media_read_seconds=media_read.seconds,
+                indexed_requested_bytes=(
+                    int(metadata["indexed_metadata_requested_bytes"])
+                    + media_read.requested_bytes
+                ),
+                indexed_read_bytes=(
+                    int(metadata["indexed_metadata_read_bytes"])
+                    + media_read.read_bytes
+                ),
+                indexed_read_seconds=(
+                    float(metadata["indexed_metadata_read_seconds"])
+                    + media_read.seconds
+                ),
+            )
         metadata["worker_prepare_seconds"] = time.perf_counter() - started
-        metadata["encoded_bytes"] = sum(map(len, plan.rgb_sources)) + sum(map(len, plan.depth_sources))
+        metadata["encoded_bytes"] = sum(map(len, rgb_sources)) + sum(map(len, depth_sources))
         sample = EncodedTapVid3DSample(
-            jpeg_bytes=plan.rgb_sources,
+            jpeg_bytes=rgb_sources,
             depth=None,
             theta=torch.from_numpy(plan.theta),
             intrs=torch.from_numpy(plan.intrinsics),
@@ -469,7 +684,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             max_depth=plan.max_depth,
             depth_patch_operations=plan.depth_patch_operations,
             image_codec=plan.image_codec,
-            depth_bytes=plan.depth_sources,
+            depth_bytes=depth_sources,
             depth_sensor_widths=plan.depth_sensor_widths,
             depth_focal_lengths=plan.depth_focal_lengths,
         )
@@ -655,6 +870,7 @@ class DaliKubricValidationDataset(DaliKubricMultiViewDataset):
             scene_reuse_passes=1,
             fixed_views=fixed_views,
             seed_by_scene=True,
+            sequential_stream=True,
             **kwargs,
         )
         self.virtual_len = self.stream.local_scene_count
@@ -671,6 +887,7 @@ __all__ = [
     "DaliKubricMultiViewDataset",
     "DaliKubricRecipePlanner",
     "DaliKubricValidationDataset",
+    "IndexedReadStats",
     "KubricSceneMetadata",
     "KubricWebDatasetCatalog",
 ]

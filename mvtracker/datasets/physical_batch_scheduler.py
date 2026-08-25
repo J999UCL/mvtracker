@@ -3,8 +3,8 @@
 The scheduler is deliberately independent of dataset materialisation and model
 execution.  It receives eight already-planned scene summaries and partitions
 them into two synchronized rank waves.  A physical group contains at most two
-logical scenes; two scenes may share a group only when their tensor shapes are
-identical and the selected hardware capacity permits the pair.
+logical scenes with matching view/frame/image dimensions; trajectory counts
+are padded and masked after materialization.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Sequence
 
 
 Resolution = tuple[int, int]
-ShapeKey = tuple[int, int, Resolution, int]
+ShapeKey = tuple[int, int, Resolution]
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,6 @@ class SceneSummary:
             self.view_count,
             self.frame_count,
             self.resolution,
-            self.schedule_start,
         )
 
 
@@ -45,10 +44,11 @@ class SceneSummary:
 class BatchCapacity:
     """Static physical-batching rules for one hardware configuration.
 
-    ``pair_track_capacity_by_views`` applies only to groups of two.  A
-    singleton has no pair-specific trajectory limit here; its capacity is
-    enforced by the model/profile that produced the plan.  Views in
-    ``singleton_only_views`` can never be paired.
+    The capacity names the profiled hardware and the maximum scene group size.
+    ``pair_track_capacity_by_views`` records the profiled trajectory ceilings
+    for observability; trajectory counts do not split otherwise-compatible
+    samples into separate physical batches.  Views in ``singleton_only_views``
+    can never be paired.
     """
 
     name: str
@@ -223,10 +223,9 @@ def _can_pair(
         return False
     if first.view_count in capacity.singleton_only_views:
         return False
-    track_capacity = capacity.pair_track_capacity(first.view_count)
-    return track_capacity is not None and max(
-        first.track_count, second.track_count
-    ) <= track_capacity
+    # Trajectory counts are padded within the physical batch and masked by the
+    # model; they are not a pairing compatibility constraint.
+    return True
 
 
 def _groupings(
@@ -284,46 +283,47 @@ def schedule_physical_batch(
 ) -> SynchronizedBatchWave:
     """Return the deterministic two-rank physical batching plan.
 
-    The objective is lexicographic: maximize safe pairs, minimize trajectory
-    padding, minimize the maximum rank work, minimize rank-work imbalance, and
-    finally choose the stable input-order tie-break.  No data is loaded and no
-    runtime capacity fallback is attempted.
+    The objective is lexicographic: maximize safe pairs, minimize maximum rank
+    work and rank-work imbalance, minimize trajectory padding, and finally
+    choose the stable input-order tie-break.  Both ranks receive the same
+    physical-group count so their final DDP backward collective is aligned.
     """
 
     summaries = tuple(summaries)
     _validate_summaries(summaries, capacity)
-    rank_size = capacity.logical_scenes_per_rank
     all_indices = tuple(range(len(summaries)))
     candidates = []
-    # Fix input index zero on rank zero to remove the rank-swap duplicate while
-    # retaining stable input-order semantics.
-    for rank_zero in combinations(all_indices[1:], rank_size - 1):
-        rank_zero = (0,) + rank_zero
-        rank_one = tuple(index for index in all_indices if index not in rank_zero)
-        rank_zero_groupings = _groupings(rank_zero, summaries, capacity)
-        rank_one_groupings = _groupings(rank_one, summaries, capacity)
-        for raw_groups_zero in rank_zero_groupings:
-            for raw_groups_one in rank_one_groupings:
-                groups_zero = _order_groups(tuple(
-                    PhysicalBatchGroup(tuple(summaries[index] for index in group))
-                    for group in raw_groups_zero
-                ), summaries)
-                groups_one = _order_groups(tuple(
-                    PhysicalBatchGroup(tuple(summaries[index] for index in group))
-                    for group in raw_groups_one
-                ), summaries)
-                rank_groups = tuple(
-                    RankWave(
-                        rank=rank,
-                        groups=groups,
+    # Allow unequal logical-scene counts, but require synchronized physical
+    # group counts so DDP's final backward collective is aligned.
+    for rank_size in range(1, len(all_indices)):
+        for rank_zero in combinations(all_indices[1:], rank_size - 1):
+            rank_zero = (0,) + rank_zero
+            rank_one = tuple(index for index in all_indices if index not in rank_zero)
+            rank_zero_groupings = _groupings(rank_zero, summaries, capacity)
+            rank_one_groupings = _groupings(rank_one, summaries, capacity)
+            for raw_groups_zero in rank_zero_groupings:
+                for raw_groups_one in rank_one_groupings:
+                    groups_zero = _order_groups(tuple(
+                        PhysicalBatchGroup(tuple(summaries[index] for index in group))
+                        for group in raw_groups_zero
+                    ), summaries)
+                    groups_one = _order_groups(tuple(
+                        PhysicalBatchGroup(tuple(summaries[index] for index in group))
+                        for group in raw_groups_one
+                    ), summaries)
+                    rank_groups = tuple(
+                        RankWave(
+                            rank=rank,
+                            groups=groups,
+                        )
+                        for rank, groups in enumerate((groups_zero, groups_one))
                     )
-                    for rank, groups in enumerate((groups_zero, groups_one))
-                )
-                wave = SynchronizedBatchWave(
-                    ranks=rank_groups,
-                    capacity_name=capacity.name,
-                )
-                candidates.append(wave)
+                    wave = SynchronizedBatchWave(
+                        ranks=rank_groups,
+                        capacity_name=capacity.name,
+                    )
+                    if len(groups_zero) == len(groups_one):
+                        candidates.append(wave)
 
     if not candidates:
         raise ValueError("no synchronized physical batching plan exists")
@@ -338,10 +338,9 @@ def schedule_physical_batch(
         rank_work = wave.rank_work
         return (
             -wave.pair_count,
-            wave.total_padding_tracks,
             max(rank_work),
             abs(rank_work[0] - rank_work[1]),
-            abs(len(wave.ranks[0].groups) - len(wave.ranks[1].groups)),
+            wave.total_padding_tracks,
             rank_zero_signature,
             rank_one_signature,
         )

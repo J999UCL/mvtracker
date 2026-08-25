@@ -6,12 +6,17 @@ import json
 import tempfile
 import time
 import unittest
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
 from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
+from mvtracker.datasets.physical_batch_scheduler import (
+    BatchCapacity,
+    schedule_physical_batch,
+)
 from mvtracker.datasets.training_recipe import (
     RecipeReader,
     plan_training_recipe,
@@ -96,6 +101,26 @@ class TrainingRecipeTests(unittest.TestCase):
             datasets, logs, summary = self._plan(root)
             reader = RecipeReader(root / "recipe")
             reader.validate()
+            steps = list(reader.steps())
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(
+                [len(step["logical_samples"]) for step in steps], [8, 8]
+            )
+            self.assertEqual(
+                [
+                    sample["logical_index"]
+                    for sample in steps[0]["logical_samples"]
+                ],
+                list(range(8)),
+            )
+            self.assertEqual(
+                {
+                    index
+                    for group in steps[0]["physical_groups"]
+                    for index in group["logical_indices"]
+                },
+                set(range(8)),
+            )
 
             records = [
                 record
@@ -210,11 +235,60 @@ class TrainingRecipeTests(unittest.TestCase):
             for name in (
                 "rank-0.jsonl",
                 "rank-1.jsonl",
+                "steps.jsonl",
                 "estimated-depth-requests.jsonl",
             ):
                 self.assertEqual(
                     (root / "serial" / "recipe" / name).read_text(),
                     (root / "parallel" / "recipe" / name).read_text(),
+                )
+
+    def test_parallel_planner_stores_synchronized_global_physical_groups(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "recipe"
+            datasets = {
+                "diegesis": _MetadataDataset("diegesis"),
+                "kubric": _MetadataDataset("kubric"),
+            }
+            schedule = BalancedMixedSourceSchedule(
+                {"diegesis": 5, "kubric": 4},
+                ("diegesis", "kubric", "diegesis", "kubric"),
+                world_size=2,
+                master_seed=31,
+            )
+            capacity = BatchCapacity(
+                name="test",
+                rank_count=2,
+                logical_scenes_per_rank=4,
+                max_group_size=2,
+                pair_track_capacity_by_views=((2, 2048),),
+                singleton_only_views=frozenset(),
+            )
+            plan_training_recipe_parallel(
+                root,
+                datasets=datasets,
+                schedule=schedule,
+                step_count=2,
+                manifest={},
+                worker_count=2,
+                block_steps=1,
+                log=lambda _: None,
+                physical_scheduler=lambda summaries: schedule_physical_batch(
+                    summaries, capacity=capacity
+                ),
+            )
+            reader = RecipeReader(root)
+            reader.validate()
+            for step in reader.steps():
+                counts = Counter(
+                    group["rank"] for group in step["physical_groups"]
+                )
+                self.assertEqual(counts[0], counts[1])
+                self.assertTrue(
+                    all(
+                        len(group["logical_indices"]) == 2
+                        for group in step["physical_groups"]
+                    )
                 )
 
 

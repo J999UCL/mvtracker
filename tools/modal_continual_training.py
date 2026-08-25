@@ -114,7 +114,7 @@ EXPERIMENT_PHASES = {
     ),
 }
 RECIPE_ROOT = RUN_ROOT / "training-recipes"
-RECIPE_SMOKE_GPU_REQUEST = "H100!:2"
+RECIPE_SMOKE_GPU_REQUEST = GPU_REQUEST
 
 
 def _run_logged_command(command, *, cwd, environment, log_path, label):
@@ -320,16 +320,18 @@ def profile_h100_loader_remote() -> dict:
 )
 def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     """Plan the mixed-source recipe using metadata only on sixteen CPU cores."""
+    from functools import partial
     from types import SimpleNamespace
 
     import wandb
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
-    from mvtracker.cli.train import _build_training_dataset
+    from mvtracker.cli.train import _build_training_dataset, _physical_batch_capacity
     from mvtracker.datasets.kubric_dali_dataset import DaliKubricRecipePlanner
     from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
     from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
+    from mvtracker.datasets.physical_batch_scheduler import schedule_physical_batch
     from mvtracker.datasets.training_recipe import plan_training_recipe_parallel
 
     validate_run_name(recipe_name)
@@ -377,6 +379,8 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                     f"trainer.num_steps={int(step_count)}",
                     "datasets.train.recipe_path=null",
                     "datasets.train.force_gt_depth=false",
+                    "datasets.train.physical_batching.max_scenes=2",
+                    "datasets.train.physical_batching.rank_local=false",
                     "augmentations.variable_depth_type=true",
                 ],
             )
@@ -459,6 +463,10 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
             worker_count=16,
             block_steps=25,
             heartbeat_seconds=10,
+            physical_scheduler=partial(
+                schedule_physical_batch,
+                capacity=_physical_batch_capacity(cfg),
+            ),
         )
     finally:
         heartbeat_stop.set()
@@ -858,7 +866,7 @@ def recipe_smoke20(run_name: str, recipe_name: str) -> None:
     validate_run_name(run_name)
     validate_run_name(recipe_name)
     app.set_tags(
-        {**MODAL_TAGS, "experiment": run_name, "gpu": "h100x2"}
+        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x2"}
     )
     deployed = modal.Function.from_name(APP_NAME, "recipe_smoke20_remote")
     call = deployed.spawn(run_name, recipe_name)
