@@ -2043,6 +2043,27 @@ need estimated depth.
 - Depth-assignment W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/pzf4vlnm
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+### Production training launch
+
+The final recipe was launched as a 1,000-step production run on three H200s:
+two DDP training ranks on devices 0--1 and one asynchronous DA3-Giant-1.1
+producer on device 2. The run restores the published mixed-depth MV-Tracker
+checkpoint, uses a 1,000-step OneCycle horizon at peak LR 5e-5, validates and
+saves every 250 steps, evaluates all 27 held-out MV-Kubric scenes at steps 0
+and 1,000, and logs to W&B.
+
+Initial validation completed and saved all step-0 metrics. By optimizer step 28,
+warm steps measured 3.55--9.80 seconds with 0.26--0.58 seconds of exposed data
+time. The depth producer had reached recipe step 60, so estimated depth was
+comfortably ahead of training. No OOM, DDP divergence or runtime-depth failure
+was observed during stabilization.
+
+- Run: `expanded-syn4d-da3-1000-20260825T1834BST`
+- Run Volume: `continual-training/expanded-syn4d-da3-1000-20260825T1834BST`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/e9ec63d4168d
+- Local dashboard: http://127.0.0.1:8766/
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
 ## 2026-08-25 — Asynchronous DA3-Giant mixed-depth training smoke
 
 A preplanned 20-step continual-training recipe was replayed on three H200s:
