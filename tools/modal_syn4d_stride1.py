@@ -370,7 +370,6 @@ def preprocess_environment_remote(
     from mvtracker.preprocessing.syn4d import convert_syn4d_sequence
 
     torch.set_num_threads(os.cpu_count() or 1)
-    torch.set_num_interop_threads(1)
     run = wandb.init(
         project="mvtracker-modal-profiling",
         job_type="syn4d-preprocess",
