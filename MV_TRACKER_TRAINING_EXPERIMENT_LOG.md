@@ -927,6 +927,18 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+The run was manually stopped shortly after step 299. Two issues motivated the
+termination. First, the `/tmp` depth-file handoff accumulated approximately
+410 GiB of Linux page cache, making reported container memory rise roughly
+linearly despite consumed files being deleted. Second, three large Syn4D
+trajectory outliers produced visible moving-average jumps: planet scene 5 at
+step 131, and countryside scene 4 at steps 134 and 196. The countryside
+outliers occurred with both GT and estimated depth, implicating remaining scene
+scale inconsistency rather than DA3 alone. The next run should evict consumed
+depth pages and apply scale-aware scene normalization.
+
+The durable `model_000250.pth` checkpoint and all logs remain on the run Volume.
+
 ## 23 August 2026: centered three-source final external evaluation
 
 The completed 2,000-step singleton-batch checkpoint was transferred from the
