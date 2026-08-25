@@ -118,8 +118,19 @@ class _Progress:
         self.fields: dict[str, object] = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
+        self.cpu_count = os.cpu_count() or 1
+        self.last_cpu_usage_usec = self._cpu_usage_usec()
+        self.last_cpu_sample = time.perf_counter()
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.thread.start()
+
+    @staticmethod
+    def _cpu_usage_usec() -> int:
+        for line in Path("/sys/fs/cgroup/cpu.stat").read_text(encoding="utf-8").splitlines():
+            key, value = line.split()
+            if key == "usage_usec":
+                return int(value)
+        raise RuntimeError("cgroup cpu.stat did not report usage_usec")
 
     def emit(self, event: str, **fields: object) -> None:
         with self.lock:
@@ -145,7 +156,19 @@ class _Progress:
     def _heartbeat(self) -> None:
         while not self.stop.wait(15):
             usage = shutil.disk_usage("/tmp")
-            self.emit("heartbeat", local_disk_free_gib=round(usage.free / (1 << 30), 2), local_disk_used_gib=round(usage.used / (1 << 30), 2))
+            now = time.perf_counter()
+            cpu_usage_usec = self._cpu_usage_usec()
+            interval = now - self.last_cpu_sample
+            cpu_percent = 100 * (cpu_usage_usec - self.last_cpu_usage_usec) / (1_000_000 * interval * self.cpu_count)
+            self.last_cpu_usage_usec = cpu_usage_usec
+            self.last_cpu_sample = now
+            self.emit(
+                "heartbeat",
+                allocated_cpus=self.cpu_count,
+                cpu_percent=round(cpu_percent, 1),
+                local_disk_free_gib=round(usage.free / (1 << 30), 2),
+                local_disk_used_gib=round(usage.used / (1 << 30), 2),
+            )
 
     def close(self) -> None:
         self.stop.set()
@@ -334,54 +357,64 @@ def prepare_mapping_remote(manifest_name: str) -> dict[str, object]:
     memory=48 * 1024,
     ephemeral_disk=1024 * 1024,
     timeout=24 * 60 * 60,
-    max_containers=1,
+    max_containers=4,
     include_source=False,
 )
-def preprocess_remote(manifest: dict[str, object]) -> dict[str, object]:
+def preprocess_environment_remote(
+    environment: str,
+    rows: list[dict[str, str]],
+    manifest_name: str,
+) -> dict[str, object]:
     import wandb
+    import torch
     from mvtracker.preprocessing.syn4d import convert_syn4d_sequence
 
-    name = str(manifest.get("name", "syn4d-stride1"))
-    run = wandb.init(project="mvtracker-modal-profiling", job_type="syn4d-preprocess", name=name, tags=["modal", "cpu", "syn4d", "stride1"], config={**TAGS})
-    progress = _Progress(run, REPORT_ROOT / name / "events.ndjson", name)
+    torch.set_num_threads(os.cpu_count() or 1)
+    torch.set_num_interop_threads(1)
+    run = wandb.init(
+        project="mvtracker-modal-profiling",
+        job_type="syn4d-preprocess",
+        name=f"{manifest_name}-{environment}",
+        tags=["modal", "cpu", "syn4d", "stride1", "environment"],
+        config={**TAGS, "environment": environment, "sequences": len(rows), "allocated_cpus": os.cpu_count() or 1},
+    )
+    progress = _Progress(run, REPORT_ROOT / manifest_name / f"{environment}.ndjson", manifest_name)
     results = []
     try:
-        grouped: dict[str, list[dict[str, str]]] = {}
-        for row in _rows(manifest):
-            grouped.setdefault(row["environment"], []).append(row)
-        for environment, rows in grouped.items():
-            archive = _archive(environment)
-            if archive is None:
-                progress.emit("archive_missing", environment=environment)
-                results.extend({**row, "status": "blocked", "error": "missing archive"} for row in rows)
-                continue
-            work = Path("/tmp/syn4d-preprocess") / environment
-            extracted = work / "extracted"
-            progress.set_phase("extract", environment=environment, sequences=len(rows))
-            extracted.mkdir(parents=True, exist_ok=True)
-            extraction = subprocess.run(["tar", "-I", "zstd -T0", "-xf", str(archive), "-C", str(extracted)], check=False)
-            if extraction.returncode:
-                progress.emit("extract_failed", environment=environment, returncode=extraction.returncode)
-                results.extend({**row, "status": "failed", "error": "extract failed"} for row in rows)
-                continue
-            for row in rows:
+        archive = _archive(environment)
+        if archive is None:
+            progress.emit("archive_missing", environment=environment)
+            return {"environment": environment, "status": "blocked", "sequences": [{**row, "status": "blocked", "error": "missing archive"} for row in rows]}
+        work = Path("/tmp/syn4d-preprocess") / environment
+        extracted = work / "extracted"
+        progress.set_phase("extract", environment=environment, sequences=len(rows))
+        extracted.mkdir(parents=True, exist_ok=True)
+        extraction_started = time.perf_counter()
+        extraction = subprocess.run(["tar", "-I", "zstd -T0", "-xf", str(archive), "-C", str(extracted)], check=False)
+        progress.emit("extract_complete", environment=environment, seconds=round(time.perf_counter() - extraction_started, 2), returncode=extraction.returncode)
+        if extraction.returncode:
+            results.extend({**row, "status": "failed", "error": "extract failed"} for row in rows)
+        else:
+            for sequence_index, row in enumerate(rows, start=1):
                 output = OUTPUT_ROOTS[row["split"]] / f"{environment}__{row['sequence']}"
                 if (output / "manifest.json").is_file():
-                    progress.emit("sequence_reused", **row, output=str(output))
+                    progress.emit("sequence_reused", **row, sequence_index=sequence_index, output=str(output))
                     results.append({**row, "status": "reused"})
                     continue
                 try:
-                    progress.set_phase("sequence_convert", **row)
+                    progress.set_phase("sequence_convert", **row, sequence_index=sequence_index, sequences=len(rows))
+                    started = time.perf_counter()
                     result = convert_syn4d_sequence(extracted / environment, METADATA_ROOT, OUTPUT_ROOTS[row["split"]], official_visualizer_root=Path("/opt/syn4d-visualizer"), sequence=row["sequence"], device="cpu", progress=lambda event: progress.emit("converter", **{**row, **event}))
-                    progress.emit("sequence_complete", **row, output=result["output_path"])
+                    progress.emit("sequence_complete", **row, sequence_index=sequence_index, seconds=round(time.perf_counter() - started, 2), output=result["output_path"])
                     results.append({**row, "status": "complete"})
-                    progress.set_phase("volume_commit", **row)
+                    progress.set_phase("volume_commit", **row, sequence_index=sequence_index)
+                    commit_started = time.perf_counter()
                     data_volume.commit()
-                    progress.emit("volume_commit_complete", **row)
+                    progress.emit("volume_commit_complete", **row, sequence_index=sequence_index, seconds=round(time.perf_counter() - commit_started, 2))
                 except Exception as error:
-                    progress.emit("sequence_failed", **row, error_type=type(error).__name__, error=str(error))
+                    progress.emit("sequence_failed", **row, sequence_index=sequence_index, error_type=type(error).__name__, error=str(error))
                     results.append({**row, "status": "failed", "error": f"{type(error).__name__}: {error}"})
-        return {"status": "complete" if all(item["status"] != "failed" for item in results) else "partial", "sequences": results}
+        return {"environment": environment, "status": "complete" if all(item["status"] != "failed" for item in results) else "partial", "sequences": results}
     finally:
         progress.close()
         run.finish()
@@ -404,4 +437,11 @@ def download(manifest: str = DEFAULT_MANIFEST) -> None:
 
 @app.local_entrypoint(name="preprocess")
 def preprocess(manifest: str = DEFAULT_MANIFEST) -> None:
-    print(json.dumps(preprocess_remote.remote(_manifest(manifest)), indent=2, sort_keys=True))
+    payload = _manifest(manifest)
+    name = str(payload.get("name", "syn4d-stride1"))
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in _rows(payload):
+        grouped.setdefault(row["environment"], []).append(row)
+    environments = sorted(grouped)
+    results = list(preprocess_environment_remote.map(environments, [grouped[environment] for environment in environments], [name] * len(environments)))
+    print(json.dumps({"environments": results}, indent=2, sort_keys=True))
