@@ -347,7 +347,7 @@ def prepare_mapping_remote(manifest_name: str) -> dict[str, object]:
     secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume},
     cpu=CPU_WORKER_COUNT,
-    memory=32 * 1024,
+    memory=16 * 1024,
     ephemeral_disk=1024 * 1024,
     timeout=24 * 60 * 60,
     max_containers=4,
