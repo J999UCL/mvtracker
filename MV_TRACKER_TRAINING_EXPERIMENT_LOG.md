@@ -927,6 +927,31 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+## 2026-08-25 — Canonical fresh 1,000-step mixed-depth recipe
+
+A new recipe was generated from scratch with current dataset planners; no
+logical samples or physical assignments were reused from earlier recipes. It
+contains 8,000 samples over 1,000 optimizer steps: 2,000 DIEGESIS, 4,000
+MV-Kubric and 2,000 Syn4D. Syn4D planning applies the 65 m camera-centred
+track-radius filter. Mixed depth was sampled in the same planning pass, yielding
+5,660 GT, 1,559 estimated and 781 confidence-cleaned estimated samples.
+
+Physical scene pairing is disabled natively during planning. Every optimizer
+step contains four singleton groups on each of two ranks. The planner performed
+67 normal deterministic replacement attempts and completed sample planning in
+1,005.2 seconds after fresh metadata construction. A complete structural audit
+verified all 1,000 steps, all 8,000 logical samples, singleton rank coverage and
+the embedded current configuration. Thirteen samples from the two previously
+problematic far-field scenes were checked directly; their maximum selected
+radius was 64.35 m.
+
+- Canonical recipe: `training-recipes/fresh-mixed-da3-r65-singleton-1000-20260825`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/zfa5xcae
+- Implementation: `5f1a99d`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+- Earlier incrementally derived recipes are retained only as diagnostics and
+  must not be used for canonical training.
+
 The run was manually stopped shortly after step 299. Two issues motivated the
 termination. First, the `/tmp` depth-file handoff accumulated approximately
 410 GiB of Linux page cache, making reported container memory rise roughly
