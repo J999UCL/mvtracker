@@ -566,6 +566,36 @@ of 24 frames (one chunk each), the measured batch-1 rates project to 50.5 minute
 of H100 inference, or about $3.32. This excludes one-time input staging and the
 final upload of complete sidecars to persistent storage.
 
+## 2026-08-25 — VGGT-Omega H200 bounded burst frontier
+
+A deliberately small H200 follow-up reused the 24-frame burst path and the
+existing packed RGB loaders. The H100 absolute-memory results determined the
+starting probes, avoiding a low-batch sweep. Each safe case used one warm-up
+and two timed repetitions; cases above 90% VRAM stopped after warm-up.
+
+| Views / source | Batch | Status | Peak VRAM | End-to-end / batch | Scenes/s |
+|---|---:|---|---:|---:|---:|
+| 4 / DIEGESIS | 1 | safe | 11.68% | 5.44 s | 0.1838 |
+| 4 / DIEGESIS | 10 | safe | 89.15% | 54.36 s | 0.1839 |
+| 4 / DIEGESIS | 11 | unsafe | 97.61% | warm-up only | 0.1812 |
+| 6 / Syn4D | 6 | safe | 81.16% | 67.03 s | 0.0895 |
+| 6 / Syn4D | 7 | unsafe | 94.15% | warm-up only | 0.0860 |
+
+The H200 four-view batch-1 model time was 3.59 seconds and total local-cache
+time was 5.44 seconds, including 0.67 seconds of RGB loading/preprocessing,
+1.11 seconds of metric alignment/postprocessing, and 0.064 seconds writing
+float32 depth plus the cleaned mask to local SSD. Batch 10 consumed nearly the
+entire safe VRAM budget but did not improve per-scene throughput. Six-view
+batch 6 likewise filled 121.83 GB without creating a batching throughput gain.
+
+Therefore additional H200 memory permits a deeper asynchronous queue but does
+not make one producer process recipe samples faster. At a 30% mixture, one
+depth producer remains borderline or slower than two-H200 training unless
+repeated DIEGESIS/Syn4D windows are deduplicated or precomputed by scene.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/0kj6o4dx
+- Report: `vggt-omega-h200-frontier-20260825T072743Z/h200-burst-report.json`
+
 ## 2026-08-17 — Cached Modal dataset image and CPU loader profile
 
 The continual-training data is now a cached Modal image layer at
