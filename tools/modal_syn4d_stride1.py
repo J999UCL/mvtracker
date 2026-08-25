@@ -372,7 +372,7 @@ def preprocess_remote(manifest: dict[str, object]) -> dict[str, object]:
                     continue
                 try:
                     progress.set_phase("sequence_convert", **row)
-                    result = convert_syn4d_sequence(extracted / environment, METADATA_ROOT, OUTPUT_ROOTS[row["split"]], official_visualizer_root=Path("/opt/syn4d-visualizer"), sequence=row["sequence"], device="cpu", progress=lambda event: progress.emit("converter", **row, **event))
+                    result = convert_syn4d_sequence(extracted / environment, METADATA_ROOT, OUTPUT_ROOTS[row["split"]], official_visualizer_root=Path("/opt/syn4d-visualizer"), sequence=row["sequence"], device="cpu", progress=lambda event: progress.emit("converter", **{**row, **event}))
                     progress.emit("sequence_complete", **row, output=result["output_path"])
                     results.append({**row, "status": "complete"})
                     progress.set_phase("volume_commit", **row)
