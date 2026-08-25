@@ -452,8 +452,9 @@ def preprocess(manifest: str = DEFAULT_MANIFEST) -> None:
 @app.local_entrypoint(name="resume-interrupted")
 def resume_interrupted() -> None:
     name = "syn4d-stride1-resume-interrupted"
+    deployed = modal.Function.from_name(APP_NAME, "preprocess_environment_remote")
     calls = {
-        environment: preprocess_environment_remote.spawn(environment, rows, name)
+        environment: deployed.spawn(environment, rows, name)
         for environment, rows in INTERRUPTED_RESUME.items()
     }
     print(json.dumps({"function_call_ids": {environment: call.object_id for environment, call in calls.items()}}, indent=2, sort_keys=True))
