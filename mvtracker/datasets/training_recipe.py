@@ -708,56 +708,65 @@ def plan_training_recipe_parallel(
         ):
             for block_start in range(0, step_count, block_steps):
                 block_end = min(block_start + block_steps, step_count)
-                compact_by_source: dict[str, dict[int, dict[int, Any]]] = {}
+                compact_by_source = {
+                    source: {
+                        rank: {} for rank in range(schedule.world_size)
+                    }
+                    for source in positions
+                }
                 timing_by_source: Counter[str] = Counter()
                 block_records = []
-                for source, source_microbatches in positions.items():
-                    required = (block_end - block_start) * len(source_microbatches)
-                    start_cursor = cursors[source]
-                    candidate_count = required + max(16, required // 4)
-                    while True:
-                        end_cursor = start_cursor + candidate_count
-                        lanes = max(
-                            1, len(positions) * int(schedule.world_size)
-                        )
-                        chunks_per_rank = max(
-                            1, (worker_count + lanes - 1) // lanes
-                        )
-                        chunk_size = max(
-                            1,
-                            (candidate_count + chunks_per_rank - 1)
-                            // chunks_per_rank,
-                        )
-                        tasks = [
-                            (
-                                source,
-                                rank,
-                                cursor,
-                                min(cursor + chunk_size, end_cursor),
-                            )
-                            for rank in range(schedule.world_size)
-                            for cursor in range(start_cursor, end_cursor, chunk_size)
-                        ]
-                        planned = {rank: {} for rank in range(schedule.world_size)}
-                        for _, rank, results, seconds in pool.map(
-                            _plan_process_chunk, tasks
-                        ):
-                            planned[rank].update(results)
-                            timing_by_source[source] += seconds
-                            source_plan_calls[source] += len(results)
-                            progress["planned"] += len(results)
-                        valid = [
-                            cursor
-                            for cursor in range(start_cursor, end_cursor)
-                            if all(
+                required_by_source = {
+                    source: (block_end - block_start) * len(source_microbatches)
+                    for source, source_microbatches in positions.items()
+                }
+                next_cursor = dict(cursors)
+                while True:
+                    ranges = {}
+                    for source, required in required_by_source.items():
+                        planned = compact_by_source[source]
+                        valid_count = sum(
+                            all(
                                 planned[rank].get(cursor) is not None
                                 for rank in range(schedule.world_size)
                             )
-                        ]
-                        if len(valid) >= required:
-                            compact_by_source[source] = planned
-                            break
-                        candidate_count *= 2
+                            for cursor in range(cursors[source], next_cursor[source])
+                        )
+                        deficit = required - valid_count
+                        if deficit > 0:
+                            ranges[source] = (
+                                next_cursor[source],
+                                next_cursor[source] + deficit,
+                            )
+                    if not ranges:
+                        break
+                    plan_count = sum(
+                        (end - start) * int(schedule.world_size)
+                        for start, end in ranges.values()
+                    )
+                    chunk_size = max(
+                        1, (plan_count + worker_count - 1) // worker_count
+                    )
+                    tasks = [
+                        (
+                            source,
+                            rank,
+                            cursor,
+                            min(cursor + chunk_size, end),
+                        )
+                        for source, (start, end) in ranges.items()
+                        for rank in range(schedule.world_size)
+                        for cursor in range(start, end, chunk_size)
+                    ]
+                    for source, rank, results, seconds in pool.map(
+                        _plan_process_chunk, tasks
+                    ):
+                        compact_by_source[source][rank].update(results)
+                        timing_by_source[source] += seconds
+                        source_plan_calls[source] += len(results)
+                        progress["planned"] += len(results)
+                    for source, (_, end) in ranges.items():
+                        next_cursor[source] = end
 
                 for source, source_microbatches in positions.items():
                     slots = [

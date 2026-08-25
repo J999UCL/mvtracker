@@ -192,7 +192,7 @@ class TrainingRecipeTests(unittest.TestCase):
                 world_size=2,
                 master_seed=31,
             )
-            plan_training_recipe_parallel(
+            summary = plan_training_recipe_parallel(
                 root / "parallel" / "recipe",
                 datasets=datasets,
                 schedule=schedule,
@@ -206,6 +206,7 @@ class TrainingRecipeTests(unittest.TestCase):
                 block_steps=2,
                 log=lambda _: None,
             )
+            self.assertEqual(sum(summary["source_plan_calls"].values()), 34)
             for name in (
                 "rank-0.jsonl",
                 "rank-1.jsonl",
