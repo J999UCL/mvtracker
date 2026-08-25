@@ -798,8 +798,9 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
                 flush=True,
             )
         time.sleep(1)
+    prefill_seconds = time.monotonic() - prefill_started
     print(
-        f"DA3 prefill ready elapsed={time.monotonic() - prefill_started:.1f}s",
+        f"DA3 prefill ready elapsed={prefill_seconds:.1f}s",
         flush=True,
     )
 
@@ -837,7 +838,7 @@ def recipe_da3_smoke20_remote(run_name: str, recipe_name: str) -> dict:
     final_producer_metrics = json.loads(metrics_lines[-1])
     result = {
         **manifest,
-        "prefill_seconds": time.monotonic() - prefill_started,
+        "prefill_seconds": prefill_seconds,
         "producer": final_producer_metrics,
         "checkpoint": str(run_dir / "model_final.pth"),
     }

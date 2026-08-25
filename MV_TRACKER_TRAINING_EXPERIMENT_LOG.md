@@ -2005,6 +2005,43 @@ Raw delta1 rose from 0.8710 to 0.9579 and foreground delta1 from 0.8108 to
 - Report: `jeet-mvtracker-runs-v2/da3-giant-h100/da3-giant-1.1-diningroom02-20260825T110038Z/report.json`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
 
+## 2026-08-25 — Asynchronous DA3-Giant mixed-depth training smoke
+
+A preplanned 20-step continual-training recipe was replayed on three H200s:
+two DDP training ranks and one asynchronous DA3-Giant-1.1 depth producer. The
+recipe preserved the original sampled scenes, frames, views, tracks and
+augmentations while assigning 70% of its 160 logical samples to GT depth, 20%
+to raw estimated depth and 10% to top-60%-confidence estimated depth. The exact
+counts were 112 GT, 32 estimated and 16 estimated-cleaned samples.
+
+The producer generated all 48 requested non-GT samples (5,088 inference
+images) sequentially from the recipe. It supplied four inference-only context
+cameras whenever a training sample selected fewer than four views, then wrote
+depth only for the recipe's selected views. This fixed the degenerate Umeyama
+alignment encountered with static one-view MV-Kubric samples without changing
+training sample semantics. Sustained DA3 model throughput reached 53.60
+images/s; model compute occupied 94.93 seconds and total producer wall time was
+438.33 seconds, including a cold 117.93-second model load and RGB/materialization
+work. The producer remained ahead of training after prefill.
+
+Training completed all 20 optimizer steps and saved both the step-20 and final
+checkpoints. The first physical sample exposed 21.21 seconds of cold loading;
+across the 61 subsequent physical-group observations, median wait was 0.07
+seconds, p90 was 0.71 seconds and the mean including cold startup was 0.69
+seconds. The final optimizer step took 3.93 seconds, with 0.18 seconds attributed
+to the dataloader. Final reported throughput was 2.03 logical samples/s and
+2,486.9 trajectories/s. The integration metric accidentally measured prefill
+through the end of training and reported 529.65 seconds; the actual prefill was
+approximately 248 seconds, and the timer was corrected after the run.
+
+- Implementation: `8b9a989` (alignment context); subsequent timing correction
+- Run: `da3-runtime-depth-smoke20-8b9a989-r4`
+- Run Volume: `continual-training/da3-runtime-depth-smoke20-8b9a989-r4`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/b01188777039
+- Checkpoints: `model_000020.pth`, `model_final.pth`
+- Recipe: `training-recipes/global-smartbatch-da3-70-20-10-smoke20`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
 ### Matched H200 follow-up
 
 The same native-batch Giant path was run on the H200 intended for the depth
