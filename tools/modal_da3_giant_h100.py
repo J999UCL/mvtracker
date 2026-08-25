@@ -205,7 +205,7 @@ def benchmark(scene: str = "diningroom02"):
             )
 
             with torch.inference_mode():
-                warm = model.forward(images, normalized_exts, ints)
+                warm = model.forward(images, normalized_exts, ints, export_feat_layers=[])
             torch.cuda.synchronize()
             del warm
 
@@ -214,7 +214,7 @@ def benchmark(scene: str = "diningroom02"):
             for _ in range(2):
                 started = time.perf_counter()
                 with torch.inference_mode():
-                    output = model.forward(images, normalized_exts, ints)
+                    output = model.forward(images, normalized_exts, ints, export_feat_layers=[])
                 torch.cuda.synchronize()
                 timings.append(time.perf_counter() - started)
 
