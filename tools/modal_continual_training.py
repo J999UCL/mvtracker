@@ -373,7 +373,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     from types import SimpleNamespace
 
     import wandb
-    from omegaconf import OmegaConf
+    from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
     from mvtracker.cli.train import _build_training_dataset, _physical_batch_capacity
@@ -565,7 +565,7 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
     from types import SimpleNamespace
 
     import wandb
-    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
 
     from mvtracker.cli.train import _build_training_dataset
     from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
