@@ -237,6 +237,97 @@ def download_remote(manifest: dict[str, object]) -> dict[str, object]:
 
 @app.function(
     image=image,
+    secrets=[modal.Secret.from_name("jeet-mvtracker-huggingface", required_keys=["HF_TOKEN"]), wandb_secret],
+    volumes={str(DATA_ROOT): data_volume},
+    cpu=16,
+    memory=32 * 1024,
+    ephemeral_disk=1024 * 1024,
+    timeout=24 * 60 * 60,
+    max_containers=4,
+    include_source=False,
+)
+def download_environment_remote(environment: str, manifest_name: str) -> dict[str, object]:
+    import wandb
+    from huggingface_hub import hf_hub_download
+
+    run = wandb.init(
+        project="mvtracker-modal-profiling",
+        job_type="syn4d-download",
+        name=f"{manifest_name}-{environment}",
+        tags=["modal", "cpu", "syn4d", "stride1", "archive"],
+        config={**TAGS, "source_revision": SYN4D_REVISION, "environment": environment},
+    )
+    progress = _Progress(run, REPORT_ROOT / manifest_name / f"{environment}.ndjson", manifest_name)
+    try:
+        existing = _archive(environment)
+        if existing is not None:
+            progress.emit("archive_reused", environment=environment, path=str(existing))
+            return {"environment": environment, "status": "reused", "path": str(existing)}
+        progress.set_phase("archive_download", environment=environment, expected_bytes=ARCHIVE_BYTES.get(environment))
+        work = Path("/tmp/syn4d-download") / environment
+        work.mkdir(parents=True, exist_ok=True)
+        source = Path(hf_hub_download(
+            repo_id=SYN4D_REPO_ID,
+            repo_type="dataset",
+            revision=SYN4D_REVISION,
+            filename=f"{SYN4D_SUBSET}/{environment}.tar.zst",
+            token=os.environ["HF_TOKEN"],
+            local_dir=str(work),
+            cache_dir=str(work / "cache"),
+        ))
+        target = ARCHIVE_ROOT / f"{environment}.tar.zst"
+        partial = target.with_suffix(target.suffix + ".partial")
+        progress.set_phase("volume_copy", environment=environment)
+        _copy(source, partial, progress, "archive_to_volume")
+        partial.replace(target)
+        progress.emit("archive_downloaded", environment=environment, path=str(target), bytes=target.stat().st_size)
+        progress.set_phase("volume_commit", environment=environment)
+        data_volume.commit()
+        progress.emit("volume_commit_complete", environment=environment)
+        return {"environment": environment, "status": "downloaded", "path": str(target)}
+    except Exception as error:
+        progress.emit("archive_failed", environment=environment, error_type=type(error).__name__, error=str(error))
+        return {"environment": environment, "status": "failed", "error": f"{type(error).__name__}: {error}"}
+    finally:
+        progress.close()
+        run.finish()
+
+
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("jeet-mvtracker-huggingface", required_keys=["HF_TOKEN"]), wandb_secret],
+    volumes={str(DATA_ROOT): data_volume},
+    cpu=4,
+    memory=8 * 1024,
+    ephemeral_disk=512 * 1024,
+    timeout=60 * 60,
+    max_containers=1,
+    include_source=False,
+)
+def prepare_mapping_remote(manifest_name: str) -> dict[str, object]:
+    import wandb
+    from huggingface_hub import hf_hub_download
+
+    run = wandb.init(project="mvtracker-modal-profiling", job_type="syn4d-download", name=f"{manifest_name}-mapping", tags=["modal", "cpu", "syn4d", "stride1", "mapping"], config={**TAGS, "source_revision": SYN4D_REVISION})
+    progress = _Progress(run, REPORT_ROOT / manifest_name / "mapping.ndjson", manifest_name)
+    try:
+        if MAPPING_PATH.is_file():
+            progress.emit("mapping_reused", path=str(MAPPING_PATH))
+            return {"status": "reused", "path": str(MAPPING_PATH)}
+        progress.set_phase("mapping_download")
+        source = Path(hf_hub_download(repo_id=SYN4D_REPO_ID, repo_type="dataset", revision=SYN4D_REVISION, filename=f"{SYN4D_SUBSET}/sequence_to_asset_mapping.csv", token=os.environ["HF_TOKEN"], local_dir="/tmp/syn4d-mapping"))
+        _copy(source, MAPPING_PATH, progress, "mapping_to_volume")
+        progress.set_phase("volume_commit")
+        data_volume.commit()
+        progress.emit("volume_commit_complete")
+        return {"status": "downloaded", "path": str(MAPPING_PATH)}
+    finally:
+        progress.close()
+        run.finish()
+
+
+@app.function(
+    image=image,
     secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume},
     cpu=16,
@@ -302,7 +393,13 @@ def _manifest(path: str) -> dict[str, object]:
 
 @app.local_entrypoint(name="download")
 def download(manifest: str = DEFAULT_MANIFEST) -> None:
-    print(json.dumps(download_remote.remote(_manifest(manifest)), indent=2, sort_keys=True))
+    payload = _manifest(manifest)
+    name = str(payload.get("name", "syn4d-stride1"))
+    rows = _rows(payload)
+    mapping = prepare_mapping_remote.remote(name)
+    environments = sorted({row["environment"] for row in rows})
+    archives = list(download_environment_remote.map(environments, [name] * len(environments)))
+    print(json.dumps({"mapping": mapping, "archives": archives}, indent=2, sort_keys=True))
 
 
 @app.local_entrypoint(name="preprocess")
