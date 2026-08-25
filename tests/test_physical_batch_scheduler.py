@@ -1,5 +1,6 @@
 """Focused CPU contracts for the pure physical-batch scheduler."""
 
+from dataclasses import replace
 from importlib.util import module_from_spec, spec_from_file_location
 from itertools import product
 from pathlib import Path
@@ -45,6 +46,17 @@ def _identities(wave):
 
 
 class PhysicalBatchSchedulerTests(unittest.TestCase):
+    def test_max_group_size_one_produces_balanced_singletons(self):
+        capacity = replace(H100_BATCH_CAPACITY, max_group_size=1)
+        wave = schedule_physical_batch(
+            tuple(_scene(index, tracks=64 + index * 128) for index in range(8)),
+            capacity=capacity,
+        )
+        self.assertEqual([len(rank.groups) for rank in wave.ranks], [4, 4])
+        self.assertTrue(
+            all(len(group.scenes) == 1 for rank in wave.ranks for group in rank.groups)
+        )
+
     def assert_valid_wave(self, wave, summaries):
         self.assertEqual(len(wave.ranks), 2)
         self.assertEqual(sum(rank.logical_scene_count for rank in wave.ranks), 8)

@@ -191,8 +191,8 @@ def _validate_summaries(
         raise ValueError(f"expected exactly {expected} scene summaries")
     if capacity.rank_count != 2:
         raise ValueError("synchronized scheduling currently requires two ranks")
-    if capacity.max_group_size != 2:
-        raise ValueError("this scheduler currently supports groups of at most two")
+    if capacity.max_group_size not in {1, 2}:
+        raise ValueError("physical groups must contain at most one or two scenes")
     identities = [(s.source, s.scene, s.cursor) for s in summaries]
     if len(set(identities)) != len(identities):
         raise ValueError("scene summaries must have unique source/scene/cursor identities")

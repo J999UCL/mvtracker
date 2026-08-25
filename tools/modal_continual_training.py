@@ -428,9 +428,10 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                     f"trainer.num_steps={int(step_count)}",
                     "datasets.train.recipe_path=null",
                     "datasets.train.force_gt_depth=false",
-                    "datasets.train.physical_batching.max_scenes=2",
+                    "datasets.train.physical_batching.max_scenes=1",
                     "datasets.train.physical_batching.rank_local=false",
                     "augmentations.variable_depth_type=true",
+                    "+datasets.syn4d_manifest_load_workers=16",
                 ],
             )
         phase["name"] = "scene_inventory"
