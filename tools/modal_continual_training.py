@@ -373,7 +373,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     from types import SimpleNamespace
 
     import wandb
-    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
     from omegaconf import OmegaConf
 
     from mvtracker.cli.train import _build_training_dataset, _physical_batch_capacity
@@ -581,18 +581,13 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
         f"source={source_dir} output={output_dir} workers=16",
         flush=True,
     )
-    with initialize_config_dir(
-        config_dir=str(SOURCE_ROOT / "configs"), version_base="1.3"
-    ):
-        cfg = compose(
-            config_name="train.yaml",
-            overrides=[
-                "+experiment=diegesis_syn4d_mvkubric_gt_ddp",
-                "datasets.train.recipe_path=null",
-                "+datasets.syn4d_mmap_cache_sequences=16",
-                "+datasets.syn4d_manifest_load_workers=16",
-            ],
-        )
+    source_manifest = json.loads(
+        (source_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    cfg = OmegaConf.create(source_manifest["config"])
+    cfg.datasets.syn4d_max_track_radius = 65.0
+    cfg.datasets.syn4d_mmap_cache_sequences = 16
+    cfg.datasets.syn4d_manifest_load_workers = 16
     source_cfg = cfg.datasets.train.sources.syn4d
     dataset = _build_training_dataset(
         source_cfg.name,
