@@ -333,9 +333,11 @@ def plan_training_recipe(
 
     def status() -> str:
         elapsed = max(time.perf_counter() - started, 1e-9)
-        completed = max(progress["planned"], progress["records"])
+        completed = progress["records"] or min(
+            progress["planned"], records_per_step * step_count
+        )
         rate = completed / elapsed
-        remaining = records_per_step * step_count - completed
+        remaining = max(0, records_per_step * step_count - completed)
         eta = remaining / rate if rate else 0.0
         return (
             "recipe heartbeat "
@@ -671,9 +673,11 @@ def plan_training_recipe_parallel(
 
     def status() -> str:
         elapsed = max(time.perf_counter() - started, 1e-9)
-        completed = max(progress["planned"], progress["records"])
+        completed = progress["records"] or min(
+            progress["planned"], records_per_step * step_count
+        )
         rate = completed / elapsed
-        remaining = records_per_step * step_count - completed
+        remaining = max(0, records_per_step * step_count - completed)
         eta = remaining / rate if rate else 0.0
         return (
             "recipe heartbeat "

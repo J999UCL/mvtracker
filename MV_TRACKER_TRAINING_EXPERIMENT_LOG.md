@@ -1839,3 +1839,22 @@ projected roughly 45 minutes. The implementation supports full recipes, but
 that path still needs additional sampler-side optimization before it should be
 used as a routine preflight. No silent or unbounded full planning run was left
 active.
+
+### Planner scheduling optimization
+
+The process planner was subsequently changed to submit DIEGESIS, Syn4D and
+MV-Kubric rank chunks into one shared 16-process queue. It now plans exactly
+the required cursor range and requests only the observed deficit after a
+rejection, rather than planning a fixed 48% candidate surplus.
+
+A real 100-step recipe produced 800 accepted records from 804 plan calls with
+two rejected cursors. Planning completed in 85.74 seconds. After the first
+25-step block warmed the worker-local dataset caches, later 25-step blocks
+took roughly 16 seconds. This is about 42% faster than the previous warm
+planner and projects approximately 21--23 minutes of trajectory planning for
+2,000 steps. The separate cold read of all 1,992 MV-Kubric metadata records
+took 368.8 seconds in this run, so an end-to-end full recipe remains roughly
+27--29 minutes unless that metadata cache is persisted or reused.
+
+- Recipe: `training-recipes/diegesis-syn4d-mvkubric-recipe-profile100-20260825T055311Z`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/4rezmpfn
