@@ -329,6 +329,10 @@ def _request_dict(request: Any) -> dict[str, Any]:
 
 _PROCESS_DATASETS: Mapping[str, Any] | None = None
 _PROCESS_SCHEDULE: Any = None
+_REPLAN_DATASET: Any = None
+_REPLAN_REQUEST_FACTORY: Callable[..., Any] | None = None
+_REPLAN_SOURCE: str | None = None
+_REPLAN_TARGETS: Sequence[RecipeRecord] | None = None
 
 
 def _compact_plan(request: Any, plan: Any) -> dict[str, Any]:
@@ -368,6 +372,43 @@ def _plan_process_chunk(task):
             (cursor, None if plan is None else _compact_plan(request, plan))
         )
     return source, rank, results, time.perf_counter() - started
+
+
+def _replan_process_chunk(bounds: tuple[int, int]) -> list[RecipeRecord]:
+    start, end = bounds
+    records = []
+    for record in _REPLAN_TARGETS[start:end]:
+        request = record.replay_request(_REPLAN_REQUEST_FACTORY)
+        plan = _REPLAN_DATASET.plan_sample(request)
+        if plan is None:
+            raise RuntimeError(
+                f"{_REPLAN_SOURCE} recipe record became invalid: step={record.step} "
+                f"logical_index={record.logical_index} scene={record.scene}"
+            )
+        compact = _compact_plan(request, plan)
+        expected = {
+            "scene": record.scene,
+            "seed": record.seed,
+            "frames": record.frames,
+            "views": record.views,
+            "resolution": record.resolution,
+            "depth_source": record.depth_source,
+        }
+        actual = {key: compact[key] for key in expected}
+        if actual != expected:
+            raise RuntimeError(
+                f"{_REPLAN_SOURCE} replay changed non-track sampling at "
+                f"step={record.step}: expected={expected} actual={actual}"
+            )
+        records.append(
+            replace(
+                record,
+                track_count=int(compact["track_count"]),
+                tracks=tuple(compact["tracks"]),
+                augmentation=compact["augmentation"],
+            )
+        )
+    return records
 
 
 def _scene_summary(source: str, plan: Any) -> Any:
@@ -1080,47 +1121,38 @@ def replan_recipe_source(
             f"scene={progress['scene']} rate={rate:.1f}/s eta={eta:.1f}s"
         )
 
-    def replan(record: RecipeRecord) -> RecipeRecord:
-        request = record.replay_request(request_factory)
-        plan = dataset.plan_sample(request)
-        if plan is None:
-            raise RuntimeError(
-                f"{source} recipe record became invalid: step={record.step} "
-                f"logical_index={record.logical_index} scene={record.scene}"
-            )
-        compact = _compact_plan(request, plan)
-        expected = {
-            "scene": record.scene,
-            "seed": record.seed,
-            "frames": record.frames,
-            "views": record.views,
-            "resolution": record.resolution,
-            "depth_source": record.depth_source,
-        }
-        actual = {key: compact[key] for key in expected}
-        if actual != expected:
-            raise RuntimeError(
-                f"{source} replay changed non-track sampling at step={record.step}: "
-                f"expected={expected} actual={actual}"
-            )
-        updated = replace(
-            record,
-            track_count=int(compact["track_count"]),
-            tracks=tuple(compact["tracks"]),
-            augmentation=compact["augmentation"],
-        )
-        with progress_lock:
-            progress.update(completed=progress["completed"] + 1, scene=record.scene)
-        return updated
-
     log(
         "recipe source-replan start "
         f"source={source} records={len(targets)} workers={worker_count}"
     )
-    with _Heartbeat(heartbeat_seconds, log, status), ThreadPoolExecutor(
-        max_workers=int(worker_count)
-    ) as executor:
-        replanned = list(executor.map(replan, targets))
+    global _REPLAN_DATASET, _REPLAN_REQUEST_FACTORY, _REPLAN_SOURCE, _REPLAN_TARGETS
+    _REPLAN_DATASET = dataset
+    _REPLAN_REQUEST_FACTORY = request_factory
+    _REPLAN_SOURCE = source
+    _REPLAN_TARGETS = targets
+    replanned = []
+    chunk_size = 4
+    chunks = [
+        (start, min(start + chunk_size, len(targets)))
+        for start in range(0, len(targets), chunk_size)
+    ]
+    context = multiprocessing.get_context("fork")
+    try:
+        with context.Pool(processes=int(worker_count)) as pool, _Heartbeat(
+            heartbeat_seconds, log, status
+        ):
+            for records in pool.imap_unordered(_replan_process_chunk, chunks):
+                replanned.extend(records)
+                with progress_lock:
+                    progress.update(
+                        completed=progress["completed"] + len(records),
+                        scene=records[-1].scene,
+                    )
+    finally:
+        _REPLAN_DATASET = None
+        _REPLAN_REQUEST_FACTORY = None
+        _REPLAN_SOURCE = None
+        _REPLAN_TARGETS = None
     replacements = {
         (record.step, record.logical_index): record for record in replanned
     }
