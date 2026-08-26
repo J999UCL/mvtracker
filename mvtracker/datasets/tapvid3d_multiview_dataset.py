@@ -1010,10 +1010,12 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         raw_root: str,
         view_count_probabilities: Sequence[float] | None = None,
         manifest_load_workers: int = 1,
+        max_track_radius: float = 30.0,
         **kwargs,
     ):
         self.raw_root = Path(raw_root)
         self.view_count_probabilities = tuple(view_count_probabilities or (0.25,) * 4)
+        self.max_track_radius = float(max_track_radius)
         super().__init__(*args, **kwargs)
         self._manifests: dict[str, dict[str, Any]] = {}
         self._arrays: dict[Path, np.ndarray] = {}
@@ -1123,6 +1125,9 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             "num_views": int(datasets_cfg.get("tapvid3d_num_views", 4)),
             "view_count_probabilities": datasets_cfg.get(
                 "tapvid3d_view_count_probabilities", (0.25,) * 4
+            ),
+            "max_track_radius": float(
+                datasets_cfg.get("diegesis_max_track_radius", 30.0)
             ),
             "views_to_return": None,
             "novel_views": None,
@@ -1256,6 +1261,15 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             extrinsics_np,
             world_anchor,
         )
+        within_radius = (
+            np.linalg.norm(tracks, axis=-1).max(axis=0)
+            <= float(getattr(self, "max_track_radius", 30.0))
+        )
+        preselected = preselected[within_radius]
+        tracks = tracks[:, within_radius]
+        visibility_np = visibility_np[:, :, within_radius]
+        if not len(preselected):
+            return None
         xy, camera_z = _project(tracks, extrinsics_np, intrinsics_np)
         visibility_np &= np.isfinite(xy).all(axis=-1) & np.isfinite(camera_z) & (camera_z > 0)
         augment_this_datapoint = bool(

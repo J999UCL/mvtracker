@@ -127,7 +127,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         view_count_probabilities: Sequence[float] | None = None,
         mmap_cache_sequences: int = 4,
         manifest_load_workers: int = 1,
-        max_track_radius: float = 65.0,
+        max_track_radius: float = 30.0,
         **kwargs,
     ):
         probabilities = tuple(view_count_probabilities or (1 / 6,) * 6)
@@ -221,7 +221,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             ),
             max_depth=float(datasets_cfg.get("syn4d_max_depth", 300.0)),
             max_track_radius=float(
-                datasets_cfg.get("syn4d_max_track_radius", 65.0)
+                datasets_cfg.get("syn4d_max_track_radius", 30.0)
             ),
             enable_variable_depth_type_augs=bool(
                 requested == "training"

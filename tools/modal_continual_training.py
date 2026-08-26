@@ -586,7 +586,7 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
         (source_dir / "manifest.json").read_text(encoding="utf-8")
     )
     cfg = OmegaConf.create(source_manifest["config"])
-    cfg.datasets.syn4d_max_track_radius = 65.0
+    cfg.datasets.syn4d_max_track_radius = 30.0
     cfg.datasets.syn4d_mmap_cache_sequences = 32
     cfg.datasets.syn4d_manifest_load_workers = 16
     source_cfg = cfg.datasets.train.sources.syn4d

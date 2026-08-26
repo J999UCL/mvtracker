@@ -106,7 +106,7 @@ def _dataset(root: Path):
     dataset.ratio_very_dynamic = 0.25
     dataset.max_tracks_to_preload = 24
     dataset.max_depth = 1000.0
-    dataset.max_track_radius = 65.0
+    dataset.max_track_radius = 30.0
     dataset.eraser_aug_prob = 0.5
     dataset.eraser_max = 10
     dataset.eraser_bounds = [2, 100]
@@ -205,7 +205,7 @@ class Syn4DLoaderTests(unittest.TestCase):
                 "syn4d_num_views": 6,
                 "syn4d_mmap_cache_sequences": 2,
                 "syn4d_max_depth": 321.0,
-                "syn4d_max_track_radius": 65.0,
+                "syn4d_max_track_radius": 30.0,
             }
         )
         kwargs = Syn4DMultiViewDataset.from_name(
@@ -222,7 +222,7 @@ class Syn4DLoaderTests(unittest.TestCase):
         self.assertEqual(kwargs["num_views"], 6)
         self.assertEqual(kwargs["mmap_cache_sequences"], 2)
         self.assertEqual(kwargs["max_depth"], 321.0)
-        self.assertEqual(kwargs["max_track_radius"], 65.0)
+        self.assertEqual(kwargs["max_track_radius"], 30.0)
         self.assertFalse(kwargs["enable_variable_depth_type_augs"])
 
     def test_plans_window_views_tracks_and_materializes_indexed_jpegs(self):

@@ -7,7 +7,8 @@ datasets:
   root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets
   syn4d_num_views: 4
   syn4d_max_depth: 300.0
-  syn4d_max_track_radius: 65.0
+  diegesis_max_track_radius: 30.0
+  syn4d_max_track_radius: 30.0
   train:
     name: mixed-diegesis-syn4d-mvkubric-training
     batch_size: 1

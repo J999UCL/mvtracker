@@ -233,6 +233,7 @@ def _dataset(root: Path, *, points=16, views=4, world_anchor=(0.0, 0.0, 0.0)):
     dataset.replace_max = 10
     dataset.replace_bounds = [2, 100]
     dataset.max_depth = 24
+    dataset.max_track_radius = 30.0
     dataset.enable_variable_depth_type_augs = False
     dataset.estimated_depth_store = loader.EstimatedDepthStore(None, None)
     return dataset
@@ -322,6 +323,26 @@ class CacheTests(unittest.TestCase):
 
 
 class SelectiveLoaderTests(unittest.TestCase):
+    def test_plan_filters_tracks_outside_camera_centred_radius(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = _dataset(root, points=16)
+            dataset.augmentation_probability = 0.0
+            dataset.enable_rgb_augs = False
+            dataset.enable_depth_augs = False
+            dataset.enable_variable_trajpersample_augs = False
+            tracks_path = root / "raw/train/scene-alpha/tracks_xyz.npy"
+            tracks = np.load(tracks_path)
+            tracks[:, :2, 0] = 100.0
+            np.save(tracks_path, tracks)
+            dataset._arrays = {}
+
+            plan = dataset.plan_sample(0)
+
+            self.assertIsNotNone(plan)
+            radii = np.linalg.norm(plan.trajectory_3d, axis=-1)
+            self.assertLessEqual(float(radii.max()), dataset.max_track_radius)
+
     def test_plan_recentres_world_coordinates_and_preserves_cameras(self):
         with tempfile.TemporaryDirectory() as directory:
             anchor = np.asarray((100.0, 20.0, 0.0), dtype=np.float32)
@@ -484,6 +505,7 @@ class FromNameTests(unittest.TestCase):
         self.assertEqual(kwargs["data_root"], "/datasets/indexed-data/validation")
         self.assertEqual(kwargs["raw_root"], "/datasets/raw-data/validation")
         self.assertEqual(kwargs["num_views"], 3)
+        self.assertEqual(kwargs["max_track_radius"], 30.0)
         self.assertEqual(kwargs["estimated_depth_root"], "/datasets/estimated/validation")
         self.assertEqual(kwargs["estimated_depth_provider"], "vggt_omega")
         self.assertIsNone(kwargs["metadata_index_root"])
