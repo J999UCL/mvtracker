@@ -215,9 +215,9 @@ def build_waymo_rerun(
     output_path: Path,
     *,
     track_count: int = 6,
-    scene_frame_count: int = 13,
-    points_per_frame: int = 120_000,
-    voxel_size: float = 0.08,
+    scene_frame_count: int = 25,
+    points_per_frame: int = 180_000,
+    voxel_size: float = 0.04,
 ) -> dict[str, object]:
     """Parse one Waymo segment and save a synchronized `.rrd` recording."""
     import tensorflow as tf
@@ -254,6 +254,15 @@ def build_waymo_rerun(
     if alignment_rmse > 0.10:
         raise ValueError(f"raw/annotation camera alignment RMSE is {alignment_rmse:.3f}m")
 
+    selected = select_tracks(annotation_world_tracks, annotation.visibility, track_count)
+    focus_points = np.concatenate([
+        annotation_centers,
+        annotation_world_tracks[:, selected].reshape(-1, 3),
+    ])
+    focus_points = focus_points[np.isfinite(focus_points).all(axis=1)]
+    focus_min = focus_points.min(axis=0) - np.asarray([15.0, 15.0, 8.0])
+    focus_max = focus_points.max(axis=0) + np.asarray([15.0, 15.0, 8.0])
+
     scene_positions = np.linspace(0, len(raw_indices) - 1, scene_frame_count).round().astype(np.int32)
     scene_raw_indices = set(raw_indices[scene_positions].tolist())
     point_batches, color_batches = [], []
@@ -263,11 +272,15 @@ def build_waymo_rerun(
         frame = dataset_pb2.Frame()
         frame.ParseFromString(record.numpy())
         range_images, projections, _, top_pose = frame_utils.parse_range_image_and_camera_projection(frame)
-        points_list, projection_list = frame_utils.convert_range_image_to_point_cloud(
-            frame, range_images, projections, top_pose, ri_index=0
-        )
-        points_vehicle = np.concatenate(points_list, axis=0)
-        camera_projections = np.concatenate(projection_list, axis=0)
+        points_returns, projection_returns = [], []
+        for return_index in (0, 1):
+            points_list, projection_list = frame_utils.convert_range_image_to_point_cloud(
+                frame, range_images, projections, top_pose, ri_index=return_index
+            )
+            points_returns.append(np.concatenate(points_list, axis=0))
+            projection_returns.append(np.concatenate(projection_list, axis=0))
+        points_vehicle = np.concatenate(points_returns, axis=0)
+        camera_projections = np.concatenate(projection_returns, axis=0)
         boxes = [
             (label.box.center_x, label.box.center_y, label.box.center_z,
              label.box.length, label.box.width, label.box.height, label.box.heading)
@@ -282,13 +295,15 @@ def build_waymo_rerun(
             camera_projections = camera_projections[sample]
         world_from_vehicle = np.asarray(frame.pose.transform, dtype=np.float64).reshape(4, 4)
         points_raw_world = transform_points(world_from_vehicle, points_vehicle)
-        point_batches.append(transform_points(annotation_from_raw, points_raw_world))
-        color_batches.append(_colorize_points(points_vehicle, camera_projections, _camera_images(frame)))
+        points_annotation_world = transform_points(annotation_from_raw, points_raw_world)
+        point_colors = _colorize_points(points_vehicle, camera_projections, _camera_images(frame))
+        corridor = np.all((points_annotation_world >= focus_min) & (points_annotation_world <= focus_max), axis=1)
+        point_batches.append(points_annotation_world[corridor])
+        color_batches.append(point_colors[corridor])
 
     points = np.concatenate(point_batches).astype(np.float32)
     colors = np.concatenate(color_batches)
     points, colors = voxel_downsample(points, colors, voxel_size)
-    selected = select_tracks(annotation_world_tracks, annotation.visibility, track_count)
     anchor = annotation_centers[0].astype(np.float32)
     points -= anchor
     tracks = annotation_world_tracks - anchor
@@ -300,7 +315,12 @@ def build_waymo_rerun(
     rr.send_blueprint(
         rrb.Blueprint(
             rrb.Vertical(
-                rrb.Spatial3DView(origin="/world", name="Waymo world"),
+                rrb.Spatial3DView(
+                    origin="/world",
+                    name="Waymo world",
+                    background=[255, 255, 255],
+                    line_grid=rrb.archetypes.LineGrid3D(visible=False),
+                ),
                 rrb.Horizontal(
                     *(rrb.Spatial2DView(origin=f"/cameras/{name}", name=name.replace("_", " ").title())
                       for name in CAMERA_NAMES.values()),
@@ -312,10 +332,10 @@ def build_waymo_rerun(
         )
     )
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
-    rr.log("world/scene", rr.Points3D(points, colors=colors, radii=0.025), static=True)
+    rr.log("world/scene", rr.Points3D(points, colors=colors, radii=0.045), static=True)
     rr.log(
         "world/trajectories",
-        rr.LineStrips3D(strips=segments, colors=segment_colors, radii=0.045),
+        rr.LineStrips3D(strips=segments, colors=segment_colors, radii=0.085),
         static=True,
     )
     current_colors = time_colors(len(raw_indices))
@@ -332,7 +352,7 @@ def build_waymo_rerun(
             rr.Points3D(
                 tracks[frame_index, selected][visible],
                 colors=np.repeat(current_colors[frame_index][None], int(visible.sum()), axis=0),
-                radii=0.09,
+                radii=0.14,
             ),
         )
     rr.disconnect()
