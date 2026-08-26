@@ -2273,3 +2273,42 @@ checkpoint was written because the first scheduled save was step 250.
 - Runtime cache changes: `24c2e90`
 - Correct total-cgroup telemetry: `58c58ad`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 2026-08-26 — Mixed-depth host-memory leak fixed and training relaunched
+
+Live process inspection identified two unbounded caches behind the earlier RAM
+growth. The DA3 producer retained every decoded MV-Kubric scene's full tracks
+and visibility arrays, while each training rank retained JPEG descriptors and
+depth/offset mmaps for every newly sampled Syn4D scene. At step 125 of the
+diagnostic run, each rank had approximately 2,166 open descriptors and 150 GiB
+RSS. The filesystem output queue itself was bounded and was not the leak.
+
+The producer metadata cache was removed. Training media materialization now
+opens, reads and closes selected JPEG/depth/offset files per sample. Bounded
+host pinning was retained after an A/B showed that removing it increased warm
+step time from approximately 8--10 seconds to 13--15 seconds without being
+necessary for memory safety.
+
+The final detached run used the unchanged canonical recipe and showed a stable
+RAM curve:
+
+| Optimizer step | Total cgroup RAM |
+|---:|---:|
+| 1 | 55.98 GiB |
+| 10 | 59.14 GiB |
+| 20 | 62.11 GiB |
+| 30 | 62.26 GiB |
+
+At step 10, training ranks held only 412--425 descriptors and roughly 24 GiB
+RSS each. DA3 maximum RSS remained flat near 16.37 GiB while producing fresh
+depth. The run was left active after step 30 with no model, DDP, depth or
+numerical errors.
+
+- Active run: `fresh-r65-da3-final-1000-20260826T0720BST`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/e8e6f62043f1
+- Modal FunctionCall: `fc-01M0YBQ7Z0VDPVCTGZPE87CQ5P`
+- Run Volume: `continual-training/fresh-r65-da3-final-1000-20260826T0720BST`
+- Producer/cache fix: `7070893`
+- Media descriptor/mmap fix: `a00cdda`
+- Restored bounded pinning: `df79a8f`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
