@@ -2418,3 +2418,39 @@ clipped fraction. The prior diagnostic path independently scanned all model
 gradients before and after clipping; those scans and their DDP reductions were
 removed. The dashboard computes its trailing clipped-step rate from the new
 per-step scalar stream.
+
+## 2026-08-26 — Kitchen03 corrupt-gradient replay at optimizer steps 625 and 688
+
+The eight logical samples at optimizer steps 625 and 688 were replayed from
+checkpoint 500 on one H200. The audit regenerated the three required
+DA3-Giant depths, used BF16 training-mode forward/backward passes, accumulated
+the original eight losses with the training `1/8` scaling, and performed no
+optimizer update. It recorded exact individual and accumulated gradient norms,
+fixed 2,048-element gradient sketches, pairwise/leave-one-out agreement and an
+additive per-track decomposition of the trajectory loss. The per-track sums
+reconstructed every scene trajectory loss to floating-point precision.
+
+At optimizer step 625, the `kitchen03` sample had loss 0.840 and gradient norm
+13.03. Its worst 1% of tracks contributed 95.8% of trajectory loss, and its
+gradient-sketch cosine against the mean of the other seven samples was -0.672.
+Removing the two tracks beyond 30 m reduced trajectory loss from 0.562 to
+0.026 and gradient norm from 13.03 to 3.73. The original eight-sample
+accumulated norm was 2.694, corresponding to a max-norm-1 clip scale of 0.371.
+
+At optimizer step 688, the `kitchen03` sample had loss 1.167 and gradient norm
+39.91. Its worst 1% contributed 98.8% of trajectory loss, and its gradient
+cosine against the other-seven mean was -0.357. Removing the single track
+beyond 30 m reduced trajectory loss from 0.973 to 0.012 and gradient norm from
+39.91 to 2.09. The original accumulated norm was 5.419, corresponding to a
+clip scale of 0.185.
+
+These samples are therefore structurally corrupted rather than ordinary hard
+examples: one or two geometrically invalid tracks dominate the loss, dominate
+the gradient magnitude, and oppose the consensus direction. The 30 m data
+filter removes the source of the failure, while global norm clipping would
+have limited both historical optimizer updates.
+
+- Report: `gradient-audits/kitchen03-gradient-audit-step625-688-r4-20260826/report.json`
+- Modal: https://modal.com/apps/ucl-prism/main/ap-IEiIMDp06NJ0eZjhqnNchY
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/xekl0je2
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
