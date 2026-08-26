@@ -223,7 +223,7 @@ def _counterfactual_batch(batch, plan, dataset, radius: float = 30.0):
     ), int((~keep).sum().item())
 
 
-def _build_config(args, recipe_manifest):
+def _build_config(args, recipe_manifest, selected_scenes):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
@@ -245,6 +245,7 @@ def _build_config(args, recipe_manifest):
     cfg.datasets.train.mvkubric_webdataset_root = str(
         Path(args.data_root) / "datasets/kubric-multiview-webdataset"
     )
+    cfg.reproducibility.seed = int(recipe_manifest["seed"])
     # The recipe predates the radius filter currently used by DIEGESIS.
     cfg.datasets.diegesis_max_track_radius = float("inf")
     # The recipe was generated with the 65m Syn4D radius.
@@ -253,13 +254,13 @@ def _build_config(args, recipe_manifest):
         OmegaConf.update(
             cfg,
             f"datasets.train.sources.{source}.include_scene_ids",
-            list(recipe_manifest["scene_lists"].get(source, ())),
+            list(selected_scenes.get(source, ())),
             force_add=True,
         )
     return cfg
 
 
-def _build_datasets(cfg, args, recipe_manifest):
+def _build_datasets(cfg, args, recipe_manifest, selected_scenes):
     from mvtracker.cli.train import _build_training_dataset
 
     fabric = SimpleNamespace(world_size=int(recipe_manifest["world_size"]), global_rank=0)
@@ -275,7 +276,11 @@ def _build_datasets(cfg, args, recipe_manifest):
             fabric,
             source_cfg[source],
         )
-        print(f"AUDIT event=dataset_ready source={source} scenes={len(recipe_manifest['scene_lists'][source])}", flush=True)
+        print(
+            f"AUDIT event=dataset_ready source={source} "
+            f"scenes={len(selected_scenes[source])}",
+            flush=True,
+        )
     return datasets
 
 
@@ -411,8 +416,23 @@ def run(args) -> dict[str, Any]:
         int(optimizer_step): _load_recipe_step(reader, int(optimizer_step) - 1)
         for optimizer_step in args.optimizer_steps
     }
-    cfg = _build_config(args, reader.manifest)
-    datasets = _build_datasets(cfg, args, reader.manifest)
+    selected_scenes = {
+        source: tuple(
+            sorted(
+                {
+                    record.scene
+                    for records in records_by_step.values()
+                    for record in records
+                    if record.source == source
+                }
+            )
+        )
+        for source in SOURCE_NAMES
+    }
+    cfg = _build_config(args, reader.manifest, selected_scenes)
+    datasets = _build_datasets(
+        cfg, args, reader.manifest, selected_scenes
+    )
     if args.depth_mode == "runtime":
         _generate_runtime_depths(
             [record for records in records_by_step.values() for record in records],
@@ -450,6 +470,10 @@ def run(args) -> dict[str, Any]:
             model.zero_grad(set_to_none=True)
             for position, record in enumerate(records):
                 request = record.replay_request(ScheduledSampleRequest)
+                request = dataclasses.replace(
+                    request,
+                    scene_index=datasets[record.source].seq_names.index(record.scene),
+                )
                 plan = datasets[record.source].plan_sample(request)
                 if plan is None:
                     raise RuntimeError(f"recipe sample replayed invalid: {record.source} {record.logical_index}")
