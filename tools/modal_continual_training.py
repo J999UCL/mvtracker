@@ -379,6 +379,7 @@ def audit_recipe_gradients_remote(
     audit_name: str,
     source_run_name: str,
     recipe_name: str,
+    optimizer_steps_csv: str = "625,688",
 ) -> dict:
     """Replay two anomalous optimizer steps without updating the model."""
     from types import SimpleNamespace
@@ -390,6 +391,11 @@ def audit_recipe_gradients_remote(
     validate_run_name(audit_name)
     validate_run_name(source_run_name)
     validate_run_name(recipe_name)
+    optimizer_steps = tuple(
+        int(value) for value in optimizer_steps_csv.split(",") if value.strip()
+    )
+    if not optimizer_steps or any(step < 1 for step in optimizer_steps):
+        raise ValueError("optimizer_steps_csv must contain positive integers")
     source_run = RUN_ROOT / CONTINUAL_RUN_SUBDIR / source_run_name
     output_dir = RUN_ROOT / "gradient-audits" / audit_name
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -412,7 +418,7 @@ def audit_recipe_gradients_remote(
             "source_run": source_run_name,
             "recipe": recipe_name,
             "checkpoint_step": 500,
-            "optimizer_steps": [625, 688],
+            "optimizer_steps": list(optimizer_steps),
             **evaluation_tags,
         },
     )
@@ -434,7 +440,7 @@ def audit_recipe_gradients_remote(
                 mvkubric_root=Path(DATA_VOLUME_ROOT) / "datasets",
                 runtime_depth_root=runtime_depth_root,
                 depth_mode="runtime",
-                optimizer_steps=(625, 688),
+                optimizer_steps=optimizer_steps,
                 sketch_size=2048,
                 sketch_seed=0,
                 device="cuda",
@@ -1489,6 +1495,7 @@ def audit_recipe_gradients(
     audit_name: str,
     source_run_name: str,
     recipe_name: str,
+    optimizer_steps: str = "625,688",
 ) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
@@ -1506,7 +1513,12 @@ def audit_recipe_gradients(
         }
     )
     deployed = modal.Function.from_name(APP_NAME, "audit_recipe_gradients_remote")
-    call = deployed.spawn(audit_name, source_run_name, recipe_name)
+    call = deployed.spawn(
+        audit_name,
+        source_run_name,
+        recipe_name,
+        optimizer_steps,
+    )
     print(
         json.dumps(
             {"audit_name": audit_name, "function_call_id": call.object_id},
