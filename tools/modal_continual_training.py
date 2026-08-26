@@ -1131,6 +1131,7 @@ def _run_recipe_da3(
     training_devices: tuple[int, ...],
     depth_device: int,
     da3_image_capacity: int,
+    max_pending_depth_samples: int,
 ) -> dict:
     validate_run_name(run_name)
     validate_run_name(recipe_name)
@@ -1162,6 +1163,7 @@ def _run_recipe_da3(
         "training_devices": list(training_devices),
         "depth_device": int(depth_device),
         "da3_image_capacity": int(da3_image_capacity),
+        "max_pending_depth_samples": int(max_pending_depth_samples),
         "steps": int(expected_steps),
         "depth_counts": recipe_summary["planned_depth_counts"],
         "validation": "smoke20" not in experiment_name,
@@ -1218,6 +1220,8 @@ def _run_recipe_da3(
         str(runtime_root),
         "--prefill-steps",
         str(prefill_steps),
+        "--max-pending-samples",
+        str(max_pending_depth_samples),
     ]
     producer, producer_thread = _start_logged_process(
         producer_command,
@@ -1331,6 +1335,7 @@ def recipe_da3_remote(
         training_devices=(0, 1),
         depth_device=2,
         da3_image_capacity=80,
+        max_pending_depth_samples=32,
     )
 
 
@@ -1365,6 +1370,7 @@ def recipe_da3_h100x5_remote(
         training_devices=(0, 1, 2, 3),
         depth_device=4,
         da3_image_capacity=64,
+        max_pending_depth_samples=64,
     )
 
 

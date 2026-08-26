@@ -2510,6 +2510,20 @@ Total ingestion time was 2,724.8 seconds (45.4 minutes).
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/7dxp9sy0
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+### Five-H100 execution path
+
+The 5K recipe now has a dedicated exact-H100 launcher. One Modal container
+requests `H100!:5`; devices 0--3 run four-rank training with two singleton
+microbatches each and device 4 runs DA3-Giant. Scene batching remains disabled
+with `max_scenes=1`. The depth producer uses an explicit 64-image capacity,
+matching the safer and slightly faster measured H100 operating point, and a
+64-sample pending-depth queue to absorb validation and short training stalls. The
+production configuration uses a 5,000-step LR horizon, validation every 500
+steps, full MV-Kubric validation at steps 0/2500/5000, and checkpoints every
+500 steps. The deployed function has Modal's maximum 24-hour execution
+timeout; actual ETA must be checked early because Modal cannot accept a longer
+single-function timeout.
+
 The new training source uses only those 351 scenes. The former 17 training
 scenes have zero overlap with the new recipe; the existing two validation and
 two test scenes remain available only through the old evaluation root.
