@@ -8,7 +8,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -71,7 +71,32 @@ class RecipeRecord:
     logical_index: int = -1
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(asdict(self))
+        return {
+            "step": self.step,
+            "microbatch": self.microbatch,
+            "rank": self.rank,
+            "scheduled_rank": self.scheduled_rank,
+            "source": self.source,
+            "source_cursor": self.source_cursor,
+            "retry_count": self.retry_count,
+            "request": self.request,
+            "seed": self.seed,
+            "scene_index": self.scene_index,
+            "scene": self.scene,
+            "frames": self.frames,
+            "views": self.views,
+            "resolution": self.resolution,
+            "track_count": self.track_count,
+            "tracks": self.tracks,
+            "augmentation": self.augmentation,
+            "depth_source": self.depth_source,
+            "physical": {
+                "rank": self.physical.rank,
+                "group": self.physical.group,
+                "position": self.physical.position,
+            },
+            "logical_index": self.logical_index,
+        }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RecipeRecord":
