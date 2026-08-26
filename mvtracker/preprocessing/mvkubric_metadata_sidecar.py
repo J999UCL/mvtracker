@@ -76,7 +76,13 @@ def _indexed_metadata_locations(
     shards = manifest.get("shards")
     if not isinstance(shards, list) or not shards:
         raise ValueError(f"{manifest_path}: manifest has no shards")
-    for shard in shards:
+    started = time.perf_counter()
+    print(
+        "MVKUBRIC_METADATA event=index_scan_start "
+        f"source_shards={len(shards)} scenes={len(scene_ids)}",
+        flush=True,
+    )
+    for shard_number, shard in enumerate(shards, start=1):
         if not isinstance(shard, dict):
             raise ValueError(f"{manifest_path}: malformed shard entry")
         archive_path = _archive_path(manifest_path, shard)
@@ -102,6 +108,14 @@ def _indexed_metadata_locations(
             if key in found:
                 raise ValueError(f"scene metadata is duplicated: {scene}")
             found[key] = (archive_path, component.offset, component.size)
+        if shard_number % 50 == 0 or shard_number == len(shards):
+            print(
+                "MVKUBRIC_METADATA event=index_scan_progress "
+                f"source_shards={shard_number}/{len(shards)} "
+                f"scenes={len(found)}/{len(scene_ids)} "
+                f"elapsed={time.perf_counter() - started:.1f}s",
+                flush=True,
+            )
     missing = sorted(set(wanted).difference(found), key=str)
     if missing:
         raise FileNotFoundError(f"metadata records are missing from indexed WebDataset: {missing}")
@@ -227,7 +241,17 @@ def build_metadata_sidecar(
             ): index
             for index, group in enumerate(groups)
         }
-        results = [future.result() for future in as_completed(futures)]
+        results = []
+        for completed, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            results.append(result)
+            print(
+                "MVKUBRIC_METADATA event=write_progress "
+                f"shards={completed}/{len(futures)} "
+                f"latest={result['name']} bytes={result['bytes']} "
+                f"elapsed={time.perf_counter() - started:.1f}s",
+                flush=True,
+            )
     results.sort(key=lambda item: int(item["index"]))
     shards = [{key: value for key, value in result.items() if key != "index_path"} for result in results]
     locator = build_record_locator(shards, output_root / RECORD_LOCATOR)
