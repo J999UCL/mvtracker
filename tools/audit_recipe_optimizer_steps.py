@@ -224,13 +224,18 @@ def _counterfactual_batch(batch, plan, dataset, radius: float = 30.0):
 
 
 def _build_config(args, recipe_manifest):
-    from omegaconf import OmegaConf
+    from hydra import compose, initialize_config_dir
 
     repo_root = Path(__file__).resolve().parents[1]
-    cfg = OmegaConf.merge(
-        OmegaConf.load(repo_root / "configs/train.yaml"),
-        OmegaConf.load(repo_root / "configs/experiment/diegesis_syn4d_mvkubric_recipe_da3_ddp_1000.yaml"),
-    )
+    with initialize_config_dir(
+        config_dir=str(repo_root / "configs"), version_base="1.3"
+    ):
+        cfg = compose(
+            config_name="train.yaml",
+            overrides=[
+                "+experiment=diegesis_syn4d_mvkubric_recipe_da3_ddp_1000"
+            ],
+        )
     cfg.datasets.root = str(args.mvkubric_root)
     cfg.datasets.train.sources.diegesis.root = str(args.diegesis_root)
     cfg.datasets.train.sources.syn4d.root = str(args.syn4d_root)
