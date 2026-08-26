@@ -927,6 +927,20 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+## 2026-08-26 — DIEGESIS and Syn4D training radius reduced to 30 m
+
+The DIEGESIS loss spike near optimizer step 625 was traced to two selected
+Kitchen03 tracks at approximately 431 m and 668 m camera-centred radius. A
+later Kitchen03 sample at step 688 selected a 653 m track and produced the same
+trajectory-loss failure with GT depth, confirming that distant track sampling,
+not estimated depth, was the root cause.
+
+Both the DIEGESIS TAPVid3D planner and Syn4D planner now reject tracks whose
+maximum camera-centred radius over the sampled window exceeds 30 m. Recipe
+configuration and the Syn4D source-replanning helper use the same threshold.
+The change applies to newly planned samples; the already-running 1,000-step
+recipe remains unchanged.
+
 ## 2026-08-25 — Canonical fresh 1,000-step mixed-depth recipe
 
 A new recipe was generated from scratch with current dataset planners; no
@@ -2312,3 +2326,29 @@ numerical errors.
 - Media descriptor/mmap fix: `a00cdda`
 - Restored bounded pinning: `df79a8f`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 2026-08-26 — Exact DA3 scale audit for the Syn4D step-396 spike
+
+Syn4D virtual sample 822 was replayed on one isolated H200 using the same
+recipe record, six views, frames 3--26 and DA3-Giant runtime path as training.
+The audit recorded every per-frame Umeyama scale and compared the resized raw
+and confidence-cleaned DA3 depth against Syn4D GT depth before recipe depth
+augmentation.
+
+The scale estimate was stable: 0.1460 minimum, 0.1490 median and 0.1507
+maximum, with a 0.76% coefficient of variation and a 1.48% maximum adjacent
+scale ratio. Aligned camera-centre RMSE remained 0.167--0.172 m. This rules out
+a temporal metric-scale jump as the cause of the step-396 loss spike.
+
+Raw DA3 depth had 16.36% absolute-relative error and a 1.060 median
+predicted/GT ratio. Its very large 87.3 m RMSE came from rare catastrophic
+pixels. Confidence cleaning retained 60% of pixels, reduced absolute-relative
+error to 11.50%, reduced RMSE to 0.200 m and produced a 1.054 median ratio.
+Therefore the remaining likely cause is localized depth failure at sampled
+tracks and/or the subsequent heavy depth augmentation, rather than global
+coordinate normalization or scale alignment.
+
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-depth-evaluation/runs/69b7prr2
+- Report: `da3-scale-audits/syn4d-v822-20260826T091931Z/report.json`
+- Implementation: `2fe8b5f`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
