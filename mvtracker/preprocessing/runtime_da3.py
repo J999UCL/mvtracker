@@ -74,10 +74,14 @@ class _PackedScenes:
         if source == "diegesis":
             cache = (
                 self.data_root
-                / "datasets/diegesis-mvtracker/TAPVid3D_MVTracker_cache/train"
+                / "datasets/diegesis-train/TAPVid3D_MVTracker_cache/train"
                 / scene
             )
-            cameras = self.data_root / "source/diegesis/scenes" / scene / "tracking/sequence"
+            cameras = (
+                self.data_root
+                / "datasets/diegesis-train/TAPVid3D_raw/train"
+                / scene
+            )
             return cache, cameras
         root = self.data_root / "datasets/syn4d-mvtracker/train" / scene
         return root, root
