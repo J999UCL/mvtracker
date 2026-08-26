@@ -104,6 +104,7 @@ def prepare_tapvid3d_cache(
     cache_root: Path,
     *,
     workers: int = 1,
+    progress=None,
 ) -> dict[str, int]:
     """Index raw JPEG object arrays into seekable byte stores.
 
@@ -115,106 +116,111 @@ def prepare_tapvid3d_cache(
     cache_root = cache_root.resolve()
     if workers < 1:
         raise ValueError("workers must be at least one")
-    counts = {"prepared": 0, "reused": 0}
+    sources = []
     for split in _SPLITS.values():
         split_root = raw_root / split
         if not split_root.is_dir():
             continue
         for source in sorted(path for path in split_root.iterdir() if path.is_dir()):
-            tracks_path = source / "tracks_xyz.npy"
-            queries_path = source / "queries_xytv.npy"
-            tracks = np.load(tracks_path, mmap_mode="r", allow_pickle=False)
-            queries = np.load(queries_path, mmap_mode="r", allow_pickle=False)
-            if tracks.ndim != 3 or tracks.shape[2] != 3 or tracks.dtype != np.float32:
-                raise ValueError(f"{tracks_path}: expected (F, P, 3) float32")
-            frame_count, point_count, _ = tracks.shape
-            if queries.shape != (point_count, 4) or queries.dtype != np.float32:
-                raise ValueError(f"{queries_path}: expected {(point_count, 4)} float32")
+            sources.append((split, source))
 
-            view_roots = _numeric_view_dirs(source)
-            resolution = None
-            for view_root in view_roots:
-                view = int(view_root.name)
-                expected = {
-                    "images_jpeg_bytes.npy": ((frame_count,), np.dtype(object)),
-                    "intrinsics.npy": ((4,), np.dtype(np.float32)),
-                    "extrinsics_w2c.npy": ((frame_count, 4, 4), np.dtype(np.float32)),
-                    "visibility.npy": ((frame_count, point_count), np.dtype(np.bool_)),
-                }
-                for name, (shape, dtype) in expected.items():
-                    path = view_root / name
-                    array = np.load(path, mmap_mode=None if dtype == np.dtype(object) else "r", allow_pickle=dtype == np.dtype(object))
-                    if array.shape != shape or array.dtype != dtype:
-                        raise ValueError(f"{path}: expected shape {shape} and dtype {dtype}")
-                for name, dtype in (("depth.npy", np.float32), ("foreground_mask.npy", np.bool_)):
-                    path = view_root / name
-                    array = np.load(path, mmap_mode="r", allow_pickle=False)
-                    if array.shape[:1] != (frame_count,) or array.ndim != 3 or array.dtype != np.dtype(dtype):
-                        raise ValueError(f"{path}: invalid shape or dtype")
-                    if resolution is None:
-                        resolution = tuple(int(value) for value in array.shape[1:])
-                    if tuple(array.shape[1:]) != resolution:
-                        raise ValueError(f"{path}: inconsistent image resolution")
-            target = cache_root / split / source.name
-            manifest_path = target / "manifest.json"
-            if manifest_path.is_file():
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if _cache_files_complete(
-                    target,
-                    frame_count,
-                    [int(path.name) for path in view_roots],
-                ):
-                    counts["reused"] += 1
-                    continue
+    def prepare_source(item):
+        split, source = item
+        tracks_path = source / "tracks_xyz.npy"
+        queries_path = source / "queries_xytv.npy"
+        tracks = np.load(tracks_path, mmap_mode="r", allow_pickle=False)
+        queries = np.load(queries_path, mmap_mode="r", allow_pickle=False)
+        if tracks.ndim != 3 or tracks.shape[2] != 3 or tracks.dtype != np.float32:
+            raise ValueError(f"{tracks_path}: expected (F, P, 3) float32")
+        frame_count, point_count, _ = tracks.shape
+        if queries.shape != (point_count, 4) or queries.dtype != np.float32:
+            raise ValueError(f"{queries_path}: expected {(point_count, 4)} float32")
 
-            staging = target.with_name(f".{target.name}.tmp-{os.getpid()}")
-            if staging.exists():
-                import shutil
-
-                shutil.rmtree(staging)
-            staging.mkdir(parents=True)
-            def pack_view(view_root: Path) -> None:
-                view = int(view_root.name)
-                encoded_frames = _read_jpeg_objects(view_root / "images_jpeg_bytes.npy", frame_count)
-                current_resolution = _jpeg_size(encoded_frames[0])
-                if current_resolution != resolution:
-                    raise ValueError(f"{view_root}: JPEG and depth resolutions differ")
-                offsets = np.zeros(frame_count + 1, dtype=np.int64)
-                view_target = staging / f"view_{view}"
-                view_target.mkdir()
-                with (view_target / "jpeg_bytes.bin").open("wb") as handle:
-                    for frame, encoded in enumerate(encoded_frames):
-                        handle.write(encoded)
-                        offsets[frame + 1] = offsets[frame] + encoded.size
-                np.save(view_target / "jpeg_offsets.npy", offsets)
-
-            if workers == 1:
-                for view_root in view_roots:
-                    pack_view(view_root)
-            else:
-                from concurrent.futures import ThreadPoolExecutor
-
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    list(executor.map(pack_view, view_roots))
-
-            manifest = {
-                "format": _CACHE_FORMAT,
-                "schema_version": _CACHE_VERSION,
-                "source_split": split,
-                "source_sequence": source.name,
-                "frame_count": frame_count,
-                "point_count": point_count,
-                "views": [int(path.name) for path in view_roots],
-                "resolution_hw": list(resolution),
+        view_roots = _numeric_view_dirs(source)
+        resolution = None
+        for view_root in view_roots:
+            expected = {
+                "intrinsics.npy": ((4,), np.dtype(np.float32)),
+                "extrinsics_w2c.npy": ((frame_count, 4, 4), np.dtype(np.float32)),
+                "visibility.npy": ((frame_count, point_count), np.dtype(np.bool_)),
             }
-            _atomic_json(staging / "manifest.json", manifest)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                import shutil
+            for name, (shape, dtype) in expected.items():
+                path = view_root / name
+                array = np.load(path, mmap_mode="r", allow_pickle=False)
+                if array.shape != shape or array.dtype != dtype:
+                    raise ValueError(f"{path}: expected shape {shape} and dtype {dtype}")
+            for name, dtype in (("depth.npy", np.float32), ("foreground_mask.npy", np.bool_)):
+                path = view_root / name
+                array = np.load(path, mmap_mode="r", allow_pickle=False)
+                if array.shape[:1] != (frame_count,) or array.ndim != 3 or array.dtype != np.dtype(dtype):
+                    raise ValueError(f"{path}: invalid shape or dtype")
+                if resolution is None:
+                    resolution = tuple(int(value) for value in array.shape[1:])
+                if tuple(array.shape[1:]) != resolution:
+                    raise ValueError(f"{path}: inconsistent image resolution")
 
-                shutil.rmtree(target)
-            os.replace(staging, target)
-            counts["prepared"] += 1
+        target = cache_root / split / source.name
+        manifest_path = target / "manifest.json"
+        if manifest_path.is_file() and _cache_files_complete(
+            target,
+            frame_count,
+            [int(path.name) for path in view_roots],
+        ):
+            return "reused"
+
+        staging = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+        if staging.exists():
+            import shutil
+
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        for view_root in view_roots:
+            view = int(view_root.name)
+            encoded_frames = _read_jpeg_objects(
+                view_root / "images_jpeg_bytes.npy", frame_count
+            )
+            current_resolution = _jpeg_size(encoded_frames[0])
+            if current_resolution != resolution:
+                raise ValueError(f"{view_root}: JPEG and depth resolutions differ")
+            offsets = np.zeros(frame_count + 1, dtype=np.int64)
+            view_target = staging / f"view_{view}"
+            view_target.mkdir()
+            with (view_target / "jpeg_bytes.bin").open("wb") as handle:
+                for frame, encoded in enumerate(encoded_frames):
+                    handle.write(encoded)
+                    offsets[frame + 1] = offsets[frame] + encoded.size
+            np.save(view_target / "jpeg_offsets.npy", offsets)
+
+        manifest = {
+            "format": _CACHE_FORMAT,
+            "schema_version": _CACHE_VERSION,
+            "source_split": split,
+            "source_sequence": source.name,
+            "frame_count": frame_count,
+            "point_count": point_count,
+            "views": [int(path.name) for path in view_roots],
+            "resolution_hw": list(resolution),
+        }
+        _atomic_json(staging / "manifest.json", manifest)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            import shutil
+
+            shutil.rmtree(target)
+        os.replace(staging, target)
+        return "prepared"
+
+    counts = {"prepared": 0, "reused": 0}
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(sources)))) as executor:
+        futures = {executor.submit(prepare_source, item): item for item in sources}
+        for completed, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            counts[result] += 1
+            if progress is not None:
+                split, source = futures[future]
+                progress(completed, len(sources), split, source.name, result)
     return counts
 
 

@@ -36,25 +36,8 @@ datasets:
     sources:
       diegesis:
         name: tapvid3d-multiview-training
-        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/diegesis-mvtracker
-        include_scene_ids:
-          - bathroom01
-          - bathroom02
-          - bathroom03
-          - bedroom02
-          - bedroom03
-          - bedroom04
-          - diningroom01
-          - diningroom03
-          - diningroom04
-          - kitchen01
-          - kitchen02
-          - kitchen03
-          - kitchen04
-          - livingroom01
-          - livingroom03
-          - livingroom04
-          - livingroom05
+        root: ${oc.env:MVTRACKER_DATA_ROOT,/mnt/mvtracker-data}/datasets/diegesis-train
+        include_scene_ids: null
         view_count_probabilities: [0.25, 0.25, 0.25, 0.25]
       syn4d:
         name: syn4d-multiview-training
