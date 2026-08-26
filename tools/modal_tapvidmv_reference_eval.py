@@ -43,8 +43,7 @@ SOURCES = (
     ("diegesis", BUCKET_ROOT, "diegesis/scenes/", 21),
 )
 SOURCE_NAMES = tuple(source[0] for source in SOURCES)
-PREDICTION_LANES = 4
-SOURCE_PREDICTION_LANES = {"hi4d": 2}
+PREDICTION_LANES = 8
 LOADER_WORKERS_PER_LANE = 1
 
 TAGS = {
@@ -104,10 +103,10 @@ tapvidmv_image = (
             "PYTHONPATH": str(WORKSPACE),
             "PYTHONUNBUFFERED": "1",
             "TOKENIZERS_PARALLELISM": "false",
-            "OMP_NUM_THREADS": "4",
-            "MKL_NUM_THREADS": "4",
-            "OPENBLAS_NUM_THREADS": "4",
-            "NUMEXPR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "2",
+            "MKL_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "2",
+            "NUMEXPR_NUM_THREADS": "2",
         }
     )
 )
@@ -422,9 +421,9 @@ def _prediction_complete(output_dir: Path) -> bool:
 
 @app.function(
     image=tapvidmv_image,
-    gpu="A100-40GB",
+    gpu="H100",
     cpu=16,
-    memory=65536,
+    memory=98304,
     timeout=24 * 60 * 60,
     volumes={
         CHECKPOINT_MOUNT: run_volume.with_mount_options(read_only=True),
@@ -484,7 +483,7 @@ def predict_reference_depth(run_name: str) -> dict:
                 source_timings[source] = 0.0
                 continue
             source_started = time.perf_counter()
-            lane_count = SOURCE_PREDICTION_LANES.get(source, PREDICTION_LANES)
+            lane_count = PREDICTION_LANES
             lanes = [
                 incomplete[lane_idx::lane_count]
                 for lane_idx in range(min(lane_count, len(incomplete)))
