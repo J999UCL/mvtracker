@@ -335,7 +335,6 @@ def build_waymo_rerun(
                 radii=0.09,
             ),
         )
-    rr.flush(timeout_sec=120.0)
     rr.disconnect()
     return {
         "output_path": str(output_path),
