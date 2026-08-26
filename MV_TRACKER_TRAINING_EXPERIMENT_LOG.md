@@ -2368,3 +2368,42 @@ optimizer step. The dashboard now reports pre/post global norm, the resulting
 uniform clip scale, and the diagnostic clipped-step rate. The change affects
 future processes only; the already-running 1,000-step job retains its original
 elementwise clipping behavior.
+
+## 2026-08-26 — Scene-local recipe planner reduced cold planning below five minutes
+
+The recipe planner previously spent roughly 11 minutes loading MV-Kubric
+metadata from 742 media TARs and 18 minutes planning 8,000 mixed-source
+samples. Profiling showed that cursor-range work distribution repeatedly moved
+workers between scenes, Syn4D discarded mmap pages after every slice, and the
+writer recursively copied and encoded every large track list twice.
+
+A metadata-only MV-Kubric sidecar now stores the existing `meta.npz` payloads
+verbatim in 16 indexed, uncompressed TARs. The one-time CPU build covered 2,935
+scenes, produced 26.0 GiB and completed in 110.9 seconds. Routine planning
+stages those sequential shards to local SSD, groups the complete request stream
+by source and scene, processes each scene locally in the fork pool, reconstructs
+the original cursor order, and applies unchanged rejection and physical
+scheduling semantics. Syn4D keeps pages warm only within a scene group;
+DIEGESIS reuses exact per-view-subset motion calculations. Scene permutations
+are cached by cycle, and recipe records are converted and JSON-encoded once.
+
+The first full acceptance run completed correctly in 342 seconds but exposed
+111.6 seconds of serialization. Removing the recursive dataclass deep copy
+reduced serialization to 9.5 seconds. The final cold acceptance run produced
+all 8,000 records from 8,134 plan calls, with the same 67 rejected cursors, in
+approximately 234 seconds total:
+
+| Phase | Seconds |
+|---|---:|
+| MV-Kubric sidecar staging | 3.66 |
+| MV-Kubric metadata decode | 32.46 |
+| Request resolution | 34.00 |
+| Parallel planning, scheduling and writing | 154.02 |
+| Physical scheduling | 6.86 |
+| Recipe serialization | 9.49 |
+
+- Recipe: `training-recipes/fast-scene-local-accept1000-v2-20260826`
+- Modal: https://modal.com/apps/ucl-prism/main/ap-0d5RI7VJzQCPSiXVmdi2DG
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/f4s59b0i
+- Sidecar W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/edtbhae0
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling|training`
