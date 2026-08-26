@@ -347,5 +347,6 @@ def main() -> None:
             "gpu": "cpu",
         }
     )
-    call = ingest_remote.spawn()
+    deployed = modal.Function.from_name(APP_NAME, "ingest_remote")
+    call = deployed.spawn()
     print(json.dumps({"function_call_id": call.object_id}, indent=2))
