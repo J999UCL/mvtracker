@@ -80,7 +80,6 @@ wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME, required_keys=["WANDB_A
     image=_image(),
     cpu=8,
     memory=16 * 1024,
-    ephemeral_disk=32 * 1024,
     timeout=2 * 60 * 60,
     retries=0,
     max_containers=1,
