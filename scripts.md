@@ -458,6 +458,24 @@ modal container list --json
 modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_shard_a
 modal run --detach --timestamps tools/modal_syn4d_split_setup.py::convert_shard_b
 ```
+
+## Build the first Waymo long-horizon Rerun recording
+
+Upload the licensed raw Waymo TFRecord once, then build a CPU-only `.rrd` with
+an accumulated RGB LiDAR scene, time-coloured DriveTrack trajectories, and the
+three synchronized front cameras.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+modal volume put jeet-mvtracker-data-v2 \
+  /Users/jeetthakwani/Downloads/segment-9142545919543484617_86_000_106_000_with_camera_labels.tfrecord \
+  datasets/waymo-visualization/source/segment-9142545919543484617_86_000_106_000_with_camera_labels.tfrecord
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --timestamps tools/modal_waymo_rerun.py::render
+modal volume get jeet-mvtracker-runs-v2 \
+  waymo-visualization/9142545919543484617_86_000_106_000.rrd \
+  /Users/jeetthakwani/Downloads/waymo_tracks.rrd
+```
 ### Render visibility-aware Syn4D loss-spike track overlays
 
 ```bash
