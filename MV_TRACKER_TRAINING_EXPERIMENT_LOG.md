@@ -2495,3 +2495,38 @@ necessary.
 - Modal: https://modal.com/apps/ucl-prism/main/ap-9ufjtWwERbe80n56bbTgFN
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/ttnn2b4n
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
+
+## 2026-08-26 — Official 351-scene DIEGESIS ingestion and 5K DDP4 recipe
+
+The public DIEGESIS training release was downloaded from GCS in one CPU-only
+Modal container using the official 16-worker downloader. All 10,566 files
+succeeded with no retries or failures. The source contains 351 scenes and
+456.51 GiB of tracking data. Downloading took 1,812.7 seconds. A scene-parallel
+JPEG-cache builder prepared all 351 scenes in 80.2 seconds, after which 476.04
+GiB across 13,727 files was published to the Modal Volume in 831.4 seconds.
+Total ingestion time was 2,724.8 seconds (45.4 minutes).
+
+- Data root: `datasets/diegesis-train`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/7dxp9sy0
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+The new training source uses only those 351 scenes. The former 17 training
+scenes have zero overlap with the new recipe; the existing two validation and
+two test scenes remain available only through the old evaluation root.
+
+The completed recipe contains 5,000 optimizer steps and 40,000 logical samples
+over four DDP ranks. Every rank receives exactly two singleton samples per
+step, with no paired-scene physical batches. Source counts are 10,000
+DIEGESIS, 20,000 MV-Kubric and 10,000 Syn4D. Planned depth counts are 27,946
+GT, 8,070 estimated and 3,984 cleaned-estimated samples. The manifest embeds
+gradient accumulation 2, elementwise clipping 1.0, global norm clipping 3.0,
+and a 5,000-step LR horizon.
+
+Modal reclaimed the first planner worker near completion and automatically
+rescheduled the call. The successful attempt planned and validated all 40,000
+records in 966.4 seconds and committed the complete recipe; no partial recipe
+was published.
+
+- Recipe: `training-recipes/fresh-diegesis351-da3-r30-singleton-ddp4-5000-20260826`
+- Successful W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/8xptjk43
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
