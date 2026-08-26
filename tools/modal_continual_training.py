@@ -366,7 +366,7 @@ def profile_h100_loader_remote() -> dict:
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
-    gpu="H200!",
+    gpu="H200",
     cpu=32,
     memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
     ephemeral_disk=512 * 1024,
