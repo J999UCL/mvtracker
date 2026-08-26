@@ -485,6 +485,47 @@ def audit_recipe_gradients_remote(
 
 @app.function(
     image=training_image,
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="T4",
+    cpu=8,
+    memory=32768,
+    timeout=30 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def visualize_recipe_augmentations_remote(audit_name: str, recipe_name: str) -> dict:
+    from types import SimpleNamespace
+
+    from tools.visualize_recipe_augmentations import run
+
+    validate_run_name(audit_name)
+    validate_run_name(recipe_name)
+    output = RUN_ROOT / "augmentation-audits" / audit_name
+    print(
+        f"AUGMENTATION_VIS event=start audit={audit_name} recipe={recipe_name}",
+        flush=True,
+    )
+    result = run(
+        SimpleNamespace(
+            data_root=Path(DATA_VOLUME_ROOT),
+            recipe=RECIPE_ROOT / recipe_name,
+            diegesis_root=Path(DATA_VOLUME_ROOT) / "datasets/diegesis-mvtracker",
+            syn4d_root=Path(DATA_VOLUME_ROOT) / "datasets/syn4d-mvtracker",
+            mvkubric_root=Path(DATA_VOLUME_ROOT) / "datasets",
+            output=output,
+        )
+    )
+    run_volume.commit()
+    print(f"AUGMENTATION_VIS event=complete output={output}", flush=True)
+    return result
+
+
+@app.function(
+    image=training_image,
     secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume},
     cpu=16,
@@ -1525,6 +1566,32 @@ def audit_recipe_gradients(
             indent=2,
         )
     )
+
+
+@app.local_entrypoint(name="visualize-recipe-augmentations")
+def visualize_recipe_augmentations(
+    audit_name: str,
+    recipe_name: str,
+) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    validate_run_name(audit_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {
+            "owner": "jeet",
+            "project": "mvtracker",
+            "purpose": "evaluation",
+            "experiment": audit_name,
+            "gpu": "t4x1",
+        }
+    )
+    deployed = modal.Function.from_name(
+        APP_NAME, "visualize_recipe_augmentations_remote"
+    )
+    result = deployed.remote(audit_name, recipe_name)
+    print(json.dumps(result, indent=2))
 
 
 @app.local_entrypoint(name="plan-recipe")
