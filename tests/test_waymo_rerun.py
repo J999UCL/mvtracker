@@ -62,6 +62,11 @@ class WaymoRerunTest(unittest.TestCase):
         np.testing.assert_allclose(transform_points(transform, source), target, atol=1e-6)
         self.assertLess(rmse, 1e-6)
 
+        camera_tracks = np.asarray([[1.0, 2.0, 3.0]])
+        camera_to_world = np.eye(4)
+        camera_to_world[:3, 3] = [10, 20, 30]
+        np.testing.assert_allclose(transform_points(camera_to_world, camera_tracks), [[11, 22, 33]])
+
     def test_boxes_voxels_tracks_and_colors(self):
         points = np.asarray([[0, 0, 0], [0.4, 0, 0], [2, 0, 0]], dtype=float)
         inside = points_inside_boxes(points, [(0, 0, 0, 1, 1, 1, 0)])

@@ -241,7 +241,12 @@ def build_waymo_rerun(
         raw_timestamps.append(int(frame.timestamp_micros))
 
     camera, raw_indices, image_match_mse = match_annotation_frames(annotation.images_jpeg, raw_images)
-    annotation_centers = np.linalg.inv(annotation.extrinsics_w2c)[:, :3, 3]
+    annotation_c2w = np.linalg.inv(annotation.extrinsics_w2c)
+    annotation_centers = annotation_c2w[:, :3, 3]
+    annotation_world_tracks = np.stack([
+        transform_points(annotation_c2w[frame], annotation.tracks_xyz[frame])
+        for frame in range(len(annotation.tracks_xyz))
+    ]).astype(np.float32)
     source_centers = np.asarray(raw_centers[camera])[raw_indices]
     annotation_from_raw, alignment_rmse = fit_rigid_transform(source_centers, annotation_centers)
     if alignment_rmse > 0.10:
@@ -281,10 +286,10 @@ def build_waymo_rerun(
     points = np.concatenate(point_batches).astype(np.float32)
     colors = np.concatenate(color_batches)
     points, colors = voxel_downsample(points, colors, voxel_size)
-    selected = select_tracks(annotation.tracks_xyz, annotation.visibility, track_count)
+    selected = select_tracks(annotation_world_tracks, annotation.visibility, track_count)
     anchor = annotation_centers[0].astype(np.float32)
     points -= anchor
-    tracks = annotation.tracks_xyz - anchor
+    tracks = annotation_world_tracks - anchor
     segments, segment_colors = trajectory_segments(tracks, selected)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
