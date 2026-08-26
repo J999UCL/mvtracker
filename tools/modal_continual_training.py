@@ -1375,6 +1375,41 @@ def recipe_da3_h100x5_remote(
 
 
 @app.function(
+    image=da3_training_image,
+    secrets=[hf_secret, wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H200:5",
+    cpu=32,
+    memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
+    timeout=24 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def recipe_da3_h200x5_remote(
+    run_name: str,
+    recipe_name: str,
+    prefill_steps: int = 4,
+) -> dict:
+    return _run_recipe_da3(
+        run_name,
+        recipe_name,
+        "diegesis_syn4d_mvkubric_recipe_da3_h200_ddp_5000",
+        5000,
+        "diegesis351-syn4d-mvkubric-da3-h200-5000",
+        prefill_steps,
+        gpu_label="H200:5",
+        training_devices=(0, 1, 2, 3),
+        depth_device=4,
+        da3_image_capacity=64,
+        max_pending_depth_samples=64,
+    )
+
+
+@app.function(
     image=training_image,
     secrets=[wandb_secret],
     volumes={
@@ -1860,6 +1895,26 @@ def recipe_da3_h100x5_train5000(run_name: str, recipe_name: str) -> None:
         {**MODAL_TAGS, "experiment": run_name, "gpu": "h100x5"}
     )
     deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h100x5_remote")
+    call = deployed.spawn(run_name, recipe_name, 4)
+    print(
+        json.dumps(
+            {"run_name": run_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint(name="recipe-da3-h200x5-train5000")
+def recipe_da3_h200x5_train5000(run_name: str, recipe_name: str) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=5)
+    validate_run_name(run_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x5"}
+    )
+    deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h200x5_remote")
     call = deployed.spawn(run_name, recipe_name, 4)
     print(
         json.dumps(

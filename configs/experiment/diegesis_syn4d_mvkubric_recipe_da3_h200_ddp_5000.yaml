@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - diegesis_syn4d_mvkubric_recipe_da3_ddp_5000
+  - _self_
+
+logging:
+  wandb_group: diegesis351-syn4d-mvkubric-da3-h200-5000
+  tags:
+    - diegesis351-syn4d-mvkubric-25-25-50
+    - recipe
+    - da3-giant-1.1
+    - da3-image-capacity64
+    - da3-queue64
+    - mixed-depth-70-20-10
+    - ddp4-h200-plus-producer
+    - singleton-scenes
+    - continual-training
+    - steps5000
