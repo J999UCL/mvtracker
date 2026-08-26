@@ -26,6 +26,7 @@ CHECKPOINT_RELATIVE_PATH = Path(
 
 WORKSPACE = Path("/opt/tapvidmv-workspace")
 TAPVIDMV_ROOT = WORKSPACE / "tapvidmv"
+TAPVIDMV_PERFORMANCE_PATCHER = Path("/tmp/patch_tapvidmv_performance.py")
 CHECKPOINT_MOUNT = Path("/mnt/mvtracker-runs")
 EVAL_MOUNT = Path("/mnt/tapvidmv-eval")
 DATASET_ROOT = EVAL_MOUNT / "tapvidmv_dataset"
@@ -86,6 +87,14 @@ tapvidmv_image = (
     .run_commands(
         f"python -m pip install -r {TAPVIDMV_ROOT / 'requirements.txt'}",
         "python -m pip install wandb",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "patch_tapvidmv_performance.py"),
+        str(TAPVIDMV_PERFORMANCE_PATCHER),
+        copy=True,
+    )
+    .run_commands(
+        f"python {TAPVIDMV_PERFORMANCE_PATCHER} {TAPVIDMV_ROOT}",
     )
     .env(
         {
@@ -485,6 +494,8 @@ def predict_reference_depth(run_name: str) -> dict:
                 "512",
                 "--seed",
                 "72",
+                "--loader_workers",
+                "4",
             ]
             if len(incomplete) != len(sequence_names):
                 command.extend(["--sequences", ",".join(incomplete), "--overwrite_predictions"])
