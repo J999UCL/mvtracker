@@ -59,6 +59,7 @@ LOADER_PROFILE_MEASURED = 32
 H100_LOADER_PROFILE_WARMUP = 20
 H100_LOADER_PROFILE_MEASURED = 100
 RECIPE_PLANNER_CPUS = 32
+RECIPE_PLANNER_DISK_MIB = 64 * 1024
 RECIPE_METADATA_WORKERS = 16
 RECIPE_METADATA_COPY_WORKERS = 8
 MVKUBRIC_METADATA_SIDECAR = (
@@ -441,6 +442,7 @@ def build_mvkubric_recipe_metadata_remote() -> dict:
     },
     cpu=RECIPE_PLANNER_CPUS,
     memory=65536,
+    ephemeral_disk=RECIPE_PLANNER_DISK_MIB,
     timeout=6 * 60 * 60,
     max_containers=1,
     retries=0,
