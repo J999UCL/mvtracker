@@ -179,12 +179,12 @@ def _camera_images(frame: object) -> dict[int, bytes]:
     return {int(image.name): bytes(image.image) for image in frame.images}
 
 
-def _camera_centers(frame: object) -> dict[int, np.ndarray]:
+def _camera_poses(frame: object) -> dict[int, np.ndarray]:
     world_from_vehicle = np.asarray(frame.pose.transform, dtype=np.float64).reshape(4, 4)
     result = {}
     for calibration in frame.context.camera_calibrations:
         vehicle_from_camera = np.asarray(calibration.extrinsic.transform, dtype=np.float64).reshape(4, 4)
-        result[int(calibration.name)] = (world_from_vehicle @ vehicle_from_camera)[:3, 3]
+        result[int(calibration.name)] = world_from_vehicle @ vehicle_from_camera
     return result
 
 
@@ -228,16 +228,16 @@ def build_waymo_rerun(
 
     annotation = load_tapvid3d_annotation(annotation_path)
     raw_images = {camera: [] for camera in CAMERA_NAMES}
-    raw_centers = {camera: [] for camera in CAMERA_NAMES}
+    raw_camera_poses = {camera: [] for camera in CAMERA_NAMES}
     raw_timestamps = []
     for record in tf.data.TFRecordDataset(str(tfrecord_path)):
         frame = dataset_pb2.Frame()
         frame.ParseFromString(bytearray(record.numpy()))
         images = _camera_images(frame)
-        centers = _camera_centers(frame)
+        poses = _camera_poses(frame)
         for camera in CAMERA_NAMES:
             raw_images[camera].append(images[camera])
-            raw_centers[camera].append(centers[camera])
+            raw_camera_poses[camera].append(poses[camera])
         raw_timestamps.append(int(frame.timestamp_micros))
 
     camera, raw_indices, image_match_mse = match_annotation_frames(annotation.images_jpeg, raw_images)
@@ -247,8 +247,12 @@ def build_waymo_rerun(
         transform_points(annotation_c2w[frame], annotation.tracks_xyz[frame])
         for frame in range(len(annotation.tracks_xyz))
     ]).astype(np.float32)
-    source_centers = np.asarray(raw_centers[camera])[raw_indices]
-    annotation_from_raw, alignment_rmse = fit_rigid_transform(source_centers, annotation_centers)
+    source_camera_poses = np.asarray(raw_camera_poses[camera])[raw_indices]
+    annotation_from_raw = annotation_c2w[0] @ np.linalg.inv(source_camera_poses[0])
+    aligned_camera_poses = annotation_from_raw[None] @ source_camera_poses
+    alignment_rmse = float(np.sqrt(np.mean(np.sum(
+        (aligned_camera_poses[:, :3, 3] - annotation_centers) ** 2, axis=1
+    ))))
     if alignment_rmse > 0.10:
         raise ValueError(f"raw/annotation camera alignment RMSE is {alignment_rmse:.3f}m")
 
