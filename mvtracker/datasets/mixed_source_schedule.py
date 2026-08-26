@@ -62,6 +62,19 @@ class BalancedMixedSourceSchedule:
             )
             for source in self.scene_counts
         }
+        self._cycle_permutations: dict[tuple[str, int], np.ndarray] = {}
+
+    def _cycle_permutation(self, source: str, cycle: int) -> np.ndarray:
+        key = (source, int(cycle))
+        permutation = self._cycle_permutations.get(key)
+        if permutation is None:
+            permutation = np.random.default_rng(
+                np.random.SeedSequence(
+                    [self.master_seed, self._source_indices[source], cycle]
+                )
+            ).permutation(self.scene_counts[source])
+            self._cycle_permutations[key] = permutation
+        return permutation
 
     def sample(
         self,
@@ -106,11 +119,7 @@ class BalancedMixedSourceSchedule:
         source_ordinal = local_cursor * self.world_size + rank
         scene_count = self.scene_counts[source]
         cycle, offset = divmod(source_ordinal, scene_count)
-        permutation = np.random.default_rng(
-            np.random.SeedSequence(
-                [self.master_seed, self._source_indices[source], cycle]
-            )
-        ).permutation(scene_count)
+        permutation = self._cycle_permutation(source, cycle)
         return MixedSourceSample(
             source=source,
             request=ScheduledSampleRequest(

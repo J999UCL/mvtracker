@@ -117,7 +117,7 @@ class RecipeWriter:
         ]
         self._steps = (self.output_dir / "steps.jsonl").open("w", encoding="utf-8")
         self._pending_step: int | None = None
-        self._pending_records: list[tuple[RecipeRecord, dict[str, Any]]] = []
+        self._pending_records: list[tuple[RecipeRecord, str]] = []
         self._manifest = {
             **_jsonable(manifest),
             "world_size": self.world_size,
@@ -136,15 +136,21 @@ class RecipeWriter:
 
     def write(self, record: RecipeRecord) -> None:
         payload = record.to_dict()
+        if record.logical_index < 0:
+            payload["logical_index"] = (
+                int(record.microbatch) * self.world_size
+                + int(record.scheduled_rank)
+            )
+        encoded = json.dumps(payload, separators=(",", ":"))
         handle = self._files[record.rank]
-        handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        handle.write(encoded + "\n")
         self._counts[record.rank] += 1
         if self._pending_step is None:
             self._pending_step = int(record.step)
         if int(record.step) != self._pending_step:
             self._flush_step()
             self._pending_step = int(record.step)
-        self._pending_records.append((record, payload))
+        self._pending_records.append((record, encoded))
 
     def _flush_step(self) -> None:
         if self._pending_step is None:
@@ -166,30 +172,25 @@ class RecipeWriter:
             groups.setdefault(
                 (int(record.physical.rank), int(record.physical.group)), []
             ).append((int(record.physical.position), logical_index))
-        logical_samples = []
-        for record, payload in records:
-            item = dict(payload)
-            item["logical_index"] = (
-                int(record.logical_index)
-                if record.logical_index >= 0
-                else int(record.microbatch) * self.world_size + int(record.scheduled_rank)
-            )
-            logical_samples.append(item)
-        payload = {
-            "step": int(self._pending_step),
-            "logical_samples": logical_samples,
-            "physical_groups": [
-                {
-                    "rank": rank,
-                    "group": group,
-                    "logical_indices": [
-                        logical_index for _, logical_index in sorted(indices)
-                    ],
-                }
-                for (rank, group), indices in sorted(groups.items())
-            ],
-        }
-        self._steps.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        physical_groups = [
+            {
+                "rank": rank,
+                "group": group,
+                "logical_indices": [
+                    logical_index for _, logical_index in sorted(indices)
+                ],
+            }
+            for (rank, group), indices in sorted(groups.items())
+        ]
+        self._steps.write(
+            '{"step":'
+            + str(int(self._pending_step))
+            + ',"logical_samples":['
+            + ",".join(encoded for _, encoded in records)
+            + '],"physical_groups":'
+            + json.dumps(physical_groups, separators=(",", ":"))
+            + "}\n"
+        )
         self._pending_records = []
         self._pending_step = None
 
