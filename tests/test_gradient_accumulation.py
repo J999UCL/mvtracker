@@ -230,6 +230,13 @@ class GradientAccumulationTests(unittest.TestCase):
         self.assertLess(clip_line, optimizer_line)
         self.assertLess(optimizer_line, scheduler_line)
 
+        clip_keywords = {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in calls["fabric.clip_gradients"][0].keywords
+        }
+        self.assertEqual(clip_keywords["max_norm"], "cfg.trainer.grad_clip")
+        self.assertNotIn("clip_val", clip_keywords)
+
         backward_argument = ast.unparse(calls["fabric.backward"][0].args[0])
         self.assertEqual(
             backward_argument,

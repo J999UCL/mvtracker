@@ -71,10 +71,10 @@ class TrainingLogReaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "train.log"
             path.write_text(
-                "[optimizer:000000] elements_clipped=10 clipped=1\n"
-                "[optimizer:000001] elements_clipped=0 clipped=0\n"
-                "[optimizer:000002] elements_clipped=2 clipped=1\n"
-                "[optimizer:000003] elements_clipped=0 clipped=0\n",
+                "[optimizer:000000] max_norm=1.0 clipped=1\n"
+                "[optimizer:000001] max_norm=1.0 clipped=0\n"
+                "[optimizer:000002] max_norm=1.0 clipped=1\n"
+                "[optimizer:000003] max_norm=1.0 clipped=0\n",
                 encoding="utf-8",
             )
             reader = dashboard.TrainingLogReader(path)
@@ -476,7 +476,7 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("Full (27 scenes) and subset (101–102) remain separate", html)
         self.assertIn("movingAverageXY(trackMean)", html)
         self.assertIn("Clipped steps (last 50)", html)
-        self.assertIn("latest 50 optimizer steps", html)
+        self.assertIn("latest 50 diagnostic optimizer steps", html)
         self.assertNotIn("setInterval", html)
 
     def test_state_endpoint_is_uncached_json(self):

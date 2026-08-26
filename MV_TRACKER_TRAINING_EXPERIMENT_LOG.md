@@ -2352,3 +2352,19 @@ coordinate normalization or scale alignment.
 - Report: `da3-scale-audits/syn4d-v822-20260826T091931Z/report.json`
 - Implementation: `2fe8b5f`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
+
+## 2026-08-26 — Optimizer clipping changed to global L2 norm
+
+Training previously passed `clip_val=1.0` to Lightning Fabric, independently
+clamping each accumulated gradient element to ±1. Across the active run's 17
+recorded clipping diagnostics through step 801, no individual element exceeded
+the threshold: the maximum was 0.497 and the clipped-element fraction was zero
+throughout. This offered no protection based on the magnitude of the complete
+optimizer update.
+
+The training and profiling paths now pass `max_norm=1.0`, applying global L2
+norm clipping to the fully accumulated gradient immediately before the
+optimizer step. The dashboard now reports pre/post global norm, the resulting
+uniform clip scale, and the diagnostic clipped-step rate. The change affects
+future processes only; the already-running 1,000-step job retains its original
+elementwise clipping behavior.

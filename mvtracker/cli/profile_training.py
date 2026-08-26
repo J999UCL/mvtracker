@@ -295,7 +295,7 @@ def _run_update(
 
     optimizer_start, optimizer_end = _events(2)
     optimizer_start.record()
-    fabric.clip_gradients(model, optimizer, clip_val=cfg.trainer.grad_clip)
+    fabric.clip_gradients(model, optimizer, max_norm=cfg.trainer.grad_clip)
     optimizer.step()
     scheduler.step()
     optimizer_end.record()

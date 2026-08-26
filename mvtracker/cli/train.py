@@ -324,25 +324,6 @@ def _global_gradient_l2_norm(parameters):
     return torch.stack(per_parameter_norms).norm(2)
 
 
-def _gradient_value_clip_stats(parameters, clip_value):
-    """Summarize the elementwise clipping performed by Fabric ``clip_val``."""
-    max_abs_terms = []
-    clipped_count_terms = []
-    total_elements = 0
-    for parameter in parameters:
-        if parameter.grad is None:
-            continue
-        gradient = parameter.grad.detach()
-        max_abs_terms.append(gradient.abs().max().float())
-        clipped_count_terms.append((gradient.abs() > clip_value).sum())
-        total_elements += gradient.numel()
-    if not max_abs_terms:
-        return 0.0, 0.0
-    max_abs = float(torch.stack(max_abs_terms).max().item())
-    clipped_elements = int(torch.stack(clipped_count_terms).sum().item())
-    return max_abs, clipped_elements / float(total_elements)
-
-
 class _MicrobatchGradientDiagnostics:
     """Measure individual microbatch gradients without storing full copies.
 
@@ -3865,13 +3846,11 @@ def main(cfg: DictConfig):
                     pre_clip_gradient_norm = float(
                         _global_gradient_l2_norm(model_parameters).item()
                     )
-                    max_abs_gradient_pre_clip, clipped_element_fraction = (
-                        _gradient_value_clip_stats(
-                            model_parameters,
-                            float(cfg.trainer.grad_clip),
-                        )
-                    )
-                fabric.clip_gradients(model, optimizer, clip_val=cfg.trainer.grad_clip)
+                fabric.clip_gradients(
+                    model,
+                    optimizer,
+                    max_norm=cfg.trainer.grad_clip,
+                )
                 if run_expensive_diagnostics:
                     post_clip_gradient_norm = float(
                         _global_gradient_l2_norm(model_parameters).item()
@@ -3881,7 +3860,7 @@ def main(cfg: DictConfig):
                         if pre_clip_gradient_norm > 0.0
                         else 1.0
                     )
-                    was_clipped = clipped_element_fraction > 0.0
+                    was_clipped = pre_clip_gradient_norm > float(cfg.trainer.grad_clip)
                     clipped_optimizer_steps += int(was_clipped)
                     diagnostic_optimizer_steps += 1
                     clipped_step_fraction = (
@@ -3981,31 +3960,25 @@ def main(cfg: DictConfig):
                     {
                         "pre_clip_gradient_norm": pre_clip_gradient_norm,
                         "post_clip_gradient_norm": post_clip_gradient_norm,
-                        "max_abs_gradient_pre_clip": max_abs_gradient_pre_clip,
                         "gradient_norm_retention": gradient_norm_retention,
-                        "clipped_element_fraction": clipped_element_fraction,
                         "clipped_step_fraction": clipped_step_fraction,
                     },
                 )
                 pre_clip_gradient_norm = reduced_optimization["pre_clip_gradient_norm"]
                 post_clip_gradient_norm = reduced_optimization["post_clip_gradient_norm"]
-                max_abs_gradient_pre_clip = reduced_optimization["max_abs_gradient_pre_clip"]
                 gradient_norm_retention = reduced_optimization["gradient_norm_retention"]
-                clipped_element_fraction = reduced_optimization["clipped_element_fraction"]
                 clipped_step_fraction = reduced_optimization["clipped_step_fraction"]
                 logging.info(
                     "[optimizer:%06d] loss=%.8f grad_pre=%.8f grad_post=%.8f "
-                    "max_abs_pre=%.8f value_clip=%.8f norm_retention=%.8f "
-                    "elements_clipped=%.8f clipped=%d clipped_step_fraction=%.6f "
+                    "max_norm=%.8f norm_retention=%.8f "
+                    "clipped=%d clipped_step_fraction=%.6f "
                     "micro_grad_mean=%s micro_grad_cos_mean=%s micro_grad_cos_min=%s",
                     total_steps,
                     mean_loss_value,
                     pre_clip_gradient_norm,
                     post_clip_gradient_norm,
-                    max_abs_gradient_pre_clip,
                     float(cfg.trainer.grad_clip),
                     gradient_norm_retention,
-                    clipped_element_fraction,
                     int(was_clipped),
                     clipped_step_fraction,
                     (
@@ -4086,22 +4059,12 @@ def main(cfg: DictConfig):
                         total_steps,
                     )
                     tb_writer.add_scalar(
-                        "optimization/max_abs_grad_pre_clip",
-                        max_abs_gradient_pre_clip,
-                        total_steps,
-                    )
-                    tb_writer.add_scalar(
-                        "optimization/norm_retention_after_value_clip",
+                        "optimization/global_grad_clip_scale",
                         gradient_norm_retention,
                         total_steps,
                     )
                     tb_writer.add_scalar(
-                        "optimization/gradient_elements_clipped_fraction",
-                        clipped_element_fraction,
-                        total_steps,
-                    )
-                    tb_writer.add_scalar(
-                        "optimization/value_clipped_step_fraction",
+                        "optimization/global_grad_clipped_step_fraction",
                         clipped_step_fraction,
                         total_steps,
                     )
