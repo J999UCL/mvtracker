@@ -73,6 +73,34 @@ def main(root: Path) -> None:
             yield sequence
 ''',
     )
+    replace_once(
+        dataloading,
+        '''        num_tracks = int(tracks_xyz.shape[1])
+
+    views: list[ViewData] = []
+''',
+        '''        num_tracks = int(tracks_xyz.shape[1])
+
+    clamped_queries = 0
+    for track_id, (x, y, _t_float, v_float) in enumerate(queries_xytv):
+        view = raw_views[int(round(float(v_float)))]
+        height, width = view["images"].shape[1:3]
+        max_x = np.nextafter(np.float32(width - 0.5), np.float32(-np.inf))
+        max_y = np.nextafter(np.float32(height - 0.5), np.float32(-np.inf))
+        x_clamped = np.clip(x, -0.5, max_x)
+        y_clamped = np.clip(y, -0.5, max_y)
+        if x_clamped != x or y_clamped != y:
+            queries_xytv[track_id, :2] = [x_clamped, y_clamped]
+            clamped_queries += 1
+    if clamped_queries:
+        print(
+            f"clamped {clamped_queries} query anchors to image bounds in {sequence_dir}",
+            flush=True,
+        )
+
+    views: list[ViewData] = []
+''',
+    )
 
     reconstruction = root / "predictors" / "reconstruction_conditioned.py"
     replace_once(
