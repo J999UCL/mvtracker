@@ -225,6 +225,34 @@ class Syn4DLoaderTests(unittest.TestCase):
         self.assertEqual(kwargs["max_track_radius"], 30.0)
         self.assertFalse(kwargs["enable_variable_depth_type_augs"])
 
+    def test_grouped_recipe_planning_matches_individual_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            individual_dataset = _dataset(root)
+            requests = tuple(
+                SimpleNamespace(virtual_index=index, scene_index=0, view_count=6)
+                for index in range(3)
+            )
+            individual = tuple(
+                individual_dataset.plan_sample(request) for request in requests
+            )
+            grouped_dataset = individual_dataset
+            grouped = grouped_dataset.plan_recipe_requests(requests)
+
+            for expected, observed in zip(individual, grouped, strict=True):
+                np.testing.assert_array_equal(
+                    observed.selected_global_track_indices,
+                    expected.selected_global_track_indices,
+                )
+                np.testing.assert_array_equal(
+                    observed.query_points_3d,
+                    expected.query_points_3d,
+                )
+                self.assertEqual(observed.views, expected.views)
+                self.assertEqual(observed.depth_source, expected.depth_source)
+            store, _ = next(iter(grouped_dataset._sequence_cache.stores.values()))
+            self.assertTrue(store.discard_after_read)
+
     def test_plans_window_views_tracks_and_materializes_indexed_jpegs(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = _dataset(Path(directory))

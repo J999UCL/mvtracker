@@ -241,6 +241,15 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
     _seed_by_scene = False
     _stream_start_offset = 0
 
+    def _scene_index(self, scene_name: str) -> int:
+        indices = getattr(self, "_scene_indices", None)
+        if indices is None:
+            indices = {
+                name: index for index, name in enumerate(self.seq_names)
+            }
+            self._scene_indices = indices
+        return int(indices[scene_name])
+
     def __init__(
         self,
         *args,
@@ -268,6 +277,9 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         kwargs["metadata_catalog"] = self.catalog
         kwargs["metadata_index_root"] = None
         super().__init__(*args, **kwargs)
+        self._scene_indices = {
+            scene_name: index for index, scene_name in enumerate(self.seq_names)
+        }
         if int(scene_reuse_passes) != 1:
             raise ValueError("MV-Kubric DALI scenes must be consumed once per epoch")
         self._scene_reuse_passes = 1
@@ -370,7 +382,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             scene_name = str(expected_scene)
             if scene_name not in self.seq_names:
                 raise KeyError(f"planned scene {scene_name!r} is unavailable")
-            scene_index = self.seq_names.index(scene_name)
+            scene_index = self._scene_index(scene_name)
             if requested_index is not None and int(requested_index) != scene_index:
                 raise RuntimeError(
                     f"planned scene/index diverged: {scene_name!r} != {requested_index}"
@@ -417,7 +429,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         virtual_index = request.virtual_index if request is not None else int(index)
         if scene.invalid_frame_indices:
             return None
-        scene_index = self.seq_names.index(scene.name)
+        scene_index = self._scene_index(scene.name)
         seed_index = scene_index if self._seed_by_scene else virtual_index
         seed = int(self.seed + seed_index) if self.seed is not None else None
         rng = np.random.RandomState(seed)
@@ -741,6 +753,9 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
         kwargs["metadata_index_root"] = None
         kwargs["metadata_catalog"] = self.catalog
         KubricMultiViewDataset.__init__(self, *args, **kwargs)
+        self._scene_indices = {
+            scene_name: index for index, scene_name in enumerate(self.seq_names)
+        }
         resolved_seed = self.seed if stream_seed is None else stream_seed
         self._recipe_world_size = int(stream_world_size)
         self._recipe_start_cursor = int(stream_start_request_cursor)
@@ -833,7 +848,7 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
         )[position]
         return replace(
             request,
-            scene_index=self.seq_names.index(scene_name),
+            scene_index=self._scene_index(scene_name),
             expected_scene=scene_name,
         )
 

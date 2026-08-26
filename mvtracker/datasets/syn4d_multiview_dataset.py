@@ -41,6 +41,7 @@ class _MappedSequence:
         self.root = root
         self.arrays: dict[Path, np.ndarray] = {}
         self.lock = threading.Lock()
+        self.discard_after_read = True
 
     def read(self, relative: str | Path, index=()) -> np.ndarray:
         path = self.root / relative
@@ -50,8 +51,13 @@ class _MappedSequence:
                 array = np.load(path, mmap_mode="r", allow_pickle=False)
                 self.arrays[path] = array
             result = np.array(array[index], copy=True)
-            array._mmap.madvise(mmap.MADV_DONTNEED)
+            if self.discard_after_read:
+                array._mmap.madvise(mmap.MADV_DONTNEED)
             return result
+
+    def discard(self) -> None:
+        for array in self.arrays.values():
+            array._mmap.madvise(mmap.MADV_DONTNEED)
 
     def close(self) -> None:
         for array in self.arrays.values():
@@ -178,6 +184,22 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         manifest["views"] = list(range(view_count))
         manifest["resolution_hw"] = list(manifest["cache_resolution"])
         return manifest
+
+    def plan_recipe_requests(self, requests: Sequence[Any]) -> tuple[SamplePlan | None, ...]:
+        """Plan one scene group without evicting mmap pages between requests."""
+        sequences = {
+            self.seq_names[int(request.scene_index)] for request in requests
+        }
+        if len(sequences) != 1:
+            raise ValueError("recipe request group must contain one Syn4D scene")
+        sequence = sequences.pop()
+        with self._sequence_cache.use(sequence) as store:
+            store.discard_after_read = False
+            try:
+                return tuple(self.plan_sample(request) for request in requests)
+            finally:
+                store.discard_after_read = True
+                store.discard()
 
     @staticmethod
     def from_name(

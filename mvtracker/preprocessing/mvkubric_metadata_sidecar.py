@@ -66,12 +66,12 @@ def _ordered_scene_ids(scene_ids: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(values, key=lambda value: (not value.isdigit(), int(value) if value.isdigit() else value)))
 
 
-def _read_indexed_metadata(
+def _indexed_metadata_locations(
     manifest_path: Path,
     scene_ids: Sequence[str],
-) -> dict[str, bytes]:
+) -> dict[str, tuple[Path, int, int]]:
     wanted = {f"scene-{scene}" : str(scene) for scene in scene_ids}
-    found: dict[str, bytes] = {}
+    found: dict[str, tuple[Path, int, int]] = {}
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     shards = manifest.get("shards")
     if not isinstance(shards, list) or not shards:
@@ -84,23 +84,24 @@ def _read_indexed_metadata(
         if not archive_path.is_file():
             raise FileNotFoundError(f"source WebDataset TAR is missing: {archive_path}")
         records = parse_dali_index(index_path)
-        with archive_path.open("rb") as archive:
-            for record in records:
-                key = record.key
-                scene = wanted.get(key)
-                if scene is None:
-                    continue
-                components = [component for component in record.components if component.extension == META_COMPONENT]
-                if len(components) != 1:
-                    raise ValueError(f"{index_path}: {key} must have exactly one {META_COMPONENT} component")
-                component = components[0]
-                archive.seek(component.offset)
-                payload = archive.read(component.size)
-                if len(payload) != component.size:
-                    raise OSError(f"short indexed read from {archive_path} at {component.offset}")
-                if key in found:
-                    raise ValueError(f"scene metadata is duplicated: {scene}")
-                found[key] = payload
+        for record in records:
+            key = record.key
+            scene = wanted.get(key)
+            if scene is None:
+                continue
+            components = [
+                component
+                for component in record.components
+                if component.extension == META_COMPONENT
+            ]
+            if len(components) != 1:
+                raise ValueError(
+                    f"{index_path}: {key} must have exactly one {META_COMPONENT} component"
+                )
+            component = components[0]
+            if key in found:
+                raise ValueError(f"scene metadata is duplicated: {scene}")
+            found[key] = (archive_path, component.offset, component.size)
     missing = sorted(set(wanted).difference(found), key=str)
     if missing:
         raise FileNotFoundError(f"metadata records are missing from indexed WebDataset: {missing}")
@@ -150,15 +151,33 @@ def _write_metadata_shard(
     output_root: Path,
     shard_index: int,
     scene_ids: Sequence[str],
-    metadata: Mapping[str, bytes],
+    locations: Mapping[str, tuple[Path, int, int]],
 ) -> dict[str, object]:
     name = f"mvkubric-meta-{shard_index:02d}"
     archive_path = output_root / f"{name}.tar"
     partial = archive_path.with_suffix(archive_path.suffix + ".partial")
     partial.unlink(missing_ok=True)
+    written_scenes = []
+    by_archive: dict[Path, list[tuple[str, int, int]]] = {}
+    for scene in scene_ids:
+        source_archive_path, offset, size = locations[scene]
+        by_archive.setdefault(source_archive_path, []).append((scene, offset, size))
     with tarfile.open(partial, "w", format=tarfile.USTAR_FORMAT) as archive:
-        for scene in scene_ids:
-            _tar_add_bytes(archive, f"scene-{scene}.{META_COMPONENT}", metadata[scene])
+        for source_archive, records in by_archive.items():
+            with source_archive.open("rb") as source:
+                for scene, offset, size in sorted(records, key=lambda item: item[1]):
+                    source.seek(offset)
+                    payload = source.read(size)
+                    if len(payload) != size:
+                        raise OSError(
+                            f"short indexed read from {source_archive} at {offset}"
+                        )
+                    _tar_add_bytes(
+                        archive,
+                        f"scene-{scene}.{META_COMPONENT}",
+                        payload,
+                    )
+                    written_scenes.append(scene)
     partial.replace(archive_path)
     index_path = _write_dali_index(archive_path, archive_path.with_suffix(".idx"))
     return {
@@ -166,8 +185,8 @@ def _write_metadata_shard(
         "index": shard_index,
         "tar": archive_path.name,
         "index_path": index_path.name,
-        "scene_ids": list(scene_ids),
-        "nsamples": len(scene_ids),
+        "scene_ids": written_scenes,
+        "nsamples": len(written_scenes),
         "bytes": archive_path.stat().st_size,
     }
 
@@ -192,12 +211,24 @@ def build_metadata_sidecar(
     if requested is None:
         raise ValueError("scene_ids are required when the source manifest has no scene_ids")
     ordered = _ordered_scene_ids(requested)
-    metadata = _read_indexed_metadata(source_manifest_path, ordered)
+    locations = _indexed_metadata_locations(source_manifest_path, ordered)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     groups = _partition(ordered, int(shard_count))
     started = time.perf_counter()
-    results = [_write_metadata_shard(output_root, index, group, metadata) for index, group in enumerate(groups)]
+    with ThreadPoolExecutor(max_workers=min(shard_count, len(groups))) as executor:
+        futures = {
+            executor.submit(
+                _write_metadata_shard,
+                output_root,
+                index,
+                group,
+                locations,
+            ): index
+            for index, group in enumerate(groups)
+        }
+        results = [future.result() for future in as_completed(futures)]
+    results.sort(key=lambda item: int(item["index"]))
     shards = [{key: value for key, value in result.items() if key != "index_path"} for result in results]
     locator = build_record_locator(shards, output_root / RECORD_LOCATOR)
     scenes = {}
@@ -325,20 +356,79 @@ class KubricMetadataSidecar:
 
     def load(self, scene: str, staged_root: str | Path | None = None):
         """Load one :class:`KubricSceneMetadata` from a staged or source shard."""
-        from mvtracker.datasets.kubric_dali_dataset import KubricSceneMetadata
+        return _decode_metadata(str(scene), self._payload(str(scene), staged_root))
 
-        arrays = read_component(self._payload(str(scene), staged_root))
-        return KubricSceneMetadata(
-            name=str(scene),
-            tracks_3d=arrays["tracks_3d"].astype("float32", copy=False),
-            visibility=arrays["visibility"].astype("bool", copy=False),
-            intrinsics=arrays["intrinsics"].astype("float32", copy=False),
-            extrinsics=arrays["extrinsics"].astype("float32", copy=False),
-            sensor_widths=arrays["sensor_widths"].astype("float32", copy=False),
-            focal_lengths=arrays["focal_lengths"].astype("float32", copy=False),
-            invalid_frame_indices=tuple(int(value) for value in arrays.get("invalid_frame_indices", ()).reshape(-1)),
-            resolution_hw=tuple(int(value) for value in arrays["resolution_hw"].reshape(-1)),
-        )
+    def load_many(
+        self,
+        scene_ids: Iterable[str],
+        *,
+        staged_root: str | Path | None = None,
+        workers: int = 16,
+    ) -> dict[str, object]:
+        """Load selected scenes while opening and indexing each shard once."""
+        if workers < 1:
+            raise ValueError("workers must be positive")
+        requested = tuple(dict.fromkeys(str(scene) for scene in scene_ids))
+        self.required_shards(requested)
+        by_shard: dict[str, list[str]] = {}
+        for scene in requested:
+            by_shard.setdefault(str(self.scenes[scene]["shard"]), []).append(scene)
+
+        root = Path(staged_root) if staged_root is not None else self.root
+
+        def load_shard(shard_name: str, scenes: Sequence[str]):
+            archive_path = root / shard_name
+            records = {
+                record.key: record for record in parse_dali_index(archive_path.with_suffix(".idx"))
+            }
+            loaded = {}
+            with archive_path.open("rb") as archive:
+                for scene in scenes:
+                    record = records[f"scene-{scene}"]
+                    component = next(
+                        item
+                        for item in record.components
+                        if item.extension == META_COMPONENT
+                    )
+                    archive.seek(component.offset)
+                    payload = archive.read(component.size)
+                    loaded[scene] = _decode_metadata(scene, payload)
+            return loaded
+
+        loaded = {}
+        with ThreadPoolExecutor(
+            max_workers=min(int(workers), max(1, len(by_shard)))
+        ) as executor:
+            futures = [
+                executor.submit(load_shard, shard, scenes)
+                for shard, scenes in by_shard.items()
+            ]
+            for future in as_completed(futures):
+                loaded.update(future.result())
+        return loaded
+
+
+def _decode_metadata(scene: str, payload: bytes):
+    """Decode one copied ``meta.npz`` payload into planner metadata."""
+    from mvtracker.datasets.kubric_dali_dataset import KubricSceneMetadata
+
+    arrays = read_component(payload)
+    return KubricSceneMetadata(
+        name=str(scene),
+        tracks_3d=arrays["tracks_3d"].astype("float32", copy=False),
+        visibility=arrays["visibility"].astype("bool", copy=False),
+        intrinsics=arrays["intrinsics"].astype("float32", copy=False),
+        extrinsics=arrays["extrinsics"].astype("float32", copy=False),
+        sensor_widths=arrays["sensor_widths"].astype("float32", copy=False),
+        focal_lengths=arrays["focal_lengths"].astype("float32", copy=False),
+        invalid_frame_indices=tuple(
+            int(value)
+            for value in arrays.get("invalid_frame_indices", ()).reshape(-1)
+        ),
+        resolution_hw=tuple(
+            int(value) for value in arrays["resolution_hw"].reshape(-1)
+        ),
+    )
 
 
 def stage_metadata_shards(

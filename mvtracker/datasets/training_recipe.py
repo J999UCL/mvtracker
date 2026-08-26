@@ -117,7 +117,7 @@ class RecipeWriter:
         ]
         self._steps = (self.output_dir / "steps.jsonl").open("w", encoding="utf-8")
         self._pending_step: int | None = None
-        self._pending_records: list[RecipeRecord] = []
+        self._pending_records: list[tuple[RecipeRecord, dict[str, Any]]] = []
         self._manifest = {
             **_jsonable(manifest),
             "world_size": self.world_size,
@@ -135,25 +135,30 @@ class RecipeWriter:
             handle.write("\n")
 
     def write(self, record: RecipeRecord) -> None:
+        payload = record.to_dict()
         handle = self._files[record.rank]
-        handle.write(json.dumps(record.to_dict(), separators=(",", ":")) + "\n")
+        handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
         self._counts[record.rank] += 1
         if self._pending_step is None:
             self._pending_step = int(record.step)
         if int(record.step) != self._pending_step:
             self._flush_step()
             self._pending_step = int(record.step)
-        self._pending_records.append(record)
+        self._pending_records.append((record, payload))
 
     def _flush_step(self) -> None:
         if self._pending_step is None:
             return
         records = sorted(
             self._pending_records,
-            key=lambda item: (int(item.logical_index), int(item.microbatch), int(item.scheduled_rank)),
+            key=lambda item: (
+                int(item[0].logical_index),
+                int(item[0].microbatch),
+                int(item[0].scheduled_rank),
+            ),
         )
         groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
-        for record in records:
+        for record, _ in records:
             if record.logical_index < 0:
                 logical_index = int(record.microbatch) * self.world_size + int(record.scheduled_rank)
             else:
@@ -162,8 +167,8 @@ class RecipeWriter:
                 (int(record.physical.rank), int(record.physical.group)), []
             ).append((int(record.physical.position), logical_index))
         logical_samples = []
-        for record in records:
-            item = record.to_dict()
+        for record, payload in records:
+            item = dict(payload)
             item["logical_index"] = (
                 int(record.logical_index)
                 if record.logical_index >= 0
@@ -328,7 +333,6 @@ def _request_dict(request: Any) -> dict[str, Any]:
 
 
 _PROCESS_DATASETS: Mapping[str, Any] | None = None
-_PROCESS_SCHEDULE: Any = None
 _REPLAN_DATASET: Any = None
 _REPLAN_REQUEST_FACTORY: Callable[..., Any] | None = None
 _REPLAN_SOURCE: str | None = None
@@ -357,21 +361,37 @@ def _compact_plan(request: Any, plan: Any) -> dict[str, Any]:
     }
 
 
-def _plan_process_chunk(task):
-    source, rank, start_cursor, end_cursor = task
+def _plan_scene_group(task):
+    source, scene, requests = task
     dataset = _PROCESS_DATASETS[source]
-    results = []
     started = time.perf_counter()
-    for cursor in range(start_cursor, end_cursor):
-        request = _PROCESS_SCHEDULE.sample_source(source, cursor, rank).request
-        resolver = getattr(dataset, "resolve_recipe_request", None)
-        if resolver is not None:
-            request = resolver(request)
-        plan = dataset.plan_sample(request)
-        results.append(
-            (cursor, None if plan is None else _compact_plan(request, plan))
-        )
-    return source, rank, results, time.perf_counter() - started
+    request_values = tuple(request for _, _, request in requests)
+    grouped_planner = getattr(dataset, "plan_recipe_requests", None)
+    plans = (
+        grouped_planner(request_values)
+        if grouped_planner is not None
+        else tuple(dataset.plan_sample(request) for request in request_values)
+    )
+    results = [
+        (rank, cursor, None if plan is None else _compact_plan(request, plan))
+        for (rank, cursor, request), plan in zip(requests, plans, strict=True)
+    ]
+    return source, scene, results, time.perf_counter() - started
+
+
+def _resolve_recipe_request(dataset: Any, request: Any) -> Any:
+    resolver = getattr(dataset, "resolve_recipe_request", None)
+    return resolver(request) if resolver is not None else request
+
+
+def _request_scene(dataset: Any, request: Any) -> str:
+    expected = getattr(request, "expected_scene", None)
+    if expected is not None:
+        return str(expected)
+    names = getattr(dataset, "seq_names", None)
+    if names is not None:
+        return str(names[int(request.scene_index)])
+    return f"scene-index-{int(request.scene_index)}"
 
 
 def _replan_process_chunk(bounds: tuple[int, int]) -> list[RecipeRecord]:
@@ -788,7 +808,7 @@ def plan_training_recipe_parallel(
     log: LogFunction = _print_log,
     physical_scheduler: Callable[[Sequence[Any]], Any] | None = None,
 ) -> dict[str, Any]:
-    """Plan singleton physical batches in forked CPU workers."""
+    """Plan one complete recipe with scene-local forked CPU workers."""
     if step_count < 1 or worker_count < 1 or block_steps < 1:
         raise ValueError("steps, workers and block size must be positive")
     started = time.perf_counter()
@@ -809,6 +829,8 @@ def plan_training_recipe_parallel(
         "retries": 0,
         "source": "startup",
         "scene": "-",
+        "scene_groups": 0,
+        "scene_groups_total": 0,
     }
     source_counts: Counter[str] = Counter()
     view_counts: Counter[str] = Counter()
@@ -831,6 +853,7 @@ def plan_training_recipe_parallel(
             "recipe heartbeat "
             f"step={progress['step']}/{step_count} planned={progress['planned']} "
             f"records={progress['records']} retries={progress['retries']} "
+            f"scene_groups={progress['scene_groups']}/{progress['scene_groups_total']} "
             f"rate={rate:.1f}/s eta={eta:.1f}s depth={dict(depth_counts)}"
         )
 
@@ -850,95 +873,104 @@ def plan_training_recipe_parallel(
         f"steps={step_count} workers={worker_count} records={step_count * records_per_step}"
     )
 
-    global _PROCESS_DATASETS, _PROCESS_SCHEDULE
+    global _PROCESS_DATASETS
     _PROCESS_DATASETS = dict(datasets)
-    _PROCESS_SCHEDULE = schedule
     context = multiprocessing.get_context("fork")
+    request_resolution_seconds = 0.0
+    scheduling_seconds = 0.0
+    serialization_seconds = 0.0
     try:
         with context.Pool(processes=worker_count) as pool, _Heartbeat(
             heartbeat_seconds, log, status
         ):
-            for block_start in range(0, step_count, block_steps):
-                block_end = min(block_start + block_steps, step_count)
-                compact_by_source = {
-                    source: {
-                        rank: {} for rank in range(schedule.world_size)
-                    }
-                    for source in positions
-                }
-                timing_by_source: Counter[str] = Counter()
-                block_records = []
-                required_by_source = {
-                    source: (block_end - block_start) * len(source_microbatches)
-                    for source, source_microbatches in positions.items()
-                }
-                next_cursor = dict(cursors)
-                while True:
-                    ranges = {}
-                    for source, required in required_by_source.items():
-                        planned = compact_by_source[source]
-                        valid_count = sum(
-                            all(
-                                planned[rank].get(cursor) is not None
-                                for rank in range(schedule.world_size)
-                            )
-                            for cursor in range(cursors[source], next_cursor[source])
-                        )
-                        deficit = required - valid_count
-                        if deficit > 0:
-                            ranges[source] = (
-                                next_cursor[source],
-                                next_cursor[source] + deficit,
-                            )
-                    if not ranges:
-                        break
-                    plan_count = sum(
-                        (end - start) * int(schedule.world_size)
-                        for start, end in ranges.values()
-                    )
-                    chunk_size = max(
-                        1, (plan_count + worker_count - 1) // worker_count
-                    )
-                    tasks = [
-                        (
-                            source,
-                            rank,
-                            cursor,
-                            min(cursor + chunk_size, end),
-                        )
-                        for source, (start, end) in ranges.items()
-                        for rank in range(schedule.world_size)
-                        for cursor in range(start, end, chunk_size)
-                    ]
-                    for source, rank, results, seconds in pool.map(
-                        _plan_process_chunk, tasks
-                    ):
-                        compact_by_source[source][rank].update(results)
-                        timing_by_source[source] += seconds
-                        source_plan_calls[source] += len(results)
-                        progress["planned"] += len(results)
-                    for source, (_, end) in ranges.items():
-                        next_cursor[source] = end
-
-                for source, source_microbatches in positions.items():
-                    slots = [
-                        (step, microbatch)
-                        for step in range(block_start, block_end)
-                        for microbatch in source_microbatches
-                    ]
+            compact_by_source = {
+                source: {rank: {} for rank in range(schedule.world_size)}
+                for source in positions
+            }
+            required_by_source = {
+                source: step_count * len(source_microbatches)
+                for source, source_microbatches in positions.items()
+            }
+            next_cursor = dict(cursors)
+            while True:
+                ranges = {}
+                for source, required in required_by_source.items():
                     planned = compact_by_source[source]
-                    cursor = cursors[source]
-                    rejected = 0
-                    slot_index = 0
-                    while slot_index < len(slots):
-                        payloads = [
-                            planned[rank].get(cursor)
+                    valid_count = sum(
+                        all(
+                            planned[rank].get(cursor) is not None
                             for rank in range(schedule.world_size)
-                        ]
-                        if all(payload is not None for payload in payloads):
-                            step, microbatch = slots[slot_index]
-                            for rank, payload in enumerate(payloads):
-                                record = RecipeRecord(
+                        )
+                        for cursor in range(cursors[source], next_cursor[source])
+                    )
+                    deficit = required - valid_count
+                    if deficit > 0:
+                        ranges[source] = (
+                            next_cursor[source],
+                            next_cursor[source] + deficit,
+                        )
+                if not ranges:
+                    break
+
+                resolution_started = time.perf_counter()
+                grouped: dict[tuple[str, str], list[tuple[int, int, Any]]] = {}
+                for source, (start, end) in ranges.items():
+                    dataset = datasets[source]
+                    for cursor in range(start, end):
+                        for rank in range(schedule.world_size):
+                            request = schedule.sample_source(
+                                source, cursor, rank
+                            ).request
+                            request = _resolve_recipe_request(dataset, request)
+                            scene = _request_scene(dataset, request)
+                            grouped.setdefault((source, scene), []).append(
+                                (rank, cursor, request)
+                            )
+                request_resolution_seconds += time.perf_counter() - resolution_started
+                tasks = sorted(
+                    (
+                        (source, scene, tuple(requests))
+                        for (source, scene), requests in grouped.items()
+                    ),
+                    key=lambda item: (-len(item[2]), item[0], item[1]),
+                )
+                progress["scene_groups_total"] += len(tasks)
+                for source, scene, results, seconds in pool.imap_unordered(
+                    _plan_scene_group,
+                    tasks,
+                    chunksize=1,
+                ):
+                    for rank, cursor, payload in results:
+                        compact_by_source[source][rank][cursor] = payload
+                    source_planning_seconds[source] += seconds
+                    source_plan_calls[source] += len(results)
+                    progress["planned"] += len(results)
+                    progress["scene_groups"] += 1
+                    progress.update(source=source, scene=scene)
+                for source, (_, end) in ranges.items():
+                    next_cursor[source] = end
+
+            records = []
+            for source, source_microbatches in positions.items():
+                slots = [
+                    (step, microbatch)
+                    for step in range(step_count)
+                    for microbatch in source_microbatches
+                ]
+                planned = compact_by_source[source]
+                cursor = cursors[source]
+                rejected = 0
+                slot_index = 0
+                while slot_index < len(slots):
+                    payloads = [
+                        planned[rank].get(cursor)
+                        for rank in range(schedule.world_size)
+                    ]
+                    if all(payload is not None for payload in payloads):
+                        step, microbatch = slots[slot_index]
+                        for rank, payload in enumerate(payloads):
+                            records.append(
+                                RecipeRecord(
                                     step=step,
                                     microbatch=microbatch,
                                     rank=rank,
@@ -967,83 +999,92 @@ def plan_training_recipe_parallel(
                                         + int(rank)
                                     ),
                                 )
-                                block_records.append(record)
-                            slot_index += 1
-                            rejected = 0
-                        else:
-                            progress["retries"] += 1
-                            rejected += 1
-                        cursor += 1
-                    cursors[source] = cursor
-                    source_planning_seconds[source] += timing_by_source[source]
-                if physical_scheduler is not None:
-                    from .physical_batch_scheduler import SceneSummary
-
-                    scheduled_records = []
-                    for step in range(block_start, block_end):
-                        step_records = [
-                            record for record in block_records if record.step == step
-                        ]
-                        summaries = tuple(
-                            SceneSummary(
-                                source=record.source,
-                                scene=record.scene,
-                                cursor=int(record.request["virtual_index"]),
-                                view_count=len(record.views),
-                                frame_count=len(record.frames),
-                                resolution=record.resolution,
-                                track_count=record.track_count,
                             )
-                            for record in step_records
-                        )
-                        physical = physical_scheduler(summaries)
-                        by_identity = {
-                            (
-                                record.source,
-                                record.scene,
-                                int(record.request["virtual_index"]),
-                            ): record
-                            for record in step_records
-                        }
-                        for rank_wave in physical.ranks:
-                            for group_index, group in enumerate(rank_wave.groups):
-                                for position, summary in enumerate(group.scenes):
-                                    record = by_identity[
-                                        (summary.source, summary.scene, summary.cursor)
-                                    ]
-                                    scheduled_records.append(
-                                        replace(
-                                            record,
-                                            rank=int(rank_wave.rank),
-                                            physical=PhysicalAssignment(
-                                                rank=int(rank_wave.rank),
-                                                group=group_index,
-                                                position=position,
-                                            ),
-                                        )
-                                    )
-                    block_records = scheduled_records
+                        slot_index += 1
+                        rejected = 0
+                    else:
+                        progress["retries"] += 1
+                        rejected += 1
+                    cursor += 1
+                cursors[source] = cursor
 
-                for record in sorted(
-                    block_records,
-                    key=lambda item: (item.step, item.logical_index),
-                ):
-                    writer.write(record)
-                    source_counts[record.source] += 1
-                    view_counts[str(len(record.views))] += 1
-                    track_counts[str(record.track_count)] += 1
-                    depth_counts[record.depth_source] += 1
-                    augmentation_counts[
-                        str(bool(record.augmentation["apply_rgb"]))
-                    ] += 1
-                    if record.depth_source != "gt":
-                        estimated.setdefault(
-                            (record.source, record.scene), set()
-                        ).add(record.depth_source)
-                    progress["records"] += 1
-                    progress.update(source=record.source, scene=record.scene)
-                progress["step"] = block_end
-                log(status())
+            if physical_scheduler is not None:
+                from .physical_batch_scheduler import SceneSummary
+
+                scheduling_started = time.perf_counter()
+                records_by_step: dict[int, list[RecipeRecord]] = {
+                    step: [] for step in range(step_count)
+                }
+                for record in records:
+                    records_by_step[record.step].append(record)
+                scheduled_records = []
+                for step in range(step_count):
+                    step_records = records_by_step[step]
+                    summaries = tuple(
+                        SceneSummary(
+                            source=record.source,
+                            scene=record.scene,
+                            cursor=int(record.request["virtual_index"]),
+                            view_count=len(record.views),
+                            frame_count=len(record.frames),
+                            resolution=record.resolution,
+                            track_count=record.track_count,
+                        )
+                        for record in step_records
+                    )
+                    physical = physical_scheduler(summaries)
+                    by_identity = {
+                        (
+                            record.source,
+                            record.scene,
+                            int(record.request["virtual_index"]),
+                        ): record
+                        for record in step_records
+                    }
+                    for rank_wave in physical.ranks:
+                        for group_index, group in enumerate(rank_wave.groups):
+                            for position, summary in enumerate(group.scenes):
+                                record = by_identity[
+                                    (summary.source, summary.scene, summary.cursor)
+                                ]
+                                scheduled_records.append(
+                                    replace(
+                                        record,
+                                        rank=int(rank_wave.rank),
+                                        physical=PhysicalAssignment(
+                                            rank=int(rank_wave.rank),
+                                            group=group_index,
+                                            position=position,
+                                        ),
+                                    )
+                                )
+                records = scheduled_records
+                scheduling_seconds = time.perf_counter() - scheduling_started
+
+            serialization_started = time.perf_counter()
+            for record in sorted(
+                records,
+                key=lambda item: (item.step, item.logical_index),
+            ):
+                writer.write(record)
+                source_counts[record.source] += 1
+                view_counts[str(len(record.views))] += 1
+                track_counts[str(record.track_count)] += 1
+                depth_counts[record.depth_source] += 1
+                augmentation_counts[
+                    str(bool(record.augmentation["apply_rgb"]))
+                ] += 1
+                if record.depth_source != "gt":
+                    estimated.setdefault((record.source, record.scene), set()).add(
+                        record.depth_source
+                    )
+                progress["records"] += 1
+                progress.update(source=record.source, scene=record.scene)
+                if record.logical_index == records_per_step - 1:
+                    progress["step"] = record.step + 1
+                    if progress["step"] % block_steps == 0:
+                        log(status())
+            serialization_seconds = time.perf_counter() - serialization_started
 
         elapsed = time.perf_counter() - started
         summary = {
@@ -1058,6 +1099,9 @@ def plan_training_recipe_parallel(
             "rgb_augmentation_counts": dict(augmentation_counts),
             "source_plan_calls": dict(source_plan_calls),
             "source_planning_seconds": dict(source_planning_seconds),
+            "request_resolution_seconds": request_resolution_seconds,
+            "physical_scheduling_seconds": scheduling_seconds,
+            "serialization_seconds": serialization_seconds,
             "unique_estimated_depth_scenes": len(estimated),
         }
         writer.finalize(
@@ -1082,7 +1126,6 @@ def plan_training_recipe_parallel(
         raise
     finally:
         _PROCESS_DATASETS = None
-        _PROCESS_SCHEDULE = None
 
 
 def replan_recipe_source(

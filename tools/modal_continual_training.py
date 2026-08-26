@@ -60,6 +60,11 @@ H100_LOADER_PROFILE_WARMUP = 20
 H100_LOADER_PROFILE_MEASURED = 100
 RECIPE_PLANNER_CPUS = 32
 RECIPE_METADATA_WORKERS = 16
+RECIPE_METADATA_COPY_WORKERS = 8
+MVKUBRIC_METADATA_SIDECAR = (
+    Path(DATA_VOLUME_ROOT)
+    / "datasets/kubric-multiview-webdataset/train/recipe-metadata"
+)
 EXPERIMENT_PHASES = {
     "smoke": (
         {
@@ -356,6 +361,75 @@ def profile_h100_loader_remote() -> dict:
 @app.function(
     image=training_image,
     secrets=[wandb_secret],
+    volumes={str(DATA_ROOT): data_volume},
+    cpu=16,
+    memory=65536,
+    timeout=6 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def build_mvkubric_recipe_metadata_remote() -> dict:
+    """Build the reusable metadata-only MV-Kubric planning sidecar."""
+    import wandb
+
+    from mvtracker.preprocessing.mvkubric_metadata_sidecar import (
+        build_metadata_sidecar,
+    )
+
+    source_root = (
+        Path(DATA_VOLUME_ROOT) / "datasets/kubric-multiview-webdataset/train"
+    )
+    started = time.perf_counter()
+    print(
+        "MVKUBRIC_METADATA event=build_start "
+        f"source={source_root} output={MVKUBRIC_METADATA_SIDECAR}",
+        flush=True,
+    )
+    manifest = build_metadata_sidecar(
+        source_root,
+        MVKUBRIC_METADATA_SIDECAR,
+        shard_count=16,
+    )
+    data_volume.commit()
+    elapsed = time.perf_counter() - started
+    total_bytes = sum(int(shard["bytes"]) for shard in manifest["shards"])
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group="training-recipe-planning",
+        job_type="recipe-metadata-build",
+        name="mvkubric-recipe-metadata",
+        tags=["modal", "recipe", "metadata-sidecar", "cpu"],
+        config={"source_commit": _source_commit(), **PROFILE_TAGS},
+    )
+    run.summary.update(
+        {
+            "elapsed_seconds": elapsed,
+            "scene_count": len(manifest["scene_ids"]),
+            "shard_count": len(manifest["shards"]),
+            "bytes": total_bytes,
+        }
+    )
+    run.finish()
+    print(
+        "MVKUBRIC_METADATA event=build_complete "
+        f"scenes={len(manifest['scene_ids'])} bytes={total_bytes} "
+        f"elapsed={elapsed:.1f}s",
+        flush=True,
+    )
+    return {
+        "elapsed_seconds": elapsed,
+        "scene_count": len(manifest["scene_ids"]),
+        "shard_count": len(manifest["shards"]),
+        "bytes": total_bytes,
+        "output": str(MVKUBRIC_METADATA_SIDECAR),
+    }
+
+
+@app.function(
+    image=training_image,
+    secrets=[wandb_secret],
     volumes={
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
@@ -382,6 +456,9 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
     from mvtracker.datasets.physical_batch_scheduler import schedule_physical_batch
     from mvtracker.datasets.training_recipe import plan_training_recipe_parallel
+    from mvtracker.preprocessing.mvkubric_metadata_sidecar import (
+        KubricMetadataSidecar,
+    )
 
     validate_run_name(recipe_name)
     seed = 72
@@ -485,8 +562,31 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 stream_seed=seed,
                 stream_include_scene_ids=source_cfg.get("include_scene_ids"),
             )
-            phase["name"] = "mvkubric_metadata_preload"
-            datasets[source].preload_recipe_metadata(workers=RECIPE_METADATA_WORKERS)
+            phase["name"] = "mvkubric_metadata_stage"
+            metadata_sidecar = KubricMetadataSidecar(MVKUBRIC_METADATA_SIDECAR)
+            local_metadata = Path("/tmp/mvkubric-recipe-metadata")
+            metadata_stage_started = time.perf_counter()
+            metadata_sidecar.stage(
+                datasets[source].seq_names,
+                local_metadata,
+                workers=RECIPE_METADATA_COPY_WORKERS,
+            )
+            metadata_stage_seconds = time.perf_counter() - metadata_stage_started
+            phase["name"] = "mvkubric_metadata_decode"
+            metadata_decode_started = time.perf_counter()
+            datasets[source]._recipe_metadata = metadata_sidecar.load_many(
+                datasets[source].seq_names,
+                staged_root=local_metadata,
+                workers=RECIPE_METADATA_WORKERS,
+            )
+            metadata_decode_seconds = time.perf_counter() - metadata_decode_started
+            print(
+                "recipe phase=mvkubric_metadata_ready "
+                f"scenes={len(datasets[source]._recipe_metadata)} "
+                f"stage_seconds={metadata_stage_seconds:.1f} "
+                f"decode_seconds={metadata_decode_seconds:.1f}",
+                flush=True,
+            )
         schedule = BalancedMixedSourceSchedule(
             {source: dataset.real_len for source, dataset in datasets.items()},
             source_pattern,
@@ -517,6 +617,14 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 schedule_physical_batch,
                 capacity=_physical_batch_capacity(cfg),
             ),
+        )
+        summary.update(
+            mvkubric_metadata_stage_seconds=metadata_stage_seconds,
+            mvkubric_metadata_decode_seconds=metadata_decode_seconds,
+        )
+        (local_output_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
     finally:
         heartbeat_stop.set()
@@ -1253,6 +1361,26 @@ def plan_recipe(recipe_name: str, step_count: int = 2000) -> None:
     deployed = modal.Function.from_name(APP_NAME, "plan_recipe_remote")
     call = deployed.spawn(recipe_name, step_count)
     print(json.dumps({"recipe_name": recipe_name, "function_call_id": call.object_id}, indent=2))
+
+
+@app.local_entrypoint(name="build-mvkubric-recipe-metadata")
+def build_mvkubric_recipe_metadata() -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    app.set_tags(
+        {
+            **PROFILE_TAGS,
+            "experiment": "mvkubric-recipe-metadata",
+            "gpu": "cpu",
+            "cpu": "16",
+        }
+    )
+    deployed = modal.Function.from_name(
+        APP_NAME, "build_mvkubric_recipe_metadata_remote"
+    )
+    call = deployed.spawn()
+    print(json.dumps({"function_call_id": call.object_id}, indent=2))
 
 
 @app.local_entrypoint(name="replan-syn4d-recipe")

@@ -89,12 +89,19 @@ class MvKubricMetadataSidecarTests(unittest.TestCase):
             sidecar = KubricMetadataSidecar(root / "sidecar")
             staged = sidecar.stage(("2",), root / "staged", workers=2)
             required = sidecar.required_shards(("2",))[0]
-            self.assertEqual(sorted(path.name for path in staged.iterdir()), [required, required.replace(".tar", ".idx")])
+            self.assertEqual(
+                sorted(path.name for path in staged.iterdir()),
+                sorted([required, required.replace(".tar", ".idx")]),
+            )
             loaded = sidecar.load("2", staged_root=staged)
             self.assertEqual(loaded.name, "2")
             self.assertEqual(loaded.frame_count, 2)
             self.assertEqual(loaded.view_count, 2)
             self.assertEqual(loaded.invalid_frame_indices, (1,))
+            loaded_many = sidecar.load_many(
+                ("1", "2", "3"), staged_root=root / "sidecar", workers=2
+            )
+            self.assertEqual(set(loaded_many), {"1", "2", "3"})
 
 
 if __name__ == "__main__":

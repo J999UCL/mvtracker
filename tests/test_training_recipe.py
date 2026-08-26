@@ -58,6 +58,12 @@ class _MetadataDataset:
         self.materialize_calls += 1
         raise AssertionError("recipe planning must not materialize media")
 
+    def plan_recipe_requests(self, requests):
+        scene_indices = {request.scene_index for request in requests}
+        if len(scene_indices) != 1:
+            raise AssertionError("parallel planner mixed scenes in one worker task")
+        return tuple(self.plan_sample(request) for request in requests)
+
 
 class TrainingRecipeTests(unittest.TestCase):
     def _plan(

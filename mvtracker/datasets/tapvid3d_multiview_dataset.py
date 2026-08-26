@@ -1087,6 +1087,16 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             arrays[path] = np.load(path, mmap_mode="r", allow_pickle=False)
         return arrays[path]
 
+    def plan_recipe_requests(self, requests: Sequence[Any]) -> tuple[SamplePlan | None, ...]:
+        """Plan one scene's requests while reusing its full-sequence motion data."""
+        self._recipe_motion_cache: dict[
+            tuple[str, tuple[int, ...]], tuple[np.ndarray, np.ndarray]
+        ] = {}
+        try:
+            return tuple(self.plan_sample(request) for request in requests)
+        finally:
+            self._recipe_motion_cache.clear()
+
     @staticmethod
     def from_name(
         dataset_name,
@@ -1212,13 +1222,24 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         )
 
         tracks_all = np.asarray(self._mmap(source_root / "tracks_xyz.npy"), dtype=np.float32)
-        visibility_all = np.stack(
-            [
-                np.asarray(self._mmap(source_root / str(view) / "visibility.npy"), dtype=np.bool_)
-                for view in views
-            ]
-        )
-        full_movement_all = _visible_path_lengths(tracks_all, visibility_all)
+        motion_key = (sequence, tuple(views))
+        motion_cache = getattr(self, "_recipe_motion_cache", None)
+        cached_motion = None if motion_cache is None else motion_cache.get(motion_key)
+        if cached_motion is None:
+            visibility_all = np.stack(
+                [
+                    np.asarray(
+                        self._mmap(source_root / str(view) / "visibility.npy"),
+                        dtype=np.bool_,
+                    )
+                    for view in views
+                ]
+            )
+            full_movement_all = _visible_path_lengths(tracks_all, visibility_all)
+            if motion_cache is not None:
+                motion_cache[motion_key] = (visibility_all, full_movement_all)
+        else:
+            visibility_all, full_movement_all = cached_motion
         preselected = _preselect_available_motion_tracks(
             full_movement_all,
             np.ones(tracks_all.shape[1], dtype=bool),
