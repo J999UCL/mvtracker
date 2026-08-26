@@ -1017,7 +1017,6 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         super().__init__(*args, **kwargs)
         self._manifests: dict[str, dict[str, Any]] = {}
         self._arrays: dict[Path, np.ndarray] = {}
-        self._jpeg_descriptors: dict[Path, int] = {}
         started = time.perf_counter()
         print(
             "MANIFEST_LOAD event=start "
@@ -1085,15 +1084,6 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         if path not in arrays:
             arrays[path] = np.load(path, mmap_mode="r", allow_pickle=False)
         return arrays[path]
-
-    def _jpeg_descriptor(self, path: Path) -> int:
-        descriptors = getattr(self, "_jpeg_descriptors", None)
-        if descriptors is None:
-            self._jpeg_descriptors = {}
-            descriptors = self._jpeg_descriptors
-        if path not in descriptors:
-            descriptors[path] = os.open(path, os.O_RDONLY)
-        return descriptors[path]
 
     @staticmethod
     def from_name(
@@ -1420,15 +1410,27 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         encoded = []
         depths = []
         for (byte_path, offset_path), depth_path in zip(plan.rgb_sources, plan.depth_sources):
-            encoded.extend(_read_encoded_frames(
-                self._jpeg_descriptor(byte_path),
-                self._mmap(offset_path),
-                plan.frame_indices,
-                label=byte_path.parent,
-            ))
+            descriptor = os.open(byte_path, os.O_RDONLY)
+            offsets = np.load(offset_path, mmap_mode="r", allow_pickle=False)
+            try:
+                encoded.extend(_read_encoded_frames(
+                    descriptor,
+                    offsets,
+                    plan.frame_indices,
+                    label=byte_path.parent,
+                ))
+            finally:
+                os.close(descriptor)
+                offsets._mmap.close()
             if plan.depth_source == "gt":
-                depth = self._mmap(depth_path)[plan.frame_indices]
-                depths.append(torch.from_numpy(np.asarray(depth, dtype=np.float32).copy()))
+                depth_array = np.load(depth_path, mmap_mode="r", allow_pickle=False)
+                try:
+                    depth = np.asarray(
+                        depth_array[plan.frame_indices], dtype=np.float32
+                    ).copy()
+                finally:
+                    depth_array._mmap.close()
+                depths.append(torch.from_numpy(depth))
                 descriptor = os.open(depth_path, os.O_RDONLY)
                 try:
                     discard_file_range(descriptor)
