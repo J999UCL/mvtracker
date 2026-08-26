@@ -248,11 +248,9 @@ def build_waymo_rerun(
         for frame in range(len(annotation.tracks_xyz))
     ]).astype(np.float32)
     source_camera_poses = np.asarray(raw_camera_poses[camera])[raw_indices]
-    annotation_from_raw = annotation_c2w[0] @ np.linalg.inv(source_camera_poses[0])
-    aligned_camera_poses = annotation_from_raw[None] @ source_camera_poses
-    alignment_rmse = float(np.sqrt(np.mean(np.sum(
-        (aligned_camera_poses[:, :3, 3] - annotation_centers) ** 2, axis=1
-    ))))
+    annotation_from_raw, alignment_rmse = fit_rigid_transform(
+        source_camera_poses[:, :3, 3], annotation_centers
+    )
     if alignment_rmse > 0.10:
         raise ValueError(f"raw/annotation camera alignment RMSE is {alignment_rmse:.3f}m")
 
