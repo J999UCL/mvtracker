@@ -1,0 +1,55 @@
+# @package _global_
+defaults:
+  - diegesis_syn4d_mvkubric_gt_ddp
+  - _self_
+
+datasets:
+  train:
+    recipe_path: ${oc.env:MVTRACKER_TRAINING_RECIPE}
+    force_gt_depth: false
+    runtime_depth_root: ${oc.env:MVTRACKER_RUNTIME_DEPTH_ROOT}
+    runtime_depth_metrics_path: ${oc.env:MVTRACKER_RUNTIME_DEPTH_METRICS}
+    physical_batching:
+      rank_count: 4
+      lookahead_steps: 8
+      cpu_cache_gib_per_rank: 24
+      max_scenes: 1
+      rank_local: false
+  eval:
+    schedule:
+      - steps: [0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
+        names:
+          - tapvid3d-multiview-validation
+          - syn4d-multiview-validation
+          - kubric-multiview-v3-validation-subset
+      - steps: [0, 2500, 5000]
+        names:
+          - kubric-multiview-v3-validation-full
+
+trainer:
+  num_steps: 5000
+  lr_schedule_steps: 5000
+  eval_freq: 500
+  viz_freq: 10000
+  save_ckpt_freq: 500
+  gradient_accumulation_steps: 2
+  hardware_metrics_interval: 10
+
+modes:
+  validate_at_start: true
+
+augmentations:
+  variable_depth_type: true
+
+logging:
+  wandb_group: diegesis351-syn4d-mvkubric-da3-5000
+  tags:
+    - diegesis351-syn4d-mvkubric-25-25-50
+    - recipe
+    - da3-giant-1.1
+    - da3-image-capacity64
+    - mixed-depth-70-20-10
+    - ddp4-h100-plus-producer
+    - singleton-scenes
+    - continual-training
+    - steps5000

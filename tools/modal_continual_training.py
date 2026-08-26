@@ -1119,28 +1119,18 @@ def recipe_smoke20_remote(run_name: str, recipe_name: str) -> dict:
     return manifest
 
 
-@app.function(
-    image=da3_training_image,
-    secrets=[hf_secret, wandb_secret],
-    volumes={
-        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
-        str(RUN_ROOT): run_volume,
-    },
-    gpu="H200:3",
-    cpu=32,
-    memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
-    timeout=12 * 60 * 60,
-    max_containers=1,
-    retries=0,
-    include_source=False,
-)
-def recipe_da3_remote(
+def _run_recipe_da3(
     run_name: str,
     recipe_name: str,
     experiment_name: str,
     expected_steps: int,
     wandb_group: str,
     prefill_steps: int = 4,
+    *,
+    gpu_label: str,
+    training_devices: tuple[int, ...],
+    depth_device: int,
+    da3_image_capacity: int,
 ) -> dict:
     validate_run_name(run_name)
     validate_run_name(recipe_name)
@@ -1168,9 +1158,10 @@ def recipe_da3_remote(
         "run_name": run_name,
         "recipe": recipe_name,
         "source_commit": commit,
-        "gpu": "H200:3",
-        "training_devices": [0, 1],
-        "depth_device": 2,
+        "gpu": gpu_label,
+        "training_devices": list(training_devices),
+        "depth_device": int(depth_device),
+        "da3_image_capacity": int(da3_image_capacity),
         "steps": int(expected_steps),
         "depth_counts": recipe_summary["planned_depth_counts"],
         "validation": "smoke20" not in experiment_name,
@@ -1211,8 +1202,9 @@ def recipe_da3_remote(
     )
     producer_environment = {
         **base_environment,
-        "CUDA_VISIBLE_DEVICES": "2",
+        "CUDA_VISIBLE_DEVICES": str(depth_device),
         "HF_HOME": "/tmp/huggingface-da3",
+        "MVTRACKER_DA3_IMAGE_CAPACITY": str(da3_image_capacity),
     }
     producer_command = [
         sys.executable,
@@ -1256,7 +1248,10 @@ def recipe_da3_remote(
         flush=True,
     )
 
-    training_environment = {**base_environment, "CUDA_VISIBLE_DEVICES": "0,1"}
+    training_environment = {
+        **base_environment,
+        "CUDA_VISIBLE_DEVICES": ",".join(map(str, training_devices)),
+    }
     return_code = _run_logged_command(
         [
             sys.executable,
@@ -1300,6 +1295,77 @@ def recipe_da3_remote(
     run_volume.commit()
     print(f"DA3 recipe training complete result={result}", flush=True)
     return result
+
+
+@app.function(
+    image=da3_training_image,
+    secrets=[hf_secret, wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H200:3",
+    cpu=32,
+    memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
+    timeout=12 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def recipe_da3_remote(
+    run_name: str,
+    recipe_name: str,
+    experiment_name: str,
+    expected_steps: int,
+    wandb_group: str,
+    prefill_steps: int = 4,
+) -> dict:
+    return _run_recipe_da3(
+        run_name,
+        recipe_name,
+        experiment_name,
+        expected_steps,
+        wandb_group,
+        prefill_steps,
+        gpu_label="H200:3",
+        training_devices=(0, 1),
+        depth_device=2,
+        da3_image_capacity=80,
+    )
+
+
+@app.function(
+    image=da3_training_image,
+    secrets=[hf_secret, wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H100!:5",
+    cpu=32,
+    memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
+    timeout=24 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def recipe_da3_h100x5_remote(
+    run_name: str,
+    recipe_name: str,
+    prefill_steps: int = 4,
+) -> dict:
+    return _run_recipe_da3(
+        run_name,
+        recipe_name,
+        "diegesis_syn4d_mvkubric_recipe_da3_ddp_5000",
+        5000,
+        "diegesis351-syn4d-mvkubric-da3-5000",
+        prefill_steps,
+        gpu_label="H100!:5",
+        training_devices=(0, 1, 2, 3),
+        depth_device=4,
+        da3_image_capacity=64,
+    )
 
 
 @app.function(
@@ -1775,6 +1841,26 @@ def recipe_da3_train1000(run_name: str, recipe_name: str) -> None:
         4,
     )
     print(json.dumps({"run_name": run_name, "function_call_id": call.object_id}, indent=2))
+
+
+@app.local_entrypoint(name="recipe-da3-h100x5-train5000")
+def recipe_da3_h100x5_train5000(run_name: str, recipe_name: str) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=5)
+    validate_run_name(run_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {**MODAL_TAGS, "experiment": run_name, "gpu": "h100x5"}
+    )
+    deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h100x5_remote")
+    call = deployed.spawn(run_name, recipe_name, 4)
+    print(
+        json.dumps(
+            {"run_name": run_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint(name="smoke")

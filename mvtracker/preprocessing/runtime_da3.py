@@ -27,7 +27,7 @@ from mvtracker.preprocessing.mvkubric_webdataset import META_COMPONENT, RGB_COMP
 
 
 MODEL_ID = "depth-anything/DA3-GIANT-1.1"
-IMAGE_CAPACITY = 80
+IMAGE_CAPACITY = int(os.environ.get("MVTRACKER_DA3_IMAGE_CAPACITY", "80"))
 MIN_ALIGNMENT_VIEWS = 4
 MAX_PENDING_SAMPLES = 32
 
