@@ -61,7 +61,7 @@ def main(root: Path) -> None:
         }
         next_submit = worker_count
         for idx in range(len(sequence_dirs)):
-            yield futures.pop(idx).result()
+            sequence = futures.pop(idx).result()
             if next_submit < len(sequence_dirs):
                 futures[next_submit] = loader.submit(
                     load_sequence,
@@ -70,6 +70,7 @@ def main(root: Path) -> None:
                     resolution=resolution,
                 )
                 next_submit += 1
+            yield sequence
 ''',
     )
 

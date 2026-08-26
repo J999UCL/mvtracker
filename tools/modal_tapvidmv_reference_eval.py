@@ -43,6 +43,8 @@ SOURCES = (
     ("diegesis", BUCKET_ROOT, "diegesis/scenes/", 21),
 )
 SOURCE_NAMES = tuple(source[0] for source in SOURCES)
+PREDICTION_LANES = 4
+LOADER_WORKERS_PER_LANE = 1
 
 TAGS = {
     "owner": "jeet",
@@ -477,35 +479,58 @@ def predict_reference_depth(run_name: str) -> dict:
                 source_timings[source] = 0.0
                 continue
             source_started = time.perf_counter()
-            command = [
-                sys.executable,
-                "-u",
-                "-m",
-                "tapvidmv.run_predictor",
-                "--predictor",
-                "reconstruction__mvtracker",
-                "--tapvidmv_dir",
-                str(DATASET_ROOT),
-                "--tapvidmv_predictions",
-                str(method_root),
-                "--data_sources_to_predict",
-                source,
-                "--resolution",
-                "512",
-                "--seed",
-                "72",
-                "--loader_workers",
-                "4",
+            lanes = [
+                incomplete[lane_idx::PREDICTION_LANES]
+                for lane_idx in range(min(PREDICTION_LANES, len(incomplete)))
             ]
-            if len(incomplete) != len(sequence_names):
-                command.extend(["--sequences", ",".join(incomplete), "--overwrite_predictions"])
             _log(
                 "prediction_source_started",
                 source=source,
                 pending=len(incomplete),
                 total=len(sequence_names),
+                lanes=len(lanes),
+                lane_sizes=[len(lane) for lane in lanes],
             )
-            _run_logged(command, cwd=WORKSPACE, stage=f"predict-{source}")
+            with ThreadPoolExecutor(max_workers=len(lanes)) as executor:
+                lane_futures = {}
+                for lane_idx, lane_sequences in enumerate(lanes):
+                    command = [
+                        sys.executable,
+                        "-u",
+                        "-m",
+                        "tapvidmv.run_predictor",
+                        "--predictor",
+                        "reconstruction__mvtracker",
+                        "--tapvidmv_dir",
+                        str(DATASET_ROOT),
+                        "--tapvidmv_predictions",
+                        str(method_root),
+                        "--data_sources_to_predict",
+                        source,
+                        "--resolution",
+                        "512",
+                        "--seed",
+                        "72",
+                        "--loader_workers",
+                        str(LOADER_WORKERS_PER_LANE),
+                        "--sequences",
+                        ",".join(lane_sequences),
+                        "--overwrite_predictions",
+                    ]
+                    stage = f"predict-{source}-lane-{lane_idx + 1}"
+                    _log(
+                        "prediction_lane_started",
+                        source=source,
+                        lane=lane_idx + 1,
+                        sequences=len(lane_sequences),
+                    )
+                    lane_futures[
+                        executor.submit(_run_logged, command, cwd=WORKSPACE, stage=stage)
+                    ] = lane_idx + 1
+                for future in as_completed(lane_futures):
+                    lane_idx = lane_futures[future]
+                    future.result()
+                    _log("prediction_lane_completed", source=source, lane=lane_idx)
             eval_volume.commit()
             source_elapsed = time.perf_counter() - source_started
             source_timings[source] = source_elapsed
