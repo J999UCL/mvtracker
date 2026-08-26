@@ -360,6 +360,124 @@ def profile_h100_loader_remote() -> dict:
 
 
 @app.function(
+    image=da3_training_image,
+    secrets=[hf_secret, wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H200!",
+    cpu=32,
+    memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
+    ephemeral_disk=512 * 1024,
+    timeout=2 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def audit_recipe_gradients_remote(
+    audit_name: str,
+    source_run_name: str,
+    recipe_name: str,
+) -> dict:
+    """Replay two anomalous optimizer steps without updating the model."""
+    from types import SimpleNamespace
+
+    import wandb
+
+    from tools.audit_recipe_optimizer_steps import run as run_audit
+
+    validate_run_name(audit_name)
+    validate_run_name(source_run_name)
+    validate_run_name(recipe_name)
+    source_run = RUN_ROOT / CONTINUAL_RUN_SUBDIR / source_run_name
+    output_dir = RUN_ROOT / "gradient-audits" / audit_name
+    output_dir.mkdir(parents=True, exist_ok=False)
+    output_path = output_dir / "report.json"
+    runtime_depth_root = Path("/tmp/mvtracker-gradient-audit-depth")
+    evaluation_tags = {
+        "owner": "jeet",
+        "project": "mvtracker",
+        "purpose": "evaluation",
+    }
+    wandb_run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group="gradient-corruption-audit",
+        job_type="gradient-audit",
+        name=audit_name,
+        tags=["modal", "h200", "gradient-audit", "no-optimizer-step"],
+        config={
+            "source_commit": _source_commit(),
+            "source_run": source_run_name,
+            "recipe": recipe_name,
+            "checkpoint_step": 500,
+            "optimizer_steps": [625, 688],
+            **evaluation_tags,
+        },
+    )
+    print(
+        "AUDIT event=modal_start "
+        f"audit={audit_name} source_run={source_run_name} recipe={recipe_name}",
+        flush=True,
+    )
+    try:
+        report = run_audit(
+            SimpleNamespace(
+                run_dir=source_run,
+                data_root=Path(DATA_VOLUME_ROOT),
+                checkpoint=source_run / "model_000500.pth",
+                recipe=RECIPE_ROOT / recipe_name,
+                diegesis_root=Path(DATA_VOLUME_ROOT)
+                / "datasets/diegesis-mvtracker",
+                syn4d_root=Path(DATA_VOLUME_ROOT) / "datasets/syn4d-mvtracker",
+                mvkubric_root=Path(DATA_VOLUME_ROOT) / "datasets",
+                runtime_depth_root=runtime_depth_root,
+                depth_mode="runtime",
+                optimizer_steps=(625, 688),
+                sketch_size=2048,
+                sketch_seed=0,
+                device="cuda",
+                output=output_path,
+            )
+        )
+    except BaseException:
+        wandb_run.summary["status"] = "failed"
+        wandb_run.finish(exit_code=1)
+        raise
+    summary = {"status": "complete", "report": str(output_path)}
+    for step in report["steps"]:
+        optimizer_step = int(step["optimizer_step"])
+        summary[f"step_{optimizer_step}/accumulated_gradient_norm"] = float(
+            step["accumulated_gradient_norm"]
+        )
+        summary[f"step_{optimizer_step}/would_clip"] = bool(
+            step["would_clip_at_global_norm_1"]
+        )
+        for sample in step["samples"]:
+            if sample["source"] == "diegesis" and sample["scene"] == "kitchen03":
+                prefix = f"step_{optimizer_step}/kitchen03"
+                summary[f"{prefix}/loss"] = float(sample["scene_losses"]["total"])
+                summary[f"{prefix}/gradient_norm"] = float(sample["gradient_norm"])
+                counterfactual = sample.get("counterfactual_radius_30m")
+                if counterfactual is not None:
+                    summary[f"{prefix}/filtered_loss"] = float(
+                        counterfactual["scene_losses"]["total"]
+                    )
+                    summary[f"{prefix}/filtered_gradient_norm"] = float(
+                        counterfactual["gradient_norm"]
+                    )
+                    summary[f"{prefix}/removed_tracks"] = int(
+                        counterfactual["removed_tracks"]
+                    )
+    wandb_run.summary.update(summary)
+    wandb_run.finish()
+    run_volume.commit()
+    print(f"AUDIT event=modal_complete report={output_path}", flush=True)
+    return summary
+
+
+@app.function(
     image=training_image,
     secrets=[wandb_secret],
     volumes={str(DATA_ROOT): data_volume},
@@ -1364,6 +1482,37 @@ def profile_h100_loader() -> None:
     preflight_active_containers(required_free_slots=1)
     app.set_tags({**PROFILE_TAGS, "experiment": "encoded-loader-h100", "gpu": "h100"})
     print(json.dumps(profile_h100_loader_remote.remote(), indent=2))
+
+
+@app.local_entrypoint(name="audit-recipe-gradients")
+def audit_recipe_gradients(
+    audit_name: str,
+    source_run_name: str,
+    recipe_name: str,
+) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    validate_run_name(audit_name)
+    validate_run_name(source_run_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {
+            "owner": "jeet",
+            "project": "mvtracker",
+            "purpose": "evaluation",
+            "experiment": audit_name,
+            "gpu": "h200x1",
+        }
+    )
+    deployed = modal.Function.from_name(APP_NAME, "audit_recipe_gradients_remote")
+    call = deployed.spawn(audit_name, source_run_name, recipe_name)
+    print(
+        json.dumps(
+            {"audit_name": audit_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint(name="plan-recipe")

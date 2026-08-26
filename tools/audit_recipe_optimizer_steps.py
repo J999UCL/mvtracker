@@ -94,16 +94,25 @@ def _concentration(batch, output: Mapping[str, Any], cfg) -> dict[str, Any]:
     frame_count = int(batch.trajectory_3d.shape[1])
     track_count = int(batch.trajectory_3d.shape[2])
     per_track = torch.zeros(track_count, device=batch.trajectory_3d.device, dtype=torch.float32)
+    target_all = batch.trajectory_3d.index_select(2, sort_indices)
+    query_frames = batch.query_points_3d[:, :, 0].long()[:, None, :]
+    frame_indices = torch.arange(
+        frame_count, device=batch.valid.device
+    )[None, :, None]
+    valid_all = batch.valid * (frame_indices >= query_frames)
+    valid_all = valid_all.index_select(2, sort_indices)
     trace_index = 0
     window_count = 0
     for window_start in range(query_times[0], frame_count - sequence_length // 2, sequence_length // 2):
         p_idx_end = bisect_left(query_times, window_start + sequence_length)
         if p_idx_end == 0:
             raise RuntimeError("trajectory trace window contains no query tracks")
-        target = batch.trajectory_3d.index_select(2, sort_indices)
-        target = target[:, window_start:window_start + sequence_length, :p_idx_end].float()
-        valid = batch.valid.index_select(2, sort_indices)
-        valid = valid[:, window_start:window_start + sequence_length, :p_idx_end].float()
+        target = target_all[
+            :, window_start:window_start + sequence_length, :p_idx_end
+        ].float()
+        valid = valid_all[
+            :, window_start:window_start + sequence_length, :p_idx_end
+        ].float()
         valid_count = valid.sum().clamp_min(1.0)
         for prediction_index in range(int(cfg.trainer.train_iters)):
             if trace_index >= len(trace["coordinates"]):
@@ -111,7 +120,9 @@ def _concentration(batch, output: Mapping[str, Any], cfg) -> dict[str, Any]:
             prediction = trace["coordinates"][trace_index].to(batch.trajectory_3d.device).float()
             trace_index += 1
             prediction = prediction[..., :p_idx_end, :]
-            prediction_z = (prediction[..., 2] - 0.1) / (65.0 - 0.1) * 128.0
+            # sequence_loss_3d normalizes prediction Z in place before this
+            # trace is captured. Only the metric GT Z still needs conversion.
+            prediction_z = prediction[..., 2]
             target_z = (target[..., 2] - 0.1) / (65.0 - 0.1) * 128.0
             error = torch.stack((prediction[..., 0] - target[..., 0], prediction[..., 1] - target[..., 1], prediction_z - target_z), dim=-1).abs().mean(dim=-1)
             weight = float(cfg.trainer.gamma) ** (int(cfg.trainer.train_iters) - prediction_index - 1)
@@ -121,10 +132,14 @@ def _concentration(batch, output: Mapping[str, Any], cfg) -> dict[str, Any]:
         raise RuntimeError("captured trajectory trace contains unexpected extra windows")
     scale = float(batch.track_upscaling_factor[0].item())
     values = per_track * scale / max(window_count, 1) / int(cfg.trainer.train_iters)
-    valid_sorted = batch.valid.index_select(2, sort_indices)
-    real = values[valid_sorted[0].sum(dim=0) > 0]
+    real = values[valid_all[0].sum(dim=0) > 0]
     total = float(real.sum())
-    result = {"track_count": int(real.numel()), "total_trajectory_loss": total}
+    result = {
+        "track_count": int(real.numel()),
+        "total_trajectory_loss": total,
+        "scene_loss_difference": total
+        - float(output["scene_losses"]["flow"][0].float().item()),
+    }
     if total == 0.0:
         return {**result, "worst_1_percent_share": 0.0, "worst_5_percent_share": 0.0, "worst_10_percent_share": 0.0}
     descending = torch.sort(real, descending=True).values
@@ -193,14 +208,14 @@ def _counterfactual_batch(batch, plan, dataset, radius: float = 30.0):
     anchor = np.asarray(manifest.get("world_anchor", (0.0, 0.0, 0.0)), dtype=np.float32)
     radii = np.linalg.norm(tracks - anchor, axis=-1).max(axis=0)
     radii = torch.as_tensor(radii)
-    keep = radii <= float(radius)
+    keep = (radii <= float(radius)).to(batch.trajectory.device)
     if bool(keep.all()):
         return None, int((~keep).sum().item())
     return dataclasses.replace(
         batch,
-        trajectory=batch.trajectory[:, :, keep],
-        trajectory_3d=batch.trajectory_3d[:, keep],
-        visibility=batch.visibility[:, :, keep],
+        trajectory=batch.trajectory[..., keep, :],
+        trajectory_3d=batch.trajectory_3d[:, :, keep, :],
+        visibility=batch.visibility[..., keep],
         valid=batch.valid[:, :, keep],
         query_points=batch.query_points[:, keep] if batch.query_points is not None else None,
         query_points_3d=batch.query_points_3d[:, keep],
@@ -220,8 +235,10 @@ def _build_config(args, recipe_manifest):
     cfg.datasets.train.sources.diegesis.root = str(args.diegesis_root)
     cfg.datasets.train.sources.syn4d.root = str(args.syn4d_root)
     cfg.datasets.train.sources.mvkubric.root = str(args.mvkubric_root)
-    cfg.datasets.train.kubric_metadata_index_root = str(args.mvkubric_index_root)
-    cfg.datasets.train.mvkubric_storage = "native"
+    cfg.datasets.train.mvkubric_storage = "dali_stream"
+    cfg.datasets.train.mvkubric_webdataset_root = str(
+        Path(args.data_root) / "datasets/kubric-multiview-webdataset"
+    )
     # The recipe predates the radius filter currently used by DIEGESIS.
     cfg.datasets.diegesis_max_track_radius = float("inf")
     # The recipe was generated with the 65m Syn4D radius.
@@ -233,8 +250,7 @@ def _build_config(args, recipe_manifest):
 
 
 def _build_datasets(cfg, args, recipe_manifest):
-    from mvtracker.datasets import KubricMultiViewDataset, Syn4DMultiViewDataset, TapVid3DMultiViewDataset
-    from mvtracker.datasets.kubric_gpu_dataset import GpuDecodedKubricMultiViewDataset
+    from mvtracker.cli.train import _build_training_dataset
 
     fabric = SimpleNamespace(world_size=int(recipe_manifest["world_size"]), global_rank=0)
     datasets = {}
@@ -242,25 +258,13 @@ def _build_datasets(cfg, args, recipe_manifest):
     for source in SOURCE_NAMES:
         if source not in recipe_manifest.get("scene_lists", {}):
             continue
-        if source == "diegesis":
-            kwargs = TapVid3DMultiViewDataset.from_name(
-                source_cfg[source].name, str(args.diegesis_root), cfg, fabric,
-                just_return_kwargs=True, include_scene_ids=list(recipe_manifest["scene_lists"][source]),
-            )
-            datasets[source] = TapVid3DMultiViewDataset(**kwargs)
-        elif source == "syn4d":
-            kwargs = Syn4DMultiViewDataset.from_name(
-                source_cfg[source].name, str(args.syn4d_root), cfg, fabric,
-                just_return_kwargs=True, include_scene_ids=list(recipe_manifest["scene_lists"][source]),
-            )
-            datasets[source] = Syn4DMultiViewDataset(**kwargs)
-        else:
-            kwargs = KubricMultiViewDataset.from_name(
-                source_cfg[source].name, str(args.mvkubric_root), cfg, fabric,
-                just_return_kwargs=True, include_scene_ids=list(recipe_manifest["scene_lists"][source]),
-            )
-            kwargs["metadata_index_root"] = str(args.mvkubric_index_root)
-            datasets[source] = GpuDecodedKubricMultiViewDataset(**kwargs)
+        datasets[source] = _build_training_dataset(
+            source_cfg[source].name,
+            source_cfg[source].root,
+            cfg,
+            fabric,
+            source_cfg[source],
+        )
         print(f"AUDIT event=dataset_ready source={source} scenes={len(recipe_manifest['scene_lists'][source])}", flush=True)
     return datasets
 
@@ -283,6 +287,8 @@ def _materialize(dataset, record, plan, args, runtime_store):
     if args.depth_mode == "gt":
         plan = dataclasses.replace(plan, depth_source="gt")
         sample, gotit = dataset.materialize_sample(plan)
+    elif record.depth_source == "gt":
+        sample, gotit = dataset.materialize_sample(plan)
     else:
         if runtime_store is None:
             raise ValueError("--depth-mode runtime requires --runtime-depth-root")
@@ -293,16 +299,34 @@ def _materialize(dataset, record, plan, args, runtime_store):
     return sample
 
 
-def _decode(sample, decoder):
-    prepared = SimpleNamespace(samples=(sample,))
+def _decode(sample, decoder, source, plan):
+    from mvtracker.datasets.mixed_physical_loader import (
+        PlannedScene,
+        PreparedPhysicalGroup,
+    )
+
+    prepared = PreparedPhysicalGroup(
+        scenes=(PlannedScene(source, plan),),
+        samples=(sample,),
+    )
     batch, _ = decoder.decode_async(prepared)
     return batch
 
 
-def _run_forward(model, batch, cfg, recipe_step, diagnostics):
+def _run_forward(
+    model,
+    batch,
+    cfg,
+    recipe_step,
+    diagnostics,
+    *,
+    loss_scale=1.0,
+    zero_grad=False,
+):
     from mvtracker.cli.train import forward_batch_multi_view
 
-    model.zero_grad(set_to_none=True)
+    if zero_grad:
+        model.zero_grad(set_to_none=True)
     diagnostics.begin()
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         output = forward_batch_multi_view(
@@ -311,11 +335,53 @@ def _run_forward(model, batch, cfg, recipe_step, diagnostics):
             run_expensive_diagnostics=False, capture_training_trace=True,
         )
         loss = output["flow"]["loss"] + output["visibility"]["loss"]
-    loss.backward()
-    gradient = diagnostics.finish(unscale_factor=1.0)
+    (loss * float(loss_scale)).backward()
+    gradient = diagnostics.finish(unscale_factor=1.0 / float(loss_scale))
     if gradient is None:
         raise RuntimeError("no gradients were observed during audit backward")
     return output, gradient
+
+
+def _global_gradient_norm(model) -> float:
+    squared = [
+        parameter.grad.detach().float().square().sum()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    ]
+    return float(torch.stack(squared).sum().sqrt().item()) if squared else 0.0
+
+
+def _generate_runtime_depths(records, data_root: Path, output_root: Path) -> None:
+    """Generate only selected non-GT samples, then unload DA3 before replay."""
+    import gc
+    from depth_anything_3.api import DepthAnything3
+    from mvtracker.preprocessing.runtime_da3 import (
+        MODEL_ID,
+        _MVKubricScenes,
+        _PackedScenes,
+        _produce_record,
+    )
+
+    selected = [record for record in records if record.depth_source != "gt"]
+    if not selected:
+        return
+    output_root.mkdir(parents=True, exist_ok=True)
+    print(f"AUDIT event=depth_generation_start samples={len(selected)}", flush=True)
+    model = DepthAnything3.from_pretrained(MODEL_ID).to("cuda").eval()
+    packed = _PackedScenes(data_root)
+    mvkubric = _MVKubricScenes(data_root)
+    for position, record in enumerate(selected, start=1):
+        reader = mvkubric if record.source == "mvkubric" else packed
+        _produce_record(model, reader, record, output_root)
+        print(
+            f"AUDIT event=depth_sample_ready progress={position}/{len(selected)} "
+            f"step={record.step} logical_index={record.logical_index}",
+            flush=True,
+        )
+    del model, packed, mvkubric
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("AUDIT event=depth_generation_complete", flush=True)
 
 
 def run(args) -> dict[str, Any]:
@@ -331,6 +397,16 @@ def run(args) -> dict[str, Any]:
     from mvtracker.datasets.training_recipe import RecipeReader
 
     reader = RecipeReader(recipe_path)
+    records_by_step = {
+        int(optimizer_step): _load_recipe_step(reader, int(optimizer_step) - 1)
+        for optimizer_step in args.optimizer_steps
+    }
+    if args.depth_mode == "runtime":
+        _generate_runtime_depths(
+            [record for records in records_by_step.values() for record in records],
+            Path(args.data_root),
+            Path(args.runtime_depth_root),
+        )
     cfg = _build_config(args, reader.manifest)
     device = torch.device(args.device)
     model = _load_model(cfg, checkpoint, device)
@@ -357,9 +433,11 @@ def run(args) -> dict[str, Any]:
             recipe_step = int(optimizer_step) - 1
             if recipe_step < 0:
                 raise ValueError("optimizer steps are 1-indexed and must be positive")
-            records = _load_recipe_step(reader, recipe_step)
+            records = records_by_step[int(optimizer_step)]
             print(f"AUDIT event=step_start optimizer_step={optimizer_step} recipe_step={recipe_step} samples={len(records)}", flush=True)
             step_rows = []
+            counterfactuals = []
+            model.zero_grad(set_to_none=True)
             for position, record in enumerate(records):
                 request = record.replay_request(ScheduledSampleRequest)
                 plan = datasets[record.source].plan_sample(request)
@@ -367,8 +445,15 @@ def run(args) -> dict[str, Any]:
                     raise RuntimeError(f"recipe sample replayed invalid: {record.source} {record.logical_index}")
                 _validate_plan(record, plan)
                 sample = _materialize(datasets[record.source], record, plan, args, runtime_store)
-                batch = _decode(sample, decoder)
-                output, gradient = _run_forward(model, batch, cfg, recipe_step, diagnostics)
+                batch = _decode(sample, decoder, record.source, plan)
+                output, gradient = _run_forward(
+                    model,
+                    batch,
+                    cfg,
+                    recipe_step,
+                    diagnostics,
+                    loss_scale=1.0 / len(records),
+                )
                 row = {
                     "optimizer_step": optimizer_step, "recipe_step": recipe_step,
                     "logical_index": int(record.logical_index), "source": record.source,
@@ -385,20 +470,35 @@ def run(args) -> dict[str, Any]:
                         batch, plan, datasets[record.source]
                     )
                 if counterfactual is not None:
-                    cf_output, cf_gradient = _run_forward(model, counterfactual, cfg, recipe_step, diagnostics)
-                    row["counterfactual_radius_30m"] = {
-                        "removed_tracks": removed,
-                        "remaining_tracks": int(counterfactual.trajectory_3d.shape[1]),
-                        "gradient_norm": float(cf_gradient["norm"]),
-                        "scene_losses": _scene_loss_report(cf_output),
-                        "trajectory_concentration": _concentration(counterfactual, cf_output, cfg),
-                    }
+                    counterfactuals.append((row, counterfactual, removed))
                 step_rows.append(row)
                 report["samples"].append(row)
                 print(f"AUDIT event=sample_complete optimizer_step={optimizer_step} progress={position + 1}/{len(records)} source={record.source} scene={record.scene} gradient_norm={row['gradient_norm']:.6g}", flush=True)
+            accumulated_gradient_norm = _global_gradient_norm(model)
+            for row, counterfactual, removed in counterfactuals:
+                cf_output, cf_gradient = _run_forward(
+                    model,
+                    counterfactual,
+                    cfg,
+                    recipe_step,
+                    diagnostics,
+                    zero_grad=True,
+                )
+                row["counterfactual_radius_30m"] = {
+                    "removed_tracks": removed,
+                    "remaining_tracks": int(counterfactual.trajectory_3d.shape[2]),
+                    "gradient_norm": float(cf_gradient["norm"]),
+                    "scene_losses": _scene_loss_report(cf_output),
+                    "trajectory_concentration": _concentration(
+                        counterfactual, cf_output, cfg
+                    ),
+                }
             report.setdefault("steps", []).append({
                 "optimizer_step": optimizer_step, "recipe_step": recipe_step,
-                "samples": step_rows, "gradient_relations": _gradient_relations(step_rows),
+                "samples": step_rows,
+                "accumulated_gradient_norm": accumulated_gradient_norm,
+                "would_clip_at_global_norm_1": accumulated_gradient_norm > 1.0,
+                "gradient_relations": _gradient_relations(step_rows),
             })
             print(f"AUDIT event=step_complete optimizer_step={optimizer_step} recipe_step={recipe_step}", flush=True)
     finally:
@@ -414,12 +514,12 @@ def run(args) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--recipe", type=Path)
     parser.add_argument("--diegesis-root", type=Path, required=True)
     parser.add_argument("--syn4d-root", type=Path, required=True)
     parser.add_argument("--mvkubric-root", type=Path, required=True)
-    parser.add_argument("--mvkubric-index-root", type=Path, required=True)
     parser.add_argument("--runtime-depth-root", type=Path)
     parser.add_argument("--depth-mode", choices=("gt", "runtime"), default="gt")
     parser.add_argument("--optimizer-steps", type=int, nargs="+", default=DEFAULT_OPTIMIZER_STEPS)
