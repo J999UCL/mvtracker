@@ -209,12 +209,11 @@ def _source_download_jobs(source: str, base_url: str, strip_prefix: str):
         entries = [line.strip() for line in response.read().decode().splitlines() if line.strip()]
     jobs = []
     for entry in entries:
-        if strip_prefix:
-            if not entry.startswith(strip_prefix):
-                raise ValueError(f"{source} manifest entry lacks {strip_prefix!r}: {entry}")
-            relative = entry[len(strip_prefix) :]
-        else:
-            relative = entry
+        relative = (
+            entry[len(strip_prefix) :]
+            if strip_prefix and entry.startswith(strip_prefix)
+            else entry
+        )
         jobs.append((source, f"{base_url}/{entry}", DATASET_ROOT / source / relative))
     _log("manifest_ready", source=source, files=len(jobs))
     return jobs
