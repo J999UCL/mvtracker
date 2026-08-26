@@ -380,20 +380,6 @@ def build_mvkubric_recipe_metadata_remote() -> dict:
     source_root = (
         Path(DATA_VOLUME_ROOT) / "datasets/kubric-multiview-webdataset/train"
     )
-    started = time.perf_counter()
-    print(
-        "MVKUBRIC_METADATA event=build_start "
-        f"source={source_root} output={MVKUBRIC_METADATA_SIDECAR}",
-        flush=True,
-    )
-    manifest = build_metadata_sidecar(
-        source_root,
-        MVKUBRIC_METADATA_SIDECAR,
-        shard_count=16,
-    )
-    data_volume.commit()
-    elapsed = time.perf_counter() - started
-    total_bytes = sum(int(shard["bytes"]) for shard in manifest["shards"])
     run = wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
@@ -403,6 +389,25 @@ def build_mvkubric_recipe_metadata_remote() -> dict:
         tags=["modal", "recipe", "metadata-sidecar", "cpu"],
         config={"source_commit": _source_commit(), **PROFILE_TAGS},
     )
+    started = time.perf_counter()
+    print(
+        "MVKUBRIC_METADATA event=build_start "
+        f"source={source_root} output={MVKUBRIC_METADATA_SIDECAR}",
+        flush=True,
+    )
+    try:
+        manifest = build_metadata_sidecar(
+            source_root,
+            MVKUBRIC_METADATA_SIDECAR,
+            shard_count=16,
+        )
+        data_volume.commit()
+    except BaseException:
+        run.summary["status"] = "failed"
+        run.finish(exit_code=1)
+        raise
+    elapsed = time.perf_counter() - started
+    total_bytes = sum(int(shard["bytes"]) for shard in manifest["shards"])
     run.summary.update(
         {
             "elapsed_seconds": elapsed,
@@ -464,6 +469,20 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     seed = 72
     output_dir = RECIPE_ROOT / recipe_name
     local_output_dir = Path("/tmp/mvtracker-training-recipes") / recipe_name
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group="training-recipe-planning",
+        job_type="recipe-planning",
+        name=recipe_name,
+        tags=["modal", "recipe", f"cpu{RECIPE_PLANNER_CPUS}", "training"],
+        config={
+            "source_commit": _source_commit(),
+            "step_count": int(step_count),
+            "cpu_cores": RECIPE_PLANNER_CPUS,
+            **MODAL_TAGS,
+        },
+    )
     print(
         "recipe startup "
         f"commit={_source_commit()} cpus={RECIPE_PLANNER_CPUS} steps={step_count} "
@@ -626,31 +645,27 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
             json.dumps(summary, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+    except BaseException:
+        run.summary["status"] = "failed"
+        run.finish(exit_code=1)
+        raise
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join()
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        group="training-recipe-planning",
-        job_type="recipe-planning",
-        name=recipe_name,
-        tags=["modal", "recipe", f"cpu{RECIPE_PLANNER_CPUS}", "training"],
-        config={
-            "source_commit": _source_commit(),
-            "step_count": int(step_count),
-            "cpu_cores": RECIPE_PLANNER_CPUS,
-            **MODAL_TAGS,
-        },
-    )
+    try:
+        print(
+            f"recipe phase=publish source={local_output_dir} destination={output_dir}",
+            flush=True,
+        )
+        shutil.copytree(local_output_dir, output_dir)
+        run_volume.commit()
+    except BaseException:
+        run.summary["status"] = "failed"
+        run.finish(exit_code=1)
+        raise
     run.summary.update(summary)
+    run.summary["status"] = "complete"
     run.finish()
-    print(
-        f"recipe phase=publish source={local_output_dir} destination={output_dir}",
-        flush=True,
-    )
-    shutil.copytree(local_output_dir, output_dir)
-    run_volume.commit()
     print(f"recipe volume commit complete output={output_dir}", flush=True)
     return summary
 
