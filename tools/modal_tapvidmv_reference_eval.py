@@ -589,8 +589,12 @@ def predict_reference_depth(run_name: str) -> dict:
     volumes={EVAL_MOUNT: eval_volume},
     secrets=[wandb_secret],
 )
-def evaluate_predictions(run_name: str) -> dict:
-    run = _wandb_run(run_name, "evaluate")
+def evaluate_predictions(run_name: str, source_only: str = "") -> dict:
+    if source_only:
+        assert source_only in SOURCE_NAMES
+    sources = (source_only,) if source_only else SOURCE_NAMES
+    stage = f"evaluate-{source_only}" if source_only else "evaluate"
+    run = _wandb_run(run_name, stage)
     run_root = RUNS_ROOT / run_name
     prediction_parent = run_root / "tapvidmv_predictions"
     method_root = prediction_parent / "reconstruction__mvtracker"
@@ -602,7 +606,7 @@ def evaluate_predictions(run_name: str) -> dict:
         preview_root=str(preview_root),
     )
     started = time.perf_counter()
-    for source in SOURCE_NAMES:
+    for source in sources:
         _run_logged(
             [
                 sys.executable,
@@ -629,6 +633,24 @@ def evaluate_predictions(run_name: str) -> dict:
         )
         eval_volume.commit()
         _log("evaluation_source_completed", source=source, volume_committed=True)
+
+    if source_only:
+        metrics_files = sorted(
+            (preview_root / method_root.name / source_only).rglob("metrics.json")
+        )
+        elapsed = time.perf_counter() - started
+        eval_volume.commit()
+        result = {
+            "source": source_only,
+            "seconds": elapsed,
+            "metrics_files": len(metrics_files),
+            "preview_root": str(preview_root),
+        }
+        _log("evaluation_completed", **result, volume_committed=True)
+        run.log({"evaluation/seconds": elapsed, "evaluation/metrics_files": len(metrics_files)})
+        run.summary.update(result)
+        run.finish()
+        return result
 
     for source in SOURCE_NAMES:
         _run_logged(
@@ -692,7 +714,7 @@ def evaluate_predictions(run_name: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(stage: str = "full", run_name: str = "") -> None:
+def main(stage: str = "full", run_name: str = "", source: str = "") -> None:
     if not run_name:
         run_name = f"tapvidmv-reference-step1500-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     app.set_tags({**TAGS, "run_name": run_name, "stage": stage})
@@ -704,7 +726,7 @@ def main(stage: str = "full", run_name: str = "") -> None:
         prediction = predict_reference_depth.remote(run_name)
         _log("prediction_result", result=prediction)
     if stage in {"full", "evaluate"}:
-        evaluation = evaluate_predictions.remote(run_name)
+        evaluation = evaluate_predictions.remote(run_name, source)
         _log("evaluation_result", result=evaluation)
     if stage not in {"full", "download", "predict", "evaluate"}:
         raise ValueError(f"unsupported stage: {stage}")
