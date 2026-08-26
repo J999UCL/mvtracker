@@ -61,6 +61,7 @@ def _image() -> modal.Image:
         )
         .pip_install(
             "waymo-open-dataset-tf-2-12-0==1.6.7",
+            "protobuf==3.20.3",
             "rerun-sdk==0.21.0",
             "requests==2.32.3",
             "wandb==0.19.9",
