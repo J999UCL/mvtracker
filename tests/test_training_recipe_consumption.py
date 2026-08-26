@@ -110,6 +110,8 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
         smoke_decorator = source[source.rfind("@app.function(", 0, smoke_start):smoke_start]
         self.assertIn("data_volume.with_mount_options(read_only=True)", planner_decorator)
         self.assertIn("str(RUN_ROOT): run_volume", planner_decorator)
+        self.assertIn("KubricMetadataSidecar", source[planner_start:smoke_start])
+        self.assertNotIn("preload_recipe_metadata", source[planner_start:smoke_start])
         self.assertIn("RECIPE_SMOKE_GPU_REQUEST = GPU_REQUEST", source)
         self.assertIn("gpu=RECIPE_SMOKE_GPU_REQUEST", smoke_decorator)
         self.assertIn('heartbeat_seconds=10', source)
