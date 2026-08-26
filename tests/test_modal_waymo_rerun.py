@@ -14,7 +14,8 @@ class ModalWaymoRerunTest(unittest.TestCase):
         self.assertIn("cpu=8", SOURCE)
 
     def test_pinned_dependencies_and_paths(self):
-        self.assertIn('"waymo-open-dataset-tf-2-12-0==1.6.6"', SOURCE)
+        self.assertIn('"waymo-open-dataset-tf-2-12-0==1.6.7"', SOURCE)
+        self.assertIn("jax_releases.html jaxlib==0.4.13", SOURCE)
         self.assertIn('"rerun-sdk==0.21.0"', SOURCE)
         self.assertIn("datasets/waymo-visualization/source", SOURCE)
         self.assertIn("waymo-visualization", SOURCE)

@@ -55,10 +55,13 @@ def _image() -> modal.Image:
     return (
         modal.Image.debian_slim(python_version="3.10")
         .apt_install("ca-certificates", "git", "libgl1", "libglib2.0-0")
+        .run_commands(
+            "python -m pip install --find-links "
+            "https://storage.googleapis.com/jax-releases/jax_releases.html jaxlib==0.4.13"
+        )
         .pip_install(
-            "waymo-open-dataset-tf-2-12-0==1.6.6",
+            "waymo-open-dataset-tf-2-12-0==1.6.7",
             "rerun-sdk==0.21.0",
-            "Pillow==11.1.0",
             "requests==2.32.3",
             "wandb==0.19.9",
         )
