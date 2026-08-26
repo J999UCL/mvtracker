@@ -232,7 +232,7 @@ def build_waymo_rerun(
     raw_timestamps = []
     for record in tf.data.TFRecordDataset(str(tfrecord_path)):
         frame = dataset_pb2.Frame()
-        frame.ParseFromString(bytearray(record.numpy()))
+        frame.ParseFromString(record.numpy())
         images = _camera_images(frame)
         poses = _camera_poses(frame)
         for camera in CAMERA_NAMES:
@@ -263,7 +263,7 @@ def build_waymo_rerun(
         if raw_index not in scene_raw_indices:
             continue
         frame = dataset_pb2.Frame()
-        frame.ParseFromString(bytearray(record.numpy()))
+        frame.ParseFromString(record.numpy())
         range_images, projections, _, top_pose = frame_utils.parse_range_image_and_camera_projection(frame)
         points_list, projection_list = frame_utils.convert_range_image_to_point_cloud(
             frame, range_images, projections, top_pose, ri_index=0
