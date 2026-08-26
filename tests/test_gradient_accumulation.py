@@ -206,6 +206,7 @@ class GradientAccumulationTests(unittest.TestCase):
             "optimizer.zero_grad",
             "fabric.backward",
             "fabric.clip_gradients",
+            "torch.nn.utils.clip_grad_norm_",
             "optimizer.step",
             "scheduler.step",
         ):
@@ -222,25 +223,35 @@ class GradientAccumulationTests(unittest.TestCase):
 
         backward_line = calls["fabric.backward"][0].lineno
         guard_line = guard.lineno
-        clip_line = calls["fabric.clip_gradients"][0].lineno
+        value_clip_line = calls["fabric.clip_gradients"][0].lineno
+        global_clip_line = calls["torch.nn.utils.clip_grad_norm_"][0].lineno
         optimizer_line = calls["optimizer.step"][0].lineno
         scheduler_line = calls["scheduler.step"][0].lineno
         self.assertLess(backward_line, guard_line)
-        self.assertLess(guard_line, clip_line)
-        self.assertLess(clip_line, optimizer_line)
+        self.assertLess(guard_line, value_clip_line)
+        self.assertLess(value_clip_line, global_clip_line)
+        self.assertLess(global_clip_line, optimizer_line)
         self.assertLess(optimizer_line, scheduler_line)
 
         clip_keywords = {
             keyword.arg: ast.unparse(keyword.value)
             for keyword in calls["fabric.clip_gradients"][0].keywords
         }
-        self.assertEqual(clip_keywords["max_norm"], "cfg.trainer.grad_clip")
-        self.assertNotIn("clip_val", clip_keywords)
+        self.assertEqual(clip_keywords["clip_val"], "cfg.trainer.grad_clip")
+        self.assertNotIn("max_norm", clip_keywords)
+        global_clip_keywords = {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in calls["torch.nn.utils.clip_grad_norm_"][0].keywords
+        }
+        self.assertEqual(
+            global_clip_keywords["max_norm"],
+            "cfg.trainer.global_grad_clip",
+        )
         clip_assignment = next(
             node
             for node in ast.walk(main)
             if isinstance(node, ast.Assign)
-            and node.value is calls["fabric.clip_gradients"][0]
+            and node.value is calls["torch.nn.utils.clip_grad_norm_"][0]
         )
         self.assertEqual(
             ast.unparse(clip_assignment.targets[0]),

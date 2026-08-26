@@ -91,6 +91,7 @@ trainer:
   wdecay: 0.00001
   anneal_strategy: linear
   grad_clip: 1.0
+  global_grad_clip: 3.0
   gradient_accumulation_steps: 4
   gradient_diagnostics_interval: 25
   expensive_diagnostics_interval: 50

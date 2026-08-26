@@ -2419,6 +2419,21 @@ gradients before and after clipping; those scans and their DDP reductions were
 removed. The dashboard computes its trailing clipped-step rate from the new
 per-step scalar stream.
 
+## 2026-08-26 — Upstream value clipping restored with a norm-3 safeguard
+
+Training now applies MVTracker's upstream elementwise gradient clipping at
+`[-1, 1]` before an additional global L2-norm limit of `3.0`. The order is
+intentional: value clipping suppresses isolated extreme coordinates, while the
+global limit guards the complete accumulated optimizer update. The global norm
+is measured after value clipping and logged before and after the norm guard,
+along with both thresholds and the resulting retention factor.
+
+The threshold is a conservative calibration from the checkpoint-500 replay:
+it clips the largest known corrupt update while only mildly affecting the
+upper end of the augmentation-heavy hard-sample controls. It does not replace
+the camera-centred track-radius filter, which removes the known geometric
+corruption before training.
+
 ## 2026-08-26 — Kitchen03 corrupt-gradient replay at optimizer steps 625 and 688
 
 The eight logical samples at optimizer steps 625 and 688 were replayed from
