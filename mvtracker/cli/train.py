@@ -4407,6 +4407,7 @@ def main(cfg: DictConfig):
                         "model_seconds",
                         "model_images_per_second",
                         "sample_seconds",
+                        "producer_max_rss_gib",
                     ):
                         tb_writer.add_scalar(
                             f"depth_producer/{name}",

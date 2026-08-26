@@ -7,6 +7,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import resource
 import shutil
 import time
 
@@ -130,16 +131,13 @@ class _MVKubricScenes:
         root = data_root / "datasets/kubric-multiview-webdataset/train"
         self.catalog = KubricWebDatasetCatalog(root / "manifest.json")
         self.records = _IndexedRecordStore(self.catalog.record_locator_path)
-        self.metadata = {}
 
     def _scene(self, name: str):
-        if name not in self.metadata:
-            entry = self.catalog.scenes[name]
-            record, _ = self.records.read(int(entry["metadata_index"]))
-            self.metadata[name] = _scene_metadata(
-                KubricDaliSceneBundle(name, record[f".{META_COMPONENT}"], (), ())
-            )
-        return self.metadata[name]
+        entry = self.catalog.scenes[name]
+        record, _ = self.records.read(int(entry["metadata_index"]))
+        return _scene_metadata(
+            KubricDaliSceneBundle(name, record[f".{META_COMPONENT}"], (), ())
+        )
 
     def load(self, record: RecipeRecord):
         scene = self._scene(record.scene)
@@ -337,6 +335,10 @@ def run(
                     "model_seconds": model_seconds,
                     "model_images_per_second": generated_images / max(model_seconds, 1e-9),
                     "sample_seconds": time.perf_counter() - sample_started,
+                    "producer_max_rss_gib": (
+                        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                        / 1024**2
+                    ),
                 }
                 with metrics_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(metric, separators=(",", ":")) + "\n")

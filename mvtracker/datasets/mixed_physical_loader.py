@@ -120,27 +120,6 @@ def _sample_nbytes(sample: EncodedTapVid3DSample) -> int:
     return total
 
 
-def _pin_sample(sample: EncodedTapVid3DSample) -> EncodedTapVid3DSample:
-    for field in fields(sample):
-        value = getattr(sample, field.name)
-        if isinstance(value, torch.Tensor) and value.device.type == "cpu":
-            setattr(sample, field.name, value.pin_memory())
-        elif isinstance(value, tuple) and any(
-            isinstance(item, torch.Tensor) for item in value
-        ):
-            setattr(
-                sample,
-                field.name,
-                tuple(
-                    item.pin_memory()
-                    if isinstance(item, torch.Tensor) and item.device.type == "cpu"
-                    else item
-                    for item in value
-                ),
-            )
-    return sample
-
-
 def _step_fingerprint(
     scenes: Sequence[PlannedScene],
     physical_groups: Sequence[PhysicalBatchGroup],
@@ -438,7 +417,7 @@ class MixedStepLookahead:
                 materialization_error = f"{scene.identity}: invalid materialized sample"
                 break
             sample.metadata["source"] = scene.source
-            prepared[scene.identity] = _pin_sample(sample)
+            prepared[scene.identity] = sample
 
         groups = []
         if materialization_error is None:
