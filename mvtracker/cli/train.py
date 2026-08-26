@@ -1149,7 +1149,7 @@ def _physical_batch_capacity(cfg):
     settings = cfg.datasets.train.physical_batching
     return BatchCapacity(
         name=str(settings.capacity_name),
-        rank_count=2,
+        rank_count=int(settings.get("rank_count", 2)),
         logical_scenes_per_rank=int(cfg.trainer.gradient_accumulation_steps),
         max_group_size=int(settings.max_scenes),
         pair_track_capacity_by_views=tuple(
@@ -2528,7 +2528,7 @@ def main(cfg: DictConfig):
             raise ValueError(
                 "mixed source schedule must contain every configured source"
             )
-        if gradient_accumulation_steps != len(source_pattern):
+        if not recipe_path and gradient_accumulation_steps != len(source_pattern):
             raise ValueError(
                 "gradient accumulation must match the mixed source schedule length"
             )
@@ -2585,6 +2585,17 @@ def main(cfg: DictConfig):
             if tuple(mixed_schedule.source_pattern) != source_pattern:
                 raise ValueError(
                     "recipe source pattern does not match datasets.train.source_schedule"
+                )
+            logical_samples = int(
+                mixed_schedule.reader.manifest["logical_samples_per_step"]
+            )
+            if logical_samples % fabric.world_size:
+                raise ValueError(
+                    "recipe logical samples do not divide evenly across DDP ranks"
+                )
+            if gradient_accumulation_steps != logical_samples // fabric.world_size:
+                raise ValueError(
+                    "gradient accumulation must match recipe samples per rank"
                 )
             train_datasets = {
                 source: _RecipeDataset(

@@ -16,6 +16,7 @@ from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
 from mvtracker.datasets.physical_batch_scheduler import (
     BatchCapacity,
     schedule_physical_batch,
+    schedule_singleton_batch,
 )
 from mvtracker.datasets.training_recipe import (
     RecipeReader,
@@ -294,6 +295,62 @@ class TrainingRecipeTests(unittest.TestCase):
                     all(
                         len(group["logical_indices"]) == 2
                         for group in step["physical_groups"]
+                    )
+                )
+
+    def test_parallel_planner_distributes_eight_singletons_over_four_ranks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "recipe"
+            datasets = {
+                "diegesis": _MetadataDataset("diegesis"),
+                "kubric": _MetadataDataset("kubric"),
+            }
+            schedule = BalancedMixedSourceSchedule(
+                {"diegesis": 5, "kubric": 4},
+                ("diegesis", "kubric", "diegesis", "kubric"),
+                world_size=2,
+                master_seed=31,
+            )
+            capacity = BatchCapacity(
+                name="four-rank-singletons",
+                rank_count=4,
+                logical_scenes_per_rank=2,
+                max_group_size=1,
+                pair_track_capacity_by_views=((2, 2048),),
+                singleton_only_views=frozenset(),
+            )
+            plan_training_recipe_parallel(
+                root,
+                datasets=datasets,
+                schedule=schedule,
+                step_count=2,
+                manifest={},
+                worker_count=2,
+                block_steps=1,
+                log=lambda _: None,
+                physical_scheduler=lambda summaries: schedule_singleton_batch(
+                    summaries, capacity=capacity
+                ),
+                output_world_size=4,
+            )
+            reader = RecipeReader(root)
+            reader.validate()
+            self.assertEqual(reader.manifest["world_size"], 4)
+            self.assertEqual(reader.manifest["logical_samples_per_step"], 8)
+            self.assertEqual(reader.manifest["rank_record_counts"], [4, 4, 4, 4])
+            for step in reader.steps():
+                self.assertEqual(len(step["physical_groups"]), 8)
+                self.assertTrue(
+                    all(len(group["logical_indices"]) == 1 for group in step["physical_groups"])
+                )
+                self.assertEqual(
+                    Counter(group["rank"] for group in step["physical_groups"]),
+                    Counter({0: 2, 1: 2, 2: 2, 3: 2}),
+                )
+                self.assertTrue(
+                    all(
+                        sample["rank"] == sample["scheduled_rank"]
+                        for sample in step["logical_samples"]
                     )
                 )
 

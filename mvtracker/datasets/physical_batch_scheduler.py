@@ -348,6 +348,52 @@ def schedule_physical_batch(
     return min(candidates, key=objective)
 
 
+def schedule_singleton_batch(
+    summaries: Sequence[SceneSummary],
+    *,
+    capacity: BatchCapacity,
+) -> SynchronizedBatchWave:
+    """Balance singleton scenes across any number of synchronized ranks."""
+    summaries = tuple(summaries)
+    expected = capacity.rank_count * capacity.logical_scenes_per_rank
+    if len(summaries) != expected:
+        raise ValueError(f"expected exactly {expected} scene summaries")
+    if capacity.max_group_size != 1:
+        raise ValueError("singleton scheduling requires max_group_size=1")
+    rank_scenes: list[list[SceneSummary]] = [
+        [] for _ in range(capacity.rank_count)
+    ]
+    rank_work = [0] * capacity.rank_count
+    ordered = sorted(
+        enumerate(summaries),
+        key=lambda item: (-PhysicalBatchGroup((item[1],)).work, item[0]),
+    )
+    for _, scene in ordered:
+        rank = min(
+            (
+                candidate
+                for candidate in range(capacity.rank_count)
+                if len(rank_scenes[candidate]) < capacity.logical_scenes_per_rank
+            ),
+            key=lambda candidate: (rank_work[candidate], candidate),
+        )
+        rank_scenes[rank].append(scene)
+        rank_work[rank] += PhysicalBatchGroup((scene,)).work
+    return SynchronizedBatchWave(
+        ranks=tuple(
+            RankWave(
+                rank=rank,
+                groups=_order_groups(
+                    tuple(PhysicalBatchGroup((scene,)) for scene in scenes),
+                    summaries,
+                ),
+            )
+            for rank, scenes in enumerate(rank_scenes)
+        ),
+        capacity_name=capacity.name,
+    )
+
+
 def schedule_rank_local_batch(
     summaries: Sequence[SceneSummary],
     *,
@@ -396,4 +442,5 @@ __all__ = [
     "SynchronizedBatchWave",
     "schedule_rank_local_batch",
     "schedule_physical_batch",
+    "schedule_singleton_batch",
 ]

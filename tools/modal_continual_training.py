@@ -613,7 +613,12 @@ def build_mvkubric_recipe_metadata_remote() -> dict:
     retries=0,
     include_source=False,
 )
-def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
+def plan_recipe_remote(
+    recipe_name: str,
+    step_count: int = 2000,
+    world_size: int = 2,
+    global_batch_size: int = 8,
+) -> dict:
     """Plan the mixed-source recipe using metadata only."""
     from functools import partial
     from types import SimpleNamespace
@@ -626,7 +631,10 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     from mvtracker.datasets.kubric_dali_dataset import DaliKubricRecipePlanner
     from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
     from mvtracker.datasets.mixed_source_schedule import BalancedMixedSourceSchedule
-    from mvtracker.datasets.physical_batch_scheduler import schedule_physical_batch
+    from mvtracker.datasets.physical_batch_scheduler import (
+        schedule_physical_batch,
+        schedule_singleton_batch,
+    )
     from mvtracker.datasets.training_recipe import plan_training_recipe_parallel
     from mvtracker.preprocessing.mvkubric_metadata_sidecar import (
         KubricMetadataSidecar,
@@ -646,6 +654,8 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
         config={
             "source_commit": _source_commit(),
             "step_count": int(step_count),
+            "world_size": int(world_size),
+            "global_batch_size": int(global_batch_size),
             "cpu_cores": RECIPE_PLANNER_CPUS,
             **MODAL_TAGS,
         },
@@ -653,6 +663,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
     print(
         "recipe startup "
         f"commit={_source_commit()} cpus={RECIPE_PLANNER_CPUS} steps={step_count} "
+        f"world_size={world_size} global_batch_size={global_batch_size} "
         f"data_root={DATA_VOLUME_ROOT} local_output={local_output_dir} "
         f"volume_output={output_dir}",
         flush=True,
@@ -689,6 +700,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 overrides=[
                     "+experiment=diegesis_syn4d_mvkubric_gt_ddp",
                     f"trainer.num_steps={int(step_count)}",
+                    f"trainer.lr_schedule_steps={int(step_count)}",
                     "datasets.train.recipe_path=null",
                     "datasets.train.force_gt_depth=false",
                     "datasets.train.physical_batching.max_scenes=1",
@@ -697,6 +709,14 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                     "+datasets.syn4d_manifest_load_workers=16",
                 ],
             )
+        source_pattern = tuple(cfg.datasets.train.source_schedule)
+        if global_batch_size % len(source_pattern):
+            raise ValueError("global batch must divide the source schedule evenly")
+        if global_batch_size % world_size:
+            raise ValueError("global batch must divide evenly across DDP ranks")
+        planning_world_size = global_batch_size // len(source_pattern)
+        cfg.trainer.gradient_accumulation_steps = global_batch_size // world_size
+        cfg.datasets.train.physical_batching.rank_count = int(world_size)
         phase["name"] = "scene_inventory"
         diegesis_source = cfg.datasets.train.sources.diegesis
         diegesis_cache = (
@@ -715,8 +735,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
             flush=True,
         )
         phase["name"] = "dataset_construction"
-        fabric = SimpleNamespace(world_size=2, global_rank=0)
-        source_pattern = tuple(cfg.datasets.train.source_schedule)
+        fabric = SimpleNamespace(world_size=planning_world_size, global_rank=0)
         datasets = {}
         for source, source_cfg in cfg.datasets.train.sources.items():
             print(f"recipe phase=dataset_construction source={source}", flush=True)
@@ -744,7 +763,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
                 **kwargs,
                 webdataset_root=cfg.datasets.train.mvkubric_webdataset_root,
                 webdataset_split="train",
-                stream_world_size=2,
+                stream_world_size=planning_world_size,
                 stream_seed=seed,
                 stream_include_scene_ids=source_cfg.get("include_scene_ids"),
             )
@@ -776,7 +795,7 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
         schedule = BalancedMixedSourceSchedule(
             {source: dataset.real_len for source, dataset in datasets.items()},
             source_pattern,
-            world_size=2,
+            world_size=planning_world_size,
             master_seed=seed,
         )
         phase["name"] = "sample_planning"
@@ -800,9 +819,14 @@ def plan_recipe_remote(recipe_name: str, step_count: int = 2000) -> dict:
             block_steps=25,
             heartbeat_seconds=10,
             physical_scheduler=partial(
-                schedule_physical_batch,
+                (
+                    schedule_singleton_batch
+                    if int(world_size) != planning_world_size
+                    else schedule_physical_batch
+                ),
                 capacity=_physical_batch_capacity(cfg),
             ),
+            output_world_size=int(world_size),
         )
         summary.update(
             mvkubric_metadata_stage_seconds=metadata_stage_seconds,
@@ -1595,7 +1619,12 @@ def visualize_recipe_augmentations(
 
 
 @app.local_entrypoint(name="plan-recipe")
-def plan_recipe(recipe_name: str, step_count: int = 2000) -> None:
+def plan_recipe(
+    recipe_name: str,
+    step_count: int = 2000,
+    world_size: int = 2,
+    global_batch_size: int = 8,
+) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
     preflight_active_containers(required_free_slots=1)
@@ -1604,7 +1633,7 @@ def plan_recipe(recipe_name: str, step_count: int = 2000) -> None:
         {**MODAL_TAGS, "experiment": recipe_name, "gpu": "cpu", "cpu": "32"}
     )
     deployed = modal.Function.from_name(APP_NAME, "plan_recipe_remote")
-    call = deployed.spawn(recipe_name, step_count)
+    call = deployed.spawn(recipe_name, step_count, world_size, global_batch_size)
     print(json.dumps({"recipe_name": recipe_name, "function_call_id": call.object_id}, indent=2))
 
 

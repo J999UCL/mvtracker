@@ -21,6 +21,7 @@ datasets:
     physical_batching:
       enabled: true
       capacity_name: h200-profile-20260816
+      rank_count: 2
       lookahead_steps: 4
       cpu_cache_gib_per_rank: 12
       decode_image_chunk_size: 64

@@ -833,12 +833,14 @@ def plan_training_recipe_parallel(
     heartbeat_seconds: float = 10.0,
     log: LogFunction = _print_log,
     physical_scheduler: Callable[[Sequence[Any]], Any] | None = None,
+    output_world_size: int | None = None,
 ) -> dict[str, Any]:
     """Plan one complete recipe with scene-local forked CPU workers."""
     if step_count < 1 or worker_count < 1 or block_steps < 1:
         raise ValueError("steps, workers and block size must be positive")
     started = time.perf_counter()
     records_per_step = len(schedule.source_pattern) * int(schedule.world_size)
+    recipe_world_size = int(output_world_size or schedule.world_size)
     cursors = {source: 0 for source in schedule.scene_counts}
     positions = {
         source: tuple(
@@ -889,8 +891,9 @@ def plan_training_recipe_parallel(
             **manifest,
             "source_pattern": list(schedule.source_pattern),
             "initial_source_cursors": cursors,
+            "planning_world_size": int(schedule.world_size),
         },
-        world_size=schedule.world_size,
+        world_size=recipe_world_size,
         step_count=step_count,
         records_per_step=records_per_step,
     )
@@ -1073,12 +1076,23 @@ def plan_training_recipe_parallel(
                                 record = by_identity[
                                     (summary.source, summary.scene, summary.cursor)
                                 ]
+                                target_rank = int(rank_wave.rank)
                                 scheduled_records.append(
                                     replace(
                                         record,
-                                        rank=int(rank_wave.rank),
+                                        rank=target_rank,
+                                        scheduled_rank=(
+                                            target_rank
+                                            if recipe_world_size != schedule.world_size
+                                            else record.scheduled_rank
+                                        ),
+                                        microbatch=(
+                                            group_index
+                                            if recipe_world_size != schedule.world_size
+                                            else record.microbatch
+                                        ),
                                         physical=PhysicalAssignment(
-                                            rank=int(rank_wave.rank),
+                                            rank=target_rank,
                                             group=group_index,
                                             position=position,
                                         ),
