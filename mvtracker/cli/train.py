@@ -3002,7 +3002,7 @@ def main(cfg: DictConfig):
     total_batches_loaded = 0
     total_batches_failed = 0
     clipped_optimizer_steps = 0
-    diagnostic_optimizer_steps = 0
+    clipping_optimizer_steps = 0
     if fabric.global_rank == 0:
         tqdm_total_steps = tqdm(
             total=cfg.trainer.num_steps,
@@ -3841,30 +3841,28 @@ def main(cfg: DictConfig):
                 logging.info(f"{prefix} LR at step {total_steps}: {scheduler.get_last_lr()}")
             optimizer_update_started_at = time.time()
             with torch.profiler.record_function("train/gradient_clip_and_optimizer"):
-                model_parameters = list(model.parameters())
-                if run_expensive_diagnostics:
-                    pre_clip_gradient_norm = float(
-                        _global_gradient_l2_norm(model_parameters).item()
-                    )
-                fabric.clip_gradients(
+                pre_clip_gradient_norm_tensor = fabric.clip_gradients(
                     model,
                     optimizer,
                     max_norm=cfg.trainer.grad_clip,
                 )
-                if run_expensive_diagnostics:
-                    post_clip_gradient_norm = float(
-                        _global_gradient_l2_norm(model_parameters).item()
+                if fabric.global_rank == 0:
+                    pre_clip_gradient_norm = float(
+                        pre_clip_gradient_norm_tensor.detach().item()
                     )
-                    gradient_norm_retention = (
-                        post_clip_gradient_norm / pre_clip_gradient_norm
-                        if pre_clip_gradient_norm > 0.0
-                        else 1.0
+                    clip_threshold = float(cfg.trainer.grad_clip)
+                    gradient_norm_retention = min(
+                        1.0,
+                        clip_threshold / (pre_clip_gradient_norm + 1e-6),
                     )
-                    was_clipped = pre_clip_gradient_norm > float(cfg.trainer.grad_clip)
+                    post_clip_gradient_norm = (
+                        pre_clip_gradient_norm * gradient_norm_retention
+                    )
+                    was_clipped = pre_clip_gradient_norm > clip_threshold
                     clipped_optimizer_steps += int(was_clipped)
-                    diagnostic_optimizer_steps += 1
+                    clipping_optimizer_steps += 1
                     clipped_step_fraction = (
-                        clipped_optimizer_steps / float(diagnostic_optimizer_steps)
+                        clipped_optimizer_steps / float(clipping_optimizer_steps)
                     )
                 optimizer.step()
                 scheduler.step()
@@ -3954,20 +3952,7 @@ def main(cfg: DictConfig):
                     microbatch_gradient_cosine_min = _reduce_scalar(
                         fabric, microbatch_gradient_cosine_min, reduce_op="min"
                     )
-            if run_expensive_diagnostics:
-                reduced_optimization = _reduce_scalar_dict(
-                    fabric,
-                    {
-                        "pre_clip_gradient_norm": pre_clip_gradient_norm,
-                        "post_clip_gradient_norm": post_clip_gradient_norm,
-                        "gradient_norm_retention": gradient_norm_retention,
-                        "clipped_step_fraction": clipped_step_fraction,
-                    },
-                )
-                pre_clip_gradient_norm = reduced_optimization["pre_clip_gradient_norm"]
-                post_clip_gradient_norm = reduced_optimization["post_clip_gradient_norm"]
-                gradient_norm_retention = reduced_optimization["gradient_norm_retention"]
-                clipped_step_fraction = reduced_optimization["clipped_step_fraction"]
+            if run_expensive_diagnostics and fabric.global_rank == 0:
                 logging.info(
                     "[optimizer:%06d] loss=%.8f grad_pre=%.8f grad_post=%.8f "
                     "max_norm=%.8f norm_retention=%.8f "
@@ -4047,27 +4032,31 @@ def main(cfg: DictConfig):
                 if len(output) > 1:
                     tb_writer.add_scalar(f"live_total_loss", mean_loss_value, total_steps)
                 tb_writer.add_scalar(f"learning_rate", optimizer.param_groups[0]["lr"], total_steps)
-                if run_expensive_diagnostics:
-                    tb_writer.add_scalar(
-                        "optimization/grad_norm_pre_clip",
-                        pre_clip_gradient_norm,
-                        total_steps,
-                    )
-                    tb_writer.add_scalar(
-                        "optimization/grad_norm_post_clip",
-                        post_clip_gradient_norm,
-                        total_steps,
-                    )
-                    tb_writer.add_scalar(
-                        "optimization/global_grad_clip_scale",
-                        gradient_norm_retention,
-                        total_steps,
-                    )
-                    tb_writer.add_scalar(
-                        "optimization/global_grad_clipped_step_fraction",
-                        clipped_step_fraction,
-                        total_steps,
-                    )
+                tb_writer.add_scalar(
+                    "optimization/grad_norm_pre_clip",
+                    pre_clip_gradient_norm,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "optimization/grad_norm_post_clip",
+                    post_clip_gradient_norm,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "optimization/global_grad_clip_scale",
+                    gradient_norm_retention,
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "optimization/global_grad_clipped",
+                    float(was_clipped),
+                    total_steps,
+                )
+                tb_writer.add_scalar(
+                    "optimization/global_grad_clipped_step_fraction",
+                    clipped_step_fraction,
+                    total_steps,
+                )
                 if microbatch_gradient_norms:
                     tb_writer.add_scalar(
                         "optimization/microbatch_grad_norm_mean",

@@ -36,7 +36,6 @@ DATAPOINT_RE = re.compile(
 )
 TRACK_COUNT_RE = re.compile(r"FWD pass:.*?num_points=(\d+)")
 FAILED_BATCH_RE = re.compile(r"batch is None: failed\s+(\d+)\s+/\s+(\d+)")
-OPTIMIZER_CLIP_RE = re.compile(r"\[optimizer:(\d+)\].*?\sclipped=([01])(?:\s|$)")
 TIMING_RE = re.compile(
     r"\[timing:(\d+)\]\s+Total:\s*([0-9.]+)s\s*\|\s*"
     r"Data:\s*([0-9.]+)s\s*\|\s*Fwd:\s*([0-9.]+)s\s*\|\s*"
@@ -514,7 +513,6 @@ class TrainingLogReader:
         self.samples: list[dict[str, Any]] = []
         self.failure_events: list[int] = []
         self.timing_rows: list[dict[str, float | int]] = []
-        self.optimizer_clipped: dict[int, int] = {}
         self.finished = False
         self.fatal_error: str | None = None
         self.last_message: str | None = None
@@ -526,7 +524,6 @@ class TrainingLogReader:
         self.samples.clear()
         self.failure_events.clear()
         self.timing_rows.clear()
-        self.optimizer_clipped.clear()
         self.finished = False
         self.fatal_error = None
         self.last_message = None
@@ -572,11 +569,6 @@ class TrainingLogReader:
         failure = FAILED_BATCH_RE.search(line)
         if failure:
             self.failure_events.append(len(self.samples))
-        optimizer_clip = OPTIMIZER_CLIP_RE.search(line)
-        if optimizer_clip:
-            self.optimizer_clipped[int(optimizer_clip.group(1))] = int(
-                optimizer_clip.group(2)
-            )
         timing = TIMING_RE.search(line)
         if timing:
             self.timing_rows.append(
@@ -595,24 +587,6 @@ class TrainingLogReader:
             if marker in line:
                 self.fatal_error = stripped[-500:]
                 break
-
-    def rolling_clipped_step_rate(
-        self,
-        window_size: int = 50,
-    ) -> list[dict[str, float | int]]:
-        """Return the share of recent optimizer steps clipped by global norm."""
-        window_size = max(1, window_size)
-        ordered = sorted(self.optimizer_clipped.items())
-        output: list[dict[str, float | int]] = []
-        for index, (step, _) in enumerate(ordered):
-            window = ordered[max(0, index - window_size + 1) : index + 1]
-            output.append(
-                {
-                    "step": step,
-                    "value": statistics.fmean(clipped for _, clipped in window),
-                }
-            )
-        return output
 
     def pipeline_series(self, accumulation_steps: int) -> list[dict[str, Any]]:
         accumulation_steps = max(1, accumulation_steps)
@@ -870,7 +844,10 @@ class TrainingDashboardState:
                     "optimization/global_grad_clip_scale",
                     [],
                 ),
-                "clipped_step_rate_50": self.log_reader.rolling_clipped_step_rate(50),
+                "clipped": scalars.get(
+                    "optimization/global_grad_clipped",
+                    [],
+                ),
             }
             log_timing = {
                 key: [
@@ -1326,7 +1303,7 @@ function render(state){
   const gradients=state.series?.gradients||{};
   update(charts.gradientNorms,[points(gradients.pre_clip),movingAveragePoints(gradients.pre_clip),points(gradients.post_clip),movingAveragePoints(gradients.post_clip),points(gradients.microbatch_mean),movingAveragePoints(gradients.microbatch_mean)]);
   update(charts.gradientCosine,[points(gradients.cosine_mean),movingAveragePoints(gradients.cosine_mean),points(gradients.cosine_min),movingAveragePoints(gradients.cosine_min)]);
-  update(charts.gradientClipping,[points(gradients.clip_scale),points(gradients.clipped_step_rate_50)]);
+  update(charts.gradientClipping,[points(gradients.clip_scale),movingAveragePoints(gradients.clipped)]);
   const pipeline=state.series?.pipeline||[];
   update(charts.rejection,[pipePoints(pipeline,'rejection_percent')]);
   const trackMean=pipePoints(pipeline,'tracks_mean'), trackMax=pipePoints(pipeline,'tracks_max'), trackMin=pipePoints(pipeline,'tracks_min');

@@ -2407,3 +2407,14 @@ approximately 234 seconds total:
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/f4s59b0i
 - Sidecar W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/edtbhae0
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling|training`
+
+## 2026-08-26 — Global clipping norms logged every optimizer step
+
+Training now uses the pre-clipping L2 norm already returned by Lightning
+Fabric's global-norm clipping call. Rank 0 converts that one tensor to a scalar
+on every optimizer step and logs the pre-clip norm, analytically derived
+post-clip norm, uniform clip scale, per-step clipped flag and cumulative
+clipped fraction. The prior diagnostic path independently scanned all model
+gradients before and after clipping; those scans and their DDP reductions were
+removed. The dashboard computes its trailing clipped-step rate from the new
+per-step scalar stream.

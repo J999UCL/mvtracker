@@ -67,28 +67,6 @@ class TrainingLogReaderTests(unittest.TestCase):
             self.assertIn("CUDA out of memory", reader.fatal_error)
             self.assertTrue(reader.finished)
 
-    def test_computes_trailing_clipped_step_rate(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "train.log"
-            path.write_text(
-                "[optimizer:000000] max_norm=1.0 clipped=1\n"
-                "[optimizer:000001] max_norm=1.0 clipped=0\n"
-                "[optimizer:000002] max_norm=1.0 clipped=1\n"
-                "[optimizer:000003] max_norm=1.0 clipped=0\n",
-                encoding="utf-8",
-            )
-            reader = dashboard.TrainingLogReader(path)
-            reader.refresh()
-
-            series = reader.rolling_clipped_step_rate(window_size=3)
-
-            self.assertEqual([point["step"] for point in series], [0, 1, 2, 3])
-            self.assertEqual(
-                [point["value"] for point in series],
-                [1.0, 0.5, 2 / 3, 1 / 3],
-            )
-
-
 class HydraConfigReaderTests(unittest.TestCase):
     def test_reads_dashboard_fields_from_real_hydra_yaml(self):
         try:
@@ -359,6 +337,9 @@ class DashboardStateTests(unittest.TestCase):
                     "optimization/grad_norm_pre_clip": [
                         {"step": 0, "value": 2.0, "wall_time": 1.0}
                     ],
+                    "optimization/global_grad_clipped": [
+                        {"step": 0, "value": 1.0, "wall_time": 1.0}
+                    ],
                     "timing/step": [{"step": 1, "value": 2.0, "wall_time": 1.0}],
                     "sampling/motion_window_mean_m": [
                         {"step": 1, "value": 0.2, "wall_time": 1.0}
@@ -392,8 +373,8 @@ class DashboardStateTests(unittest.TestCase):
                 3.0,
             )
             self.assertEqual(
-                snapshot["series"]["gradients"]["clipped_step_rate_50"],
-                [{"step": 1, "value": 1.0}],
+                snapshot["series"]["gradients"]["clipped"],
+                [{"step": 0, "value": 1.0, "wall_time": 1.0}],
             )
 
 

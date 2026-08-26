@@ -236,6 +236,16 @@ class GradientAccumulationTests(unittest.TestCase):
         }
         self.assertEqual(clip_keywords["max_norm"], "cfg.trainer.grad_clip")
         self.assertNotIn("clip_val", clip_keywords)
+        clip_assignment = next(
+            node
+            for node in ast.walk(main)
+            if isinstance(node, ast.Assign)
+            and node.value is calls["fabric.clip_gradients"][0]
+        )
+        self.assertEqual(
+            ast.unparse(clip_assignment.targets[0]),
+            "pre_clip_gradient_norm_tensor",
+        )
 
         backward_argument = ast.unparse(calls["fabric.backward"][0].args[0])
         self.assertEqual(
