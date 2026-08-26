@@ -706,6 +706,7 @@ def plan_recipe_remote(
                     "datasets.train.physical_batching.max_scenes=1",
                     "datasets.train.physical_batching.rank_local=false",
                     "augmentations.variable_depth_type=true",
+                    "+datasets.diegesis_manifest_load_workers=16",
                     "+datasets.syn4d_manifest_load_workers=16",
                 ],
             )

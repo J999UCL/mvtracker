@@ -1145,6 +1145,9 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             "max_track_radius": float(
                 datasets_cfg.get("diegesis_max_track_radius", 30.0)
             ),
+            "manifest_load_workers": int(
+                datasets_cfg.get("diegesis_manifest_load_workers", 1)
+            ),
             "views_to_return": None,
             "novel_views": None,
             "use_duster_depths": False,
