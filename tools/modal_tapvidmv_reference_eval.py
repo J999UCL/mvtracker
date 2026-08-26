@@ -417,7 +417,7 @@ def _prediction_complete(output_dir: Path) -> bool:
 
 @app.function(
     image=tapvidmv_image,
-    gpu="H100",
+    gpu="A100-40GB",
     cpu=16,
     memory=65536,
     timeout=24 * 60 * 60,
