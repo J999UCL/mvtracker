@@ -37,7 +37,7 @@ SOURCES = (
     ("hi4d", f"{BUCKET_ROOT}/hi4d", "hi4d/", 24),
     ("harmony4d", BUCKET_ROOT, "harmony4d/", 21),
     ("egoexo4d", f"{BUCKET_ROOT}/egoexo4d", "", 18),
-    ("pace", BUCKET_ROOT, "", 69),
+    ("pace", f"{BUCKET_ROOT}/pace", "", 69),
     ("waymo", f"{BUCKET_ROOT}/waymo", "", 50),
     ("diegesis", BUCKET_ROOT, "diegesis/scenes/", 21),
 )
