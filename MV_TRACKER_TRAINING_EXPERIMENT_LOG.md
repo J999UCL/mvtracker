@@ -2454,3 +2454,29 @@ have limited both historical optimizer updates.
 - Modal: https://modal.com/apps/ucl-prism/main/ap-IEiIMDp06NJ0eZjhqnNchY
 - W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/xekl0je2
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
+
+## 2026-08-26 — Global clipping calibration on five hard-loss controls
+
+Five high-loss but non-radius-corrupt optimizer steps were replayed with the
+same checkpoint-500 audit: MV-Kubric trajectory spikes at steps 515, 487, 750
+and 675, plus the visibility-dominated Syn4D hospital sample at step 382. Each
+step replayed all eight logical samples with the original mixed-depth recipe
+and performed no optimizer update.
+
+The accumulated gradient norms were 3.307, 2.359, 2.850, 3.358 and 2.360. The
+selected spike samples had distributed per-track trajectory errors rather than
+Kitchen03's one-track domination. Their leave-one-out gradient-sketch cosines
+ranged from -0.396 to +0.191, rather than defining a clean magnitude boundary.
+
+There is therefore no scalar global-norm threshold that preserves all five
+hard controls while clipping both known corrupt updates. Preserving every
+control requires a threshold of at least 3.358, which would not clip corrupt
+step 625 at 2.694. Clipping both corrupt updates requires a threshold below
+2.694, which clips every control. Global clipping can only serve as a coarse
+catastrophe guard; geometric filtering and corruption diagnostics remain
+necessary.
+
+- Report: `gradient-audits/hard-control-gradient-audit-515-487-750-675-382-20260826/report.json`
+- Modal: https://modal.com/apps/ucl-prism/main/ap-9ufjtWwERbe80n56bbTgFN
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/ttnn2b4n
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
