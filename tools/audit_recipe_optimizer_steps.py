@@ -225,6 +225,7 @@ def _counterfactual_batch(batch, plan, dataset, radius: float = 30.0):
 
 def _build_config(args, recipe_manifest):
     from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
 
     repo_root = Path(__file__).resolve().parents[1]
     with initialize_config_dir(
@@ -248,9 +249,13 @@ def _build_config(args, recipe_manifest):
     cfg.datasets.diegesis_max_track_radius = float("inf")
     # The recipe was generated with the 65m Syn4D radius.
     cfg.datasets.syn4d_max_track_radius = 65.0
-    cfg.datasets.train.sources.diegesis.include_scene_ids = list(recipe_manifest["scene_lists"].get("diegesis", ()))
-    cfg.datasets.train.sources.syn4d.include_scene_ids = list(recipe_manifest["scene_lists"].get("syn4d", ()))
-    cfg.datasets.train.sources.mvkubric.include_scene_ids = list(recipe_manifest["scene_lists"].get("mvkubric", ()))
+    for source in SOURCE_NAMES:
+        OmegaConf.update(
+            cfg,
+            f"datasets.train.sources.{source}.include_scene_ids",
+            list(recipe_manifest["scene_lists"].get(source, ())),
+            force_add=True,
+        )
     return cfg
 
 
@@ -406,16 +411,16 @@ def run(args) -> dict[str, Any]:
         int(optimizer_step): _load_recipe_step(reader, int(optimizer_step) - 1)
         for optimizer_step in args.optimizer_steps
     }
+    cfg = _build_config(args, reader.manifest)
+    datasets = _build_datasets(cfg, args, reader.manifest)
     if args.depth_mode == "runtime":
         _generate_runtime_depths(
             [record for records in records_by_step.values() for record in records],
             Path(args.data_root),
             Path(args.runtime_depth_root),
         )
-    cfg = _build_config(args, reader.manifest)
     device = torch.device(args.device)
     model = _load_model(cfg, checkpoint, device)
-    datasets = _build_datasets(cfg, args, reader.manifest)
     from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
     from mvtracker.datasets.mixed_physical_loader import PhysicalBatchDecoder
     from mvtracker.cli.train import _MicrobatchGradientDiagnostics
