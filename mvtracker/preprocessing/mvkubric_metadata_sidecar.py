@@ -50,7 +50,7 @@ def _archive_path(manifest_path: Path, shard: Mapping[str, object]) -> Path:
 
 
 def _index_path(manifest_path: Path, shard: Mapping[str, object]) -> Path:
-    value = shard.get("index")
+    value = shard.get("index_path")
     if value is not None:
         path = Path(str(value))
         return path if path.is_absolute() else manifest_path.parent / path

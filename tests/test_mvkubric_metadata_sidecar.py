@@ -56,7 +56,7 @@ class MvKubricMetadataSidecarTests(unittest.TestCase):
                 {
                     "format": "mvtracker-kubric-webdataset",
                     "scene_ids": list(payloads),
-                    "shards": [{"tar": "source.tar", "nsamples": 6}],
+                    "shards": [{"tar": "source.tar", "index": 0, "nsamples": 6}],
                 }
             ),
             encoding="utf-8",
