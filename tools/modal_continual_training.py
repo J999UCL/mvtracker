@@ -908,8 +908,13 @@ def compile_execution_recipe_remote(
     from omegaconf import OmegaConf
 
     from mvtracker.cli.train import _build_training_dataset
+    from mvtracker.datasets.kubric_dali_dataset import DaliKubricRecipePlanner
+    from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
     from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
     from mvtracker.datasets.training_recipe import compile_execution_recipe
+    from mvtracker.preprocessing.mvkubric_metadata_sidecar import (
+        KubricMetadataSidecar,
+    )
 
     validate_run_name(source_name)
     validate_run_name(recipe_name)
@@ -926,16 +931,56 @@ def compile_execution_recipe_remote(
         world_size=int(source_manifest["world_size"]),
         global_rank=0,
     )
-    datasets = {
-        source: _build_training_dataset(
-            source_cfg.name,
-            source_cfg.root,
-            cfg,
-            fabric,
-            source_cfg,
+    datasets = {}
+    for source, source_cfg in cfg.datasets.train.sources.items():
+        source_started = time.monotonic()
+        print(
+            f"EXECUTION_RECIPE event=dataset_start source={source}", flush=True
         )
-        for source, source_cfg in cfg.datasets.train.sources.items()
-    }
+        if source != "mvkubric":
+            datasets[source] = _build_training_dataset(
+                source_cfg.name,
+                source_cfg.root,
+                cfg,
+                fabric,
+                source_cfg,
+            )
+        else:
+            kwargs = KubricMultiViewDataset.from_name(
+                source_cfg.name,
+                source_cfg.root,
+                cfg,
+                fabric,
+                just_return_kwargs=True,
+                include_scene_ids=source_cfg.include_scene_ids,
+            )
+            kwargs.pop("data_root")
+            kwargs.pop("metadata_index_root")
+            datasets[source] = DaliKubricRecipePlanner(
+                **kwargs,
+                webdataset_root=cfg.datasets.train.mvkubric_webdataset_root,
+                webdataset_split="train",
+                stream_world_size=int(source_manifest["planning_world_size"]),
+                stream_seed=int(source_manifest["seed"]),
+                stream_include_scene_ids=tuple(source_cfg.include_scene_ids),
+            )
+            metadata_sidecar = KubricMetadataSidecar(MVKUBRIC_METADATA_SIDECAR)
+            local_metadata = Path("/tmp/mvkubric-execution-metadata")
+            metadata_sidecar.stage(
+                datasets[source].seq_names,
+                local_metadata,
+                workers=RECIPE_METADATA_COPY_WORKERS,
+            )
+            datasets[source]._recipe_metadata = metadata_sidecar.load_many(
+                datasets[source].seq_names,
+                staged_root=local_metadata,
+                workers=RECIPE_METADATA_WORKERS,
+            )
+        print(
+            "EXECUTION_RECIPE event=dataset_ready "
+            f"source={source} elapsed={time.monotonic() - source_started:.1f}s",
+            flush=True,
+        )
     run = wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,

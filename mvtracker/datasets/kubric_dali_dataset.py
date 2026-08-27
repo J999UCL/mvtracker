@@ -281,6 +281,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         kwargs["data_root"] = str(Path(webdataset_root))
         kwargs["metadata_catalog"] = self.catalog
         kwargs["metadata_index_root"] = None
+        kwargs["validate_scene_directories"] = False
         super().__init__(*args, **kwargs)
         self._scene_indices = {
             scene_name: index for index, scene_name in enumerate(self.seq_names)
@@ -745,21 +746,28 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         """Read selected MV-Kubric metadata without invoking its planner."""
         from .training_recipe import unpack_execution_mask
 
-        if getattr(self, "_records", None) is None:
-            raise RuntimeError("execution recipes require indexed MV-Kubric records")
         record = execution_record.recipe
         trace = execution_record.trace
-        metadata_record, metadata_read = self._records.read(
-            int(trace["source"]["metadata_index"])
-        )
-        expected_key = f"scene-{record.scene}"
-        if metadata_record["__key__"] != expected_key:
-            raise RuntimeError(
-                f"metadata locator diverged: expected {expected_key!r}, got {metadata_record['__key__']!r}"
+        if getattr(self, "_records", None) is None:
+            scene = self._recipe_metadata[record.scene]
+            metadata_read = IndexedReadStats(0, 0, 0.0, 0)
+        else:
+            metadata_record, metadata_read = self._records.read(
+                int(trace["source"]["metadata_index"])
             )
-        scene = _scene_metadata(
-            KubricDaliSceneBundle(record.scene, metadata_record[f".{META_COMPONENT}"], (), ())
-        )
+            expected_key = f"scene-{record.scene}"
+            if metadata_record["__key__"] != expected_key:
+                raise RuntimeError(
+                    f"metadata locator diverged: expected {expected_key!r}, got {metadata_record['__key__']!r}"
+                )
+            scene = _scene_metadata(
+                KubricDaliSceneBundle(
+                    record.scene,
+                    metadata_record[f".{META_COMPONENT}"],
+                    (),
+                    (),
+                )
+            )
         frames = np.asarray(record.frames, dtype=np.int64)
         views = tuple(record.views)
         selected_global = np.asarray(record.tracks, dtype=np.int64)
@@ -868,6 +876,7 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
         kwargs["data_root"] = str(Path(webdataset_root))
         kwargs["metadata_index_root"] = None
         kwargs["metadata_catalog"] = self.catalog
+        kwargs["validate_scene_directories"] = False
         KubricMultiViewDataset.__init__(self, *args, **kwargs)
         self._scene_indices = {
             scene_name: index for index, scene_name in enumerate(self.seq_names)
