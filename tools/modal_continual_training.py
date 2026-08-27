@@ -706,8 +706,6 @@ def plan_recipe_remote(
                     "datasets.train.physical_batching.max_scenes=1",
                     "datasets.train.physical_batching.rank_local=false",
                     "augmentations.variable_depth_type=true",
-                    "+datasets.diegesis_manifest_load_workers=16",
-                    "+datasets.syn4d_manifest_load_workers=16",
                 ],
             )
         source_pattern = tuple(cfg.datasets.train.source_schedule)
@@ -903,7 +901,6 @@ def replan_syn4d_recipe_remote(source_name: str, recipe_name: str) -> dict:
     cfg = OmegaConf.create(source_manifest["config"])
     cfg.datasets.syn4d_max_track_radius = 30.0
     cfg.datasets.syn4d_mmap_cache_sequences = 32
-    cfg.datasets.syn4d_manifest_load_workers = 16
     source_cfg = cfg.datasets.train.sources.syn4d
     dataset = _build_training_dataset(
         source_cfg.name,

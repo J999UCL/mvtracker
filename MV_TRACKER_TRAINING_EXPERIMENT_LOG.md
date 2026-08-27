@@ -2519,7 +2519,7 @@ with `max_scenes=1`. The depth producer uses an explicit 64-image capacity,
 matching the safer and slightly faster measured H100 operating point, and a
 64-sample pending-depth queue to absorb validation and short training stalls. The
 production configuration uses a 5,000-step LR horizon, validation every 500
-steps, full MV-Kubric validation at steps 0/2500/5000, and checkpoints every
+steps, full MV-Kubric validation at steps 2500/5000, and checkpoints every
 500 steps. The deployed function has Modal's maximum 24-hour execution
 timeout; actual ETA must be checked early because Modal cannot accept a longer
 single-function timeout.
@@ -2545,30 +2545,34 @@ was published.
 - Successful W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/8xptjk43
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
-## 2026-08-27 — Five-H200 launch blocked by redundant startup work
+## 2026-08-27 — Two aborted five-H200 starts and startup fixes
 
-The first five-H200 production attempt failed before training because the DA3
-producer still referenced the retired 17-scene DIEGESIS root. The producer was
-updated to the new 351-scene dataset and the replacement run successfully
-loaded DA3-Giant, generated 64 pending depth samples at about 52 images/s, and
-held producer RSS flat at 16.36 GiB. This verifies that one H200 can keep the
-planned depth queue full.
+Attempt 1, `diegesis351-da3-h200x5-5000-20260827T0011BST`, ran commit
+`f42c8c6` and failed during DA3 prefill. The producer tried to read
+`run-000043-e03051f3` from the retired `datasets/diegesis-mvtracker` cache and
+raised `FileNotFoundError` for `view_1/jpeg_offsets.npy`. Commit `5e40c4e`
+changed both the packed cache and raw-camera lookup to `datasets/diegesis-train`.
 
-The replacement run was deliberately stopped before optimizer step 1. Each of
-the four training ranks independently spent about 15 minutes scanning all 351
-DIEGESIS scenes and then all 303 Syn4D scenes, despite the complete training
-recipe already naming every requested sample. Startup validation then assigned
-two validation scenes across four ranks, leaving two ranks with empty loaders,
-and initialized competing nvTIFF decoders during MV-Kubric evaluation. These
-are startup-path defects rather than model, recipe, depth-throughput, or GPU
-memory failures.
+Attempt 2, `diegesis351-da3-h200x5-5000-r2-20260827T0020BST`, ran `5e40c4e`
+and verified the depth path: DA3-Giant filled the 64-sample queue at about
+52 images/s while producer RSS remained 16.36 GiB. Startup nevertheless took
+about 20 minutes because every training rank scanned the 351 DIEGESIS and 303
+Syn4D scene trees and loaded all manifests, even though the recipe had already
+selected every sample. At step-0 validation, the two-scene DIEGESIS shard left
+ranks 2 and 3 empty; both failed the evaluator's
+`assert len(test_dataloader) > 0`. Ranks 0 and 1 continued evaluation while the
+depth producer remained under consumer backpressure, and the app was stopped
+manually before optimizer step 1. No checkpoint was produced by either attempt.
 
-Before relaunch, recipe training must load source manifests lazily per requested
-scene, skip validation at step 0, avoid constructing empty validation shards,
-and retain only checkpoint validation. The new run must restart from step 0;
-neither aborted attempt produced a training checkpoint.
+The relaunch fixes are implemented. DIEGESIS and Syn4D now skip the
+serial scene-directory validation pass and load/cache a scene manifest only on
+its first request; the existing per-scene manifest checks remain. The 5K recipe
+does not validate at step 0 and retains scheduled validation every 500 steps,
+with full MV-Kubric validation at steps 2500 and 5000. Empty rank-local
+evaluation loaders now return empty metrics, allowing all ranks to reach the
+DDP metric gather.
 
-- Aborted function call: `fc-01M105ZYEPEPJMGMQ2ZD5FW5A6`
-- Aborted W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/ae21046f8389
+- Attempt 2 function call: `fc-01M105ZYEPEPJMGMQ2ZD5FW5A6`
+- Attempt 2 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/ae21046f8389
 - Dashboard: http://127.0.0.1:8766
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`

@@ -401,6 +401,7 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             exclude_scene_ids=(),
             metadata_index_root=None,
             metadata_catalog=None,
+            validate_scene_directories=True,
     ):
         super(KubricMultiViewDataset, self).__init__()
 
@@ -562,26 +563,27 @@ class KubricMultiViewDataset(torch.utils.data.Dataset):
             self.seq_names,
             key=lambda name: (0, int(name)) if name.isdigit() else (1, name),
         )
-        seq_names_clean = []
-        for seq_name in self.seq_names:
-            scene_path = os.path.join(self.data_root, seq_name)
-            if self.metadata_index is not None:
-                scene_entry, _ = self.metadata_index.scene(seq_name)
-                view_folders = scene_entry["view_names"]
-            else:
-                view_folders = [
-                    d for d in os.listdir(scene_path)
-                    if os.path.isdir(os.path.join(scene_path, d))
-                    and (d.startswith('view_') or d.isdigit())
-                ]
-            if len(view_folders) == 0:
-                logging.warning(f"Skipping {scene_path} because it has no views.")
-                continue
-            if self.num_views is not None and len(view_folders) < self.num_views:
-                logging.warning(f"Skipping {scene_path} because it has {len(view_folders)} views (<{self.num_views}).")
-                continue
-            seq_names_clean.append(seq_name)
-        self.seq_names = seq_names_clean
+        if validate_scene_directories:
+            seq_names_clean = []
+            for seq_name in self.seq_names:
+                scene_path = os.path.join(self.data_root, seq_name)
+                if self.metadata_index is not None:
+                    scene_entry, _ = self.metadata_index.scene(seq_name)
+                    view_folders = scene_entry["view_names"]
+                else:
+                    view_folders = [
+                        d for d in os.listdir(scene_path)
+                        if os.path.isdir(os.path.join(scene_path, d))
+                        and (d.startswith('view_') or d.isdigit())
+                    ]
+                if len(view_folders) == 0:
+                    logging.warning(f"Skipping {scene_path} because it has no views.")
+                    continue
+                if self.num_views is not None and len(view_folders) < self.num_views:
+                    logging.warning(f"Skipping {scene_path} because it has {len(view_folders)} views (<{self.num_views}).")
+                    continue
+                seq_names_clean.append(seq_name)
+            self.seq_names = seq_names_clean
 
         self.seq_names = select_scene_names(
             self.seq_names,

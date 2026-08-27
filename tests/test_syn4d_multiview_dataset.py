@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -113,13 +114,26 @@ def _dataset(root: Path):
     dataset.replace_aug_prob = 0.5
     dataset.replace_max = 10
     dataset.replace_bounds = [2, 100]
-    dataset._manifests = {name: dataset._load_manifest(name)}
+    dataset._manifests = {}
     dataset._sequence_cache = _SequenceMmapCache(root, maximum=1)
     dataset._mmap_cache_sequences = 1
     return dataset
 
 
 class Syn4DLoaderTests(unittest.TestCase):
+    def test_manifest_is_loaded_once_on_first_scene_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _dataset(Path(directory))
+            sequence = dataset.seq_names[0]
+            with mock.patch.object(
+                dataset, "_load_manifest", wraps=dataset._load_manifest
+            ) as load:
+                first = dataset._manifest(sequence)
+                second = dataset._manifest(sequence)
+
+            self.assertIs(first, second)
+            load.assert_called_once_with(sequence)
+
     def test_camera_rig_recentering_preserves_projection(self):
         centres = np.asarray(((1000.0, 20.0, -3.0), (1002.0, 22.0, -3.0)))
         extrinsics = np.repeat(
@@ -224,6 +238,7 @@ class Syn4DLoaderTests(unittest.TestCase):
         self.assertEqual(kwargs["max_depth"], 321.0)
         self.assertEqual(kwargs["max_track_radius"], 30.0)
         self.assertFalse(kwargs["enable_variable_depth_type_augs"])
+        self.assertFalse(kwargs["validate_scene_directories"])
 
     def test_grouped_recipe_planning_matches_individual_requests(self):
         with tempfile.TemporaryDirectory() as directory:

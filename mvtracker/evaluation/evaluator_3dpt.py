@@ -237,8 +237,14 @@ class Evaluator:
             writer: Optional[SummaryWriter] = None,
             step: Optional[int] = 0,
     ):
+        if len(test_dataloader) == 0:
+            logging.info(
+                "Skipping %s evaluation on this rank: no rank-local datapoints.",
+                dataset_name,
+            )
+            return {}
+
         metrics = {}
-        assert len(test_dataloader) > 0
         total_fps = 0.0
         count = 0
         for datapoint_idx, datapoint in enumerate(tqdm(test_dataloader)):

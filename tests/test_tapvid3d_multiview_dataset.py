@@ -15,6 +15,10 @@ from PIL import Image
 
 def _load_module():
     class StubKubric:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.seq_names = ["scene-alpha", "scene-beta"]
+
         @staticmethod
         def from_name(*args, **kwargs):
             training_args = kwargs.get("training_args")
@@ -99,6 +103,37 @@ def _load_module():
 
 
 loader = _load_module()
+
+
+class LazyManifestTests(unittest.TestCase):
+    def test_factory_skips_serial_scene_directory_validation(self):
+        kwargs = loader.TapVid3DMultiViewDataset.from_name(
+            "tapvid3d-multiview-validation",
+            "/datasets",
+            training_args=types.SimpleNamespace(datasets={}),
+            just_return_kwargs=True,
+        )
+
+        self.assertFalse(kwargs["validate_scene_directories"])
+
+    def test_constructor_does_not_read_scene_manifests(self):
+        with mock.patch.object(
+            loader.TapVid3DMultiViewDataset,
+            "_load_manifest",
+            side_effect=AssertionError("manifest was loaded eagerly"),
+        ):
+            dataset = loader.TapVid3DMultiViewDataset(raw_root="/raw")
+
+        self.assertEqual(dataset._manifests, {})
+
+    def test_manifest_is_loaded_once_on_first_scene_request(self):
+        dataset = loader.TapVid3DMultiViewDataset(raw_root="/raw")
+        manifest = {"frame_count": 24}
+        with mock.patch.object(dataset, "_load_manifest", return_value=manifest) as load:
+            self.assertIs(dataset._manifest("scene-alpha"), manifest)
+            self.assertIs(dataset._manifest("scene-alpha"), manifest)
+
+        load.assert_called_once_with("scene-alpha")
 
 
 class CudaDecodeBatchSplitTests(unittest.TestCase):
