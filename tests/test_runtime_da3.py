@@ -46,6 +46,12 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
             set(range(64)),
         )
 
+    def test_exact_64_six_gpu_prefill_partition_is_11_11_11_11_10_10(self):
+        counts = [0] * 6
+        for ordinal in range(64):
+            counts[runtime_da3._prefill_owner(ordinal, 6)] += 1
+        self.assertEqual(counts, [11, 11, 11, 11, 10, 10])
+
     def test_depth_records_skip_gt_without_changing_canonical_order(self):
         steps = [
             {
@@ -132,27 +138,38 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
             self.assertTrue((output_root / "worker-0.complete").is_file())
             self.assertFalse((output_root / "prefill.ready").exists())
 
-    def test_worker_four_waits_for_handoff_then_owns_all_later_records(self):
-        produced = []
-        with tempfile.TemporaryDirectory() as directory:
-            output_root = Path(directory)
-            (output_root / "prefill.ready").touch()
-            self._run_worker(
-                output_root,
-                worker_id=4,
-                continue_after_prefill=True,
-                produced=produced,
-            )
-            self.assertEqual(produced, [*range(4, 64, 5), 64, 65])
-            self.assertTrue((output_root / "complete").is_file())
+    def test_two_steady_workers_split_every_later_record(self):
+        for worker_id, steady_worker_id, expected in (
+            (4, 0, [*range(4, 64, 6), 64, 66]),
+            (5, 1, [*range(5, 64, 6), 65, 67]),
+        ):
+            produced = []
+            with tempfile.TemporaryDirectory() as directory:
+                output_root = Path(directory)
+                (output_root / "prefill.ready").touch()
+                self._run_worker(
+                    output_root,
+                    worker_id=worker_id,
+                    worker_count=6,
+                    continue_after_prefill=True,
+                    steady_worker_id=steady_worker_id,
+                    steady_worker_count=2,
+                    produced=produced,
+                )
+                self.assertEqual(produced, expected)
+                self.assertTrue((output_root / "complete").is_file())
 
-    def test_five_gpu_launcher_reaps_burst_workers_before_handoff(self):
+    def test_six_gpu_launcher_reaps_burst_workers_before_handoff(self):
         source = (ROOT / "tools/modal_continual_training.py").read_text(
             encoding="utf-8"
         )
         self.assertEqual(
             source.count("prefill_devices=(0, 1, 2, 3, 4)"),
-            3,
+            1,
+        )
+        self.assertEqual(
+            source.count("prefill_devices=(0, 1, 2, 3, 4, 5)"),
+            2,
         )
         recipe_launcher = source[
             source.index("def _coordinate_recipe_da3(") : source.index(
@@ -170,6 +187,7 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
         self.assertLess(publish_handoff, launch_training)
         self.assertIn("if ready_samples != expected_ready_samples:", source)
         self.assertIn('"prefill_workers": prefill_worker_metrics', source)
+        self.assertIn('"producers": final_producer_metrics', source)
         self.assertIn('"event": "da3_prefill_complete"', source)
         self.assertIn("finally:\n        _terminate_logged_processes(workers)", source)
         for name in ("OMP", "MKL", "OPENBLAS", "NUMEXPR"):
@@ -195,10 +213,13 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
         output_root: Path,
         *,
         worker_id: int,
+        worker_count: int = 5,
         continue_after_prefill: bool,
+        steady_worker_id: int = 0,
+        steady_worker_count: int = 1,
         produced: list[int],
     ) -> None:
-        records = [_record(ordinal) for ordinal in range(66)]
+        records = [_record(ordinal) for ordinal in range(68)]
         fake_torch = types.ModuleType("torch")
         fake_torch.cuda = SimpleNamespace(
             synchronize=lambda: None,
@@ -251,9 +272,11 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
                 output_root,
                 64,
                 worker_id=worker_id,
-                worker_count=5,
+                worker_count=worker_count,
                 prefill_samples=64,
                 continue_after_prefill=continue_after_prefill,
+                steady_worker_id=steady_worker_id,
+                steady_worker_count=steady_worker_count,
             )
 
 

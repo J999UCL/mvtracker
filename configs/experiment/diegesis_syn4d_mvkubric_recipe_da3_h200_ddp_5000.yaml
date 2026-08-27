@@ -12,7 +12,7 @@ logging:
     - da3-image-capacity80
     - da3-queue64
     - mixed-depth-70-20-10
-    - ddp4-h200-plus-producer
+    - ddp4-h200-plus-2producers
     - singleton-scenes
     - continual-training
     - steps5000

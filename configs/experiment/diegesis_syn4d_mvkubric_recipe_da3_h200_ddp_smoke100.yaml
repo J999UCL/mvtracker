@@ -22,6 +22,7 @@ logging:
   wandb_group: diegesis351-recipe-v2-h200-ddp4-smoke100
   tags:
     - recipe-v2
-    - da3-prefill64-h200x5
+    - da3-prefill64-h200x6
+    - da3-producers2
     - ddp4
     - smoke100

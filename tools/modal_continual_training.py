@@ -1315,7 +1315,7 @@ def _coordinate_recipe_da3(
     *,
     workers,
     prefill_devices: tuple[int, ...],
-    depth_device: int,
+    depth_devices: tuple[int, ...],
     runtime_root: Path,
     recipe_path: Path,
     prefill_samples: int,
@@ -1369,9 +1369,11 @@ def _coordinate_recipe_da3(
             f"missing={missing} unexpected={unexpected}"
         )
 
-    steady_worker_id = prefill_devices.index(depth_device)
+    steady_worker_ids = tuple(
+        prefill_devices.index(device) for device in depth_devices
+    )
     for worker_id, (process, thread) in enumerate(workers):
-        if worker_id == steady_worker_id:
+        if worker_id in steady_worker_ids:
             continue
         try:
             return_code = process.wait(timeout=30)
@@ -1385,12 +1387,13 @@ def _coordinate_recipe_da3(
                 f"DA3 prefill worker {worker_id} exited {return_code}; "
                 f"see {run_dir / f'depth-producer-{worker_id}.log'}"
             )
-    steady_return_code = workers[steady_worker_id][0].poll()
-    if steady_return_code is not None:
-        raise RuntimeError(
-            f"steady DA3 worker exited {steady_return_code} before handoff; "
-            f"see {run_dir / f'depth-producer-{steady_worker_id}.log'}"
-        )
+    for worker_id in steady_worker_ids:
+        steady_return_code = workers[worker_id][0].poll()
+        if steady_return_code is not None:
+            raise RuntimeError(
+                f"steady DA3 worker {worker_id} exited {steady_return_code} before "
+                f"handoff; see {run_dir / f'depth-producer-{worker_id}.log'}"
+            )
 
     prefill_worker_metrics = [
         {
@@ -1463,25 +1466,29 @@ def _coordinate_recipe_da3(
             f"DA3 recipe training exited {return_code}; see {training_log}"
         )
 
-    producer, producer_thread = workers[steady_worker_id]
-    producer_return_code = producer.wait(timeout=30 * 60)
-    producer_thread.join()
-    if producer_return_code != 0:
-        raise RuntimeError(
-            f"depth producer exited {producer_return_code}; see "
-            f"{run_dir / f'depth-producer-{steady_worker_id}.log'}"
+    final_producer_metrics = []
+    for worker_id in steady_worker_ids:
+        producer, producer_thread = workers[worker_id]
+        producer_return_code = producer.wait(timeout=30 * 60)
+        producer_thread.join()
+        if producer_return_code != 0:
+            raise RuntimeError(
+                f"depth producer {worker_id} exited {producer_return_code}; see "
+                f"{run_dir / f'depth-producer-{worker_id}.log'}"
+            )
+        final_producer_metrics.append(
+            json.loads(
+                (
+                    runtime_root / f"latest-metrics-worker-{worker_id}.json"
+                ).read_text(encoding="utf-8")
+            )
         )
-    final_producer_metrics = json.loads(
-        (runtime_root / f"latest-metrics-worker-{steady_worker_id}.json").read_text(
-            encoding="utf-8"
-        )
-    )
     result = {
         **manifest,
         "prefill_seconds": prefill_seconds,
         "prefill": prefill_aggregate,
         "prefill_workers": prefill_worker_metrics,
-        "producer": final_producer_metrics,
+        "producers": final_producer_metrics,
         "checkpoint": str(run_dir / "model_final.pth"),
     }
     (run_dir / "integration-summary.json").write_text(
@@ -1501,7 +1508,7 @@ def _run_recipe_da3(
     *,
     gpu_label: str,
     training_devices: tuple[int, ...],
-    depth_device: int,
+    depth_devices: tuple[int, ...],
     prefill_devices: tuple[int, ...],
     da3_image_capacity: int,
     max_pending_depth_samples: int,
@@ -1537,7 +1544,7 @@ def _run_recipe_da3(
         "source_commit": commit,
         "gpu": gpu_label,
         "training_devices": list(training_devices),
-        "depth_device": int(depth_device),
+        "depth_devices": list(depth_devices),
         "prefill_devices": list(prefill_devices),
         "prefill_samples": int(prefill_samples),
         "da3_image_capacity": int(da3_image_capacity),
@@ -1573,7 +1580,7 @@ def _run_recipe_da3(
             "MVTRACKER_RUNTIME_DEPTH_ROOT": str(runtime_root),
             "MVTRACKER_RUNTIME_DEPTH_METRICS": str(
                 runtime_root
-                / f"latest-metrics-worker-{prefill_devices.index(depth_device)}.json"
+                / f"latest-metrics-worker-{prefill_devices.index(depth_devices[0])}.json"
             ),
             "HF_HOME": str(DA3_CACHE_ROOT),
             "WANDB_ENTITY": WANDB_ENTITY,
@@ -1632,8 +1639,12 @@ def _run_recipe_da3(
         "--max-steps",
         str(training_steps),
     ]
-    if depth_device not in prefill_devices:
-        raise ValueError("depth_device must be included in prefill_devices")
+    if not depth_devices or any(
+        device not in prefill_devices for device in depth_devices
+    ):
+        raise ValueError("depth_devices must be included in prefill_devices")
+    if len(set(depth_devices)) != len(depth_devices):
+        raise ValueError("depth_devices must be unique")
     if len(set(prefill_devices)) != len(prefill_devices):
         raise ValueError("prefill_devices must be unique")
     workers = []
@@ -1651,8 +1662,17 @@ def _run_recipe_da3(
                 "--worker-count",
                 str(len(prefill_devices)),
             ]
-            if device != depth_device:
+            if device not in depth_devices:
                 command.append("--prefill-only")
+            else:
+                command.extend(
+                    [
+                        "--steady-worker-id",
+                        str(depth_devices.index(device)),
+                        "--steady-worker-count",
+                        str(len(depth_devices)),
+                    ]
+                )
             process, thread = _start_logged_process(
                 command,
                 cwd=SOURCE_ROOT,
@@ -1665,7 +1685,7 @@ def _run_recipe_da3(
         return _coordinate_recipe_da3(
             workers=workers,
             prefill_devices=prefill_devices,
-            depth_device=depth_device,
+            depth_devices=depth_devices,
             runtime_root=runtime_root,
             recipe_path=recipe_path,
             prefill_samples=prefill_samples,
@@ -1713,7 +1733,7 @@ def recipe_da3_remote(
         prefill_samples,
         gpu_label="H200:3",
         training_devices=(0, 1),
-        depth_device=2,
+        depth_devices=(2,),
         prefill_devices=(0, 1, 2),
         da3_image_capacity=80,
         max_pending_depth_samples=32,
@@ -1749,7 +1769,7 @@ def recipe_da3_h100x5_remote(
         prefill_samples,
         gpu_label="H100!:5",
         training_devices=(0, 1, 2, 3),
-        depth_device=4,
+        depth_devices=(4,),
         prefill_devices=(0, 1, 2, 3, 4),
         da3_image_capacity=64,
         max_pending_depth_samples=64,
@@ -1763,7 +1783,7 @@ def recipe_da3_h100x5_remote(
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
-    gpu="H200:5",
+    gpu="H200:6",
     cpu=32,
     memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
     timeout=24 * 60 * 60,
@@ -1771,7 +1791,7 @@ def recipe_da3_h100x5_remote(
     retries=0,
     include_source=False,
 )
-def recipe_da3_h200x5_remote(
+def recipe_da3_h200x6_remote(
     run_name: str,
     recipe_name: str,
     prefill_samples: int = 64,
@@ -1783,10 +1803,10 @@ def recipe_da3_h200x5_remote(
         5000,
         "diegesis351-syn4d-mvkubric-da3-h200-5000",
         prefill_samples,
-        gpu_label="H200:5",
+        gpu_label="H200:6",
         training_devices=(0, 1, 2, 3),
-        depth_device=4,
-        prefill_devices=(0, 1, 2, 3, 4),
+        depth_devices=(4, 5),
+        prefill_devices=(0, 1, 2, 3, 4, 5),
         da3_image_capacity=80,
         max_pending_depth_samples=64,
     )
@@ -1799,7 +1819,7 @@ def recipe_da3_h200x5_remote(
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
-    gpu="H200:5",
+    gpu="H200:6",
     cpu=32,
     memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
     timeout=4 * 60 * 60,
@@ -1807,7 +1827,7 @@ def recipe_da3_h200x5_remote(
     retries=0,
     include_source=False,
 )
-def recipe_da3_h200x5_smoke100_remote(
+def recipe_da3_h200x6_smoke100_remote(
     run_name: str,
     recipe_name: str,
     prefill_samples: int = 64,
@@ -1819,10 +1839,10 @@ def recipe_da3_h200x5_smoke100_remote(
         5000,
         "diegesis351-recipe-v2-h200-ddp4-smoke100",
         prefill_samples,
-        gpu_label="H200:5",
+        gpu_label="H200:6",
         training_devices=(0, 1, 2, 3),
-        depth_device=4,
-        prefill_devices=(0, 1, 2, 3, 4),
+        depth_devices=(4, 5),
+        prefill_devices=(0, 1, 2, 3, 4, 5),
         da3_image_capacity=80,
         max_pending_depth_samples=64,
         training_steps=100,
@@ -2347,17 +2367,17 @@ def recipe_da3_h100x5_train5000(run_name: str, recipe_name: str) -> None:
     )
 
 
-@app.local_entrypoint(name="recipe-da3-h200x5-train5000")
-def recipe_da3_h200x5_train5000(run_name: str, recipe_name: str) -> None:
+@app.local_entrypoint(name="recipe-da3-h200x6-train5000")
+def recipe_da3_h200x6_train5000(run_name: str, recipe_name: str) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
-    preflight_active_containers(required_free_slots=5)
+    preflight_active_containers(required_free_slots=6)
     validate_run_name(run_name)
     validate_run_name(recipe_name)
     app.set_tags(
-        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x5"}
+        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x6"}
     )
-    deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h200x5_remote")
+    deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h200x6_remote")
     call = deployed.spawn(run_name, recipe_name, 64)
     print(
         json.dumps(
@@ -2367,18 +2387,18 @@ def recipe_da3_h200x5_train5000(run_name: str, recipe_name: str) -> None:
     )
 
 
-@app.local_entrypoint(name="recipe-da3-h200x5-smoke100")
-def recipe_da3_h200x5_smoke100(run_name: str, recipe_name: str) -> None:
+@app.local_entrypoint(name="recipe-da3-h200x6-smoke100")
+def recipe_da3_h200x6_smoke100(run_name: str, recipe_name: str) -> None:
     commit = _source_commit()
     require_pushed_main_commit(commit)
-    preflight_active_containers(required_free_slots=5)
+    preflight_active_containers(required_free_slots=6)
     validate_run_name(run_name)
     validate_run_name(recipe_name)
     app.set_tags(
-        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x5"}
+        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x6"}
     )
     deployed = modal.Function.from_name(
-        APP_NAME, "recipe_da3_h200x5_smoke100_remote"
+        APP_NAME, "recipe_da3_h200x6_smoke100_remote"
     )
     call = deployed.spawn(run_name, recipe_name, 64)
     print(

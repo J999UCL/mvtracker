@@ -374,6 +374,8 @@ def run(
     worker_count: int = 1,
     prefill_samples: int = PREFILL_SAMPLES,
     continue_after_prefill: bool = True,
+    steady_worker_id: int = 0,
+    steady_worker_count: int = 1,
     max_steps: int | None = None,
 ) -> None:
     import torch
@@ -391,6 +393,8 @@ def run(
         raise ValueError("prefill_samples must be positive")
     if max_pending_samples < 1:
         raise ValueError("max_pending_samples must be positive")
+    if not 0 <= steady_worker_id < steady_worker_count:
+        raise ValueError("steady worker id is outside steady worker count")
     metrics_path = output_root / f"metrics-worker-{worker_id}.jsonl"
     latest_metrics_path = output_root / f"latest-metrics-worker-{worker_id}.json"
     started = time.perf_counter()
@@ -420,7 +424,11 @@ def run(
             if (
                 _prefill_owner(ordinal, worker_count) == worker_id
                 if ordinal < prefill_samples
-                else continue_after_prefill
+                else (
+                    continue_after_prefill
+                    and (ordinal - prefill_samples) % steady_worker_count
+                    == steady_worker_id
+                )
             )
         )
         handoff_started = False
@@ -564,6 +572,8 @@ def main() -> None:
     parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument("--prefill-samples", type=int, default=PREFILL_SAMPLES)
     parser.add_argument("--prefill-only", action="store_true")
+    parser.add_argument("--steady-worker-id", type=int, default=0)
+    parser.add_argument("--steady-worker-count", type=int, default=1)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--download-only", action="store_true")
     args = parser.parse_args()
@@ -581,6 +591,8 @@ def main() -> None:
         worker_count=args.worker_count,
         prefill_samples=args.prefill_samples,
         continue_after_prefill=not args.prefill_only,
+        steady_worker_id=args.steady_worker_id,
+        steady_worker_count=args.steady_worker_count,
         max_steps=args.max_steps,
     )
 
