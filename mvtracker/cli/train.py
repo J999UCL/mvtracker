@@ -933,10 +933,33 @@ def _reduce_scalar(fabric, value, reduce_op="mean"):
 
 def _reduce_scalar_dict(fabric, values, reduce_op="mean"):
     """Reduce a same-key scalar mapping, including future per-source metrics."""
+    names = tuple(values)
+    if not names:
+        return {}
+    tensor = torch.as_tensor(
+        [values[name] for name in names],
+        device=fabric.device,
+        dtype=torch.float64,
+    )
+    reduced = fabric.all_reduce(tensor, reduce_op=reduce_op)
     return {
-        name: _reduce_scalar(fabric, value, reduce_op=reduce_op)
-        for name, value in values.items()
+        name: float(reduced[index].item())
+        for index, name in enumerate(names)
     }
+
+
+def _check_recipe_step_materialization(fabric, step, succeeded):
+    """Verify recipe-step alignment and local materialization in one collective."""
+    local = torch.tensor(
+        [int(step), int(bool(succeeded))],
+        device=fabric.device,
+        dtype=torch.int64,
+    )
+    gathered = fabric.all_gather(local).reshape(fabric.world_size, 2)
+    steps = gathered[:, 0]
+    if not torch.equal(steps, steps.new_full(steps.shape, int(step))):
+        raise RuntimeError("DDP ranks loaded different recipe steps")
+    return bool(gathered[:, 1].bool().all().item())
 
 
 def _gather_rank_metrics(fabric, values):
@@ -2944,9 +2967,11 @@ def main(cfg: DictConfig):
             physical_pipeline = PhysicalStepPrefetchIterator(
                 physical_lookahead,
                 physical_decoder,
+                queue_depth=int(settings.get("decoded_queue_depth", 2)),
             )
 
     dali_stream_batches_seen = set()
+    async_decode_enabled = False
 
     profiler_start_step = int(
         cfg.trainer.get("profiler", {}).get("start_step", 0)
@@ -3071,6 +3096,8 @@ def main(cfg: DictConfig):
         microbatches_accumulated = 0
         accumulation_started_at = None
         accumulated_dataloader_duration = 0.0
+        accumulated_data_queue_wait_seconds = 0.0
+        accumulated_data_rendezvous_seconds = 0.0
         accumulated_fwd_duration = 0.0
         accumulated_sync_duration = 0.0
         accumulated_bwd_duration = 0.0
@@ -3130,6 +3157,7 @@ def main(cfg: DictConfig):
                 accumulation_started_at = time.time()
                 optimizer.zero_grad()
             start_time_1 = time.time()
+            microbatch_data_rendezvous_seconds = 0.0
             logging.info(f"Gonna load batch {i_batch + 1}/{n_batches} (rank={fabric.global_rank})")
             current_sources = None
             if mixed_training:
@@ -3148,17 +3176,30 @@ def main(cfg: DictConfig):
                             raise RuntimeError(
                                 "physical lookahead cursor does not match committed state"
                             )
+                        rendezvous_started_at = time.time()
                         if physical_step.recipe_step is not None:
-                            _assert_matching_recipe_step(
-                                fabric, physical_step.recipe_step
+                            materialization_succeeded = (
+                                _check_recipe_step_materialization(
+                                    fabric,
+                                    physical_step.recipe_step,
+                                    physical_step.materialization_error is None,
+                                )
                             )
                         elif not bool(settings.get("rank_local", False)):
                             _assert_matching_step_fingerprint(
                                 fabric, physical_step.fingerprint
                             )
-                        materialization_succeeded = _all_ranks_succeeded(
-                            fabric,
-                            physical_step.materialization_error is None,
+                            materialization_succeeded = _all_ranks_succeeded(
+                                fabric,
+                                physical_step.materialization_error is None,
+                            )
+                        else:
+                            materialization_succeeded = _all_ranks_succeeded(
+                                fabric,
+                                physical_step.materialization_error is None,
+                            )
+                        microbatch_data_rendezvous_seconds += (
+                            time.time() - rendezvous_started_at
                         )
                         if not materialization_succeeded:
                             detail = physical_step.materialization_error or (
@@ -3207,6 +3248,9 @@ def main(cfg: DictConfig):
                         physical_batching_metrics = {
                             "planning_seconds": physical_step.planning_seconds,
                             "materialization_seconds": physical_step.materialization_seconds,
+                            "consumer_wait_seconds": physical_step.consumer_wait_seconds,
+                            "ready_queue_depth": float(physical_step.ready_queue_depth),
+                            "ready_queue_gib": physical_step.ready_queue_bytes / 1024**3,
                             "encoded_cache_gib": physical_step.encoded_bytes / 1024**3,
                             "pair_count": (
                                 0.0
@@ -3343,6 +3387,14 @@ def main(cfg: DictConfig):
             start_time_2 = time.time()
             microbatch_dataloader_duration = start_time_2 - start_time_1
             accumulated_dataloader_duration += microbatch_dataloader_duration
+            accumulated_data_rendezvous_seconds += (
+                microbatch_data_rendezvous_seconds
+            )
+            accumulated_data_queue_wait_seconds += max(
+                0.0,
+                microbatch_dataloader_duration
+                - microbatch_data_rendezvous_seconds,
+            )
             logging.info(
                 f"Datapoint: {batch.seq_name} "
                 f"(microbatch {microbatches_accumulated + 1}/"
@@ -3475,6 +3527,12 @@ def main(cfg: DictConfig):
                     gradient_diagnostics=gradient_diagnostics,
                     memory_recorder=memory_recorder,
                 )
+                if physical_decoder is not None and not async_decode_enabled:
+                    physical_decoder.enable_async_publication()
+                    async_decode_enabled = True
+                    logging.info(
+                        "Enabled event-driven decode publication after initial CUDA capture"
+                    )
                 if not is_final_microbatch:
                     memory_recorder.end_group(
                         forward_duration, backward_duration
@@ -3767,6 +3825,7 @@ def main(cfg: DictConfig):
                     sums = _reduce_scalar_dict(
                         fabric,
                         {
+                            "sample_count": local_count,
                             "loss": accumulated_source_losses.get(source, 0.0),
                             "view_count": accumulated_source_view_counts.get(source, 0.0),
                             "track_count": accumulated_source_track_counts.get(source, 0.0),
@@ -3782,9 +3841,7 @@ def main(cfg: DictConfig):
                         },
                         reduce_op="sum",
                     )
-                    global_count = _reduce_scalar(
-                        fabric, local_count, reduce_op="sum"
-                    )
+                    global_count = sums.pop("sample_count")
                     reduced_source_values[f"source/{source}/sample_count"] = global_count
                     expected_count = (
                         mixed_schedule.source_pattern.count(source)
@@ -4169,6 +4226,8 @@ def main(cfg: DictConfig):
                 {
                     "total": total_duration,
                     "dataloader": dataloader_duration,
+                    "data_queue_wait": accumulated_data_queue_wait_seconds,
+                    "data_rendezvous": accumulated_data_rendezvous_seconds,
                     "forward": fwd_duration,
                     "sync": sync_duration,
                     "backward": bwd_duration,
@@ -4185,18 +4244,24 @@ def main(cfg: DictConfig):
             )
             total_duration = reduced_timing["total"]
             dataloader_duration = reduced_timing["dataloader"]
+            data_queue_wait_seconds = reduced_timing["data_queue_wait"]
+            data_rendezvous_seconds = reduced_timing["data_rendezvous"]
             fwd_duration = reduced_timing["forward"]
             sync_duration = reduced_timing["sync"]
             bwd_duration = reduced_timing["backward"]
             step_wall_seconds = _reduce_scalar(
                 fabric, training_step_duration, reduce_op="max"
             )
-            global_sample_count = _reduce_scalar(
-                fabric, accumulated_sample_count, reduce_op="sum"
+            global_counts = _reduce_scalar_dict(
+                fabric,
+                {
+                    "samples": accumulated_sample_count,
+                    "trajectories": accumulated_trajectory_count,
+                },
+                reduce_op="sum",
             )
-            global_trajectory_count = _reduce_scalar(
-                fabric, accumulated_trajectory_count, reduce_op="sum"
-            )
+            global_sample_count = global_counts["samples"]
+            global_trajectory_count = global_counts["trajectories"]
             throughput_metrics = _throughput_metrics(
                 step_wall_seconds,
                 global_sample_count,
@@ -4218,23 +4283,19 @@ def main(cfg: DictConfig):
                 int(accumulated_dali_stream_metrics["payload_bytes"]),
                 accumulated_dali_stream_metrics["batch_wait_seconds"],
             )
-            reduced_dali_stream_metrics = {
-                "batch_count": _reduce_scalar(
-                    fabric,
-                    accumulated_dali_stream_metrics["batch_count"],
-                    reduce_op="sum",
-                ),
-                "payload_bytes": _reduce_scalar(
-                    fabric,
-                    accumulated_dali_stream_metrics["payload_bytes"],
-                    reduce_op="sum",
-                ),
-                "batch_wait_seconds": _reduce_scalar(
-                    fabric,
-                    accumulated_dali_stream_metrics["batch_wait_seconds"],
-                    reduce_op="max",
-                ),
-            }
+            reduced_dali_stream_metrics = _reduce_scalar_dict(
+                fabric,
+                {
+                    "batch_count": accumulated_dali_stream_metrics["batch_count"],
+                    "payload_bytes": accumulated_dali_stream_metrics["payload_bytes"],
+                },
+                reduce_op="sum",
+            )
+            reduced_dali_stream_metrics["batch_wait_seconds"] = _reduce_scalar(
+                fabric,
+                accumulated_dali_stream_metrics["batch_wait_seconds"],
+                reduce_op="max",
+            )
             dali_wait_seconds = reduced_dali_stream_metrics[
                 "batch_wait_seconds"
             ]
@@ -4245,23 +4306,19 @@ def main(cfg: DictConfig):
                 if dali_wait_seconds > 0
                 else 0.0
             )
-            reduced_indexed_read_metrics = {
-                "sample_count": _reduce_scalar(
-                    fabric,
-                    accumulated_indexed_read_metrics["sample_count"],
-                    reduce_op="sum",
-                ),
-                "read_bytes": _reduce_scalar(
-                    fabric,
-                    accumulated_indexed_read_metrics["read_bytes"],
-                    reduce_op="sum",
-                ),
-                "read_seconds": _reduce_scalar(
-                    fabric,
-                    accumulated_indexed_read_metrics["read_seconds"],
-                    reduce_op="max",
-                ),
-            }
+            reduced_indexed_read_metrics = _reduce_scalar_dict(
+                fabric,
+                {
+                    "sample_count": accumulated_indexed_read_metrics["sample_count"],
+                    "read_bytes": accumulated_indexed_read_metrics["read_bytes"],
+                },
+                reduce_op="sum",
+            )
+            reduced_indexed_read_metrics["read_seconds"] = _reduce_scalar(
+                fabric,
+                accumulated_indexed_read_metrics["read_seconds"],
+                reduce_op="max",
+            )
             indexed_read_seconds = reduced_indexed_read_metrics["read_seconds"]
             reduced_indexed_read_metrics["effective_mib_per_second"] = (
                 reduced_indexed_read_metrics["read_bytes"]
@@ -4271,61 +4328,63 @@ def main(cfg: DictConfig):
                 else 0.0
             )
             reduced_physical_batching_metrics = None
-            reduced_runtime_depth_metrics = {
-                "sample_count": _reduce_scalar(
-                    fabric,
-                    accumulated_runtime_depth_metrics["sample_count"],
-                    reduce_op="sum",
-                ),
-                "read_bytes": _reduce_scalar(
-                    fabric,
-                    accumulated_runtime_depth_metrics["read_bytes"],
-                    reduce_op="sum",
-                ),
-                "wait_seconds": _reduce_scalar(
-                    fabric,
-                    accumulated_runtime_depth_metrics["wait_seconds"],
-                    reduce_op="max",
-                ),
-            }
+            reduced_runtime_depth_metrics = _reduce_scalar_dict(
+                fabric,
+                {
+                    "sample_count": accumulated_runtime_depth_metrics["sample_count"],
+                    "read_bytes": accumulated_runtime_depth_metrics["read_bytes"],
+                },
+                reduce_op="sum",
+            )
+            reduced_runtime_depth_metrics["wait_seconds"] = _reduce_scalar(
+                fabric,
+                accumulated_runtime_depth_metrics["wait_seconds"],
+                reduce_op="max",
+            )
             if physical_batching_metrics is not None:
-                reduced_physical_batching_metrics = {
-                    "planning_seconds": _reduce_scalar(
+                reduced_physical_batching_metrics = _reduce_scalar_dict(
+                    fabric,
+                    {
+                        name: physical_batching_metrics[name]
+                        for name in (
+                            "planning_seconds",
+                            "materialization_seconds",
+                            "consumer_wait_seconds",
+                            "ready_queue_depth",
+                            "ready_queue_gib",
+                            "diagnostic_singletons",
+                        )
+                    },
+                    reduce_op="max",
+                )
+                reduced_physical_batching_metrics.update(
+                    _reduce_scalar_dict(
                         fabric,
-                        physical_batching_metrics["planning_seconds"],
-                        reduce_op="max",
-                    ),
-                    "materialization_seconds": _reduce_scalar(
-                        fabric,
-                        physical_batching_metrics["materialization_seconds"],
-                        reduce_op="max",
-                    ),
-                    "encoded_cache_gib": _reduce_scalar(
-                        fabric,
-                        physical_batching_metrics["encoded_cache_gib"],
+                        {
+                            name: physical_batching_metrics[name]
+                            for name in (
+                                "encoded_cache_gib",
+                                "physical_group_count",
+                            )
+                        },
                         reduce_op="sum",
-                    ),
-                    "pair_count": _reduce_scalar(
-                        fabric, physical_batching_metrics["pair_count"]
-                    ),
-                    "padding_tracks": _reduce_scalar(
-                        fabric, physical_batching_metrics["padding_tracks"]
-                    ),
-                    "physical_group_count": _reduce_scalar(
+                    )
+                )
+                reduced_physical_batching_metrics.update(
+                    _reduce_scalar_dict(
                         fabric,
-                        physical_batching_metrics["physical_group_count"],
-                        reduce_op="sum",
-                    ),
-                    "diagnostic_singletons": _reduce_scalar(
-                        fabric,
-                        physical_batching_metrics["diagnostic_singletons"],
-                        reduce_op="max",
-                    ),
-                }
+                        {
+                            name: physical_batching_metrics[name]
+                            for name in ("pair_count", "padding_tracks")
+                        },
+                    )
+                )
             logging.info(
                 f"[timing:{total_steps:06d}] "
                 f"Total: {total_duration:>6.2f}s | "
                 f"Data: {dataloader_duration:>6.2f}s | "
+                f"Queue: {data_queue_wait_seconds:>6.2f}s | "
+                f"Rendezvous: {data_rendezvous_seconds:>6.2f}s | "
                 f"Fwd: {fwd_duration:>6.2f}s | "
                 f"Sync: {sync_duration:>6.2f}s | "
                 f"Bwd: {bwd_duration:>6.2f}s | "
@@ -4345,6 +4404,12 @@ def main(cfg: DictConfig):
                 tb_writer.add_scalar(f"timing/only_sync", sync_durations[-1], total_steps)
                 tb_writer.add_scalar(f"timing/only_bwd", bwd_durations[-1], total_steps)
                 tb_writer.add_scalar(f"timing/only_dataloader", dataloader_duration, total_steps)
+                tb_writer.add_scalar(
+                    "timing/data_queue_wait", data_queue_wait_seconds, total_steps
+                )
+                tb_writer.add_scalar(
+                    "timing/data_rendezvous", data_rendezvous_seconds, total_steps
+                )
                 tb_writer.add_scalar(
                     "timing/loader_worker_prepare_seconds",
                     reduced_timing["loader_worker"],
@@ -4494,6 +4559,8 @@ def main(cfg: DictConfig):
             microbatches_accumulated = 0
             accumulation_started_at = None
             accumulated_dataloader_duration = 0.0
+            accumulated_data_queue_wait_seconds = 0.0
+            accumulated_data_rendezvous_seconds = 0.0
             accumulated_fwd_duration = 0.0
             accumulated_sync_duration = 0.0
             accumulated_bwd_duration = 0.0

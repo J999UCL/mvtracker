@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -76,6 +76,9 @@ class PreparedMixedStep:
     recipe_step: int | None = None
     diagnostic_singletons: bool = False
     materialization_error: str | None = None
+    consumer_wait_seconds: float = 0.0
+    ready_queue_depth: int = 0
+    ready_queue_bytes: int = 0
 
     @property
     def logical_scene_count(self) -> int:
@@ -208,6 +211,10 @@ class _ByteBoundedQueue:
                 self._bytes -= item.encoded_bytes
                 self._condition.notify_all()
         return item
+
+    def snapshot(self) -> tuple[int, int]:
+        with self._condition:
+            return self._queue.qsize(), self._bytes
 
 
 class MixedStepLookahead:
@@ -518,12 +525,20 @@ class MixedStepLookahead:
         return self
 
     def __next__(self) -> PreparedMixedStep:
+        started = time.perf_counter()
         item = self._queue.get()
+        consumer_wait_seconds = time.perf_counter() - started
         if item is self._finished:
             raise StopIteration
         if isinstance(item, BaseException):
             raise item
-        return item
+        ready_queue_depth, ready_queue_bytes = self._queue.snapshot()
+        return replace(
+            item,
+            consumer_wait_seconds=consumer_wait_seconds,
+            ready_queue_depth=ready_queue_depth,
+            ready_queue_bytes=ready_queue_bytes,
+        )
 
 
 def _pad_tensor(
@@ -613,6 +628,7 @@ class PhysicalBatchDecoder:
         self.dali_num_threads = int(dali_num_threads)
         self.dali_prefetch_queue_depth = int(dali_prefetch_queue_depth)
         self.dali_max_encoded_images = int(dali_max_encoded_images)
+        self.async_publication = False
         if (
             self.dali_num_threads < 1
             or self.dali_prefetch_queue_depth < 1
@@ -641,6 +657,10 @@ class PhysicalBatchDecoder:
                 prefetch_queue_depth=self.dali_prefetch_queue_depth,
                 max_encoded_images=self.dali_max_encoded_images,
             )
+
+    def enable_async_publication(self) -> None:
+        """Publish CUDA events without host synchronization after graph capture."""
+        self.async_publication = True
 
     def decode_async(self, group: PreparedPhysicalGroup):
         with CUDA_CAPTURE_LOCK:
@@ -673,7 +693,8 @@ class PhysicalBatchDecoder:
                 merged = merge_decoded_datapoints(decoded)
                 ready_event = torch.cuda.Event()
                 ready_event.record(self.prepare_stream)
-            ready_event.synchronize()
+            if not self.async_publication:
+                ready_event.synchronize()
         return merged, ready_event
 
 
@@ -731,10 +752,12 @@ class PhysicalGroupPrefetchIterator:
 class PhysicalStepPrefetchIterator:
     """Carry one decoded group continuously across recipe step boundaries."""
 
-    def __init__(self, steps, decoder):
+    def __init__(self, steps, decoder, queue_depth: int = 2):
+        if queue_depth < 1:
+            raise ValueError("decoded queue depth must be positive")
         self.steps = iter(steps)
         self.decoder = decoder
-        self.ready = queue.Queue(maxsize=1)
+        self.ready = queue.Queue(maxsize=int(queue_depth))
         self.finished = object()
         self.thread = threading.Thread(target=self._produce, daemon=True)
         self.thread.start()
@@ -749,11 +772,9 @@ class PhysicalStepPrefetchIterator:
                 first_group = groups[0]
                 first_batch, first_event = self.decoder.decode_async(first_group)
                 self.ready.put(("step", step, first_group, first_batch, first_event))
-                self.ready.join()
                 for group in groups[1:]:
                     datapoint, event = self.decoder.decode_async(group)
                     self.ready.put(("group", group, datapoint, event))
-                    self.ready.join()
         except BaseException as error:
             self.ready.put(error)
         else:
