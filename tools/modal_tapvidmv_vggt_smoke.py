@@ -132,6 +132,7 @@ def _image() -> modal.Image:
         .env(
             {
                 "PYTHONPATH": str(WORKSPACE),
+                "MVTRACKER_MODAL_COMMIT": commit,
                 "PYTHONUNBUFFERED": "1",
                 "TOKENIZERS_PARALLELISM": "false",
                 "OMP_NUM_THREADS": "2",
