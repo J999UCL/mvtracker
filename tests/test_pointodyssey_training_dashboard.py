@@ -447,6 +447,8 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("solid lines are debiased exponential moving averages", html)
         self.assertIn("lossLines", html)
         self.assertIn("fitLossScale", html)
+        self.assertIn("const visibleValues=[]", html)
+        self.assertIn("Number(point.x)>=MIN_OPTIMIZER_STEP", html)
         self.assertIn("updateLossChart", html)
         self.assertIn("no smoothing is applied", html)
         self.assertIn("loss-large", html)
