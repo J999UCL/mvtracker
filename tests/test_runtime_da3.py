@@ -2,6 +2,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -122,6 +123,28 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
                 Path("runtime/step-000000/sample-02/ready"),
             ),
         )
+
+    def test_two_producers_share_exact_pending_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            for index in range(63):
+                sample = output_root / "step-000000" / f"sample-{index:02d}"
+                sample.mkdir(parents=True)
+                (sample / "ready").touch()
+            first = runtime_da3._wait_for_consumer(output_root, 64, worker_id=4)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                second_future = executor.submit(
+                    runtime_da3._wait_for_consumer,
+                    output_root,
+                    64,
+                    5,
+                )
+                with self.assertRaises(TimeoutError):
+                    second_future.result(timeout=0.1)
+                first.unlink()
+                second = second_future.result(timeout=1)
+            self.assertTrue(second.is_file())
+            second.unlink()
 
     def test_prefill_workers_only_generate_their_modulo_shard(self):
         produced = []

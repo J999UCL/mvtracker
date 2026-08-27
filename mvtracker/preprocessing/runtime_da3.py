@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 from io import BytesIO
 from itertools import islice
 import json
@@ -198,18 +199,29 @@ def _write_sample(root: Path, record: RecipeRecord, depth: np.ndarray, mask: np.
     (sample_root / "ready").touch()
 
 
-def _wait_for_consumer(output_root: Path, max_pending_samples: int) -> None:
+def _wait_for_consumer(
+    output_root: Path,
+    max_pending_samples: int,
+    worker_id: int,
+) -> Path:
     started = time.perf_counter()
     last_log = started
+    reservation = output_root / f"worker-{worker_id}.inflight"
+    lock_path = output_root / "pending.lock"
     while True:
-        pending = sum(1 for _ in output_root.glob("step-*/sample-*/ready"))
-        if pending < max_pending_samples:
-            return
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            pending = sum(1 for _ in output_root.glob("step-*/sample-*/ready"))
+            inflight = sum(1 for _ in output_root.glob("worker-*.inflight"))
+            if pending + inflight < max_pending_samples:
+                reservation.touch()
+                return reservation
         now = time.perf_counter()
         if now - last_log >= 10:
             _log(
                 "consumer_backpressure",
                 pending_samples=pending,
+                inflight_samples=inflight,
                 max_pending_samples=max_pending_samples,
                 elapsed_seconds=round(now - started, 1),
             )
@@ -454,7 +466,11 @@ def run(
                 if ordinal < prefill_samples
                 else max_pending_samples
             )
-            _wait_for_consumer(output_root, pending_limit)
+            reservation = _wait_for_consumer(
+                output_root,
+                pending_limit,
+                worker_id,
+            )
             reader = mvkubric if record.source == "mvkubric" else packed
             sample_started = time.perf_counter()
             loaded = reader.load(record)
@@ -463,6 +479,7 @@ def run(
                 record,
                 reader,
                 loaded,
+                reservation,
                 sample_started,
                 time.perf_counter() - sample_started,
             )
@@ -473,7 +490,15 @@ def run(
                 item = loaded_future.result()
                 if item is None:
                     break
-                ordinal, record, reader, loaded, sample_started, load_seconds = item
+                (
+                    ordinal,
+                    record,
+                    reader,
+                    loaded,
+                    reservation,
+                    sample_started,
+                    load_seconds,
+                ) = item
                 last_prefill_record = (
                     ordinal < prefill_samples
                     and ordinal + worker_count >= prefill_samples
@@ -487,6 +512,7 @@ def run(
                     output_root,
                     loaded=loaded,
                 )
+                reservation.unlink()
                 generated_samples += 1
                 generated_images += image_count
                 model_seconds += seconds
