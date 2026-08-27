@@ -2544,3 +2544,31 @@ was published.
 - Recipe: `training-recipes/fresh-diegesis351-da3-r30-singleton-ddp4-5000-20260826`
 - Successful W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/8xptjk43
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 2026-08-27 — Five-H200 launch blocked by redundant startup work
+
+The first five-H200 production attempt failed before training because the DA3
+producer still referenced the retired 17-scene DIEGESIS root. The producer was
+updated to the new 351-scene dataset and the replacement run successfully
+loaded DA3-Giant, generated 64 pending depth samples at about 52 images/s, and
+held producer RSS flat at 16.36 GiB. This verifies that one H200 can keep the
+planned depth queue full.
+
+The replacement run was deliberately stopped before optimizer step 1. Each of
+the four training ranks independently spent about 15 minutes scanning all 351
+DIEGESIS scenes and then all 303 Syn4D scenes, despite the complete training
+recipe already naming every requested sample. Startup validation then assigned
+two validation scenes across four ranks, leaving two ranks with empty loaders,
+and initialized competing nvTIFF decoders during MV-Kubric evaluation. These
+are startup-path defects rather than model, recipe, depth-throughput, or GPU
+memory failures.
+
+Before relaunch, recipe training must load source manifests lazily per requested
+scene, skip validation at step 0, avoid constructing empty validation shards,
+and retain only checkpoint validation. The new run must restart from step 0;
+neither aborted attempt produced a training checkpoint.
+
+- Aborted function call: `fc-01M105ZYEPEPJMGMQ2ZD5FW5A6`
+- Aborted W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/ae21046f8389
+- Dashboard: http://127.0.0.1:8766
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
