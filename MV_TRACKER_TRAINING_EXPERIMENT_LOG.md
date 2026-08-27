@@ -2600,3 +2600,27 @@ DDP metric gather.
 - Attempt 2 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/ae21046f8389
 - Dashboard: http://127.0.0.1:8766
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
+## 2026-08-27 — TAPVid-MV VGGT-Omega H200 cache smoke
+
+The six TAPVid-MV sources excluding Hi4D were materialized on
+`jeet-mvtracker-tapvidmv-eval-v1`; Harmony4D used the 29 canonical sequence
+names with obsolete duplicate `010_ballroom2` omitted. The longest available
+Harmony sequence, `005_ballroom2_human_cleaned` (741 frames, four views), then
+ran through the repository's `reconstruction__copycat__vggt_omega` cache path
+on one H200.
+
+The provided predictor completed all seven overlapping 500-image forwards and
+wrote the persistent cache. The predictor command took 850.40 seconds; total
+H200 function time was 866.80 seconds, or 0.2408 H200-hours. Across 84
+ten-second samples, mean utilization was 61.90%, peak memory was 70,187 MiB,
+and mean power was 455.72 W. Active model windows remained at 100% utilization
+and took approximately 77--78 seconds each; the lower overall utilization came
+from 256 seconds of initial sequence loading with an idle GPU.
+
+- Implementation: `132017d`
+- Modal: https://modal.com/apps/ucl-prism/main/ap-wuGf40R6vwDjACwORYGdsa
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/2bg3zp8b
+- Report: `runs/tapvidmv-vggt-h200-smoke-20260827/h200-smoke-report.json`
+- Cache: `runs/tapvidmv-vggt-h200-smoke-20260827/_reconstruction_cache/vggt_omega/harmony4d/005_ballroom2_human_cleaned.npz`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
