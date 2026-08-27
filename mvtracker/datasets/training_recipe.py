@@ -636,7 +636,9 @@ def compile_execution_recipe(
     if worker_count < 1:
         raise ValueError("worker_count must be positive")
     reader = RecipeReader(source)
+    log("execution recipe compiler phase=source_validation_start")
     reader.validate()
+    log("execution recipe compiler phase=source_validation_complete")
     required_sources = set(reader.manifest.get("source_pattern", ()))
     if missing := required_sources - set(datasets):
         raise KeyError(f"missing execution compiler datasets: {sorted(missing)}")
@@ -671,11 +673,17 @@ def compile_execution_recipe(
     global _PROCESS_DATASETS
     try:
         records_by_scene: dict[tuple[str, str], list[RecipeRecord]] = {}
-        for step in reader.steps():
+        for step_index, step in enumerate(reader.steps(), start=1):
             for sample in step["logical_samples"]:
                 record = RecipeRecord.from_dict(sample)
                 records_by_scene.setdefault((record.source, record.scene), []).append(record)
                 record_hashes.append(_record_sha256(record))
+            if step_index % 500 == 0:
+                log(
+                    "execution recipe compiler phase=task_index "
+                    f"steps={step_index}/{reader.manifest['step_count']} "
+                    f"records={len(record_hashes)}/{expected}"
+                )
         tasks = []
         for (source_name, scene), scene_records in records_by_scene.items():
             factory = request_factories[source_name]
