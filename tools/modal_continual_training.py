@@ -140,6 +140,7 @@ def _run_logged_command(command, *, cwd, environment, log_path, label):
 
     monitor = threading.Thread(target=heartbeat, daemon=True)
     monitor.start()
+    process = None
     try:
         with Path(log_path).open("a", encoding="utf-8") as log:
             process = subprocess.Popen(
@@ -157,6 +158,13 @@ def _run_logged_command(command, *, cwd, environment, log_path, label):
                 log.flush()
             return_code = process.wait()
     finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         stopped.set()
         monitor.join()
     print(
@@ -188,6 +196,20 @@ def _start_logged_process(command, *, cwd, environment, log_path, label):
     thread = threading.Thread(target=pump, daemon=True)
     thread.start()
     return process, thread
+
+
+def _terminate_logged_processes(processes) -> None:
+    for process, _ in processes:
+        if process.poll() is None:
+            process.terminate()
+    for process, thread in processes:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        thread.join()
 
 app = modal.App(
     APP_NAME,
@@ -1116,17 +1138,198 @@ def recipe_smoke20_remote(run_name: str, recipe_name: str) -> dict:
     return manifest
 
 
+def _coordinate_recipe_da3(
+    *,
+    workers,
+    prefill_devices: tuple[int, ...],
+    depth_device: int,
+    runtime_root: Path,
+    recipe_path: Path,
+    prefill_samples: int,
+    run_dir: Path,
+    base_environment: dict,
+    training_devices: tuple[int, ...],
+    experiment_name: str,
+    training_log: Path,
+    manifest: dict,
+) -> dict:
+    prefill = runtime_root / "prefill.ready"
+    prefill_started = time.monotonic()
+    next_prefill_log = prefill_started + 10
+    shard_markers = [
+        runtime_root / f"worker-{worker_id}.prefill.ready"
+        for worker_id in range(len(workers))
+    ]
+    while not all(marker.is_file() for marker in shard_markers):
+        failed_workers = [
+            worker_id
+            for worker_id, (process, _) in enumerate(workers)
+            if process.poll() is not None and not shard_markers[worker_id].is_file()
+        ]
+        if failed_workers:
+            raise RuntimeError(
+                f"DA3 prefill workers failed: {failed_workers}; see depth-producer-*.log"
+            )
+        now = time.monotonic()
+        if now >= next_prefill_log:
+            print(
+                "DA3 prefill waiting "
+                f"elapsed={now - prefill_started:.1f}s "
+                f"ready_shards={sum(marker.is_file() for marker in shard_markers)}/"
+                f"{len(shard_markers)}",
+                flush=True,
+            )
+            next_prefill_log = now + 10
+        time.sleep(1)
+
+    from mvtracker.preprocessing.runtime_da3 import prefill_ready_paths
+
+    expected_ready_samples = set(
+        prefill_ready_paths(recipe_path, runtime_root, prefill_samples)
+    )
+    ready_samples = set(runtime_root.glob("step-*/sample-*/ready"))
+    if ready_samples != expected_ready_samples:
+        missing = len(expected_ready_samples - ready_samples)
+        unexpected = len(ready_samples - expected_ready_samples)
+        raise RuntimeError(
+            f"DA3 prefill does not match the first {prefill_samples} non-GT records: "
+            f"missing={missing} unexpected={unexpected}"
+        )
+
+    steady_worker_id = prefill_devices.index(depth_device)
+    for worker_id, (process, thread) in enumerate(workers):
+        if worker_id == steady_worker_id:
+            continue
+        try:
+            return_code = process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"DA3 prefill worker {worker_id} did not release GPU {prefill_devices[worker_id]}"
+            ) from None
+        thread.join()
+        if return_code != 0:
+            raise RuntimeError(
+                f"DA3 prefill worker {worker_id} exited {return_code}; "
+                f"see {run_dir / f'depth-producer-{worker_id}.log'}"
+            )
+    steady_return_code = workers[steady_worker_id][0].poll()
+    if steady_return_code is not None:
+        raise RuntimeError(
+            f"steady DA3 worker exited {steady_return_code} before handoff; "
+            f"see {run_dir / f'depth-producer-{steady_worker_id}.log'}"
+        )
+
+    prefill_worker_metrics = [
+        {
+            **json.loads(
+                (runtime_root / f"latest-metrics-worker-{worker_id}.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            "gpu_device": device,
+        }
+        for worker_id, device in enumerate(prefill_devices)
+    ]
+    prefill_model_seconds = sum(
+        float(metrics["model_seconds"]) for metrics in prefill_worker_metrics
+    )
+    prefill_generated_images = sum(
+        int(metrics["generated_images"]) for metrics in prefill_worker_metrics
+    )
+    prefill_aggregate = {
+        "worker_count": len(prefill_worker_metrics),
+        "generated_samples": sum(
+            int(metrics["generated_samples"]) for metrics in prefill_worker_metrics
+        ),
+        "generated_images": prefill_generated_images,
+        "model_seconds": prefill_model_seconds,
+        "model_images_per_second": prefill_generated_images
+        / max(prefill_model_seconds, 1e-9),
+    }
+    if prefill_aggregate["generated_samples"] != prefill_samples:
+        raise RuntimeError(
+            "DA3 prefill worker metrics do not account for exactly "
+            f"{prefill_samples} samples: {prefill_aggregate}"
+        )
+
+    prefill.touch()
+    prefill_seconds = time.monotonic() - prefill_started
+    prefill_aggregate["wall_seconds"] = prefill_seconds
+    prefill_aggregate["wall_images_per_second"] = (
+        prefill_generated_images / max(prefill_seconds, 1e-9)
+    )
+    prefill_event = {
+        "event": "da3_prefill_complete",
+        "elapsed_seconds": prefill_seconds,
+        "aggregate": prefill_aggregate,
+        "workers": prefill_worker_metrics,
+    }
+    encoded_prefill_event = json.dumps(prefill_event, sort_keys=True)
+    print(encoded_prefill_event, flush=True)
+    with training_log.open("a", encoding="utf-8") as handle:
+        handle.write(encoded_prefill_event + "\n")
+
+    training_environment = {
+        **base_environment,
+        "CUDA_VISIBLE_DEVICES": ",".join(map(str, training_devices)),
+    }
+    return_code = _run_logged_command(
+        [
+            sys.executable,
+            "-m",
+            "mvtracker.cli.train",
+            f"+experiment={experiment_name}",
+        ],
+        cwd=SOURCE_ROOT,
+        environment=training_environment,
+        log_path=training_log,
+        label="recipe-da3-training",
+    )
+    if return_code != 0:
+        raise RuntimeError(
+            f"DA3 recipe training exited {return_code}; see {training_log}"
+        )
+
+    producer, producer_thread = workers[steady_worker_id]
+    producer_return_code = producer.wait(timeout=30 * 60)
+    producer_thread.join()
+    if producer_return_code != 0:
+        raise RuntimeError(
+            f"depth producer exited {producer_return_code}; see "
+            f"{run_dir / f'depth-producer-{steady_worker_id}.log'}"
+        )
+    final_producer_metrics = json.loads(
+        (runtime_root / f"latest-metrics-worker-{steady_worker_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    result = {
+        **manifest,
+        "prefill_seconds": prefill_seconds,
+        "prefill": prefill_aggregate,
+        "prefill_workers": prefill_worker_metrics,
+        "producer": final_producer_metrics,
+        "checkpoint": str(run_dir / "model_final.pth"),
+    }
+    (run_dir / "integration-summary.json").write_text(
+        json.dumps(result, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"DA3 recipe training complete result={result}", flush=True)
+    return result
+
+
 def _run_recipe_da3(
     run_name: str,
     recipe_name: str,
     experiment_name: str,
     expected_steps: int,
     wandb_group: str,
-    prefill_steps: int = 4,
+    prefill_samples: int = 64,
     *,
     gpu_label: str,
     training_devices: tuple[int, ...],
     depth_device: int,
+    prefill_devices: tuple[int, ...],
     da3_image_capacity: int,
     max_pending_depth_samples: int,
 ) -> dict:
@@ -1149,7 +1352,6 @@ def _run_recipe_da3(
         )
     seed = int(recipe_manifest["seed"])
     runtime_root = Path("/tmp/mvtracker-da3-depth")
-    producer_log = run_dir / "depth-producer.log"
     training_log = run_dir / "training.log"
     manifest = {
         "mode": "recipe_da3",
@@ -1159,6 +1361,8 @@ def _run_recipe_da3(
         "gpu": gpu_label,
         "training_devices": list(training_devices),
         "depth_device": int(depth_device),
+        "prefill_devices": list(prefill_devices),
+        "prefill_samples": int(prefill_samples),
         "da3_image_capacity": int(da3_image_capacity),
         "max_pending_depth_samples": int(max_pending_depth_samples),
         "steps": int(expected_steps),
@@ -1190,21 +1394,49 @@ def _run_recipe_da3(
             "MVTRACKER_WANDB_RUN_NAME": run_name,
             "MVTRACKER_WANDB_RUN_ID": wandb_run_id,
             "MVTRACKER_RUNTIME_DEPTH_ROOT": str(runtime_root),
-            "MVTRACKER_RUNTIME_DEPTH_METRICS": str(runtime_root / "metrics.jsonl"),
+            "MVTRACKER_RUNTIME_DEPTH_METRICS": str(
+                runtime_root
+                / f"latest-metrics-worker-{prefill_devices.index(depth_device)}.json"
+            ),
             "WANDB_ENTITY": WANDB_ENTITY,
             "WANDB_PROJECT": WANDB_PROJECT,
             "WANDB_RUN_GROUP": wandb_group,
             "WANDB_RUN_ID": wandb_run_id,
             "WANDB_RESUME": "allow",
             "PYTHONUNBUFFERED": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
         }
     )
-    producer_environment = {
+    cache_environment = {
         **base_environment,
-        "CUDA_VISIBLE_DEVICES": str(depth_device),
+        "CUDA_VISIBLE_DEVICES": "",
         "HF_HOME": "/tmp/huggingface-da3",
         "MVTRACKER_DA3_IMAGE_CAPACITY": str(da3_image_capacity),
     }
+    if runtime_root.exists():
+        shutil.rmtree(runtime_root)
+    runtime_root.mkdir(parents=True)
+    cache_return_code = _run_logged_command(
+        [
+            sys.executable,
+            "-m",
+            "mvtracker.preprocessing.runtime_da3",
+            "--download-only",
+        ],
+        cwd=SOURCE_ROOT,
+        environment=cache_environment,
+        log_path=run_dir / "depth-model-cache.log",
+        label="depth-model-cache",
+    )
+    if cache_return_code != 0:
+        raise RuntimeError(
+            "DA3 model cache warmup failed; see "
+            f"{run_dir / 'depth-model-cache.log'}"
+        )
+
     producer_command = [
         sys.executable,
         "-m",
@@ -1215,87 +1447,59 @@ def _run_recipe_da3(
         DATA_VOLUME_ROOT,
         "--output-root",
         str(runtime_root),
-        "--prefill-steps",
-        str(prefill_steps),
+        "--prefill-samples",
+        str(prefill_samples),
         "--max-pending-samples",
         str(max_pending_depth_samples),
     ]
-    producer, producer_thread = _start_logged_process(
-        producer_command,
-        cwd=SOURCE_ROOT,
-        environment=producer_environment,
-        log_path=producer_log,
-        label="depth-producer",
-    )
-    prefill = runtime_root / "prefill.ready"
-    prefill_started = time.monotonic()
-    while not prefill.is_file():
-        return_code = producer.poll()
-        if return_code is not None:
-            producer_thread.join()
-            raise RuntimeError(
-                f"depth producer exited {return_code} before prefill; see {producer_log}"
+    if depth_device not in prefill_devices:
+        raise ValueError("depth_device must be included in prefill_devices")
+    if len(set(prefill_devices)) != len(prefill_devices):
+        raise ValueError("prefill_devices must be unique")
+    workers = []
+    try:
+        for worker_id, device in enumerate(prefill_devices):
+            environment = {
+                **base_environment,
+                "CUDA_VISIBLE_DEVICES": str(device),
+                "HF_HOME": "/tmp/huggingface-da3",
+                "MVTRACKER_DA3_IMAGE_CAPACITY": str(da3_image_capacity),
+            }
+            command = [
+                *producer_command,
+                "--worker-id",
+                str(worker_id),
+                "--worker-count",
+                str(len(prefill_devices)),
+            ]
+            if device != depth_device:
+                command.append("--prefill-only")
+            process, thread = _start_logged_process(
+                command,
+                cwd=SOURCE_ROOT,
+                environment=environment,
+                log_path=run_dir / f"depth-producer-{worker_id}.log",
+                label=f"depth-producer-{worker_id}",
             )
-        if int(time.monotonic() - prefill_started) % 10 == 0:
-            print(
-                "DA3 prefill waiting "
-                f"elapsed={time.monotonic() - prefill_started:.1f}s",
-                flush=True,
-            )
-        time.sleep(1)
-    prefill_seconds = time.monotonic() - prefill_started
-    print(
-        f"DA3 prefill ready elapsed={prefill_seconds:.1f}s",
-        flush=True,
-    )
+            workers.append((process, thread))
 
-    training_environment = {
-        **base_environment,
-        "CUDA_VISIBLE_DEVICES": ",".join(map(str, training_devices)),
-    }
-    return_code = _run_logged_command(
-        [
-            sys.executable,
-            "-m",
-            "mvtracker.cli.train",
-            f"+experiment={experiment_name}",
-        ],
-        cwd=SOURCE_ROOT,
-        environment=training_environment,
-        log_path=training_log,
-        label="recipe-da3-training",
-    )
-    if return_code != 0:
-        producer.terminate()
-        producer.wait(timeout=30)
-        producer_thread.join()
-        run_volume.commit()
-        raise RuntimeError(
-            f"DA3 recipe training exited {return_code}; see {training_log}"
+        return _coordinate_recipe_da3(
+            workers=workers,
+            prefill_devices=prefill_devices,
+            depth_device=depth_device,
+            runtime_root=runtime_root,
+            recipe_path=recipe_path,
+            prefill_samples=prefill_samples,
+            run_dir=run_dir,
+            base_environment=base_environment,
+            training_devices=training_devices,
+            experiment_name=experiment_name,
+            training_log=training_log,
+            manifest=manifest,
         )
-    producer_return_code = producer.wait(timeout=30 * 60)
-    producer_thread.join()
-    if producer_return_code != 0:
+    finally:
+        _terminate_logged_processes(workers)
         run_volume.commit()
-        raise RuntimeError(
-            f"depth producer exited {producer_return_code}; see {producer_log}"
-        )
-    metrics_lines = (runtime_root / "metrics.jsonl").read_text(
-        encoding="utf-8"
-    ).splitlines()
-    final_producer_metrics = json.loads(metrics_lines[-1])
-    result = {
-        **manifest,
-        "prefill_seconds": prefill_seconds,
-        "producer": final_producer_metrics,
-        "checkpoint": str(run_dir / "model_final.pth"),
-    }
-    (run_dir / "integration-summary.json").write_text(
-        json.dumps(result, indent=2) + "\n", encoding="utf-8"
-    )
-    run_volume.commit()
-    print(f"DA3 recipe training complete result={result}", flush=True)
-    return result
 
 
 @app.function(
@@ -1319,7 +1523,7 @@ def recipe_da3_remote(
     experiment_name: str,
     expected_steps: int,
     wandb_group: str,
-    prefill_steps: int = 4,
+    prefill_samples: int = 64,
 ) -> dict:
     return _run_recipe_da3(
         run_name,
@@ -1327,10 +1531,11 @@ def recipe_da3_remote(
         experiment_name,
         expected_steps,
         wandb_group,
-        prefill_steps,
+        prefill_samples,
         gpu_label="H200:3",
         training_devices=(0, 1),
         depth_device=2,
+        prefill_devices=(0, 1, 2),
         da3_image_capacity=80,
         max_pending_depth_samples=32,
     )
@@ -1354,7 +1559,7 @@ def recipe_da3_remote(
 def recipe_da3_h100x5_remote(
     run_name: str,
     recipe_name: str,
-    prefill_steps: int = 4,
+    prefill_samples: int = 64,
 ) -> dict:
     return _run_recipe_da3(
         run_name,
@@ -1362,10 +1567,11 @@ def recipe_da3_h100x5_remote(
         "diegesis_syn4d_mvkubric_recipe_da3_ddp_5000",
         5000,
         "diegesis351-syn4d-mvkubric-da3-5000",
-        prefill_steps,
+        prefill_samples,
         gpu_label="H100!:5",
         training_devices=(0, 1, 2, 3),
         depth_device=4,
+        prefill_devices=(0, 1, 2, 3, 4),
         da3_image_capacity=64,
         max_pending_depth_samples=64,
     )
@@ -1389,7 +1595,7 @@ def recipe_da3_h100x5_remote(
 def recipe_da3_h200x5_remote(
     run_name: str,
     recipe_name: str,
-    prefill_steps: int = 4,
+    prefill_samples: int = 64,
 ) -> dict:
     return _run_recipe_da3(
         run_name,
@@ -1397,10 +1603,11 @@ def recipe_da3_h200x5_remote(
         "diegesis_syn4d_mvkubric_recipe_da3_h200_ddp_5000",
         5000,
         "diegesis351-syn4d-mvkubric-da3-h200-5000",
-        prefill_steps,
+        prefill_samples,
         gpu_label="H200:5",
         training_devices=(0, 1, 2, 3),
         depth_device=4,
+        prefill_devices=(0, 1, 2, 3, 4),
         da3_image_capacity=64,
         max_pending_depth_samples=64,
     )
@@ -1854,7 +2061,7 @@ def recipe_da3_smoke20(run_name: str, recipe_name: str) -> None:
         "diegesis_syn4d_mvkubric_recipe_da3_ddp_smoke20",
         20,
         "da3-runtime-depth-smoke20",
-        4,
+        64,
     )
     print(json.dumps({"run_name": run_name, "function_call_id": call.object_id}, indent=2))
 
@@ -1876,7 +2083,7 @@ def recipe_da3_train1000(run_name: str, recipe_name: str) -> None:
         "diegesis_syn4d_mvkubric_recipe_da3_ddp_1000",
         1000,
         "expanded-syn4d-da3-1000",
-        4,
+        64,
     )
     print(json.dumps({"run_name": run_name, "function_call_id": call.object_id}, indent=2))
 
@@ -1892,7 +2099,7 @@ def recipe_da3_h100x5_train5000(run_name: str, recipe_name: str) -> None:
         {**MODAL_TAGS, "experiment": run_name, "gpu": "h100x5"}
     )
     deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h100x5_remote")
-    call = deployed.spawn(run_name, recipe_name, 4)
+    call = deployed.spawn(run_name, recipe_name, 64)
     print(
         json.dumps(
             {"run_name": run_name, "function_call_id": call.object_id},
@@ -1912,7 +2119,7 @@ def recipe_da3_h200x5_train5000(run_name: str, recipe_name: str) -> None:
         {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x5"}
     )
     deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h200x5_remote")
-    call = deployed.spawn(run_name, recipe_name, 4)
+    call = deployed.spawn(run_name, recipe_name, 64)
     print(
         json.dumps(
             {"run_name": run_name, "function_call_id": call.object_id},

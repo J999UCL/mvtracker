@@ -1,9 +1,10 @@
-"""Recipe-driven DA3-Giant depth production on a dedicated local GPU."""
+"""Recipe-driven DA3-Giant depth production on local GPUs."""
 
 from __future__ import annotations
 
 import argparse
 from io import BytesIO
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ MODEL_ID = "depth-anything/DA3-GIANT-1.1"
 IMAGE_CAPACITY = int(os.environ.get("MVTRACKER_DA3_IMAGE_CAPACITY", "80"))
 MIN_ALIGNMENT_VIEWS = 4
 MAX_PENDING_SAMPLES = 32
+PREFILL_SAMPLES = 64
 
 
 def _log(event: str, **fields) -> None:
@@ -175,8 +177,12 @@ class _MVKubricScenes:
         return inference_views, images, extrinsics, intrinsics, scene.resolution_hw
 
 
+def _sample_root(root: Path, record: RecipeRecord) -> Path:
+    return root / f"step-{record.step:06d}" / f"sample-{record.logical_index:02d}"
+
+
 def _write_sample(root: Path, record: RecipeRecord, depth: np.ndarray, mask: np.ndarray) -> None:
-    sample_root = root / f"step-{record.step:06d}" / f"sample-{record.logical_index:02d}"
+    sample_root = _sample_root(root, record)
     staging = sample_root.with_name(f".{sample_root.name}.partial")
     if staging.exists():
         shutil.rmtree(staging)
@@ -208,6 +214,65 @@ def _wait_for_consumer(output_root: Path, max_pending_samples: int) -> None:
             )
             last_log = now
         time.sleep(0.1)
+
+
+def _depth_records(recipe_path: Path):
+    """Yield non-GT recipe records in their canonical execution order."""
+    ordinal = 0
+    for payload in RecipeReader(recipe_path).steps():
+        for sample in payload["logical_samples"]:
+            record = RecipeRecord.from_dict(sample)
+            if record.depth_source == "gt":
+                continue
+            yield ordinal, record
+            ordinal += 1
+
+
+def _prefill_owner(ordinal: int, worker_count: int) -> int:
+    if worker_count < 1:
+        raise ValueError("worker_count must be positive")
+    return int(ordinal) % int(worker_count)
+
+
+def prefill_ready_paths(
+    recipe_path: Path,
+    output_root: Path,
+    prefill_samples: int,
+) -> tuple[Path, ...]:
+    records = list(islice(_depth_records(recipe_path), prefill_samples))
+    if len(records) != prefill_samples:
+        raise ValueError(
+            f"recipe contains {len(records)} non-GT samples; expected at least {prefill_samples}"
+        )
+    return tuple(_sample_root(output_root, record) / "ready" for _, record in records)
+
+
+def _wait_for_handoff(output_root: Path, worker_id: int) -> None:
+    started = time.perf_counter()
+    last_log = started
+    handoff = output_root / "prefill.ready"
+    while not handoff.is_file():
+        failed = output_root / "failed"
+        if failed.is_file():
+            raise RuntimeError(failed.read_text(encoding="utf-8").strip())
+        now = time.perf_counter()
+        if now - last_log >= 10:
+            _log(
+                "prefill_handoff_wait",
+                worker_id=worker_id,
+                elapsed_seconds=round(now - started, 1),
+            )
+            last_log = now
+        time.sleep(0.1)
+
+
+def _write_metric(metrics_path: Path, latest_path: Path, metric: dict) -> None:
+    encoded = json.dumps(metric, separators=(",", ":"))
+    with metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write(encoded + "\n")
+    staging = latest_path.with_suffix(".partial")
+    staging.write_text(encoded + "\n", encoding="utf-8")
+    staging.replace(latest_path)
 
 
 def _produce_record(model, reader, record: RecipeRecord, output_root: Path):
@@ -291,94 +356,171 @@ def run(
     recipe_path: Path,
     data_root: Path,
     output_root: Path,
-    prefill_steps: int,
     max_pending_samples: int,
+    *,
+    worker_id: int = 0,
+    worker_count: int = 1,
+    prefill_samples: int = PREFILL_SAMPLES,
+    continue_after_prefill: bool = True,
 ) -> None:
     import torch
     from depth_anything_3.api import DepthAnything3
 
-    if output_root.exists():
-        shutil.rmtree(output_root)
-    output_root.mkdir(parents=True)
-    metrics_path = output_root / "metrics.jsonl"
+    if not output_root.is_dir():
+        raise FileNotFoundError(
+            f"runtime depth root must be initialized by the launcher: {output_root}"
+        )
+    if worker_id < 0 or worker_id >= worker_count:
+        raise ValueError(
+            f"worker_id {worker_id} is outside worker_count {worker_count}"
+        )
+    if prefill_samples < 1:
+        raise ValueError("prefill_samples must be positive")
+    if max_pending_samples < 1:
+        raise ValueError("max_pending_samples must be positive")
+    metrics_path = output_root / f"metrics-worker-{worker_id}.jsonl"
+    latest_metrics_path = output_root / f"latest-metrics-worker-{worker_id}.json"
     started = time.perf_counter()
     generated_samples = 0
     generated_images = 0
     model_seconds = 0.0
     try:
-        _log("model_load_started", model=MODEL_ID)
+        _log(
+            "model_load_started",
+            model=MODEL_ID,
+            worker_id=worker_id,
+            worker_count=worker_count,
+        )
         model = DepthAnything3.from_pretrained(MODEL_ID).to("cuda").eval()
         torch.cuda.synchronize()
         _log(
             "model_ready",
             seconds=round(time.perf_counter() - started, 3),
             gpu=torch.cuda.get_device_name(0),
+            worker_id=worker_id,
         )
         packed = _PackedScenes(data_root)
         mvkubric = _MVKubricScenes(data_root)
-        for payload in RecipeReader(recipe_path).steps():
-            step = int(payload["step"])
-            for sample in payload["logical_samples"]:
-                record = RecipeRecord.from_dict(sample)
-                if record.depth_source == "gt":
+        depth_records = _depth_records(recipe_path)
+        for ordinal, record in depth_records:
+            if ordinal < prefill_samples:
+                if _prefill_owner(ordinal, worker_count) != worker_id:
                     continue
-                _wait_for_consumer(output_root, max_pending_samples)
-                reader = mvkubric if record.source == "mvkubric" else packed
-                sample_started = time.perf_counter()
-                seconds, image_count = _produce_record(model, reader, record, output_root)
-                generated_samples += 1
-                generated_images += image_count
-                model_seconds += seconds
-                metric = {
-                    "step": step,
-                    "source": record.source,
-                    "scene": record.scene,
-                    "depth_source": record.depth_source,
-                    "generated_samples": generated_samples,
-                    "generated_images": generated_images,
-                    "model_seconds": model_seconds,
-                    "model_images_per_second": generated_images / max(model_seconds, 1e-9),
-                    "sample_seconds": time.perf_counter() - sample_started,
-                    "producer_max_rss_gib": (
-                        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                        / 1024**2
-                    ),
-                }
-                with metrics_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(metric, separators=(",", ":")) + "\n")
-                _log("sample_ready", **metric)
-            (output_root / f"step-{step:06d}.ready").touch()
-            if step + 1 == prefill_steps:
-                (output_root / "prefill.ready").touch()
-                _log("prefill_ready", steps=prefill_steps)
-        (output_root / "complete").touch()
+            elif not continue_after_prefill:
+                break
+            elif ordinal == prefill_samples:
+                (output_root / f"worker-{worker_id}.prefill.ready").touch()
+                _log(
+                    "prefill_shard_ready",
+                    worker_id=worker_id,
+                    generated_samples=generated_samples,
+                    prefill_samples=prefill_samples,
+                )
+                _wait_for_handoff(output_root, worker_id)
+
+            pending_limit = (
+                max(max_pending_samples, prefill_samples)
+                if ordinal < prefill_samples
+                else max_pending_samples
+            )
+            _wait_for_consumer(output_root, pending_limit)
+            reader = mvkubric if record.source == "mvkubric" else packed
+            sample_started = time.perf_counter()
+            seconds, image_count = _produce_record(model, reader, record, output_root)
+            generated_samples += 1
+            generated_images += image_count
+            model_seconds += seconds
+            metric = {
+                "ordinal": ordinal,
+                "step": record.step,
+                "logical_index": record.logical_index,
+                "source": record.source,
+                "scene": record.scene,
+                "depth_source": record.depth_source,
+                "worker_id": worker_id,
+                "generated_samples": generated_samples,
+                "generated_images": generated_images,
+                "model_seconds": model_seconds,
+                "model_images_per_second": generated_images / max(model_seconds, 1e-9),
+                "sample_seconds": time.perf_counter() - sample_started,
+                "producer_max_rss_gib": (
+                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    / 1024**2
+                ),
+            }
+            _write_metric(metrics_path, latest_metrics_path, metric)
+            _log("sample_ready", **metric)
+
+        shard_ready = output_root / f"worker-{worker_id}.prefill.ready"
+        if not shard_ready.is_file():
+            if generated_samples < sum(
+                1
+                for ordinal in range(prefill_samples)
+                if _prefill_owner(ordinal, worker_count) == worker_id
+            ):
+                raise ValueError(
+                    f"recipe contains fewer than {prefill_samples} non-GT samples"
+                )
+            shard_ready.touch()
+            _log(
+                "prefill_shard_ready",
+                worker_id=worker_id,
+                generated_samples=generated_samples,
+                prefill_samples=prefill_samples,
+            )
+        (output_root / f"worker-{worker_id}.complete").touch()
+        if continue_after_prefill:
+            (output_root / "complete").touch()
         _log(
             "producer_complete",
+            worker_id=worker_id,
             generated_samples=generated_samples,
             generated_images=generated_images,
             model_images_per_second=generated_images / max(model_seconds, 1e-9),
             wall_seconds=time.perf_counter() - started,
         )
     except BaseException as error:
-        (output_root / "failed").write_text(f"DA3 producer failed: {error}\n", encoding="utf-8")
-        _log("producer_failed", error=repr(error))
+        (output_root / "failed").write_text(
+            f"DA3 worker {worker_id} failed: {error}\n", encoding="utf-8"
+        )
+        _log("producer_failed", worker_id=worker_id, error=repr(error))
         raise
+
+
+def download_model() -> None:
+    from huggingface_hub import snapshot_download
+
+    _log("model_cache_warm_started", model=MODEL_ID)
+    snapshot_download(MODEL_ID)
+    _log("model_cache_warm_complete", model=MODEL_ID)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--recipe", type=Path, required=True)
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--prefill-steps", type=int, default=4)
+    parser.add_argument("--recipe", type=Path)
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--output-root", type=Path)
     parser.add_argument("--max-pending-samples", type=int, default=MAX_PENDING_SAMPLES)
+    parser.add_argument("--worker-id", type=int, default=0)
+    parser.add_argument("--worker-count", type=int, default=1)
+    parser.add_argument("--prefill-samples", type=int, default=PREFILL_SAMPLES)
+    parser.add_argument("--prefill-only", action="store_true")
+    parser.add_argument("--download-only", action="store_true")
     args = parser.parse_args()
+    if args.download_only:
+        download_model()
+        return
+    if args.recipe is None or args.data_root is None or args.output_root is None:
+        parser.error("--recipe, --data-root, and --output-root are required")
     run(
         args.recipe,
         args.data_root,
         args.output_root,
-        args.prefill_steps,
         args.max_pending_samples,
+        worker_id=args.worker_id,
+        worker_count=args.worker_count,
+        prefill_samples=args.prefill_samples,
+        continue_after_prefill=not args.prefill_only,
     )
 
 
