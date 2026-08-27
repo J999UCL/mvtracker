@@ -451,6 +451,8 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertIn("no smoothing is applied", html)
         self.assertIn("loss-large", html)
         self.assertIn("toggleLossSeries", html)
+        self.assertIn("const MIN_OPTIMIZER_STEP=100", html)
+        self.assertIn("xTitle==='Optimizer step'?MIN_OPTIMIZER_STEP:undefined", html)
         self.assertIn("seriesKey:'trajectory'", html)
         self.assertIn("combined_full:'Combined · full validation'", html)
         self.assertIn("Equal-weight mean of DIEGESIS, Syn4D, and MV-Kubric", html)
