@@ -927,6 +927,30 @@ exact speedup claim.
 - Output: `jeet-mvtracker-runs-v2/continual-training/smoke10-physical-batching-7c6a46c-20260818T093720Z/`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
 
+## 2026-08-27 — Execution recipe v2 and six-H200 production launch
+
+The immutable 5,000-step recipe was compiled into execution-complete schema-v2
+rank sidecars. All 40,000 records passed direct-plan parity, including exact
+MV-Kubric media locators; each of four ranks contains 10,000 records. The
+sidecars total 1,275,961,107 bytes.
+
+The production container now requests six H200s. GPUs 0--3 remain the four DDP
+ranks; GPUs 4--5 split all post-prefill DA3 records by ordinal. All six GPUs
+build the exact initial 64-sample queue as 11/11/11/11/10/10. A shared atomic
+reservation keeps ready plus in-flight depth outputs at or below 64.
+
+The active 5,000-step run completed the six-way handoff and optimizer step 1.
+After first-step warmup, steps 2--3 took about six seconds each. The ready queue
+was 60--64 and the effective ready-plus-CPU-resident buffer was 74--75.
+
+- Recipe: `training-recipes/diegesis351-ddp4-5k-exec-v2-20260827`
+- Compiler W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/cdzor9f9
+- Run: `diegesis351-v2-h200x6-5000-20260827T0816BST`
+- Source commit: `e08cc9f077cdc8c6445b4aaed007c6d4b7a90bc1`
+- Function call: `fc-01M1118R21AFQ5SWTB0NE7BYSW`
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-continual-training/runs/6c51f4b03072
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=training`
+
 ## 2026-08-25 — Canonical fresh 1,000-step mixed-depth recipe
 
 A new recipe was generated from scratch with current dataset planners; no
