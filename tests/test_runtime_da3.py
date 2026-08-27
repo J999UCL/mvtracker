@@ -76,6 +76,28 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
             [(0, "one"), (1, "two")],
         )
 
+    def test_depth_records_stop_at_requested_training_prefix(self):
+        steps = [
+            {
+                "step": step,
+                "logical_samples": [
+                    {"name": f"sample-{step}", "depth_source": "estimated"}
+                ],
+            }
+            for step in range(3)
+        ]
+        reader = SimpleNamespace(steps=lambda: iter(steps))
+        with (
+            patch.object(runtime_da3, "RecipeReader", return_value=reader),
+            patch.object(
+                runtime_da3.RecipeRecord,
+                "from_dict",
+                side_effect=lambda value: SimpleNamespace(**value),
+            ),
+        ):
+            records = list(runtime_da3._depth_records(Path("recipe"), max_steps=2))
+        self.assertEqual([record.name for _, record in records], ["sample-0", "sample-1"])
+
     def test_expected_prefill_paths_are_recipe_exact(self):
         records = [_record(ordinal) for ordinal in range(4)]
         with patch.object(
@@ -130,7 +152,7 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
         )
         self.assertEqual(
             source.count("prefill_devices=(0, 1, 2, 3, 4)"),
-            2,
+            3,
         )
         recipe_launcher = source[
             source.index("def _coordinate_recipe_da3(") : source.index(

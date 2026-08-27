@@ -1,0 +1,27 @@
+# @package _global_
+defaults:
+  - diegesis_syn4d_mvkubric_recipe_da3_h200_ddp_5000
+  - _self_
+
+datasets:
+  eval:
+    names: []
+    schedule: []
+
+trainer:
+  num_steps: 100
+  lr_schedule_steps: 100
+  eval_freq: 10000
+  save_ckpt_freq: 100
+  gradient_diagnostics: false
+
+modes:
+  validate_at_start: false
+
+logging:
+  wandb_group: diegesis351-recipe-v2-h200-ddp4-smoke100
+  tags:
+    - recipe-v2
+    - da3-prefill64-h200x5
+    - ddp4
+    - smoke100

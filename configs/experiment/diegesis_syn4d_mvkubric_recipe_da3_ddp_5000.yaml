@@ -16,6 +16,8 @@ datasets:
       max_scenes: 1
       rank_local: false
       decoded_queue_depth: 2
+    dali:
+      num_threads: 2
   eval:
     schedule:
       - steps: [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
@@ -26,7 +28,6 @@ datasets:
       - steps: [2500, 5000]
         names:
           - kubric-multiview-v3-validation-full
-
 trainer:
   num_steps: 5000
   lr_schedule_steps: 5000

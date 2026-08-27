@@ -6,12 +6,9 @@ import json
 import shutil
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import numpy as np
-
-from mvtracker.datasets.io_cache import flush_and_discard_file
-
 
 ESTIMATED_DEPTH_FORMAT = "mvtracker_estimated_depth"
 ESTIMATED_DEPTH_SCHEMA_VERSION = 2
@@ -151,13 +148,26 @@ class EstimatedDepthStore:
         return np.asarray(selected_depth), np.asarray(selected_mask)
 
 
+class RuntimeDepthLoad(NamedTuple):
+    depth: np.ndarray
+    cleaned_mask: np.ndarray
+    ready_wait_seconds: float
+    read_seconds: float
+    delete_seconds: float
+    byte_count: int
+
+    @property
+    def total_seconds(self) -> float:
+        return self.ready_wait_seconds + self.read_seconds + self.delete_seconds
+
+
 class RuntimeRecipeDepthStore:
     """Consume recipe-keyed DA3 depth produced on the container's local SSD."""
 
     def __init__(self, root: str | Path):
         self.root = Path(root)
 
-    def load(self, step: int, logical_index: int) -> tuple[np.ndarray, np.ndarray, float, int]:
+    def load(self, step: int, logical_index: int) -> RuntimeDepthLoad:
         sample_root = self.root / f"step-{int(step):06d}" / f"sample-{int(logical_index):02d}"
         ready = sample_root / "ready"
         failed = self.root / "failed"
@@ -176,12 +186,20 @@ class RuntimeRecipeDepthStore:
                 )
                 last_log = now
             time.sleep(0.05)
+        ready_at = time.perf_counter()
         depth_path = sample_root / "depth.npy"
         mask_path = sample_root / "cleaned_mask.npy"
         depth = np.load(depth_path, allow_pickle=False).astype(np.float32, copy=True)
         mask = np.load(mask_path, allow_pickle=False).astype(np.bool_, copy=True)
+        read_at = time.perf_counter()
         byte_count = depth.nbytes + mask.nbytes
-        flush_and_discard_file(depth_path)
-        flush_and_discard_file(mask_path)
         shutil.rmtree(sample_root)
-        return depth, mask, time.perf_counter() - started, byte_count
+        deleted_at = time.perf_counter()
+        return RuntimeDepthLoad(
+            depth=depth,
+            cleaned_mask=mask,
+            ready_wait_seconds=ready_at - started,
+            read_seconds=read_at - ready_at,
+            delete_seconds=deleted_at - read_at,
+            byte_count=byte_count,
+        )

@@ -43,8 +43,9 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
 
     def test_recipe_replay_is_checkpointed_and_depth_is_visible(self):
         source = (ROOT / "mvtracker/cli/train.py").read_text(encoding="utf-8")
-        self.assertIn("RecipeReader(recipe_path)", source)
-        self.assertIn("record.replay_request(ScheduledSampleRequest)", source)
+        self.assertIn("ExecutionRecipeReader(recipe_path)", source)
+        self.assertIn("execution recipes must never call plan_sample", source)
+        self.assertIn("materialize_recipe_record", source)
         self.assertIn('state.recipe_position = int(recipe_position)', source)
         self.assertIn('metadata["planned_depth_source"]', source)
         self.assertIn('metadata["effective_depth_source"]', source)
@@ -52,7 +53,7 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
         self.assertIn("OmegaConf.update(", source)
         self.assertIn("force_add=True", source)
 
-    def test_replay_uses_logical_ordinals_when_actual_cursors_have_gaps(self):
+    def test_v1_recipe_is_rejected_without_a_runtime_planning_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             recipe_dir = Path(temporary) / "recipe"
             writer = RecipeWriter(
@@ -92,13 +93,8 @@ class TrainingRecipeConsumptionContractTests(unittest.TestCase):
                 )
             writer.finalize(summary={}, estimated_depth_requests=[])
 
-            schedule = _recipe_schedule_class()(recipe_dir, rank=0, world_size=1)
-            records, _ = schedule.recipe_step(0)
-            first = schedule.replay_request(records[0])
-            second = schedule.replay_request(records[1])
-            self.assertEqual((first.virtual_index, second.virtual_index), (3, 8))
-            self.assertEqual(first.depth_source, "estimated")
-            self.assertEqual(first.expected_scene, "scene")
+            with self.assertRaisesRegex(ValueError, "schema_version=2"):
+                _recipe_schedule_class()(recipe_dir, rank=0, world_size=1)
 
     def test_modal_planner_and_smoke_resource_contract(self):
         source = (ROOT / "tools/modal_continual_training.py").read_text(

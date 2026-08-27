@@ -27,6 +27,7 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
     _sample_tracks,
     _scene_transform,
     _spatial_transform,
+    _apply_spatial_trace,
     _visible_path_lengths,
 )
 from mvtracker.datasets.estimated_depth import sample_depth_source
@@ -41,7 +42,7 @@ class _MappedSequence:
         self.root = root
         self.arrays: dict[Path, np.ndarray] = {}
         self.lock = threading.Lock()
-        self.discard_after_read = True
+        self.discard_after_read = False
 
     def read(self, relative: str | Path, index=()) -> np.ndarray:
         path = self.root / relative
@@ -89,6 +90,7 @@ class _SequenceMmapCache:
                     self.condition.wait()
                     continue
                 store, _ = self.stores.pop(idle)
+                store.discard()
                 store.close()
             if sequence in self.stores:
                 store, users = self.stores.pop(sequence)
@@ -380,6 +382,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
                 replace_bounds=self.replace_bounds,
             )
         output_size = tuple(self.crop_size) if self.enable_cropping_augs else source_size
+        spatial_trace: list[np.ndarray] = []
         xy, selected_visibility, intrinsics, theta = _spatial_transform(
             xy,
             selected_visibility,
@@ -388,6 +391,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             output_size,
             rng,
             self.enable_cropping_augs,
+            trace_out=spatial_trace,
         )
         transformed = np.concatenate([xy, camera_z[..., None]], axis=-1)
         apply_depth_aug = bool(augment and self.enable_depth_augs)
@@ -418,6 +422,7 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
         )
         if not len(selected):
             return None
+        post_selection_rng_state = rng.get_state()
         selected_global = preselected[selected]
         tracks = tracks[:, selected]
         query_points = query_points.astype(np.float32, copy=False)
@@ -508,7 +513,109 @@ class Syn4DMultiViewDataset(TapVid3DMultiViewDataset):
             depth_focal_lengths=(),
             metadata=metadata,
             track_validity=validity,
+            post_selection_rng_state=post_selection_rng_state,
+            spatial_transform=spatial_trace[0],
         )
 
     def materialize_sample(self, plan: SamplePlan, runtime_depth=None):
         return super().materialize_sample(plan, runtime_depth=runtime_depth)
+
+    def execution_plan(self, execution_record) -> SamplePlan:
+        """Build a Syn4D plan from recorded IDs and compact transform state."""
+        from .training_recipe import unpack_execution_mask
+
+        record = execution_record.recipe
+        trace = execution_record.trace
+        root = Path(self.data_root) / record.scene
+        frames = np.asarray(record.frames, dtype=np.int64)
+        views = tuple(record.views)
+        selected_global = np.asarray(record.tracks, dtype=np.int64)
+        with self._sequence_cache.use(record.scene) as store:
+            tracks = store.read(
+                "tracks_xyz.npy", np.ix_(frames, selected_global)
+            ).astype(np.float32, copy=False)
+            intrinsics = np.stack(
+                [
+                    store.read(f"{view}/intrinsics.npy", frames).astype(
+                        np.float32, copy=False
+                    )
+                    for view in views
+                ]
+            )
+            extrinsics = np.stack(
+                [
+                    store.read(
+                        f"{view}/extrinsics_w2c.npy",
+                        (frames, slice(0, 3), slice(0, 4)),
+                    ).astype(np.float32, copy=False)
+                    for view in views
+                ]
+            )
+        tracks, extrinsics = _recenter_world_coordinates(
+            tracks,
+            extrinsics,
+            np.asarray(trace["source"]["world_anchor"], dtype=np.float32),
+        )
+        xy, camera_z = _project(tracks, extrinsics, intrinsics)
+        theta = np.asarray(trace["theta"], dtype=np.float32)
+        xy, intrinsics = _apply_spatial_trace(
+            xy, intrinsics, np.asarray(trace["spatial_transform"], dtype=np.float64)
+        )
+        trajectory = np.concatenate([xy, camera_z[..., None]], axis=-1)
+        query_times = np.asarray(trace["query_times"], dtype=np.int64)
+        query_points = np.concatenate(
+            [query_times[:, None].astype(np.float32), tracks[query_times, np.arange(record.track_count)]],
+            axis=1,
+        )
+        rng = np.random.RandomState()
+        rng.set_state(trace["post_selection_rng_state"])
+        depth_scale = 1.0
+        if self.enable_scene_transform_augs:
+            tracks, query_points, trajectory, extrinsics, depth_scale = _scene_transform(
+                tracks, query_points, trajectory, extrinsics, rng
+            )
+        if self.enable_camera_params_noise_augs:
+            intrinsics = intrinsics + rng.normal(0, 0.001, size=intrinsics.shape)
+            extrinsics = extrinsics + rng.normal(0, 0.001, size=extrinsics.shape)
+        augmentation = record.augmentation
+        return SamplePlan(
+            dataset=str(trace["dataset"]),
+            virtual_index=int(record.request["virtual_index"]),
+            scene_index=record.scene_index,
+            sequence=record.scene,
+            seed=record.seed,
+            frame_indices=frames,
+            views=views,
+            preselected_track_indices=selected_global,
+            selected_track_indices=np.arange(record.track_count, dtype=np.int64),
+            selected_global_track_indices=selected_global,
+            track_count=record.track_count,
+            query_points_3d=query_points.astype(np.float32, copy=False),
+            trajectory=trajectory.astype(np.float32, copy=False),
+            trajectory_3d=tracks.astype(np.float32, copy=False),
+            visibility=unpack_execution_mask(trace["visibility"]),
+            intrinsics=intrinsics.astype(np.float32, copy=False),
+            extrinsics=extrinsics.astype(np.float32, copy=False),
+            theta=theta,
+            source_size=tuple(trace["source_size"]),
+            output_size=tuple(trace["output_size"]),
+            image_codec=str(trace["image_codec"]),
+            depth_source=record.depth_source,
+            rgb_sources=tuple(
+                (root / f"view_{view}" / "jpeg_bytes.bin", root / f"view_{view}" / "jpeg_offsets.npy")
+                for view in views
+            ),
+            depth_sources=tuple(root / str(view) / "depth.npy" for view in views),
+            apply_rgb_aug=bool(augmentation["apply_rgb"]),
+            rgb_augmentation=augmentation["rgb"],
+            apply_depth_aug=bool(augmentation["apply_depth"]),
+            depth_patch_operations=tuple(tuple(item) for item in augmentation["depth_patch_operations"]),
+            augmentation_seed=int(augmentation["seed"]),
+            depth_scale=float(depth_scale),
+            max_depth=float(trace["max_depth"]),
+            depth_sensor_widths=tuple(trace["depth_sensor_widths"]),
+            depth_focal_lengths=tuple(trace["depth_focal_lengths"]),
+            metadata=dict(trace["metadata"]),
+            track_validity=unpack_execution_mask(trace["track_validity"]),
+            post_selection_rng_state=trace["post_selection_rng_state"],
+        )

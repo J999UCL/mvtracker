@@ -41,6 +41,7 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
     _sample_tracks,
     _scene_transform,
     _spatial_transform,
+    _apply_spatial_trace,
     _visible_path_lengths,
     collate_encoded_tapvid3d,
 )
@@ -238,6 +239,10 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
     requires_cuda_prefetch = True
     _scene_reuse_passes = 1
     _fixed_views = None
+
+    def execution_recipe_source(self, plan: SamplePlan) -> dict[str, Any]:
+        entry, _ = self.catalog.scene(plan.sequence)
+        return {"metadata_index": int(entry["metadata_index"])}
     _seed_by_scene = False
     _stream_start_offset = 0
 
@@ -503,6 +508,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
                 replace_bounds=self.replace_bounds,
             )
         output_size = tuple(self.crop_size) if self.enable_cropping_augs else source_size
+        spatial_trace: list[np.ndarray] = []
         xy, visibility, intrinsics, theta = _spatial_transform(
             projected_xy,
             visibility,
@@ -511,6 +517,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             output_size,
             rng,
             self.enable_cropping_augs,
+            trace_out=spatial_trace,
         )
         transformed = np.concatenate([xy, camera_z[..., None]], axis=-1)
         apply_depth_aug = bool(augment and self.enable_depth_augs)
@@ -550,6 +557,7 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         )
         if not len(selected):
             return None
+        post_selection_rng_state = rng.get_state()
         selected_global = preselected[selected]
         selected_tracks = tracks[:, selected]
         xy_z = transformed[:, :, selected]
@@ -629,6 +637,8 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             depth_sensor_widths=tuple(float(scene.sensor_widths[view]) for view in views),
             depth_focal_lengths=tuple(float(scene.focal_lengths[view]) for view in views),
             metadata=metadata,
+            post_selection_rng_state=post_selection_rng_state,
+            spatial_transform=spatial_trace[0],
         )
 
     def materialize_sample(self, plan: SamplePlan, runtime_depth=None):
@@ -684,7 +694,8 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
         metadata["encoded_bytes"] = sum(map(len, rgb_sources)) + sum(map(len, depth_sources))
         runtime_depth_tensor = None
         if runtime_depth is not None:
-            estimated_depths, cleaned_mask, runtime_wait_seconds, runtime_bytes = runtime_depth
+            estimated_depths = runtime_depth.depth
+            cleaned_mask = runtime_depth.cleaned_mask
             expected = (len(plan.views), len(plan.frame_indices), *plan.source_size)
             if estimated_depths.shape != expected:
                 raise ValueError(
@@ -695,8 +706,12 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             runtime_depth_tensor = torch.from_numpy(
                 np.asarray(estimated_depths, dtype=np.float32).copy()
             )[:, :, None]
-            metadata["runtime_depth_wait_seconds"] = float(runtime_wait_seconds)
-            metadata["runtime_depth_bytes"] = int(runtime_bytes)
+            metadata["runtime_depth_ready_wait_seconds"] = float(
+                runtime_depth.ready_wait_seconds
+            )
+            metadata["runtime_depth_read_seconds"] = float(runtime_depth.read_seconds)
+            metadata["runtime_depth_delete_seconds"] = float(runtime_depth.delete_seconds)
+            metadata["runtime_depth_bytes"] = int(runtime_depth.byte_count)
         sample = EncodedTapVid3DSample(
             jpeg_bytes=rgb_sources,
             depth=runtime_depth_tensor,
@@ -725,6 +740,107 @@ class DaliKubricMultiViewDataset(KubricMultiViewDataset):
             depth_focal_lengths=plan.depth_focal_lengths,
         )
         return sample, True
+
+    def execution_plan(self, execution_record) -> SamplePlan:
+        """Read selected MV-Kubric metadata without invoking its planner."""
+        from .training_recipe import unpack_execution_mask
+
+        if getattr(self, "_records", None) is None:
+            raise RuntimeError("execution recipes require indexed MV-Kubric records")
+        record = execution_record.recipe
+        trace = execution_record.trace
+        metadata_record, metadata_read = self._records.read(
+            int(trace["source"]["metadata_index"])
+        )
+        expected_key = f"scene-{record.scene}"
+        if metadata_record["__key__"] != expected_key:
+            raise RuntimeError(
+                f"metadata locator diverged: expected {expected_key!r}, got {metadata_record['__key__']!r}"
+            )
+        scene = _scene_metadata(
+            KubricDaliSceneBundle(record.scene, metadata_record[f".{META_COMPONENT}"], (), ())
+        )
+        frames = np.asarray(record.frames, dtype=np.int64)
+        views = tuple(record.views)
+        selected_global = np.asarray(record.tracks, dtype=np.int64)
+        tracks = np.asarray(
+            scene.tracks_3d[np.ix_(frames, selected_global)], dtype=np.float32
+        )
+        intrinsics = np.repeat(
+            scene.intrinsics[list(views), None], len(frames), axis=1
+        ).astype(np.float32)
+        extrinsics = scene.extrinsics[list(views)][:, frames].astype(np.float32)
+        xy, camera_z = _project(tracks, extrinsics, intrinsics)
+        theta = np.asarray(trace["theta"], dtype=np.float32)
+        xy, intrinsics = _apply_spatial_trace(
+            xy, intrinsics, np.asarray(trace["spatial_transform"], dtype=np.float64)
+        )
+        trajectory = np.concatenate([xy, camera_z[..., None]], axis=-1)
+        query_times = np.asarray(trace["query_times"], dtype=np.int64)
+        query_points = np.concatenate(
+            [query_times[:, None].astype(np.float32), tracks[query_times, np.arange(record.track_count)]],
+            axis=1,
+        )
+        rng = np.random.RandomState()
+        rng.set_state(trace["post_selection_rng_state"])
+        depth_scale = 1.0
+        if self.enable_scene_transform_augs:
+            tracks, query_points, trajectory, extrinsics, depth_scale = _scene_transform(
+                tracks, query_points, trajectory, extrinsics, rng
+            )
+        if self.enable_camera_params_noise_augs:
+            intrinsics += rng.normal(0, 0.001, size=intrinsics.shape)
+            extrinsics += rng.normal(0, 0.001, size=extrinsics.shape)
+        augmentation = record.augmentation
+        metadata = {
+            **trace["metadata"],
+            "indexed_metadata_requested_bytes": metadata_read.requested_bytes,
+            "indexed_metadata_read_bytes": metadata_read.read_bytes,
+            "indexed_metadata_read_seconds": metadata_read.seconds,
+        }
+        return SamplePlan(
+            dataset=str(trace["dataset"]),
+            virtual_index=int(record.request["virtual_index"]),
+            scene_index=record.scene_index,
+            sequence=record.scene,
+            seed=record.seed,
+            frame_indices=frames,
+            views=views,
+            preselected_track_indices=selected_global,
+            selected_track_indices=np.arange(record.track_count, dtype=np.int64),
+            selected_global_track_indices=selected_global,
+            track_count=record.track_count,
+            query_points_3d=query_points.astype(np.float32, copy=False),
+            trajectory=trajectory.astype(np.float32, copy=False),
+            trajectory_3d=tracks.astype(np.float32, copy=False),
+            visibility=unpack_execution_mask(trace["visibility"]),
+            intrinsics=intrinsics.astype(np.float32, copy=False),
+            extrinsics=extrinsics.astype(np.float32, copy=False),
+            theta=theta,
+            source_size=tuple(trace["source_size"]),
+            output_size=tuple(trace["output_size"]),
+            image_codec=str(trace["image_codec"]),
+            depth_source=record.depth_source,
+            rgb_sources=(),
+            depth_sources=(),
+            apply_rgb_aug=bool(augmentation["apply_rgb"]),
+            rgb_augmentation=augmentation["rgb"],
+            apply_depth_aug=bool(augmentation["apply_depth"]),
+            depth_patch_operations=tuple(tuple(item) for item in augmentation["depth_patch_operations"]),
+            augmentation_seed=int(augmentation["seed"]),
+            depth_scale=float(depth_scale),
+            max_depth=float(trace["max_depth"]),
+            depth_sensor_widths=tuple(trace["depth_sensor_widths"]),
+            depth_focal_lengths=tuple(trace["depth_focal_lengths"]),
+            metadata=metadata,
+            media_record_indices=tuple(trace["media_record_indices"]),
+            post_selection_rng_state=trace["post_selection_rng_state"],
+        )
+
+    def materialize_recipe_record(self, execution_record, runtime_depth=None):
+        return self.materialize_sample(
+            self.execution_plan(execution_record), runtime_depth=runtime_depth
+        )
 
 
 class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):

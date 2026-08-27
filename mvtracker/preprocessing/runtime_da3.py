@@ -216,10 +216,12 @@ def _wait_for_consumer(output_root: Path, max_pending_samples: int) -> None:
         time.sleep(0.1)
 
 
-def _depth_records(recipe_path: Path):
+def _depth_records(recipe_path: Path, max_steps: int | None = None):
     """Yield non-GT recipe records in their canonical execution order."""
     ordinal = 0
     for payload in RecipeReader(recipe_path).steps():
+        if max_steps is not None and int(payload["step"]) >= int(max_steps):
+            break
         for sample in payload["logical_samples"]:
             record = RecipeRecord.from_dict(sample)
             if record.depth_source == "gt":
@@ -362,6 +364,7 @@ def run(
     worker_count: int = 1,
     prefill_samples: int = PREFILL_SAMPLES,
     continue_after_prefill: bool = True,
+    max_steps: int | None = None,
 ) -> None:
     import torch
     from depth_anything_3.api import DepthAnything3
@@ -401,7 +404,7 @@ def run(
         )
         packed = _PackedScenes(data_root)
         mvkubric = _MVKubricScenes(data_root)
-        depth_records = _depth_records(recipe_path)
+        depth_records = _depth_records(recipe_path, max_steps=max_steps)
         for ordinal, record in depth_records:
             if ordinal < prefill_samples:
                 if _prefill_owner(ordinal, worker_count) != worker_id:
@@ -505,6 +508,7 @@ def main() -> None:
     parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument("--prefill-samples", type=int, default=PREFILL_SAMPLES)
     parser.add_argument("--prefill-only", action="store_true")
+    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--download-only", action="store_true")
     args = parser.parse_args()
     if args.download_only:
@@ -521,6 +525,7 @@ def main() -> None:
         worker_count=args.worker_count,
         prefill_samples=args.prefill_samples,
         continue_after_prefill=not args.prefill_only,
+        max_steps=args.max_steps,
     )
 
 

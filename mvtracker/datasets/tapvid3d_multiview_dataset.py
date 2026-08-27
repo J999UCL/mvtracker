@@ -294,6 +294,11 @@ class SamplePlan:
     # Other datasets leave this empty and continue using rgb_sources/depth_sources.
     media_record_indices: tuple[int, ...] = ()
     track_validity: np.ndarray | None = None
+    # State immediately after track/query selection.  Execution recipes restore
+    # this state to reproduce only the cheap scene/camera transforms, without
+    # replaying scene, window, view, motion, or track planning.
+    post_selection_rng_state: tuple[Any, ...] | None = None
+    spatial_transform: np.ndarray | None = None
 
 
 @dataclass
@@ -533,6 +538,7 @@ def _spatial_transform(
     output_size: tuple[int, int],
     rng: np.random.RandomState,
     enabled: bool,
+    trace_out: list[np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     views, frames, _, _ = xy.shape
     source_h, source_w = source_size
@@ -541,6 +547,7 @@ def _spatial_transform(
     transformed = xy.copy()
     adjusted_intrinsics = intrinsics.copy()
     adjusted_visibility = visibility.copy()
+    affine_trace = np.zeros((views, frames, 6), dtype=np.float64)
     for view in range(views):
         if enabled:
             pad_left, pad_right, pad_top, pad_bottom = (
@@ -612,6 +619,14 @@ def _spatial_transform(
             transformed[view, frame, :, 1] -= crop_y
             adjusted_intrinsics[view, frame, 0, 2] -= crop_x
             adjusted_intrinsics[view, frame, 1, 2] -= crop_y
+            affine_trace[view, frame] = (
+                scale_x,
+                scale_y,
+                pad_left,
+                pad_top,
+                crop_x,
+                crop_y,
+            )
             adjusted_visibility[view, frame] &= (
                 np.isfinite(transformed[view, frame]).all(axis=-1)
                 & (transformed[view, frame, :, 0] >= 0)
@@ -625,6 +640,8 @@ def _spatial_transform(
             bx = ax + 2 * (crop_x / scale_x - pad_left) / (source_w - 1) - 1
             by = ay + 2 * (crop_y / scale_y - pad_top) / (source_h - 1) - 1
             theta[view, frame] = ((ax, 0, bx), (0, ay, by))
+    if trace_out is not None:
+        trace_out.append(affine_trace)
     return transformed, adjusted_visibility, adjusted_intrinsics, theta
 
 
@@ -806,6 +823,31 @@ def _scene_transform(
         transformed_extrinsics.astype(np.float32),
         scale,
     )
+
+
+def _apply_spatial_trace(
+    xy: np.ndarray,
+    intrinsics: np.ndarray,
+    spatial_transform: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    transformed = np.asarray(xy, dtype=np.float32).copy()
+    adjusted_intrinsics = np.asarray(intrinsics, dtype=np.float32).copy()
+    for view in range(spatial_transform.shape[0]):
+        for frame in range(spatial_transform.shape[1]):
+            scale_x, scale_y, pad_left, pad_top, crop_x, crop_y = spatial_transform[view, frame]
+            transformed[view, frame, :, 0] = (
+                (xy[view, frame, :, 0] + int(pad_left)) * scale_x - int(crop_x)
+            )
+            transformed[view, frame, :, 1] = (
+                (xy[view, frame, :, 1] + int(pad_top)) * scale_y - int(crop_y)
+            )
+            adjusted_intrinsics[view, frame, 0, :] *= scale_x
+            adjusted_intrinsics[view, frame, 1, :] *= scale_y
+            adjusted_intrinsics[view, frame, 0, 2] += int(pad_left) * scale_x
+            adjusted_intrinsics[view, frame, 1, 2] += int(pad_top) * scale_y
+            adjusted_intrinsics[view, frame, 0, 2] -= int(crop_x)
+            adjusted_intrinsics[view, frame, 1, 2] -= int(crop_y)
+    return transformed, adjusted_intrinsics
 
 
 def _sample_depth_patch_operations(
@@ -1079,6 +1121,14 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         finally:
             self._recipe_motion_cache.clear()
 
+    def execution_recipe_source(self, plan: SamplePlan) -> dict[str, Any]:
+        """Persist path/calibration metadata needed without a startup manifest read."""
+        manifest = self._manifest(plan.sequence)
+        return {
+            "source_sequence": str(manifest.get("source_sequence", plan.sequence)),
+            "world_anchor": list(manifest["world_anchor"]),
+        }
+
     @staticmethod
     def from_name(
         dataset_name,
@@ -1300,9 +1350,11 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 replace_bounds=self.replace_bounds,
             )
         output_size = tuple(int(value) for value in self.crop_size) if self.enable_cropping_augs else source_size
+        spatial_trace: list[np.ndarray] = []
         xy, visibility_np, intrinsics_np, theta = _spatial_transform(
             xy, visibility_np, intrinsics_np, source_size, output_size, rng,
             self.enable_cropping_augs,
+            trace_out=spatial_trace,
         )
         transformed_trajectory = np.concatenate([xy, camera_z[..., None]], axis=-1)
         apply_depth_aug = bool(augment_this_datapoint and self.enable_depth_augs)
@@ -1336,6 +1388,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         )
         if not len(selected):
             return None
+        post_selection_rng_state = rng.get_state()
         xy_z = transformed_trajectory[:, :, selected]
         selected_tracks = tracks[:, selected]
         selected_visibility = visibility_np[:, :, selected]
@@ -1421,6 +1474,8 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 "apply_depth_aug": bool(apply_depth_aug),
                 **motion_statistics,
             },
+            post_selection_rng_state=post_selection_rng_state,
+            spatial_transform=spatial_trace[0],
         )
 
     def materialize_sample(self, plan: SamplePlan, runtime_depth=None):
@@ -1442,6 +1497,14 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 offsets._mmap.close()
             if plan.depth_source == "gt":
                 depth_array = np.load(depth_path, mmap_mode="r", allow_pickle=False)
+                first_frame = int(np.min(plan.frame_indices))
+                last_frame = int(np.max(plan.frame_indices))
+                byte_offset = int(depth_array.offset) + first_frame * int(
+                    depth_array.strides[0]
+                )
+                byte_length = (last_frame - first_frame + 1) * int(
+                    depth_array.strides[0]
+                )
                 try:
                     depth = np.asarray(
                         depth_array[plan.frame_indices], dtype=np.float32
@@ -1451,7 +1514,7 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 depths.append(torch.from_numpy(depth))
                 descriptor = os.open(depth_path, os.O_RDONLY)
                 try:
-                    discard_file_range(descriptor)
+                    discard_file_range(descriptor, byte_offset, byte_length)
                 finally:
                     os.close(descriptor)
         if plan.depth_source != "gt":
@@ -1462,7 +1525,8 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
                 runtime_wait_seconds = 0.0
                 runtime_bytes = 0
             else:
-                estimated_depths, cleaned_mask, runtime_wait_seconds, runtime_bytes = runtime_depth
+                estimated_depths = runtime_depth.depth
+                cleaned_mask = runtime_depth.cleaned_mask
             expected = (len(plan.views), self.seq_len, *plan.source_size)
             if estimated_depths.shape != expected:
                 raise ValueError(
@@ -1480,8 +1544,12 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
         metadata = dict(plan.metadata)
         metadata["gotit"] = True
         if runtime_depth is not None:
-            metadata["runtime_depth_wait_seconds"] = float(runtime_wait_seconds)
-            metadata["runtime_depth_bytes"] = int(runtime_bytes)
+            metadata["runtime_depth_ready_wait_seconds"] = float(
+                runtime_depth.ready_wait_seconds
+            )
+            metadata["runtime_depth_read_seconds"] = float(runtime_depth.read_seconds)
+            metadata["runtime_depth_delete_seconds"] = float(runtime_depth.delete_seconds)
+            metadata["runtime_depth_bytes"] = int(runtime_depth.byte_count)
         metadata["worker_prepare_seconds"] = time.perf_counter() - load_started
         sample = EncodedTapVid3DSample(
             jpeg_bytes=tuple(encoded),
@@ -1509,6 +1577,128 @@ class TapVid3DMultiViewDataset(KubricMultiViewDataset):
             depth_patch_operations=plan.depth_patch_operations,
         )
         return sample, True
+
+    def execution_plan(self, execution_record) -> SamplePlan:
+        """Build a DIEGESIS plan directly from a schema-v2 execution record."""
+        from .training_recipe import unpack_execution_mask
+
+        record = execution_record.recipe
+        trace = execution_record.trace
+        sequence = record.scene
+        source_metadata = trace["source"]
+        source_root = self.raw_root / source_metadata["source_sequence"]
+        cache_root = Path(self.data_root) / sequence
+        frames = np.asarray(record.frames, dtype=np.int64)
+        views = tuple(record.views)
+        selected_global = np.asarray(record.tracks, dtype=np.int64)
+        tracks_all = np.load(source_root / "tracks_xyz.npy", mmap_mode="r", allow_pickle=False)
+        tracks = np.asarray(tracks_all[np.ix_(frames, selected_global)], dtype=np.float32)
+        extrinsics = np.stack(
+            [
+                np.asarray(
+                    np.load(
+                        source_root / str(view) / "extrinsics_w2c.npy",
+                        mmap_mode="r",
+                        allow_pickle=False,
+                    )[frames, :3, :4],
+                    dtype=np.float32,
+                )
+                for view in views
+            ]
+        )
+        intrinsics = np.stack(
+            [
+                np.repeat(
+                    _intrinsics_matrix(
+                        np.load(
+                            source_root / str(view) / "intrinsics.npy",
+                            mmap_mode="r",
+                            allow_pickle=False,
+                        )
+                    )[None],
+                    len(frames),
+                    axis=0,
+                )
+                for view in views
+            ]
+        ).astype(np.float32, copy=False)
+        tracks, extrinsics = _recenter_world_coordinates(
+            tracks,
+            extrinsics,
+            np.asarray(source_metadata["world_anchor"], dtype=np.float32),
+        )
+        xy, camera_z = _project(tracks, extrinsics, intrinsics)
+        theta = np.asarray(trace["theta"], dtype=np.float32)
+        xy, intrinsics = _apply_spatial_trace(
+            xy,
+            intrinsics,
+            np.asarray(trace["spatial_transform"], dtype=np.float64),
+        )
+        trajectory = np.concatenate([xy, camera_z[..., None]], axis=-1)
+        query_times = np.asarray(trace["query_times"], dtype=np.int64)
+        query_points = np.concatenate(
+            [query_times[:, None].astype(np.float32), tracks[query_times, np.arange(len(tracks[0]))]],
+            axis=1,
+        )
+        rng = np.random.RandomState()
+        rng.set_state(trace["post_selection_rng_state"])
+        depth_scale = 1.0
+        if self.enable_scene_transform_augs:
+            tracks, query_points, trajectory, extrinsics, depth_scale = _scene_transform(
+                tracks, query_points, trajectory, extrinsics, rng
+            )
+        if self.enable_camera_params_noise_augs:
+            intrinsics = intrinsics + rng.normal(0, 0.001, size=intrinsics.shape)
+            extrinsics = extrinsics + rng.normal(0, 0.001, size=extrinsics.shape)
+        augmentation = record.augmentation
+        visibility = unpack_execution_mask(trace["visibility"])
+        return SamplePlan(
+            dataset=str(trace["dataset"]),
+            virtual_index=int(record.request["virtual_index"]),
+            scene_index=record.scene_index,
+            sequence=sequence,
+            seed=record.seed,
+            frame_indices=frames,
+            views=views,
+            preselected_track_indices=selected_global,
+            selected_track_indices=np.arange(record.track_count, dtype=np.int64),
+            selected_global_track_indices=selected_global,
+            track_count=record.track_count,
+            query_points_3d=query_points.astype(np.float32, copy=False),
+            trajectory=trajectory.astype(np.float32, copy=False),
+            trajectory_3d=tracks.astype(np.float32, copy=False),
+            visibility=visibility,
+            intrinsics=intrinsics.astype(np.float32, copy=False),
+            extrinsics=extrinsics.astype(np.float32, copy=False),
+            theta=theta,
+            source_size=tuple(trace["source_size"]),
+            output_size=tuple(trace["output_size"]),
+            image_codec=str(trace["image_codec"]),
+            depth_source=record.depth_source,
+            rgb_sources=tuple(
+                (cache_root / f"view_{view}" / "jpeg_bytes.bin", cache_root / f"view_{view}" / "jpeg_offsets.npy")
+                for view in views
+            ),
+            depth_sources=tuple(source_root / str(view) / "depth.npy" for view in views),
+            apply_rgb_aug=bool(augmentation["apply_rgb"]),
+            rgb_augmentation=augmentation["rgb"],
+            apply_depth_aug=bool(augmentation["apply_depth"]),
+            depth_patch_operations=tuple(
+                tuple(item) for item in augmentation["depth_patch_operations"]
+            ),
+            augmentation_seed=int(augmentation["seed"]),
+            depth_scale=float(depth_scale),
+            max_depth=float(trace["max_depth"]),
+            depth_sensor_widths=tuple(trace["depth_sensor_widths"]),
+            depth_focal_lengths=tuple(trace["depth_focal_lengths"]),
+            metadata=dict(trace["metadata"]),
+            post_selection_rng_state=trace["post_selection_rng_state"],
+        )
+
+    def materialize_recipe_record(self, execution_record, runtime_depth=None):
+        return self.materialize_sample(
+            self.execution_plan(execution_record), runtime_depth=runtime_depth
+        )
 
     def __getitem__(self, index):
         plan = self.plan_sample(index)

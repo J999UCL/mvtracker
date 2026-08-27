@@ -46,8 +46,29 @@ class PlannedScene:
 
 
 @dataclass(frozen=True)
+class RecipeScene:
+    execution_record: object
+
+    @property
+    def source(self) -> str:
+        return str(self.execution_record.source)
+
+    @property
+    def sequence(self) -> str:
+        return str(self.execution_record.recipe.scene)
+
+    @property
+    def virtual_index(self) -> int:
+        return int(self.execution_record.recipe.request["virtual_index"])
+
+    @property
+    def identity(self) -> tuple[str, str, int]:
+        return self.source, self.sequence, self.virtual_index
+
+
+@dataclass(frozen=True)
 class PreparedPhysicalGroup:
-    scenes: tuple[PlannedScene, ...]
+    scenes: tuple[PlannedScene | RecipeScene, ...]
     samples: tuple[EncodedTapVid3DSample, ...]
 
     def __post_init__(self) -> None:
@@ -73,6 +94,7 @@ class PreparedMixedStep:
     materialization_seconds: float
     pair_count: int
     padding_tracks: int
+    recipe_read_seconds: float = 0.0
     recipe_step: int | None = None
     diagnostic_singletons: bool = False
     materialization_error: str | None = None
@@ -258,8 +280,6 @@ class MixedStepLookahead:
         self._thread.start()
 
     def _plan_step(self):
-        if hasattr(self.schedule, "recipe_step"):
-            return self._plan_recipe_step()
         start_cursors = dict(self._next_cursors)
         scenes = []
         retries = 0
@@ -334,85 +354,9 @@ class MixedStepLookahead:
             False,
         )
 
-    def _plan_recipe_step(self):
-        step = self.recipe_position
-        records, assignments = self.schedule.recipe_step(step)
-        self.recipe_position += 1
-        scenes_by_index = {}
-        retries = 0
-        for record in records:
-            request = self.schedule.replay_request(record)
-            plan = self.datasets[record.source].plan_sample(request)
-            if plan is None:
-                raise RuntimeError(
-                    f"accepted recipe sample replayed invalid at step {step} "
-                    f"logical sample {record.logical_index}"
-                )
-            scenes_by_index[int(record.logical_index)] = PlannedScene(
-                record.source, plan
-            )
-            retries += int(record.retry_count)
-
-        summaries = {
-            logical_index: _plan_summary(scene)
-            for logical_index, scene in scenes_by_index.items()
-        }
-        diagnostic_singletons = (
-            self.gradient_diagnostics_interval > 0
-            and (
-                step == 0
-                or (step + 1) % self.gradient_diagnostics_interval == 0
-            )
-        )
-        if diagnostic_singletons:
-            assignments = tuple(
-                {
-                    "rank": int(record.scheduled_rank),
-                    "group": int(record.microbatch),
-                    "logical_indices": [int(record.logical_index)],
-                }
-                for record in records
-            )
-
-        rank_groups = []
-        for rank in range(self.capacity.rank_count):
-            groups = tuple(
-                PhysicalBatchGroup(
-                    tuple(summaries[int(index)] for index in group["logical_indices"])
-                )
-                for group in sorted(
-                    (item for item in assignments if int(item["rank"]) == rank),
-                    key=lambda item: int(item["group"]),
-                )
-            )
-            rank_groups.append(RankWave(rank=rank, groups=groups))
-        physical = SynchronizedBatchWave(
-            ranks=tuple(rank_groups),
-            capacity_name=self.capacity.name,
-        )
-        if len({len(rank.groups) for rank in physical.ranks}) != 1:
-            raise RuntimeError("recipe physical group counts differ across DDP ranks")
-        local_physical_groups = physical.ranks[self.rank].groups
-        by_identity = {scene.identity: scene for scene in scenes_by_index.values()}
-        local_scenes = tuple(
-            by_identity[(summary.source, summary.scene, summary.cursor)]
-            for group in local_physical_groups
-            for summary in group.scenes
-        )
-        cursors = dict(self._next_cursors)
-        return (
-            cursors,
-            cursors,
-            tuple(scenes_by_index[index] for index in sorted(scenes_by_index)),
-            physical,
-            tuple(local_physical_groups),
-            local_scenes,
-            retries,
-            step,
-            diagnostic_singletons,
-        )
-
     def _prepare_step(self, executor: ThreadPoolExecutor) -> PreparedMixedStep:
+        if hasattr(self.schedule, "recipe_step"):
+            return self._prepare_recipe_step(executor)
         planning_started = time.perf_counter()
         (
             start_cursors,
@@ -507,6 +451,94 @@ class MixedStepLookahead:
             pair_count=pair_count,
             padding_tracks=padding_tracks,
             recipe_step=recipe_step,
+            diagnostic_singletons=diagnostic_singletons,
+            materialization_error=materialization_error,
+        )
+
+    def _prepare_recipe_step(self, executor: ThreadPoolExecutor) -> PreparedMixedStep:
+        step = self.recipe_position
+        read_started = time.perf_counter()
+        records = tuple(self.schedule.recipe_step(step))
+        self.recipe_position += 1
+        recipe_read_seconds = time.perf_counter() - read_started
+        if not records:
+            raise RuntimeError(f"rank {self.rank} has no execution records at step {step}")
+        if any(int(record.physical.rank) != self.rank for record in records):
+            raise RuntimeError("rank-local execution sidecar contains another rank")
+
+        scenes = tuple(RecipeScene(record) for record in records)
+        futures = {
+            int(scene.execution_record.logical_index): executor.submit(
+                self.datasets[scene.source].materialize_recipe_record,
+                scene.execution_record,
+            )
+            for scene in scenes
+        }
+        materialization_started = time.perf_counter()
+        prepared = {}
+        materialization_error = None
+        for scene in scenes:
+            logical_index = int(scene.execution_record.logical_index)
+            try:
+                sample, gotit = futures[logical_index].result()
+            except BaseException as error:
+                materialization_error = f"{scene.identity}: {error}"
+                break
+            if not gotit or sample is None:
+                materialization_error = f"{scene.identity}: invalid materialized sample"
+                break
+            sample.metadata["source"] = scene.source
+            prepared[logical_index] = _pin_sample(sample)
+
+        diagnostic_singletons = (
+            self.gradient_diagnostics_interval > 0
+            and (
+                step == 0
+                or (step + 1) % self.gradient_diagnostics_interval == 0
+            )
+        )
+        grouped = {}
+        for scene in scenes:
+            group = (
+                int(scene.execution_record.logical_index)
+                if diagnostic_singletons
+                else int(scene.execution_record.physical.group)
+            )
+            grouped.setdefault(group, []).append(scene)
+        groups = []
+        if materialization_error is None:
+            for group in sorted(grouped):
+                group_scenes = tuple(
+                    sorted(
+                        grouped[group],
+                        key=lambda scene: int(scene.execution_record.physical.position),
+                    )
+                )
+                groups.append(
+                    PreparedPhysicalGroup(
+                        scenes=group_scenes,
+                        samples=tuple(
+                            prepared[int(scene.execution_record.logical_index)]
+                            for scene in group_scenes
+                        ),
+                    )
+                )
+        encoded_bytes = sum(
+            _sample_nbytes(sample) for group in groups for sample in group.samples
+        )
+        return PreparedMixedStep(
+            start_cursors=dict(self._next_cursors),
+            end_cursors=dict(self._next_cursors),
+            groups=tuple(groups),
+            fingerprint="",
+            retry_count=sum(int(record.recipe.retry_count) for record in records),
+            encoded_bytes=encoded_bytes,
+            planning_seconds=0.0,
+            materialization_seconds=time.perf_counter() - materialization_started,
+            recipe_read_seconds=recipe_read_seconds,
+            pair_count=sum(max(0, len(group.scenes) - 1) for group in groups),
+            padding_tracks=0,
+            recipe_step=step,
             diagnostic_singletons=diagnostic_singletons,
             materialization_error=materialization_error,
         )

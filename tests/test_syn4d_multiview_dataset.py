@@ -17,6 +17,13 @@ from mvtracker.datasets.tapvid3d_multiview_dataset import (
     _camera_rig_anchor,
     _recenter_world_coordinates,
 )
+from mvtracker.datasets.training_recipe import (
+    ExecutionRecipeRecord,
+    PhysicalAssignment,
+    RecipeRecord,
+    _execution_trace,
+    _record_sha256,
+)
 
 
 def _write_sequence(root: Path, name="temple_group__seq_000000"):
@@ -291,6 +298,71 @@ class Syn4DLoaderTests(unittest.TestCase):
             self.assertEqual(sample.valid.shape, (3, plan.track_count))
             self.assertTrue((~sample.valid.bool()).any())
             self.assertEqual(len(dataset._sequence_cache.stores), 1)
+
+    def test_execution_record_rebuilds_identical_plan_without_planning_or_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _dataset(Path(directory))
+            dataset.enable_cropping_augs = True
+            dataset.crop_size = (6, 8)
+            dataset.enable_scene_transform_augs = True
+            dataset.enable_camera_params_noise_augs = True
+            request = SimpleNamespace(virtual_index=4, scene_index=0, view_count=6)
+            expected = dataset.plan_sample(request)
+            record = RecipeRecord(
+                step=0,
+                microbatch=0,
+                rank=0,
+                scheduled_rank=0,
+                source="syn4d",
+                source_cursor=4,
+                retry_count=0,
+                request={"virtual_index": 4, "scene_index": 0, "view_count": 6},
+                seed=expected.seed,
+                scene_index=0,
+                scene=expected.sequence,
+                frames=tuple(map(int, expected.frame_indices)),
+                views=expected.views,
+                resolution=expected.output_size,
+                track_count=expected.track_count,
+                tracks=tuple(map(int, expected.selected_global_track_indices)),
+                augmentation={
+                    "apply_rgb": expected.apply_rgb_aug,
+                    "rgb": expected.rgb_augmentation,
+                    "apply_depth": expected.apply_depth_aug,
+                    "depth_patch_operations": expected.depth_patch_operations,
+                    "seed": expected.augmentation_seed,
+                },
+                depth_source=expected.depth_source,
+                physical=PhysicalAssignment(rank=0, group=0, position=0),
+                logical_index=0,
+            )
+            execution = ExecutionRecipeRecord(
+                recipe=record,
+                trace=_execution_trace(expected, dataset),
+                source_record_sha256=_record_sha256(record),
+            )
+            dataset._manifests.clear()
+            with mock.patch.object(dataset, "plan_sample", side_effect=AssertionError("planned")), mock.patch.object(
+                dataset, "_manifest", side_effect=AssertionError("manifest read")
+            ):
+                observed = dataset.execution_plan(execution)
+
+            for name in (
+                "query_points_3d",
+                "trajectory",
+                "trajectory_3d",
+                "visibility",
+                "intrinsics",
+                "extrinsics",
+                "theta",
+                "track_validity",
+            ):
+                if name in {"visibility", "track_validity"}:
+                    np.testing.assert_array_equal(getattr(observed, name), getattr(expected, name))
+                else:
+                    np.testing.assert_allclose(
+                        getattr(observed, name), getattr(expected, name), rtol=1e-5, atol=1e-5
+                    )
 
 
 if __name__ == "__main__":

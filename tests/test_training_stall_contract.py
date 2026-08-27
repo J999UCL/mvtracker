@@ -1,6 +1,9 @@
 import ast
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import yaml
@@ -57,6 +60,47 @@ class TrainingStallContractTests(unittest.TestCase):
         fabric.gathered = torch.tensor(((7, 1), (7, 0)))
         self.assertFalse(check(fabric, 7, True))
 
+    def test_recipe_scene_losses_use_a_fixed_tensor_gather(self):
+        (gather_losses,) = _load_functions("_gather_recipe_scene_losses")
+        fabric = _Fabric()
+        fabric.world_size = 1
+        record = {
+            "source": "diegesis",
+            "scene": "scene-a",
+            "scene_index": 0,
+            "rank": 0,
+            "physical_group_index": 1,
+            "views": 2,
+            "tracks": 8,
+            "window_start": 3,
+            "window_end_exclusive": 27,
+            "virtual_index": 11,
+            "seed": 72,
+            "depth_source": "estimated",
+            "rgb_augmented": True,
+            "depth_augmented": False,
+            "cropping_enabled": True,
+            "scene_transform_enabled": True,
+            "camera_noise_enabled": True,
+            "selected_views": [1, 3],
+            "trajectory_loss": 0.2,
+            "visibility_loss": 0.1,
+            "raw_visibility_loss": 1.0,
+            "total_loss": 0.3,
+            "optimizer_step": 4,
+        }
+
+        gathered = gather_losses(
+            fabric,
+            [record],
+            ("diegesis",),
+            {"diegesis": ["scene-a"]},
+        )
+
+        self.assertEqual(gathered[0]["scene"], "scene-a")
+        self.assertEqual(gathered[0]["selected_views"], [1, 3])
+        self.assertAlmostEqual(gathered[0]["total_loss"], 0.3)
+
     def test_final_recipe_uses_two_decoded_groups(self):
         config = yaml.safe_load(
             (
@@ -78,6 +122,64 @@ class TrainingStallContractTests(unittest.TestCase):
         producer = source[start:end]
         self.assertNotIn("self.ready.join()", producer)
         self.assertIn("queue_depth: int = 2", producer)
+
+    def test_execution_recipe_path_contains_no_runtime_planner(self):
+        train_source = (ROOT / "mvtracker/cli/train.py").read_text(encoding="utf-8")
+        loader_source = (
+            ROOT / "mvtracker/datasets/mixed_physical_loader.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ExecutionRecipeReader", train_source)
+        self.assertIn("execution recipes must never call plan_sample", train_source)
+        self.assertNotIn("def _plan_recipe_step", loader_source)
+        self.assertIn("materialize_recipe_record", loader_source)
+
+    def test_recipe_lookahead_materializes_only_rank_local_records(self):
+        from mvtracker.datasets import mixed_physical_loader as loader
+
+        records = tuple(
+            SimpleNamespace(
+                source="diegesis",
+                logical_index=index,
+                physical=SimpleNamespace(rank=1, group=index, position=0),
+                recipe=SimpleNamespace(
+                    scene=f"scene-{index}",
+                    request={"virtual_index": index},
+                    retry_count=0,
+                ),
+            )
+            for index in range(2)
+        )
+
+        class Dataset:
+            def __init__(self):
+                self.seen = []
+
+            def plan_sample(self, _):
+                raise AssertionError("recipe execution must not plan")
+
+            def materialize_recipe_record(self, record):
+                self.seen.append(record.logical_index)
+                return SimpleNamespace(metadata={}), True
+
+        dataset = Dataset()
+        lookahead = loader.MixedStepLookahead.__new__(loader.MixedStepLookahead)
+        lookahead.schedule = SimpleNamespace(recipe_step=lambda step: records)
+        lookahead.datasets = {"diegesis": dataset}
+        lookahead.rank = 1
+        lookahead.recipe_position = 0
+        lookahead._next_cursors = {}
+        lookahead.gradient_diagnostics_interval = 0
+        with (
+            ThreadPoolExecutor(max_workers=2) as executor,
+            patch.object(loader, "_pin_sample", side_effect=lambda sample: sample),
+            patch.object(loader, "_sample_nbytes", return_value=1),
+        ):
+            prepared = lookahead._prepare_recipe_step(executor)
+
+        self.assertEqual(dataset.seen, [0, 1])
+        self.assertEqual(prepared.recipe_step, 0)
+        self.assertEqual(prepared.planning_seconds, 0.0)
+        self.assertEqual(len(prepared.groups), 2)
 
 
 if __name__ == "__main__":

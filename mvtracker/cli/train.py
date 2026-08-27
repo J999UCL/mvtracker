@@ -84,13 +84,12 @@ WANDB_RUN_ID_FILE = "wandb_run_id.txt"
 
 
 class _RecipeMixedSourceSchedule:
-    """Expose globally planned optimizer steps to the physical lookahead."""
+    """Expose rank-local execution-ready recipe steps."""
 
     def __init__(self, recipe_path, rank, world_size):
-        from mvtracker.datasets.training_recipe import RecipeReader, RecipeRecord
+        from mvtracker.datasets.training_recipe import ExecutionRecipeReader
 
-        self.reader = RecipeReader(recipe_path)
-        self._record_type = RecipeRecord
+        self.reader = ExecutionRecipeReader(recipe_path)
         self.rank = int(rank)
         self.world_size = int(world_size)
         if int(self.reader.manifest["world_size"]) != self.world_size:
@@ -104,38 +103,26 @@ class _RecipeMixedSourceSchedule:
         self.source_pattern = tuple(self.reader.manifest["source_pattern"])
         self._step_iterator = None
         self._next_step = None
-        self._records_by_request = {}
 
     def recipe_step(self, step):
         step = int(step)
         if self._step_iterator is None:
-            self._step_iterator = self.reader.steps(start_step=step)
+            self._step_iterator = self.reader.steps(self.rank, start_step=step)
             self._next_step = step
         if step != self._next_step:
             raise RuntimeError(
                 f"recipe requested step {step} after {self._next_step - 1}"
             )
         try:
-            payload = next(self._step_iterator)
+            actual_step, records = next(self._step_iterator)
         except StopIteration as error:
             raise RuntimeError(f"recipe has no optimizer step {step}") from error
-        records = tuple(
-            self._record_type.from_dict(sample)
-            for sample in payload["logical_samples"]
-        )
-        self._records_by_request = {
-            (str(record.source), int(record.request["virtual_index"])): record
-            for record in records
-        }
+        if int(actual_step) != step:
+            raise RuntimeError(
+                f"rank-local recipe yielded step {actual_step} after {step - 1}"
+            )
         self._next_step += 1
-        return records, tuple(payload["physical_groups"])
-
-    def record_for_request(self, source, request):
-        return self._records_by_request[(str(source), int(request.virtual_index))]
-
-    @staticmethod
-    def replay_request(record):
-        return record.replay_request(ScheduledSampleRequest)
+        return records
 
     def state_dict(self):
         return {}
@@ -146,7 +133,7 @@ class _RecipeMixedSourceSchedule:
 
 
 class _RecipeDataset:
-    """Validate replayed plans and optionally substitute GT depth."""
+    """Materialize execution-ready records without invoking dataset planning."""
 
     def __init__(self, source, dataset, schedule, force_gt_depth, runtime_depth_root=None):
         self.source = str(source)
@@ -163,34 +150,12 @@ class _RecipeDataset:
     def __getattr__(self, name):
         return getattr(self.dataset, name)
 
-    def plan_sample(self, request):
-        plan = self.dataset.plan_sample(request)
-        if plan is None:
-            raise RuntimeError("an accepted recipe request replayed as an invalid plan")
-        record = self.schedule.record_for_request(self.source, request)
-        observed = (
-            int(plan.seed),
-            str(plan.sequence),
-            tuple(int(value) for value in plan.frame_indices),
-            tuple(int(value) for value in plan.views),
-            int(plan.track_count),
-            tuple(int(value) for value in plan.selected_global_track_indices),
-            str(plan.depth_source),
-        )
-        expected = (
-            int(record.seed),
-            str(record.scene),
-            tuple(record.frames),
-            tuple(record.views),
-            int(record.track_count),
-            tuple(record.tracks),
-            str(record.depth_source),
-        )
-        if observed != expected:
-            raise RuntimeError(
-                f"recipe replay diverged for {self.source} request "
-                f"{request.virtual_index}"
-            )
+    def plan_sample(self, _):
+        raise RuntimeError("execution recipes must never call plan_sample")
+
+    def materialize_recipe_record(self, execution_record):
+        record = execution_record.recipe
+        plan = self.dataset.execution_plan(execution_record)
         metadata = dict(plan.metadata)
         metadata["recipe_step"] = int(record.step)
         metadata["recipe_microbatch"] = int(record.microbatch)
@@ -201,25 +166,18 @@ class _RecipeDataset:
         metadata["effective_depth_source"] = (
             "gt" if self.force_gt_depth else record.depth_source
         )
-        return dataclasses.replace(
+        plan = dataclasses.replace(
             plan,
             depth_source="gt" if self.force_gt_depth else plan.depth_source,
             metadata=metadata,
         )
-
-    def materialize_sample(self, plan):
-        if plan.depth_source == "gt":
-            return self.dataset.materialize_sample(plan)
-        if self.runtime_depth_store is None:
-            return self.dataset.materialize_sample(plan)
-        depth, mask, wait_seconds, byte_count = self.runtime_depth_store.load(
-            plan.metadata["recipe_step"],
-            plan.metadata["recipe_logical_index"],
-        )
-        return self.dataset.materialize_sample(
-            plan,
-            runtime_depth=(depth, mask, wait_seconds, byte_count),
-        )
+        runtime_depth = None
+        if plan.depth_source != "gt" and self.runtime_depth_store is not None:
+            runtime_depth = self.runtime_depth_store.load(
+                plan.metadata["recipe_step"],
+                plan.metadata["recipe_logical_index"],
+            )
+        return self.dataset.materialize_sample(plan, runtime_depth=runtime_depth)
 
 
 class _ContainerHardwareMonitor:
@@ -558,6 +516,82 @@ def _gather_rank_records(fabric, local_records):
     gathered = [None] * fabric.world_size
     torch.distributed.all_gather_object(gathered, list(local_records))
     return [record for rank_records in gathered for record in rank_records]
+
+
+def _gather_recipe_scene_losses(
+    fabric,
+    local_records,
+    source_order,
+    scene_lists,
+):
+    """Gather fixed recipe loss rows without Python-object collectives."""
+    source_ids = {source: index for index, source in enumerate(source_order)}
+    depth_ids = {"gt": 0, "estimated": 1, "estimated_cleaned": 2}
+    rows = []
+    for record in local_records:
+        selected_views = list(record["selected_views"])
+        selected_views.extend([-1] * (6 - len(selected_views)))
+        rows.append(
+            [
+                source_ids[record["source"]],
+                int(record["scene_index"]),
+                int(record["rank"]),
+                int(record["physical_group_index"]),
+                int(record["views"]),
+                int(record["tracks"]),
+                int(record["window_start"]),
+                int(record["window_end_exclusive"]),
+                int(record["virtual_index"]),
+                int(record["seed"]),
+                depth_ids[record["depth_source"]],
+                int(record["rgb_augmented"]),
+                int(record["depth_augmented"]),
+                int(record["cropping_enabled"]),
+                int(record["scene_transform_enabled"]),
+                int(record["camera_noise_enabled"]),
+                *selected_views,
+                float(record["trajectory_loss"]),
+                float(record["visibility_loss"]),
+                float(record["raw_visibility_loss"]),
+                float(record["total_loss"]),
+                int(record["optimizer_step"]),
+            ]
+        )
+    local = torch.tensor(rows, device=fabric.device, dtype=torch.float64)
+    gathered = fabric.all_gather(local).reshape(-1, local.shape[1]).cpu().tolist()
+    depth_names = tuple(depth_ids)
+    result = []
+    for row in gathered:
+        source = source_order[int(row[0])]
+        scene_index = int(row[1])
+        result.append(
+            {
+                "source": source,
+                "scene": scene_lists[source][scene_index],
+                "scene_index": scene_index,
+                "rank": int(row[2]),
+                "physical_group_index": int(row[3]),
+                "views": int(row[4]),
+                "tracks": int(row[5]),
+                "window_start": int(row[6]),
+                "window_end_exclusive": int(row[7]),
+                "virtual_index": int(row[8]),
+                "seed": int(row[9]),
+                "depth_source": depth_names[int(row[10])],
+                "rgb_augmented": bool(row[11]),
+                "depth_augmented": bool(row[12]),
+                "cropping_enabled": bool(row[13]),
+                "scene_transform_enabled": bool(row[14]),
+                "camera_noise_enabled": bool(row[15]),
+                "selected_views": [int(view) for view in row[16:22] if view >= 0],
+                "trajectory_loss": float(row[22]),
+                "visibility_loss": float(row[23]),
+                "raw_visibility_loss": float(row[24]),
+                "total_loss": float(row[25]),
+                "optimizer_step": int(row[26]),
+            }
+        )
+    return result
 
 
 def _finalize_scene_loss_records(pending_records, optimizer_step):
@@ -1282,6 +1316,23 @@ def _source_batch_shape_metrics(batch):
     else:
         track_count = float(batch.trajectory.shape[-2])
     return view_count, track_count
+
+
+def _prepared_scene_log(scene):
+    if hasattr(scene, "plan"):
+        return {
+            "source": scene.source,
+            "scene": scene.plan.sequence,
+            "views": len(scene.plan.views),
+            "tracks": scene.plan.track_count,
+        }
+    record = scene.execution_record.recipe
+    return {
+        "source": record.source,
+        "scene": record.scene,
+        "views": len(record.views),
+        "tracks": record.track_count,
+    }
 
 
 def _build_source_train_loader(dataset, sampler, cfg, fabric):
@@ -2760,6 +2811,34 @@ def main(cfg: DictConfig):
         train_loader = None
         num_epochs = None
 
+    physical_lookahead = None
+    if planned_physical_batching and recipe_path:
+        settings = cfg.datasets.train.physical_batching
+        physical_lookahead = MixedStepLookahead(
+            datasets=train_datasets,
+            schedule=mixed_schedule,
+            source_cursors=source_cursors,
+            rank=fabric.global_rank,
+            remaining_steps=int(cfg.trainer.num_steps) - recipe_resume_position,
+            worker_count=2,
+            lookahead_steps=int(settings.lookahead_steps),
+            max_cache_bytes=int(float(settings.cpu_cache_gib_per_rank) * 1024**3),
+            capacity=_physical_batch_capacity(cfg),
+            rank_local=False,
+            recipe_position=recipe_resume_position,
+            gradient_diagnostics_interval=(
+                int(cfg.trainer.gradient_diagnostics_interval)
+                if bool(cfg.trainer.get("gradient_diagnostics", True))
+                else 0
+            ),
+        )
+        logging.info(
+            "Started rank-local execution-recipe lookahead before model setup "
+            "(rank=%d step=%d workers=2)",
+            fabric.global_rank,
+            recipe_resume_position,
+        )
+
     epoch = -1
     total_steps = 0
 
@@ -2932,29 +3011,28 @@ def main(cfg: DictConfig):
                 tb_writer.close()
             return
 
-    physical_lookahead = None
     physical_decoder = None
     physical_pipeline = None
     if planned_physical_batching:
         settings = cfg.datasets.train.physical_batching
-        physical_lookahead = MixedStepLookahead(
-            datasets=train_datasets,
-            schedule=mixed_schedule,
-            source_cursors=source_cursors,
-            rank=fabric.global_rank,
-            remaining_steps=int(cfg.trainer.num_steps) - total_steps,
-            worker_count=int(cfg.datasets.train.num_workers),
-            lookahead_steps=int(settings.lookahead_steps),
-            max_cache_bytes=int(float(settings.cpu_cache_gib_per_rank) * 1024**3),
-            capacity=_physical_batch_capacity(cfg),
-            rank_local=bool(settings.get("rank_local", False)),
-            recipe_position=total_steps if recipe_path else 0,
-            gradient_diagnostics_interval=(
-                int(cfg.trainer.gradient_diagnostics_interval)
-                if gradient_diagnostics_enabled
-                else 0
-            ),
-        )
+        if physical_lookahead is None:
+            physical_lookahead = MixedStepLookahead(
+                datasets=train_datasets,
+                schedule=mixed_schedule,
+                source_cursors=source_cursors,
+                rank=fabric.global_rank,
+                remaining_steps=int(cfg.trainer.num_steps) - total_steps,
+                worker_count=int(cfg.datasets.train.num_workers),
+                lookahead_steps=int(settings.lookahead_steps),
+                max_cache_bytes=int(float(settings.cpu_cache_gib_per_rank) * 1024**3),
+                capacity=_physical_batch_capacity(cfg),
+                rank_local=bool(settings.get("rank_local", False)),
+                gradient_diagnostics_interval=(
+                    int(cfg.trainer.gradient_diagnostics_interval)
+                    if gradient_diagnostics_enabled
+                    else 0
+                ),
+            )
         physical_decoder = PhysicalBatchDecoder(
             fabric.device,
             decode_image_chunk_size=int(settings.decode_image_chunk_size),
@@ -3118,7 +3196,9 @@ def main(cfg: DictConfig):
         accumulated_runtime_depth_metrics = {
             "sample_count": 0.0,
             "read_bytes": 0.0,
-            "wait_seconds": 0.0,
+            "ready_wait_seconds": 0.0,
+            "read_seconds": 0.0,
+            "delete_seconds": 0.0,
         }
         accumulated_loss_value = None
         accumulated_component_losses = {}
@@ -3227,11 +3307,15 @@ def main(cfg: DictConfig):
                                 {
                                     "sources": list(group.sources),
                                     "scenes": [
-                                        scene.plan.sequence for scene in group.scenes
+                                        _prepared_scene_log(scene)["scene"]
+                                        for scene in group.scenes
                                     ],
-                                    "views": len(group.scenes[0].plan.views),
+                                    "views": _prepared_scene_log(
+                                        group.scenes[0]
+                                    )["views"],
                                     "tracks": [
-                                        scene.plan.track_count for scene in group.scenes
+                                        _prepared_scene_log(scene)["tracks"]
+                                        for scene in group.scenes
                                     ],
                                 }
                                 for group in groups_for_step
@@ -3247,6 +3331,7 @@ def main(cfg: DictConfig):
                         total_batches_failed += physical_step.retry_count
                         physical_batching_metrics = {
                             "planning_seconds": physical_step.planning_seconds,
+                            "recipe_read_seconds": physical_step.recipe_read_seconds,
                             "materialization_seconds": physical_step.materialization_seconds,
                             "consumer_wait_seconds": physical_step.consumer_wait_seconds,
                             "ready_queue_depth": float(physical_step.ready_queue_depth),
@@ -3440,14 +3525,17 @@ def main(cfg: DictConfig):
                             + float(np.mean([item[name] for item in metadata]))
                         )
                 for item in metadata:
-                    if "runtime_depth_wait_seconds" in item:
+                    if "runtime_depth_ready_wait_seconds" in item:
                         accumulated_runtime_depth_metrics["sample_count"] += 1.0
                         accumulated_runtime_depth_metrics["read_bytes"] += float(
                             item.get("runtime_depth_bytes", 0)
                         )
-                        accumulated_runtime_depth_metrics["wait_seconds"] += float(
-                            item["runtime_depth_wait_seconds"]
-                        )
+                        for phase in ("ready_wait", "read", "delete"):
+                            accumulated_runtime_depth_metrics[
+                                f"{phase}_seconds"
+                            ] += float(
+                                item.get(f"runtime_depth_{phase}_seconds", 0.0)
+                            )
                     if item.get("record_store") == "indexed-webdataset":
                         accumulated_indexed_read_metrics["sample_count"] += 1.0
                         accumulated_indexed_read_metrics["read_bytes"] += float(
@@ -3631,6 +3719,7 @@ def main(cfg: DictConfig):
                     {
                         "source": str(record_sources[scene_index]),
                         "scene": str(record_scenes[scene_index]),
+                        "scene_index": int(metadata.get("scene_index", -1)),
                         "rank": int(fabric.global_rank),
                         "physical_group_index": int(microbatches_accumulated),
                         "views": source_view_count,
@@ -3755,10 +3844,18 @@ def main(cfg: DictConfig):
                 pending_scene_loss_records,
                 total_steps + 1,
             )
-            gathered_scene_loss_records = _gather_rank_records(
-                fabric,
-                local_scene_loss_records,
-            )
+            if recipe_path:
+                gathered_scene_loss_records = _gather_recipe_scene_losses(
+                    fabric,
+                    local_scene_loss_records,
+                    tuple(mixed_schedule.scene_counts),
+                    mixed_schedule.reader.manifest["scene_lists"],
+                )
+            else:
+                gathered_scene_loss_records = _gather_rank_records(
+                    fabric,
+                    local_scene_loss_records,
+                )
             if fabric.global_rank == 0:
                 top_scenes = sorted(
                     gathered_scene_loss_records,
@@ -4336,11 +4433,18 @@ def main(cfg: DictConfig):
                 },
                 reduce_op="sum",
             )
-            reduced_runtime_depth_metrics["wait_seconds"] = _reduce_scalar(
+            reduced_runtime_depth_metrics.update(_reduce_scalar_dict(
                 fabric,
-                accumulated_runtime_depth_metrics["wait_seconds"],
+                {
+                    name: accumulated_runtime_depth_metrics[name]
+                    for name in (
+                        "ready_wait_seconds",
+                        "read_seconds",
+                        "delete_seconds",
+                    )
+                },
                 reduce_op="max",
-            )
+            ))
             if physical_batching_metrics is not None:
                 reduced_physical_batching_metrics = _reduce_scalar_dict(
                     fabric,
@@ -4348,6 +4452,7 @@ def main(cfg: DictConfig):
                         name: physical_batching_metrics[name]
                         for name in (
                             "planning_seconds",
+                            "recipe_read_seconds",
                             "materialization_seconds",
                             "consumer_wait_seconds",
                             "ready_queue_depth",
@@ -4450,10 +4555,9 @@ def main(cfg: DictConfig):
                     "runtime_depth_metrics_path"
                 )
                 if producer_metrics_path and Path(producer_metrics_path).is_file():
-                    last_line = Path(producer_metrics_path).read_text(
-                        encoding="utf-8"
-                    ).splitlines()[-1]
-                    producer_metrics = json.loads(last_line)
+                    producer_metrics = json.loads(
+                        Path(producer_metrics_path).read_text(encoding="utf-8")
+                    )
                     for name in (
                         "generated_samples",
                         "generated_images",
@@ -4581,7 +4685,9 @@ def main(cfg: DictConfig):
             accumulated_runtime_depth_metrics = {
                 "sample_count": 0.0,
                 "read_bytes": 0.0,
-                "wait_seconds": 0.0,
+                "ready_wait_seconds": 0.0,
+                "read_seconds": 0.0,
+                "delete_seconds": 0.0,
             }
             accumulated_loss_value = None
             accumulated_component_losses = {}

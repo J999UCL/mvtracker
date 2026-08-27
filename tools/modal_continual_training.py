@@ -889,6 +889,105 @@ def plan_recipe_remote(
         str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
         str(RUN_ROOT): run_volume,
     },
+    cpu=RECIPE_PLANNER_CPUS,
+    memory=65536,
+    ephemeral_disk=RECIPE_PLANNER_DISK_MIB,
+    timeout=6 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def compile_execution_recipe_remote(
+    source_name: str,
+    recipe_name: str,
+) -> dict:
+    """Compile one immutable v1 recipe into rank-local execution sidecars."""
+    from types import SimpleNamespace
+
+    import wandb
+    from omegaconf import OmegaConf
+
+    from mvtracker.cli.train import _build_training_dataset
+    from mvtracker.datasets.mixed_source_schedule import ScheduledSampleRequest
+    from mvtracker.datasets.training_recipe import compile_execution_recipe
+
+    validate_run_name(source_name)
+    validate_run_name(recipe_name)
+    source_dir = RECIPE_ROOT / source_name
+    output_dir = RECIPE_ROOT / recipe_name
+    local_output_dir = Path("/tmp/mvtracker-execution-recipes") / recipe_name
+    source_manifest = json.loads(
+        (source_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    cfg = OmegaConf.create(source_manifest["config"])
+    for source, scenes in source_manifest["scene_lists"].items():
+        cfg.datasets.train.sources[source].include_scene_ids = list(scenes)
+    fabric = SimpleNamespace(
+        world_size=int(source_manifest["world_size"]),
+        global_rank=0,
+    )
+    datasets = {
+        source: _build_training_dataset(
+            source_cfg.name,
+            source_cfg.root,
+            cfg,
+            fabric,
+            source_cfg,
+        )
+        for source, source_cfg in cfg.datasets.train.sources.items()
+    }
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group="execution-recipe-compilation",
+        job_type="execution-recipe-compilation",
+        name=recipe_name,
+        tags=["modal", "recipe-v2", f"cpu{RECIPE_PLANNER_CPUS}", "training"],
+        config={
+            "source_commit": _source_commit(),
+            "source_recipe": source_name,
+            "output_recipe": recipe_name,
+            "workers": RECIPE_PLANNER_CPUS,
+            **MODAL_TAGS,
+        },
+    )
+    try:
+        summary = compile_execution_recipe(
+            source_dir,
+            local_output_dir,
+            datasets=datasets,
+            request_factories={
+                source: ScheduledSampleRequest for source in datasets
+            },
+            compiler_commit=_source_commit(),
+            worker_count=RECIPE_PLANNER_CPUS,
+        )
+        if output_dir.exists():
+            raise FileExistsError(output_dir)
+        shutil.copytree(local_output_dir, output_dir)
+        run_volume.commit()
+    except BaseException:
+        run.summary["status"] = "failed"
+        run.finish(exit_code=1)
+        raise
+    run.summary.update(summary)
+    run.summary["status"] = "complete"
+    run.finish()
+    print(
+        "EXECUTION_RECIPE event=published "
+        f"source={source_dir} output={output_dir} summary={summary}",
+        flush=True,
+    )
+    return {**summary, "output": str(output_dir)}
+
+
+@app.function(
+    image=training_image,
+    secrets=[wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
     cpu=32,
     memory=65536,
     timeout=3 * 60 * 60,
@@ -1332,6 +1431,7 @@ def _run_recipe_da3(
     prefill_devices: tuple[int, ...],
     da3_image_capacity: int,
     max_pending_depth_samples: int,
+    training_steps: int | None = None,
 ) -> dict:
     validate_run_name(run_name)
     validate_run_name(recipe_name)
@@ -1353,6 +1453,9 @@ def _run_recipe_da3(
     seed = int(recipe_manifest["seed"])
     runtime_root = Path("/tmp/mvtracker-da3-depth")
     training_log = run_dir / "training.log"
+    training_steps = int(training_steps or expected_steps)
+    if not 1 <= training_steps <= int(expected_steps):
+        raise ValueError("training_steps must be within the source recipe")
     manifest = {
         "mode": "recipe_da3",
         "run_name": run_name,
@@ -1365,7 +1468,7 @@ def _run_recipe_da3(
         "prefill_samples": int(prefill_samples),
         "da3_image_capacity": int(da3_image_capacity),
         "max_pending_depth_samples": int(max_pending_depth_samples),
-        "steps": int(expected_steps),
+        "steps": training_steps,
         "depth_counts": recipe_summary["planned_depth_counts"],
         "validation": "smoke20" not in experiment_name,
         "modal_tags": MODAL_TAGS,
@@ -1451,6 +1554,8 @@ def _run_recipe_da3(
         str(prefill_samples),
         "--max-pending-samples",
         str(max_pending_depth_samples),
+        "--max-steps",
+        str(training_steps),
     ]
     if depth_device not in prefill_devices:
         raise ValueError("depth_device must be included in prefill_devices")
@@ -1610,6 +1715,43 @@ def recipe_da3_h200x5_remote(
         prefill_devices=(0, 1, 2, 3, 4),
         da3_image_capacity=64,
         max_pending_depth_samples=64,
+    )
+
+
+@app.function(
+    image=da3_training_image,
+    secrets=[hf_secret, wandb_secret],
+    volumes={
+        str(DATA_ROOT): data_volume.with_mount_options(read_only=True),
+        str(RUN_ROOT): run_volume,
+    },
+    gpu="H200:5",
+    cpu=32,
+    memory=(TRAIN_MEMORY_REQUEST_MIB, TRAIN_MEMORY_LIMIT_MIB),
+    timeout=4 * 60 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def recipe_da3_h200x5_smoke100_remote(
+    run_name: str,
+    recipe_name: str,
+    prefill_samples: int = 64,
+) -> dict:
+    return _run_recipe_da3(
+        run_name,
+        recipe_name,
+        "diegesis_syn4d_mvkubric_recipe_da3_h200_ddp_smoke100",
+        5000,
+        "diegesis351-recipe-v2-h200-ddp4-smoke100",
+        prefill_samples,
+        gpu_label="H200:5",
+        training_devices=(0, 1, 2, 3),
+        depth_device=4,
+        prefill_devices=(0, 1, 2, 3, 4),
+        da3_image_capacity=64,
+        max_pending_depth_samples=64,
+        training_steps=100,
     )
 
 
@@ -1949,6 +2091,29 @@ def plan_recipe(
     print(json.dumps({"recipe_name": recipe_name, "function_call_id": call.object_id}, indent=2))
 
 
+@app.local_entrypoint(name="compile-execution-recipe")
+def compile_execution_recipe_entrypoint(
+    source_name: str,
+    recipe_name: str,
+) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=1)
+    validate_run_name(source_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {**MODAL_TAGS, "experiment": recipe_name, "gpu": "cpu", "cpu": "32"}
+    )
+    deployed = modal.Function.from_name(APP_NAME, "compile_execution_recipe_remote")
+    call = deployed.spawn(source_name, recipe_name)
+    print(
+        json.dumps(
+            {"recipe_name": recipe_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
+
+
 @app.local_entrypoint(name="build-mvkubric-recipe-metadata")
 def build_mvkubric_recipe_metadata() -> None:
     commit = _source_commit()
@@ -2119,6 +2284,28 @@ def recipe_da3_h200x5_train5000(run_name: str, recipe_name: str) -> None:
         {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x5"}
     )
     deployed = modal.Function.from_name(APP_NAME, "recipe_da3_h200x5_remote")
+    call = deployed.spawn(run_name, recipe_name, 64)
+    print(
+        json.dumps(
+            {"run_name": run_name, "function_call_id": call.object_id},
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint(name="recipe-da3-h200x5-smoke100")
+def recipe_da3_h200x5_smoke100(run_name: str, recipe_name: str) -> None:
+    commit = _source_commit()
+    require_pushed_main_commit(commit)
+    preflight_active_containers(required_free_slots=5)
+    validate_run_name(run_name)
+    validate_run_name(recipe_name)
+    app.set_tags(
+        {**MODAL_TAGS, "experiment": run_name, "gpu": "h200x5"}
+    )
+    deployed = modal.Function.from_name(
+        APP_NAME, "recipe_da3_h200x5_smoke100_remote"
+    )
     call = deployed.spawn(run_name, recipe_name, 64)
     print(
         json.dumps(

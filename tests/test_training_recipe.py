@@ -19,7 +19,12 @@ from mvtracker.datasets.physical_batch_scheduler import (
     schedule_singleton_batch,
 )
 from mvtracker.datasets.training_recipe import (
+    ExecutionRecipeReader,
+    PhysicalAssignment,
     RecipeReader,
+    RecipeRecord,
+    RecipeWriter,
+    compile_execution_recipe,
     plan_training_recipe,
     plan_training_recipe_parallel,
 )
@@ -207,6 +212,128 @@ class TrainingRecipeTests(unittest.TestCase):
                 log=logs.append,
             )
             self.assertTrue(any(line.startswith("recipe heartbeat") for line in logs))
+
+    def test_compiler_writes_compact_rank_index_and_o1_step_resume(self):
+        class Dataset:
+            def __init__(self):
+                self.grouped_calls = 0
+
+            def plan_recipe_requests(self, requests):
+                self.grouped_calls += 1
+                return tuple(self.plan_sample(request) for request in requests)
+
+            def plan_sample(self, request):
+                rng = np.random.RandomState(9)
+                return SimpleNamespace(
+                    dataset="fixture",
+                    virtual_index=request.virtual_index,
+                    scene_index=0,
+                    sequence="scene",
+                    seed=9,
+                    frame_indices=np.array([0]),
+                    views=(0,),
+                    output_size=(8, 10),
+                    selected_global_track_indices=np.array([3]),
+                    track_count=1,
+                    query_points_3d=np.array([[0, 1, 2, 3]], dtype=np.float32),
+                    trajectory=np.ones((1, 1, 1, 3), dtype=np.float32),
+                    trajectory_3d=np.ones((1, 1, 3), dtype=np.float32),
+                    intrinsics=np.eye(3, dtype=np.float32)[None, None],
+                    extrinsics=np.zeros((1, 1, 3, 4), dtype=np.float32),
+                    apply_rgb_aug=False,
+                    rgb_augmentation=None,
+                    apply_depth_aug=False,
+                    depth_patch_operations=(),
+                    augmentation_seed=9,
+                    depth_source="gt",
+                    post_selection_rng_state=rng.get_state(),
+                    theta=np.array([[[[1, 0, 0], [0, 1, 0]]]], dtype=np.float32),
+                    spatial_transform=np.array([[[1, 1, 0, 0, 0, 0]]], dtype=np.float64),
+                    visibility=np.ones((1, 1, 1), dtype=bool),
+                    track_validity=None,
+                    source_size=(8, 10),
+                    image_codec="jpeg",
+                    media_record_indices=(),
+                    depth_sensor_widths=(),
+                    depth_focal_lengths=(),
+                    max_depth=1000.0,
+                    metadata={"gotit": True},
+                )
+
+            def execution_recipe_source(self, _plan):
+                return {"source_sequence": "scene", "world_anchor": [0, 0, 0]}
+
+            def execution_plan(self, execution_record):
+                return self.plan_sample(
+                    SimpleNamespace(
+                        virtual_index=execution_record.recipe.request["virtual_index"]
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "v1"
+            writer = RecipeWriter(
+                source,
+                manifest={"source_pattern": ["fixture"]},
+                world_size=1,
+                step_count=2,
+                records_per_step=1,
+            )
+            for step in range(2):
+                writer.write(
+                    RecipeRecord(
+                        step=step,
+                        microbatch=0,
+                        rank=0,
+                        scheduled_rank=0,
+                        source="fixture",
+                        source_cursor=step,
+                        retry_count=0,
+                        request={"virtual_index": step, "scene_index": 0},
+                        seed=9,
+                        scene_index=0,
+                        scene="scene",
+                        frames=(0,),
+                        views=(0,),
+                        resolution=(8, 10),
+                        track_count=1,
+                        tracks=(3,),
+                        augmentation={
+                            "apply_rgb": False,
+                            "rgb": None,
+                            "apply_depth": False,
+                            "depth_patch_operations": (),
+                            "seed": 9,
+                        },
+                        depth_source="gt",
+                        physical=PhysicalAssignment(rank=0, group=0, position=0),
+                        logical_index=0,
+                    )
+                )
+            writer.finalize(summary={}, estimated_depth_requests=[])
+            dataset = Dataset()
+            output = root / "v2"
+            summary = compile_execution_recipe(
+                source,
+                output,
+                datasets={"fixture": dataset},
+                request_factories={"fixture": SimpleNamespace},
+                compiler_commit="abc123",
+                worker_count=2,
+                heartbeat_seconds=100,
+                log=lambda _: None,
+            )
+            reader = ExecutionRecipeReader(output)
+            reader.validate()
+            resumed = list(reader.steps(0, start_step=1))
+            self.assertEqual([step for step, _ in resumed], [1])
+            self.assertEqual(resumed[0][1][0].recipe.source_cursor, 1)
+            self.assertEqual(summary["records"], 2)
+            self.assertEqual(
+                (source / "rank-0.jsonl").read_bytes(),
+                (output / "rank-0.jsonl").read_bytes(),
+            )
 
     def test_parallel_planning_matches_serial_recipe(self):
         with tempfile.TemporaryDirectory() as temporary:

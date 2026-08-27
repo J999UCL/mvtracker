@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import bisect
 import multiprocessing
+import os
+import pickle
+import shutil
 import threading
 import time
+import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -325,6 +331,435 @@ class RecipeReader:
                 set(group_counts.values())
             ) != 1:
                 raise ValueError("physical group counts differ across DDP ranks")
+
+
+EXECUTION_RECIPE_SCHEMA_VERSION = 2
+
+
+def _record_sha256(record: RecipeRecord) -> str:
+    encoded = json.dumps(
+        _jsonable(record.to_dict()), separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _pack_mask(value: np.ndarray | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=np.bool_)
+    return {
+        "shape": tuple(int(item) for item in array.shape),
+        "bits": np.packbits(array.reshape(-1), bitorder="little").tobytes(),
+    }
+
+
+def unpack_execution_mask(value: Mapping[str, Any] | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    shape = tuple(int(item) for item in value["shape"])
+    count = int(np.prod(shape, dtype=np.int64))
+    bits = np.frombuffer(value["bits"], dtype=np.uint8)
+    return np.unpackbits(bits, bitorder="little", count=count).reshape(shape).astype(bool)
+
+
+@dataclass(frozen=True)
+class ExecutionRecipeRecord:
+    """One compact, execution-complete recipe record."""
+
+    recipe: RecipeRecord
+    trace: dict[str, Any]
+    source_record_sha256: str
+
+    @property
+    def step(self) -> int:
+        return self.recipe.step
+
+    @property
+    def logical_index(self) -> int:
+        return self.recipe.logical_index
+
+    @property
+    def source(self) -> str:
+        return self.recipe.source
+
+    @property
+    def physical(self) -> PhysicalAssignment:
+        return self.recipe.physical
+
+
+def _execution_trace(plan: Any, dataset: Any) -> dict[str, Any]:
+    rng_state = getattr(plan, "post_selection_rng_state", None)
+    if rng_state is None:
+        raise ValueError(
+            f"{plan.sequence}: planner did not expose post-selection RNG state"
+        )
+    if plan.spatial_transform is None:
+        raise ValueError(f"{plan.sequence}: planner did not expose its spatial trace")
+    query_times = np.rint(np.asarray(plan.query_points_3d)[:, 0]).astype(np.int16)
+    source_metadata = dataset.execution_recipe_source(plan)
+    return {
+        "dataset": str(plan.dataset),
+        "query_times": query_times,
+        "theta": np.asarray(plan.theta, dtype=np.float32),
+        "spatial_transform": np.asarray(plan.spatial_transform, dtype=np.float64),
+        "visibility": _pack_mask(plan.visibility),
+        "track_validity": _pack_mask(getattr(plan, "track_validity", None)),
+        "post_selection_rng_state": rng_state,
+        "source_size": tuple(int(item) for item in plan.source_size),
+        "output_size": tuple(int(item) for item in plan.output_size),
+        "image_codec": str(plan.image_codec),
+        "media_record_indices": tuple(
+            int(item) for item in getattr(plan, "media_record_indices", ())
+        ),
+        "depth_sensor_widths": tuple(float(item) for item in plan.depth_sensor_widths),
+        "depth_focal_lengths": tuple(float(item) for item in plan.depth_focal_lengths),
+        "max_depth": float(plan.max_depth),
+        "metadata": _jsonable(plan.metadata),
+        "source": _jsonable(source_metadata),
+    }
+
+
+def _validate_execution_identity(record: RecipeRecord, request: Any, plan: Any) -> None:
+    compact = _compact_plan(request, plan)
+    expected = {
+        "seed": record.seed,
+        "scene_index": record.scene_index,
+        "scene": record.scene,
+        "frames": record.frames,
+        "views": record.views,
+        "resolution": record.resolution,
+        "track_count": record.track_count,
+        "tracks": record.tracks,
+        "augmentation": record.augmentation,
+        "depth_source": record.depth_source,
+    }
+    actual = {key: compact[key] for key in expected}
+    if actual != expected:
+        raise RuntimeError(
+            f"recipe identity mismatch at step={record.step} "
+            f"logical_index={record.logical_index}: expected={expected} actual={actual}"
+        )
+
+
+def _compile_execution_scene_group(task) -> list[ExecutionRecipeRecord]:
+    source, _scene, items = task
+    dataset = _PROCESS_DATASETS[source]
+    requests = tuple(request for _, request in items)
+    grouped = getattr(dataset, "plan_recipe_requests", None)
+    plans = (
+        grouped(requests)
+        if grouped is not None
+        else tuple(dataset.plan_sample(request) for request in requests)
+    )
+    compiled = []
+    for (record, request), plan in zip(items, plans, strict=True):
+        if plan is None:
+            raise RuntimeError(
+                f"recipe record became invalid: step={record.step} "
+                f"logical_index={record.logical_index} scene={record.scene}"
+            )
+        _validate_execution_identity(record, request, plan)
+        digest = _record_sha256(record)
+        execution = ExecutionRecipeRecord(
+            recipe=record,
+            trace=_execution_trace(plan, dataset),
+            source_record_sha256=digest,
+        )
+        direct = dataset.execution_plan(execution)
+        for name in (
+            "query_points_3d",
+            "trajectory",
+            "trajectory_3d",
+            "visibility",
+            "intrinsics",
+            "extrinsics",
+            "theta",
+        ):
+            expected = np.asarray(getattr(plan, name))
+            actual = np.asarray(getattr(direct, name))
+            if expected.dtype == np.bool_:
+                matches = np.array_equal(actual, expected)
+            else:
+                matches = np.allclose(actual, expected, rtol=1e-5, atol=1e-5)
+            if not matches:
+                raise RuntimeError(
+                    f"execution parity failed for {record.source}/{record.scene} "
+                    f"step={record.step} logical_index={record.logical_index} field={name}"
+                )
+        compiled.append(execution)
+    return compiled
+
+
+class _ExecutionSidecarWriter:
+    def __init__(self, root: Path, world_size: int) -> None:
+        self._binary = [
+            (root / f"rank-{rank}.execution.bin").open("wb")
+            for rank in range(world_size)
+        ]
+        self._root = root
+        self._index_entries: list[list[dict[str, Any]]] = [
+            [] for _ in range(world_size)
+        ]
+        self.counts = [0] * world_size
+        self.bytes = [0] * world_size
+
+    def write(self, value: ExecutionRecipeRecord) -> None:
+        rank = int(value.recipe.rank)
+        payload = zlib.compress(
+            pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), level=6
+        )
+        offset = self._binary[rank].tell()
+        self._binary[rank].write(payload)
+        index = {
+            "step": int(value.step),
+            "logical_index": int(value.logical_index),
+            "group": int(value.physical.group),
+            "position": int(value.physical.position),
+            "offset": int(offset),
+            "size": len(payload),
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "source": value.source,
+            "source_record_sha256": value.source_record_sha256,
+        }
+        self._index_entries[rank].append(index)
+        self.counts[rank] += 1
+        self.bytes[rank] += len(payload)
+
+    def close(self) -> None:
+        for handle in self._binary:
+            if not handle.closed:
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+        for rank, entries in enumerate(self._index_entries):
+            path = self._root / f"rank-{rank}.execution-index.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                for entry in sorted(entries, key=lambda item: (item["step"], item["logical_index"])):
+                    handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
+class ExecutionRecipeReader:
+    """Read only schema-v2 compact rank-local execution sidecars."""
+
+    def __init__(self, recipe_dir: str | Path) -> None:
+        self.recipe_dir = Path(recipe_dir)
+        with (self.recipe_dir / "manifest.json").open(encoding="utf-8") as handle:
+            self.manifest = json.load(handle)
+        if int(self.manifest.get("schema_version", -1)) != EXECUTION_RECIPE_SCHEMA_VERSION:
+            raise ValueError("training requires an execution recipe with schema_version=2")
+        if not self.manifest.get("complete") or not self.manifest.get("execution_complete"):
+            raise ValueError("execution recipe is incomplete")
+        self._indices = []
+        self._index_steps = []
+        for rank in range(int(self.manifest["world_size"])):
+            path = self.recipe_dir / f"rank-{rank}.execution-index.jsonl"
+            with path.open(encoding="utf-8") as handle:
+                entries = [json.loads(line) for line in handle]
+                self._indices.append(entries)
+                self._index_steps.append([int(entry["step"]) for entry in entries])
+
+    def _read(self, rank: int, locations: Sequence[Mapping[str, Any]]) -> Iterator[ExecutionRecipeRecord]:
+        binary_path = self.recipe_dir / f"rank-{rank}.execution.bin"
+        with binary_path.open("rb") as binary:
+            for location in locations:
+                binary.seek(int(location["offset"]))
+                payload = binary.read(int(location["size"]))
+                if len(payload) != int(location["size"]):
+                    raise ValueError(f"truncated execution sidecar for rank {rank}")
+                if hashlib.sha256(payload).hexdigest() != location["payload_sha256"]:
+                    raise ValueError(f"corrupt execution sidecar payload for rank {rank}")
+                value = pickle.loads(zlib.decompress(payload))
+                if not isinstance(value, ExecutionRecipeRecord):
+                    raise TypeError("invalid execution sidecar payload")
+                if value.source_record_sha256 != location["source_record_sha256"]:
+                    raise ValueError("execution record checksum differs from index")
+                if _record_sha256(value.recipe) != value.source_record_sha256:
+                    raise ValueError("execution record differs from source recipe")
+                yield value
+
+    def records(self, rank: int, start_step: int = 0) -> Iterator[ExecutionRecipeRecord]:
+        entries = self._indices[int(rank)]
+        offset = bisect.bisect_left(self._index_steps[int(rank)], int(start_step))
+        yield from self._read(int(rank), entries[offset:])
+
+    def steps(
+        self, rank: int, start_step: int = 0
+    ) -> Iterator[tuple[int, tuple[ExecutionRecipeRecord, ...]]]:
+        pending_step: int | None = None
+        pending: list[ExecutionRecipeRecord] = []
+        for record in self.records(rank, start_step=start_step):
+            if pending_step is not None and record.step != pending_step:
+                yield pending_step, tuple(
+                    sorted(
+                        pending,
+                        key=lambda item: (item.physical.group, item.physical.position),
+                    )
+                )
+                pending = []
+            pending_step = record.step
+            pending.append(record)
+        if pending_step is not None:
+            yield pending_step, tuple(
+                sorted(
+                    pending,
+                    key=lambda item: (item.physical.group, item.physical.position),
+                )
+            )
+
+    def validate(self) -> None:
+        counts = [
+            sum(1 for _ in self.records(rank))
+            for rank in range(int(self.manifest["world_size"]))
+        ]
+        if counts != self.manifest["rank_record_counts"]:
+            raise ValueError(f"execution rank record counts differ: {counts}")
+
+
+def compile_execution_recipe(
+    source_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    datasets: Mapping[str, Any],
+    request_factories: Mapping[str, Callable[..., Any]],
+    compiler_commit: str,
+    worker_count: int = 32,
+    heartbeat_seconds: float = 10.0,
+    log: LogFunction = _print_log,
+) -> dict[str, Any]:
+    """Compile a v1 sampling recipe into compact, directly executable sidecars."""
+    source = Path(source_dir)
+    output = Path(output_dir)
+    if output.exists():
+        raise FileExistsError(output)
+    if worker_count < 1:
+        raise ValueError("worker_count must be positive")
+    reader = RecipeReader(source)
+    reader.validate()
+    required_sources = set(reader.manifest.get("source_pattern", ()))
+    if missing := required_sources - set(datasets):
+        raise KeyError(f"missing execution compiler datasets: {sorted(missing)}")
+    if missing := required_sources - set(request_factories):
+        raise KeyError(f"missing request factories: {sorted(missing)}")
+
+    staging = output.with_name(f".{output.name}.building-{os.getpid()}")
+    if staging.exists():
+        raise FileExistsError(staging)
+    staging.mkdir(parents=True)
+    expected = int(reader.manifest["expected_records"])
+    started = time.perf_counter()
+    progress = {"completed": 0, "source": "startup", "scene": "-"}
+
+    def status() -> str:
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        rate = progress["completed"] / elapsed
+        remaining = expected - progress["completed"]
+        return (
+            "execution recipe compiler heartbeat "
+            f"completed={progress['completed']}/{expected} source={progress['source']} "
+            f"scene={progress['scene']} rate={rate:.1f}/s "
+            f"eta={remaining / rate if rate else 0.0:.1f}s"
+        )
+
+    log(
+        "execution recipe compiler start "
+        f"records={expected} source={source} output={output}"
+    )
+    writer = _ExecutionSidecarWriter(staging, int(reader.manifest["world_size"]))
+    record_hashes: list[str] = []
+    global _PROCESS_DATASETS
+    try:
+        records_by_scene: dict[tuple[str, str], list[RecipeRecord]] = {}
+        for step in reader.steps():
+            for sample in step["logical_samples"]:
+                record = RecipeRecord.from_dict(sample)
+                records_by_scene.setdefault((record.source, record.scene), []).append(record)
+                record_hashes.append(_record_sha256(record))
+        tasks = []
+        for (source_name, scene), scene_records in records_by_scene.items():
+            factory = request_factories[source_name]
+            for start in range(0, len(scene_records), 16):
+                chunk = scene_records[start : start + 16]
+                tasks.append(
+                    (
+                        source_name,
+                        scene,
+                        tuple(
+                            (record, record.replay_request(factory)) for record in chunk
+                        ),
+                    )
+                )
+        _PROCESS_DATASETS = datasets
+        context = multiprocessing.get_context("fork")
+        with context.Pool(processes=int(worker_count)) as pool, _Heartbeat(
+            heartbeat_seconds, log, status
+        ):
+            for compiled in pool.imap_unordered(
+                _compile_execution_scene_group, tasks, chunksize=1
+            ):
+                for value in compiled:
+                    writer.write(value)
+                progress.update(
+                    completed=progress["completed"] + len(compiled),
+                    source=compiled[-1].source,
+                    scene=compiled[-1].recipe.scene,
+                )
+                if progress["completed"] % 1000 < len(compiled):
+                    log(status())
+        writer.close()
+        source_manifest_sha256 = hashlib.sha256(
+            (source / "manifest.json").read_bytes()
+        ).hexdigest()
+        source_files_sha256 = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(source.iterdir())
+            if path.is_file() and path.suffix in {".json", ".jsonl"}
+        }
+        recipe_records_sha256 = hashlib.sha256(
+            "".join(record_hashes).encode("ascii")
+        ).hexdigest()
+        for path in source.iterdir():
+            if path.is_file() and path.suffix in {".json", ".jsonl"}:
+                target_name = "source-manifest.json" if path.name == "manifest.json" else path.name
+                shutil.copy2(path, staging / target_name)
+        manifest = {
+            **reader.manifest,
+            "schema_version": EXECUTION_RECIPE_SCHEMA_VERSION,
+            "execution_complete": True,
+            "compiler_commit": str(compiler_commit),
+            "source_recipe": str(source),
+            "source_manifest_sha256": source_manifest_sha256,
+            "source_files_sha256": source_files_sha256,
+            "source_records_sha256": recipe_records_sha256,
+            "rank_record_counts": writer.counts,
+            "rank_execution_bytes": writer.bytes,
+            "actual_records": progress["completed"],
+            "complete": True,
+        }
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        ExecutionRecipeReader(staging).validate()
+        os.replace(staging, output)
+        elapsed = time.perf_counter() - started
+        summary = {
+            "records": progress["completed"],
+            "elapsed_seconds": elapsed,
+            "execution_bytes": sum(writer.bytes),
+            "source_records_sha256": recipe_records_sha256,
+        }
+        log(
+            "execution recipe compiler complete "
+            f"records={progress['completed']} bytes={sum(writer.bytes)} elapsed={elapsed:.1f}s"
+        )
+        return summary
+    except BaseException:
+        writer.close()
+        log(f"execution recipe compiler failed {status()}")
+        raise
+    finally:
+        _PROCESS_DATASETS = None
 
 
 class _Heartbeat:
@@ -1476,13 +1911,18 @@ def derive_singleton_recipe(
 
 
 __all__ = [
+    "EXECUTION_RECIPE_SCHEMA_VERSION",
+    "ExecutionRecipeReader",
+    "ExecutionRecipeRecord",
     "PhysicalAssignment",
     "RecipeReader",
     "RecipeRecord",
     "RecipeWriter",
+    "compile_execution_recipe",
     "derive_mixed_depth_smoke_recipe",
     "derive_singleton_recipe",
     "plan_training_recipe",
     "plan_training_recipe_parallel",
     "replan_recipe_source",
+    "unpack_execution_mask",
 ]
