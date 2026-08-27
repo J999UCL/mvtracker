@@ -203,10 +203,11 @@ def _wait_for_consumer(
     output_root: Path,
     max_pending_samples: int,
     worker_id: int,
+    ordinal: int,
 ) -> Path:
     started = time.perf_counter()
     last_log = started
-    reservation = output_root / f"worker-{worker_id}.inflight"
+    reservation = output_root / f"worker-{worker_id}-{ordinal}.inflight"
     lock_path = output_root / "pending.lock"
     while True:
         with lock_path.open("a+") as lock:
@@ -470,6 +471,7 @@ def run(
                 output_root,
                 pending_limit,
                 worker_id,
+                ordinal,
             )
             reader = mvkubric if record.source == "mvkubric" else packed
             sample_started = time.perf_counter()

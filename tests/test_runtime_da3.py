@@ -131,13 +131,16 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
                 sample = output_root / "step-000000" / f"sample-{index:02d}"
                 sample.mkdir(parents=True)
                 (sample / "ready").touch()
-            first = runtime_da3._wait_for_consumer(output_root, 64, worker_id=4)
+            first = runtime_da3._wait_for_consumer(
+                output_root, 64, worker_id=4, ordinal=64
+            )
             with ThreadPoolExecutor(max_workers=1) as executor:
                 second_future = executor.submit(
                     runtime_da3._wait_for_consumer,
                     output_root,
                     64,
                     5,
+                    65,
                 )
                 with self.assertRaises(TimeoutError):
                     second_future.result(timeout=0.1)
@@ -145,6 +148,21 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
                 second = second_future.result(timeout=1)
             self.assertTrue(second.is_file())
             second.unlink()
+
+    def test_prefetched_record_has_its_own_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            current = runtime_da3._wait_for_consumer(
+                output_root, 2, worker_id=4, ordinal=64
+            )
+            prefetched = runtime_da3._wait_for_consumer(
+                output_root, 2, worker_id=4, ordinal=66
+            )
+            self.assertNotEqual(current, prefetched)
+            self.assertTrue(current.is_file())
+            self.assertTrue(prefetched.is_file())
+            current.unlink()
+            prefetched.unlink()
 
     def test_prefill_workers_only_generate_their_modulo_shard(self):
         produced = []
