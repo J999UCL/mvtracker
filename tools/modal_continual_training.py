@@ -124,6 +124,7 @@ EXPERIMENT_PHASES = {
 }
 RECIPE_ROOT = RUN_ROOT / "training-recipes"
 RECIPE_SMOKE_GPU_REQUEST = GPU_REQUEST
+DA3_CACHE_ROOT = RUN_ROOT / "model-cache/depth-anything-3"
 
 
 def _run_logged_command(command, *, cwd, environment, log_path, label):
@@ -241,6 +242,34 @@ da3_training_image = _source_image(
         f"git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@{DA3_REVISION}"
     )
 )
+
+
+@app.function(
+    image=da3_training_image,
+    secrets=[hf_secret],
+    volumes={str(RUN_ROOT): run_volume},
+    cpu=4,
+    memory=16384,
+    timeout=30 * 60,
+    max_containers=1,
+    retries=0,
+    include_source=False,
+)
+def warm_da3_cache_remote() -> dict:
+    from mvtracker.preprocessing.runtime_da3 import download_model
+
+    os.environ["HF_HOME"] = str(DA3_CACHE_ROOT)
+    DA3_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    print(f"DA3_CACHE event=warm_start root={DA3_CACHE_ROOT}", flush=True)
+    download_model()
+    run_volume.commit()
+    result = {
+        "root": str(DA3_CACHE_ROOT),
+        "elapsed_seconds": time.monotonic() - started,
+    }
+    print(f"DA3_CACHE event=warm_complete result={result}", flush=True)
+    return result
 
 
 def _run_identity(run_name: str, commit: str) -> tuple[int, str]:
@@ -1546,6 +1575,7 @@ def _run_recipe_da3(
                 runtime_root
                 / f"latest-metrics-worker-{prefill_devices.index(depth_device)}.json"
             ),
+            "HF_HOME": str(DA3_CACHE_ROOT),
             "WANDB_ENTITY": WANDB_ENTITY,
             "WANDB_PROJECT": WANDB_PROJECT,
             "WANDB_RUN_GROUP": wandb_group,
@@ -1561,12 +1591,12 @@ def _run_recipe_da3(
     cache_environment = {
         **base_environment,
         "CUDA_VISIBLE_DEVICES": "",
-        "HF_HOME": "/tmp/huggingface-da3",
         "MVTRACKER_DA3_IMAGE_CAPACITY": str(da3_image_capacity),
     }
     if runtime_root.exists():
         shutil.rmtree(runtime_root)
     runtime_root.mkdir(parents=True)
+    DA3_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     cache_return_code = _run_logged_command(
         [
             sys.executable,
@@ -1612,7 +1642,6 @@ def _run_recipe_da3(
             environment = {
                 **base_environment,
                 "CUDA_VISIBLE_DEVICES": str(device),
-                "HF_HOME": "/tmp/huggingface-da3",
                 "MVTRACKER_DA3_IMAGE_CAPACITY": str(da3_image_capacity),
             }
             command = [

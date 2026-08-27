@@ -187,6 +187,8 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
         self.assertIn("loaded=loaded", producer)
         self.assertEqual(launcher.count("da3_image_capacity=80"), 3)
         self.assertEqual(launcher.count("da3_image_capacity=64"), 1)
+        self.assertIn('"HF_HOME": str(DA3_CACHE_ROOT)', launcher)
+        self.assertNotIn('"HF_HOME": "/tmp/huggingface-da3"', launcher)
 
     def _run_worker(
         self,
