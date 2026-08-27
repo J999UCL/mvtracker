@@ -980,7 +980,15 @@ class DaliKubricRecipePlanner(DaliKubricMultiViewDataset):
     def plan_sample(self, request) -> SamplePlan | None:
         resolved = self.resolve_recipe_request(request)
         scene = self._recipe_metadata[resolved.expected_scene]
-        return self._plan_scene_metadata(resolved, scene)
+        plan = self._plan_scene_metadata(resolved, scene)
+        if plan is None:
+            return None
+        entry, _ = self.catalog.scene(plan.sequence)
+        media_indices = tuple(
+            int(entry["views"][str(view)]["media_index"])
+            for view in plan.views
+        )
+        return replace(plan, media_record_indices=media_indices)
 
 
 class DaliKubricValidationDataset(DaliKubricMultiViewDataset):

@@ -486,6 +486,12 @@ def _compile_execution_scene_group(task) -> list[ExecutionRecipeRecord]:
                     f"execution parity failed for {record.source}/{record.scene} "
                     f"step={record.step} logical_index={record.logical_index} field={name}"
                 )
+        if tuple(direct.media_record_indices) != tuple(plan.media_record_indices):
+            raise RuntimeError(
+                f"execution parity failed for {record.source}/{record.scene} "
+                f"step={record.step} logical_index={record.logical_index} "
+                "field=media_record_indices"
+            )
         compiled.append(execution)
     return compiled
 

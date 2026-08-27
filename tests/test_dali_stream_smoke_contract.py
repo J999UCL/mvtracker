@@ -659,6 +659,10 @@ class DaliStreamSmokeContractTests(unittest.TestCase):
         np.testing.assert_allclose(cpu_plan.theta, live_plan.theta)
         self.assertEqual(cpu_plan.rgb_sources, ())
         self.assertEqual(cpu_plan.depth_sources, ())
+        self.assertEqual(
+            cpu_plan.media_record_indices,
+            tuple(view + 1 for view in cpu_plan.views),
+        )
         self.assertGreater(len(live_plan.rgb_sources), 0)
         self.assertGreater(len(live_plan.depth_sources), 0)
 
