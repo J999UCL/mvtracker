@@ -57,6 +57,22 @@ modal run --timestamps tools/modal_vggt_omega_profile.py::profile \
   --run-name vggt-omega-h100-throughput
 ```
 
+## TAPVid-MV VGGT-Omega H200 cache smoke
+
+Download the six TAPVid-MV sources except Hi4D, then time the repository's
+VGGT-Omega cache-warming predictor on the longest Harmony4D sequence using one
+H200. The smoke records H200 wall time, utilization, memory, power, and image
+throughput in W&B and the evaluation Volume.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --timestamps tools/modal_tapvidmv_vggt_smoke.py --stage download \
+  --run-name tapvidmv-vggt-h200-smoke
+modal run --timestamps tools/modal_tapvidmv_vggt_smoke.py --stage smoke \
+  --run-name tapvidmv-vggt-h200-smoke
+```
+
 All Modal runs use the `ucl-prism` profile. Check the workspace before every
 submission and do not stop containers whose app name is not `jeet-mvtracker-profile`.
 The profiler requests exactly one GPU per function and attaches the billing tags
