@@ -1,4 +1,4 @@
-"""Download six TAPVid-MV sources and time one VGGT-Omega cache forward."""
+"""Download TAPVid-MV and profile five persistent VGGT-Omega cache conversions."""
 
 from __future__ import annotations
 
@@ -29,12 +29,14 @@ DATASET_ROOT = EVAL_MOUNT / "tapvidmv_dataset"
 RUNS_ROOT = EVAL_MOUNT / "runs"
 BUCKET_ROOT = "https://storage.googleapis.com/dm-tapnet/mv-tap"
 
-TEST_SOURCE = "harmony4d"
-TEST_SEQUENCE = "005_ballroom2_human_cleaned"
-TEST_FRAMES = 741
-TEST_VIEWS = 4
-TEST_WINDOWS = 7
-TEST_EFFECTIVE_IMAGES = 3500
+PROFILE_SOURCE = "harmony4d"
+PROFILE_SEQUENCES = (
+    "001_ballroom2_human_cleaned",
+    "001_ballroom_human_cleaned",
+    "001_hugging_human_cleaned",
+    "001_sword3_human_cleaned",
+    "001_sword_human_cleaned",
+)
 
 SOURCES = (
     ("droid", f"{BUCKET_ROOT}/droid", "tapvidmv/"),
@@ -64,7 +66,7 @@ TAGS = {
     "owner": "jeet",
     "project": "mvtracker",
     "purpose": "profiling",
-    "experiment": "tapvidmv-vggt-h200-smoke",
+    "experiment": "tapvidmv-vggt-h200-five-sequence-profile",
 }
 
 github_secret = modal.Secret.from_name(
@@ -122,6 +124,7 @@ def _image() -> modal.Image:
             "python -m pip install wandb",
             f"git clone https://github.com/facebookresearch/vggt-omega.git {WORKSPACE / 'vggt-omega'}",
             f"git -C {WORKSPACE / 'vggt-omega'} checkout {VGGT_OMEGA_REVISION}",
+            f"python /opt/mvtracker/tools/patch_tapvidmv_performance.py {TAPVIDMV_ROOT}",
         )
         .run_commands(
             f"mkdir -p {WORKSPACE / 'checkpoints'} && "
@@ -135,6 +138,7 @@ def _image() -> modal.Image:
                 "MVTRACKER_MODAL_COMMIT": commit,
                 "PYTHONUNBUFFERED": "1",
                 "TOKENIZERS_PARALLELISM": "false",
+                "TAPVIDMV_KEEP_VGGT_MODEL": "1",
                 "OMP_NUM_THREADS": "2",
                 "MKL_NUM_THREADS": "2",
                 "OPENBLAS_NUM_THREADS": "2",
@@ -310,7 +314,7 @@ def _gpu_monitor(stop: threading.Event, samples: list[dict]) -> None:
     volumes={EVAL_MOUNT: eval_volume},
     secrets=[wandb_secret],
 )
-def smoke(run_name: str) -> dict:
+def profile_five(run_name: str) -> dict:
     import wandb
 
     function_started = time.perf_counter()
@@ -318,14 +322,16 @@ def smoke(run_name: str) -> dict:
         project="mvtracker-modal-profiling",
         name=f"{run_name}-h200",
         group=run_name,
-        job_type="tapvidmv-vggt-omega-smoke",
+        job_type="tapvidmv-vggt-omega-five-sequence-profile",
         config={
             **TAGS,
             "gpu": "H200",
-            "source": TEST_SOURCE,
-            "sequence": TEST_SEQUENCE,
-            "frames": TEST_FRAMES,
-            "views": TEST_VIEWS,
+            "source": PROFILE_SOURCE,
+            "sequences": PROFILE_SEQUENCES,
+            "image_backend": "torchvision_nvjpeg_cuda_endpoint_cpu",
+            "load_optional_depth": False,
+            "keep_vggt_model": True,
+            "prefetch_sequences": 1,
             "tapvidmv_revision": TAPVIDMV_REVISION,
             "vggt_omega_revision": VGGT_OMEGA_REVISION,
         },
@@ -343,13 +349,17 @@ def smoke(run_name: str) -> dict:
         "--tapvidmv_predictions",
         str(prediction_root),
         "--data_sources_to_predict",
-        TEST_SOURCE,
+        PROFILE_SOURCE,
         "--sequences",
-        TEST_SEQUENCE,
+        ",".join(PROFILE_SEQUENCES),
         "--resolution",
         "512",
+        "--skip_optional_depth",
+        "--image_backend",
+        "cuda",
         "--overwrite_predictions",
     ]
+    profile_events: list[dict] = []
     samples: list[dict] = []
     stop = threading.Event()
     monitor = threading.Thread(target=_gpu_monitor, args=(stop, samples), daemon=True)
@@ -369,6 +379,12 @@ def smoke(run_name: str) -> dict:
         for line in process.stdout:
             if text := line.rstrip():
                 _log("inference_output", message=text)
+                try:
+                    event = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and "event" in event:
+                    profile_events.append(event)
         returncode = process.wait()
     finally:
         stop.set()
@@ -379,14 +395,24 @@ def smoke(run_name: str) -> dict:
         raise subprocess.CalledProcessError(returncode, command)
     eval_volume.commit()
     function_seconds = time.perf_counter() - function_started
+    conversion_events = [
+        event for event in profile_events if event["event"] == "image_conversion_completed"
+    ]
+    load_events = [
+        event for event in profile_events if event["event"] == "sequence_load_completed"
+    ]
+    prediction_events = [
+        event for event in profile_events if event["event"] == "sequence_prediction_completed"
+    ]
     result = {
         "inference_seconds": inference_seconds,
         "h200_seconds": function_seconds,
         "h200_hours": function_seconds / 3600.0,
-        "frames_per_second": TEST_FRAMES / inference_seconds,
-        "unique_images_per_second": TEST_FRAMES * TEST_VIEWS / inference_seconds,
-        "effective_images_per_second": TEST_EFFECTIVE_IMAGES / inference_seconds,
-        "seconds_per_window": inference_seconds / TEST_WINDOWS,
+        "sequence_count": len(PROFILE_SEQUENCES),
+        "conversion_seconds_sum": sum(event["seconds"] for event in conversion_events),
+        "load_seconds_sum": sum(event["seconds"] for event in load_events),
+        "inference_seconds_sum": sum(event["inference_seconds"] for event in prediction_events),
+        "load_wait_seconds_sum": sum(event["load_wait_seconds"] for event in prediction_events),
         "gpu_samples": len(samples),
         "mean_gpu_utilization_percent": (
             sum(sample["utilization_percent"] for sample in samples) / len(samples)
@@ -401,19 +427,30 @@ def smoke(run_name: str) -> dict:
             if samples
             else 0.0
         ),
-        "cache_path": str(
-            RUNS_ROOT
-            / run_name
-            / "_reconstruction_cache/vggt_omega/harmony4d"
-            / f"{TEST_SEQUENCE}.npz"
-        ),
+        "profile_events": profile_events,
+        "cache_paths": [
+            str(RUNS_ROOT / run_name / "_reconstruction_cache/vggt_omega" / PROFILE_SOURCE / f"{sequence}.npz")
+            for sequence in PROFILE_SEQUENCES
+        ],
     }
-    report_path = RUNS_ROOT / run_name / "h200-smoke-report.json"
+    report_path = RUNS_ROOT / run_name / "h200-five-sequence-profile.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     eval_volume.commit()
-    run.log(result)
-    run.summary.update(result)
+    scalar_result = {key: value for key, value in result.items() if isinstance(value, int | float)}
+    run.log(scalar_result)
+    for sample in samples:
+        run.log({f"gpu/{key}": value for key, value in sample.items()})
+    for event in load_events:
+        run.summary[f"sequences/{event['sequence']}/load_seconds"] = event["seconds"]
+    for event in conversion_events:
+        run.summary[
+            f"sequences/{event['sequence']}/views/{event['view']}/conversion_seconds"
+        ] = event["seconds"]
+    for event in prediction_events:
+        run.summary[f"sequences/{event['sequence']}/inference_seconds"] = event["inference_seconds"]
+        run.summary[f"sequences/{event['sequence']}/load_wait_seconds"] = event["load_wait_seconds"]
+    run.summary.update(scalar_result)
     run.finish()
     _log("inference_completed", report_path=str(report_path), **result)
     return result
@@ -423,11 +460,11 @@ def smoke(run_name: str) -> dict:
 def main(stage: str = "full", run_name: str = "") -> None:
     if not run_name:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_name = f"tapvidmv-vggt-h200-smoke-{timestamp}"
+        run_name = f"tapvidmv-vggt-h200-five-{timestamp}"
     app.set_tags({**TAGS, "run_name": run_name, "stage": stage})
     if stage in {"full", "download"}:
         print(download_dataset.remote(run_name))
-    if stage in {"full", "smoke"}:
-        print(smoke.remote(run_name))
-    if stage not in {"full", "download", "smoke"}:
+    if stage in {"full", "profile"}:
+        print(profile_five.remote(run_name))
+    if stage not in {"full", "download", "profile"}:
         raise ValueError(f"unsupported stage: {stage}")

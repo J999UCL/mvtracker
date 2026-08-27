@@ -577,6 +577,19 @@ The DALI readback entrypoint uses the CPU decoder when the Modal T4 reports an
 NVML driver error; it still validates the exact encoded float32 TIFF records
 that the training DALI reader consumes.
 
+### Profile five TAPVid-MV VGGT-Omega cache conversions on one H200
+
+This uses nvJPEG for bounded CUDA decode, the benchmark's endpoint resize on
+16 CPU threads, skips unused GT depth, preloads one sequence, and keeps the
+VGGT-Omega model resident across all five Harmony4D sequences.
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --detach --timestamps tools/modal_tapvidmv_vggt_smoke.py \
+  --stage profile --run-name <run-name>
+```
+
 For incremental monitored bursts, use the bounded entrypoint below. Each call
 persists its burst before returning; increase the window or batch only after
 the previous call completes and its artifact is present.
