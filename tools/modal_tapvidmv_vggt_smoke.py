@@ -379,8 +379,11 @@ def profile_five(run_name: str) -> dict:
         for line in process.stdout:
             if text := line.rstrip():
                 _log("inference_output", message=text)
+                json_start = text.find("{")
+                if json_start < 0:
+                    continue
                 try:
-                    event = json.loads(text)
+                    event = json.loads(text[json_start:])
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict) and "event" in event:

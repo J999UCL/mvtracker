@@ -2624,3 +2624,35 @@ from 256 seconds of initial sequence loading with an idle GPU.
 - Report: `runs/tapvidmv-vggt-h200-smoke-20260827/h200-smoke-report.json`
 - Cache: `runs/tapvidmv-vggt-h200-smoke-20260827/_reconstruction_cache/vggt_omega/harmony4d/005_ballroom2_human_cleaned.npz`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
+
+## 2026-08-27 — Five-sequence optimized TAPVid-MV VGGT-Omega profile
+
+Five fresh Harmony4D sequences ran in one persistent H200 process through the
+repository's `reconstruction__copycat__vggt_omega` cache path. The cache-only
+loader skipped unused GT depth, decoded bounded JPEG batches with torchvision's
+CUDA nvJPEG backend, center-cropped on the GPU, and applied the benchmark's
+exact endpoint Gaussian/Lanczos resize on 16 CPU threads. The existing
+one-sequence-ahead loader overlapped conversion with inference, and the
+VGGT-Omega model remained resident between sequences.
+
+The first 601-frame, four-view sequence loaded in 37.69 seconds versus 256
+seconds in the earlier 741-frame smoke. The four subsequent handoffs waited
+only 0.005--0.009 seconds each. The first six-window inference took 520.18
+seconds including one-time model/checkpoint startup; the two later six-window
+sequences took 494.01 and 493.36 seconds, confirming about 26 seconds of model
+startup was removed per sequence. The 301- and 350-frame three-window
+sequences took 250.73 and 245.60 seconds.
+
+All five caches were written in 2,070.81 H200-seconds (34 minutes 31 seconds,
+0.5752 H200-hours). Across 204 ten-second samples, mean GPU utilization was
+86.68%, peak memory was 85,500 MiB, and mean power was 610.87 W. The profiler
+recorded 37.72 seconds of total exposed load wait, of which 37.70 seconds was
+the first cold sequence; later conversion was fully hidden behind inference.
+
+- Sequences: `001_ballroom2_human_cleaned`, `001_ballroom_human_cleaned`, `001_hugging_human_cleaned`, `001_sword3_human_cleaned`, `001_sword_human_cleaned`
+- Implementation: `b9e1c06`
+- Modal: https://modal.com/apps/ucl-prism/main/ap-apFmnd4R5AAoKbGmjKx54l
+- W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/12uia087
+- Report: `runs/tapvidmv-vggt-h200-five-20260827/h200-five-sequence-profile.json`
+- Cache root: `runs/tapvidmv-vggt-h200-five-20260827/_reconstruction_cache/vggt_omega/harmony4d`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
