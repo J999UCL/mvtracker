@@ -3920,10 +3920,20 @@ def main(cfg: DictConfig):
             if mixed_training:
                 for source in mixed_schedule.scene_counts:
                     local_count = accumulated_source_counts.get(source, 0)
+                    expected_local_count = (
+                        sum(
+                            scene.source == source
+                            for group in physical_step.groups
+                            for scene in group.scenes
+                        )
+                        if recipe_path and physical_step is not None
+                        else 0
+                    )
                     sums = _reduce_scalar_dict(
                         fabric,
                         {
                             "sample_count": local_count,
+                            "expected_sample_count": expected_local_count,
                             "loss": accumulated_source_losses.get(source, 0.0),
                             "view_count": accumulated_source_view_counts.get(source, 0.0),
                             "track_count": accumulated_source_track_counts.get(source, 0.0),
@@ -3940,14 +3950,18 @@ def main(cfg: DictConfig):
                         reduce_op="sum",
                     )
                     global_count = sums.pop("sample_count")
+                    recipe_expected_count = sums.pop("expected_sample_count")
                     reduced_source_values[f"source/{source}/sample_count"] = global_count
                     expected_count = (
-                        mixed_schedule.source_pattern.count(source)
+                        recipe_expected_count
+                        if recipe_path
+                        else mixed_schedule.source_pattern.count(source)
                         * fabric.world_size
                     )
                     if global_count != expected_count:
                         raise RuntimeError(
-                            f"source {source} contributed an unexpected global sample count"
+                            f"source {source} contributed {global_count} global samples; "
+                            f"recipe expected {expected_count}"
                         )
                     for name in ("loss", "view_count", "track_count"):
                         reduced_source_values[f"source/{source}/{name}"] = (

@@ -348,6 +348,8 @@ class MixedTrainingIntegrationTests(unittest.TestCase):
         self.assertIn("state.source_cursors = dict(checkpoint_source_cursors)", source)
         self.assertIn("source/{source}/component/{component}", source)
         self.assertIn("source/{source}/sample_count", source)
+        self.assertIn("expected_sample_count", source)
+        self.assertIn("if recipe_path", source)
         self.assertIn("if eval_dataloaders and last_eval_step != total_steps", source)
         self.assertIn("cfg.logging.get('wandb_run_name')", source)
         self.assertIn("cfg.logging.get('wandb_run_id')", source)
