@@ -4597,6 +4597,7 @@ def main(cfg: DictConfig):
                         "generated_images",
                         "model_seconds",
                         "model_images_per_second",
+                        "load_seconds",
                         "sample_seconds",
                         "pending_ready_samples",
                         "producer_max_rss_gib",

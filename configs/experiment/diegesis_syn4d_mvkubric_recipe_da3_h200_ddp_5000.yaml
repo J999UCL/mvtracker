@@ -9,7 +9,7 @@ logging:
     - diegesis351-syn4d-mvkubric-25-25-50
     - recipe
     - da3-giant-1.1
-    - da3-image-capacity64
+    - da3-image-capacity80
     - da3-queue64
     - mixed-depth-70-20-10
     - ddp4-h200-plus-producer

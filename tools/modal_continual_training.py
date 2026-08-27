@@ -1758,7 +1758,7 @@ def recipe_da3_h200x5_remote(
         training_devices=(0, 1, 2, 3),
         depth_device=4,
         prefill_devices=(0, 1, 2, 3, 4),
-        da3_image_capacity=64,
+        da3_image_capacity=80,
         max_pending_depth_samples=64,
     )
 
@@ -1794,7 +1794,7 @@ def recipe_da3_h200x5_smoke100_remote(
         training_devices=(0, 1, 2, 3),
         depth_device=4,
         prefill_devices=(0, 1, 2, 3, 4),
-        da3_image_capacity=64,
+        da3_image_capacity=80,
         max_pending_depth_samples=64,
         training_steps=100,
     )

@@ -175,6 +175,19 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
         for name in ("OMP", "MKL", "OPENBLAS", "NUMEXPR"):
             self.assertIn(f'"{name}_NUM_THREADS": "1"', source)
 
+    def test_steady_producer_prefetches_reads_and_h200_uses_capacity_80(self):
+        producer = (ROOT / "mvtracker/preprocessing/runtime_da3.py").read_text(
+            encoding="utf-8"
+        )
+        launcher = (ROOT / "tools/modal_continual_training.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ThreadPoolExecutor(max_workers=1) as loader", producer)
+        self.assertIn("loaded_future = loader.submit(load_next)", producer)
+        self.assertIn("loaded=loaded", producer)
+        self.assertEqual(launcher.count("da3_image_capacity=80"), 3)
+        self.assertEqual(launcher.count("da3_image_capacity=64"), 1)
+
     def _run_worker(
         self,
         output_root: Path,
@@ -194,7 +207,7 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
         fake_package = types.ModuleType("depth_anything_3")
         fake_package.api = fake_api
 
-        def produce(model, reader, record, root):
+        def produce(model, reader, record, root, *, loaded=None):
             ordinal = int(record.scene.removeprefix("scene-"))
             produced.append(ordinal)
             sample_root = (
@@ -216,8 +229,16 @@ class RuntimeDa3PrefillTests(unittest.TestCase):
                 },
             ),
             patch.object(runtime_da3, "_depth_records", return_value=enumerate(records)),
-            patch.object(runtime_da3, "_PackedScenes", return_value=object()),
-            patch.object(runtime_da3, "_MVKubricScenes", return_value=object()),
+            patch.object(
+                runtime_da3,
+                "_PackedScenes",
+                return_value=SimpleNamespace(load=lambda record: record.scene),
+            ),
+            patch.object(
+                runtime_da3,
+                "_MVKubricScenes",
+                return_value=SimpleNamespace(load=lambda record: record.scene),
+            ),
             patch.object(runtime_da3, "_produce_record", side_effect=produce),
             patch.object(runtime_da3, "_wait_for_consumer"),
             patch.object(runtime_da3, "_log"),

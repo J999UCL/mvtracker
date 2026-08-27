@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from itertools import islice
 import json
@@ -277,12 +278,21 @@ def _write_metric(metrics_path: Path, latest_path: Path, metric: dict) -> None:
     staging.replace(latest_path)
 
 
-def _produce_record(model, reader, record: RecipeRecord, output_root: Path):
+def _produce_record(
+    model,
+    reader,
+    record: RecipeRecord,
+    output_root: Path,
+    *,
+    loaded=None,
+):
     import torch
     import torch.nn.functional as F
     from depth_anything_3.utils.pose_align import align_poses_umeyama
 
-    inference_views, images, extrinsics, intrinsics, source_size = reader.load(record)
+    if loaded is None:
+        loaded = reader.load(record)
+    inference_views, images, extrinsics, intrinsics, source_size = loaded
     selected_positions = [inference_views.index(view) for view in record.views]
     timestamp_batch = min(len(record.frames), max(1, IMAGE_CAPACITY // len(inference_views)))
     depth = np.empty((len(record.views), len(record.frames), *source_size), dtype=np.float32)
@@ -404,14 +414,24 @@ def run(
         )
         packed = _PackedScenes(data_root)
         mvkubric = _MVKubricScenes(data_root)
-        depth_records = _depth_records(recipe_path, max_steps=max_steps)
-        for ordinal, record in depth_records:
-            if ordinal < prefill_samples:
-                if _prefill_owner(ordinal, worker_count) != worker_id:
-                    continue
-            elif not continue_after_prefill:
-                break
-            elif ordinal == prefill_samples:
+        selected_records = (
+            (ordinal, record)
+            for ordinal, record in _depth_records(recipe_path, max_steps=max_steps)
+            if (
+                _prefill_owner(ordinal, worker_count) == worker_id
+                if ordinal < prefill_samples
+                else continue_after_prefill
+            )
+        )
+        handoff_started = False
+
+        def load_next():
+            nonlocal handoff_started
+            try:
+                ordinal, record = next(selected_records)
+            except StopIteration:
+                return None
+            if ordinal >= prefill_samples and not handoff_started:
                 (output_root / f"worker-{worker_id}.prefill.ready").touch()
                 _log(
                     "prefill_shard_ready",
@@ -420,7 +440,7 @@ def run(
                     prefill_samples=prefill_samples,
                 )
                 _wait_for_handoff(output_root, worker_id)
-
+                handoff_started = True
             pending_limit = (
                 max(max_pending_samples, prefill_samples)
                 if ordinal < prefill_samples
@@ -429,33 +449,66 @@ def run(
             _wait_for_consumer(output_root, pending_limit)
             reader = mvkubric if record.source == "mvkubric" else packed
             sample_started = time.perf_counter()
-            seconds, image_count = _produce_record(model, reader, record, output_root)
-            generated_samples += 1
-            generated_images += image_count
-            model_seconds += seconds
-            metric = {
-                "ordinal": ordinal,
-                "step": record.step,
-                "logical_index": record.logical_index,
-                "source": record.source,
-                "scene": record.scene,
-                "depth_source": record.depth_source,
-                "worker_id": worker_id,
-                "generated_samples": generated_samples,
-                "generated_images": generated_images,
-                "model_seconds": model_seconds,
-                "model_images_per_second": generated_images / max(model_seconds, 1e-9),
-                "sample_seconds": time.perf_counter() - sample_started,
-                "pending_ready_samples": sum(
-                    1 for _ in output_root.glob("step-*/sample-*/ready")
-                ),
-                "producer_max_rss_gib": (
-                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    / 1024**2
-                ),
-            }
-            _write_metric(metrics_path, latest_metrics_path, metric)
-            _log("sample_ready", **metric)
+            loaded = reader.load(record)
+            return (
+                ordinal,
+                record,
+                reader,
+                loaded,
+                sample_started,
+                time.perf_counter() - sample_started,
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as loader:
+            loaded_future = loader.submit(load_next)
+            while True:
+                item = loaded_future.result()
+                if item is None:
+                    break
+                ordinal, record, reader, loaded, sample_started, load_seconds = item
+                last_prefill_record = (
+                    ordinal < prefill_samples
+                    and ordinal + worker_count >= prefill_samples
+                )
+                if not last_prefill_record:
+                    loaded_future = loader.submit(load_next)
+                seconds, image_count = _produce_record(
+                    model,
+                    reader,
+                    record,
+                    output_root,
+                    loaded=loaded,
+                )
+                generated_samples += 1
+                generated_images += image_count
+                model_seconds += seconds
+                metric = {
+                    "ordinal": ordinal,
+                    "step": record.step,
+                    "logical_index": record.logical_index,
+                    "source": record.source,
+                    "scene": record.scene,
+                    "depth_source": record.depth_source,
+                    "worker_id": worker_id,
+                    "generated_samples": generated_samples,
+                    "generated_images": generated_images,
+                    "model_seconds": model_seconds,
+                    "model_images_per_second": generated_images
+                    / max(model_seconds, 1e-9),
+                    "load_seconds": load_seconds,
+                    "sample_seconds": time.perf_counter() - sample_started,
+                    "pending_ready_samples": sum(
+                        1 for _ in output_root.glob("step-*/sample-*/ready")
+                    ),
+                    "producer_max_rss_gib": (
+                        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                        / 1024**2
+                    ),
+                }
+                _write_metric(metrics_path, latest_metrics_path, metric)
+                _log("sample_ready", **metric)
+                if last_prefill_record:
+                    loaded_future = loader.submit(load_next)
 
         shard_ready = output_root / f"worker-{worker_id}.prefill.ready"
         if not shard_ready.is_file():
