@@ -1,4 +1,5 @@
 import ast
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -180,6 +181,78 @@ class TrainingStallContractTests(unittest.TestCase):
         self.assertEqual(prepared.recipe_step, 0)
         self.assertEqual(prepared.planning_seconds, 0.0)
         self.assertEqual(len(prepared.groups), 2)
+
+    def test_recipe_lookahead_keeps_two_steps_in_flight(self):
+        from mvtracker.datasets import mixed_physical_loader as loader
+
+        second_step_started = threading.Event()
+
+        def record(step):
+            return SimpleNamespace(
+                source="diegesis",
+                logical_index=step,
+                physical=SimpleNamespace(rank=0, group=0, position=0),
+                recipe=SimpleNamespace(
+                    scene=f"scene-{step}",
+                    request={"virtual_index": step},
+                    retry_count=0,
+                ),
+            )
+
+        class Dataset:
+            def materialize_recipe_record(self, execution_record):
+                if execution_record.logical_index == 0:
+                    if not second_step_started.wait(timeout=2):
+                        raise RuntimeError("second recipe step never started")
+                else:
+                    second_step_started.set()
+                return SimpleNamespace(metadata={}), True
+
+        schedule = SimpleNamespace(
+            recipe_step=lambda step: (record(step),),
+        )
+        with (
+            patch.object(loader, "_pin_sample", side_effect=lambda sample: sample),
+            patch.object(loader, "_sample_nbytes", return_value=1),
+        ):
+            lookahead = loader.MixedStepLookahead(
+                datasets={"diegesis": Dataset()},
+                schedule=schedule,
+                source_cursors={},
+                rank=0,
+                remaining_steps=2,
+                worker_count=2,
+                lookahead_steps=2,
+                max_cache_bytes=1024,
+            )
+            prepared = tuple(lookahead)
+
+        self.assertEqual([step.recipe_step for step in prepared], [0, 1])
+
+    def test_failed_materialization_reaches_step_boundary(self):
+        from mvtracker.datasets import mixed_physical_loader as loader
+
+        failed = loader.PreparedMixedStep(
+            start_cursors={},
+            end_cursors={},
+            groups=(),
+            fingerprint="",
+            retry_count=0,
+            encoded_bytes=0,
+            planning_seconds=0.0,
+            materialization_seconds=0.0,
+            pair_count=0,
+            padding_tracks=0,
+            recipe_step=3,
+            materialization_error="failed locally",
+        )
+        decoder = SimpleNamespace(device=torch.device("cpu"))
+        with patch.object(torch.cuda, "set_device"):
+            pipeline = loader.PhysicalStepPrefetchIterator([failed], decoder)
+            observed, groups = pipeline.next_step()
+
+        self.assertIs(observed, failed)
+        self.assertEqual(tuple(groups), ())
 
 
 if __name__ == "__main__":

@@ -167,6 +167,25 @@ class RuntimeRecipeDepthStore:
     def __init__(self, root: str | Path):
         self.root = Path(root)
 
+    def _resident_marker(self, step: int, logical_index: int) -> Path:
+        return (
+            self.root
+            / "resident"
+            / f"step-{int(step):06d}-sample-{int(logical_index):02d}"
+        )
+
+    def release(self, step: int, logical_index: int) -> None:
+        self._resident_marker(step, logical_index).unlink(missing_ok=True)
+
+    def inventory(self) -> dict[str, int]:
+        ready = sum(1 for _ in self.root.glob("step-*/sample-*/ready"))
+        resident = sum(1 for _ in (self.root / "resident").glob("step-*-sample-*"))
+        return {
+            "ready_samples": ready,
+            "resident_samples": resident,
+            "effective_samples": ready + resident,
+        }
+
     def load(self, step: int, logical_index: int) -> RuntimeDepthLoad:
         sample_root = self.root / f"step-{int(step):06d}" / f"sample-{int(logical_index):02d}"
         ready = sample_root / "ready"
@@ -194,6 +213,9 @@ class RuntimeRecipeDepthStore:
         read_at = time.perf_counter()
         byte_count = depth.nbytes + mask.nbytes
         shutil.rmtree(sample_root)
+        marker = self._resident_marker(step, logical_index)
+        marker.parent.mkdir(exist_ok=True)
+        marker.touch()
         deleted_at = time.perf_counter()
         return RuntimeDepthLoad(
             depth=depth,

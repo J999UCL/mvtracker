@@ -41,6 +41,13 @@ class RuntimeRecipeDepthStoreTest(unittest.TestCase):
             self.assertAlmostEqual(result.total_seconds, 0.8)
             self.assertEqual(result.byte_count, expected_depth.nbytes + expected_mask.nbytes)
             self.assertFalse(sample_root.exists())
+            store = RuntimeRecipeDepthStore(root)
+            self.assertEqual(
+                store.inventory(),
+                {"ready_samples": 0, "resident_samples": 1, "effective_samples": 1},
+            )
+            store.release(12, 3)
+            self.assertEqual(store.inventory()["effective_samples"], 0)
             fsync.assert_not_called()
 
 

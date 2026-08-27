@@ -7,6 +7,7 @@ import json
 import queue
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields, replace
 from typing import Mapping, Sequence
@@ -209,13 +210,28 @@ class _ByteBoundedQueue:
         if max_steps < 1 or max_bytes < 1:
             raise ValueError("lookahead limits must be positive")
         self._queue = queue.Queue(maxsize=max_steps)
+        self._slots = threading.BoundedSemaphore(max_steps)
         self._max_bytes = int(max_bytes)
         self._bytes = 0
         self._condition = threading.Condition()
 
-    def put(self, item: PreparedMixedStep | BaseException | object) -> None:
+    def reserve(self) -> None:
+        self._slots.acquire()
+
+    def release_reservation(self) -> None:
+        self._slots.release()
+
+    def put(
+        self,
+        item: PreparedMixedStep | BaseException | object,
+        *,
+        reserved: bool = False,
+    ) -> None:
         size = item.encoded_bytes if isinstance(item, PreparedMixedStep) else 0
+        if isinstance(item, PreparedMixedStep) and not reserved:
+            self.reserve()
         if size > self._max_bytes:
+            self.release_reservation()
             raise MemoryError(
                 f"one prepared step uses {size} bytes, exceeding the "
                 f"{self._max_bytes}-byte CPU cache"
@@ -232,6 +248,7 @@ class _ByteBoundedQueue:
             with self._condition:
                 self._bytes -= item.encoded_bytes
                 self._condition.notify_all()
+            self.release_reservation()
         return item
 
     def snapshot(self) -> tuple[int, int]:
@@ -455,12 +472,26 @@ class MixedStepLookahead:
             materialization_error=materialization_error,
         )
 
-    def _prepare_recipe_step(self, executor: ThreadPoolExecutor) -> PreparedMixedStep:
+    def _read_recipe_step(self):
         step = self.recipe_position
-        read_started = time.perf_counter()
         records = tuple(self.schedule.recipe_step(step))
         self.recipe_position += 1
-        recipe_read_seconds = time.perf_counter() - read_started
+        return step, records
+
+    def _prepare_recipe_step(
+        self,
+        executor: ThreadPoolExecutor,
+        *,
+        step: int | None = None,
+        records=None,
+        recipe_read_seconds: float | None = None,
+    ) -> PreparedMixedStep:
+        if records is None:
+            read_started = time.perf_counter()
+            step, records = self._read_recipe_step()
+            recipe_read_seconds = time.perf_counter() - read_started
+        records = tuple(records)
+        recipe_read_seconds = float(recipe_read_seconds or 0.0)
         if not records:
             raise RuntimeError(f"rank {self.rank} has no execution records at step {step}")
         if any(int(record.physical.rank) != self.rank for record in records):
@@ -546,8 +577,48 @@ class MixedStepLookahead:
     def _produce(self) -> None:
         try:
             with ThreadPoolExecutor(max_workers=self.worker_count) as executor:
-                for _ in range(self.remaining_steps):
-                    self._queue.put(self._prepare_step(executor))
+                if not hasattr(self.schedule, "recipe_step"):
+                    for _ in range(self.remaining_steps):
+                        self._queue.put(self._prepare_step(executor))
+                else:
+                    pending = deque()
+                    submitted = 0
+
+                    def submit_step(step_executor):
+                        nonlocal submitted
+                        self._queue.reserve()
+                        try:
+                            read_started = time.perf_counter()
+                            step, records = self._read_recipe_step()
+                            read_seconds = time.perf_counter() - read_started
+                            future = step_executor.submit(
+                                self._prepare_recipe_step,
+                                executor,
+                                step=step,
+                                records=records,
+                                recipe_read_seconds=read_seconds,
+                            )
+                        except BaseException:
+                            self._queue.release_reservation()
+                            raise
+                        pending.append(future)
+                        submitted += 1
+
+                    with ThreadPoolExecutor(max_workers=2) as step_executor:
+                        for _ in range(min(2, self.remaining_steps)):
+                            submit_step(step_executor)
+                        while pending:
+                            future = pending.popleft()
+                            try:
+                                prepared = future.result()
+                            except BaseException:
+                                self._queue.release_reservation()
+                                for _ in pending:
+                                    self._queue.release_reservation()
+                                raise
+                            self._queue.put(prepared, reserved=True)
+                            if submitted < self.remaining_steps:
+                                submit_step(step_executor)
         except BaseException as error:
             self._queue.put(error)
         else:
@@ -799,7 +870,8 @@ class PhysicalStepPrefetchIterator:
             torch.cuda.set_device(self.decoder.device)
             for step in self.steps:
                 if step.materialization_error is not None:
-                    raise RuntimeError(step.materialization_error)
+                    self.ready.put(("step", step, None, None, None))
+                    continue
                 groups = tuple(step.groups)
                 first_group = groups[0]
                 first_batch, first_event = self.decoder.decode_async(first_group)
@@ -856,6 +928,15 @@ class _PrefetchedStepGroups:
         current = torch.cuda.current_stream(self.parent.decoder.device)
         current.wait_event(event)
         _record_stream(datapoint, current)
+        from mvtracker.datasets.estimated_depth import RuntimeRecipeDepthStore
+
+        for sample in group.samples:
+            root = sample.metadata.get("runtime_depth_root")
+            if root:
+                RuntimeRecipeDepthStore(root).release(
+                    sample.metadata["recipe_step"],
+                    sample.metadata["recipe_logical_index"],
+                )
         return group, datapoint
 
 

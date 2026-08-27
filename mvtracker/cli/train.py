@@ -177,6 +177,7 @@ class _RecipeDataset:
                 plan.metadata["recipe_step"],
                 plan.metadata["recipe_logical_index"],
             )
+            plan.metadata["runtime_depth_root"] = str(self.runtime_depth_store.root)
         return self.dataset.materialize_sample(plan, runtime_depth=runtime_depth)
 
 
@@ -4551,6 +4552,25 @@ def main(cfg: DictConfig):
                     tb_writer.add_scalar(
                         f"io/runtime_depth/{name}", value, total_steps
                     )
+                runtime_depth_root = cfg.datasets.train.get("runtime_depth_root")
+                if runtime_depth_root:
+                    from mvtracker.datasets.estimated_depth import RuntimeRecipeDepthStore
+
+                    depth_inventory = RuntimeRecipeDepthStore(
+                        runtime_depth_root
+                    ).inventory()
+                    logging.info(
+                        "RUNTIME_DEPTH event=inventory step=%d ready_samples=%d "
+                        "resident_samples=%d effective_samples=%d",
+                        total_steps,
+                        depth_inventory["ready_samples"],
+                        depth_inventory["resident_samples"],
+                        depth_inventory["effective_samples"],
+                    )
+                    for name, value in depth_inventory.items():
+                        tb_writer.add_scalar(
+                            f"depth_buffer/{name}", value, total_steps
+                        )
                 producer_metrics_path = cfg.datasets.train.get(
                     "runtime_depth_metrics_path"
                 )
@@ -4564,6 +4584,7 @@ def main(cfg: DictConfig):
                         "model_seconds",
                         "model_images_per_second",
                         "sample_seconds",
+                        "pending_ready_samples",
                         "producer_max_rss_gib",
                     ):
                         tb_writer.add_scalar(

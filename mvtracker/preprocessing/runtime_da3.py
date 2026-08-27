@@ -446,6 +446,9 @@ def run(
                 "model_seconds": model_seconds,
                 "model_images_per_second": generated_images / max(model_seconds, 1e-9),
                 "sample_seconds": time.perf_counter() - sample_started,
+                "pending_ready_samples": sum(
+                    1 for _ in output_root.glob("step-*/sample-*/ready")
+                ),
                 "producer_max_rss_gib": (
                     resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
                     / 1024**2
