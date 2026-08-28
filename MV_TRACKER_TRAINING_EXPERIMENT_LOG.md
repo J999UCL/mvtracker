@@ -2719,3 +2719,34 @@ depth scaling; and world-space PTS 50.9 with query-frame median scaling.
 - Metrics: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/previews/reconstruction__mvtracker__vggt_omega/egoexo4d`
 - Report: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/report/index.html`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
+
+## 2026-08-28 — Complete Harmony4D VGGT-Omega cache on two H100s
+
+The optimized persistent VGGT-Omega path filled the 24 missing Harmony4D
+caches with two exact H100 lanes. The five caches from the earlier H200 profile
+were reused, and obsolete duplicate `010_ballroom2` was excluded in favor of
+`010_ballroom2_human_cleaned`. The lanes contained 12 sequences each and were
+balanced at 6,239 versus 6,201 frames. TAPVid-MV was pinned to
+`33e705db42f15995aff6d4f592be306bfdf4d2d2`.
+
+The first attached app lost its local Modal heartbeat after committing five
+new caches; Modal later stopped its two remote tasks. The same lanes resumed in
+detached mode against the same cache root, treated those five sequences as
+cache hits, and completed the remaining 19. The successful resume took
+4,021.67 seconds on lane 0 and 3,783.72 seconds on lane 1, for a 4,021.67-second
+makespan and 2.1682 H100-hours. Weighted mean utilization was 89.77%, weighted
+mean power was 635.92 W, and peak memory was 80,710 MiB on both lanes. The
+interrupted attempt consumed approximately another 0.81 H100-hours before it
+was stopped.
+
+Volume verification found exactly 29 canonical VGGT-Omega NPZ caches and 29
+corresponding predictor output directories. Both lane reports were present.
+
+- Implementation: `98327a9`
+- Successful Modal app: https://modal.com/apps/ucl-prism/main/ap-Te1TubJ9GjuRLrHPbUlKP9
+- Interrupted Modal app: https://modal.com/apps/ucl-prism/main/ap-ckxZxNThEZXAfIATNdHwVf
+- Successful lane 0 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/g59m13zp
+- Successful lane 1 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/qanyfxsh
+- Cache root: `runs/tapvidmv-vggt-h200-five-20260827/_reconstruction_cache/vggt_omega/harmony4d`
+- Reports: `runs/tapvidmv-vggt-h200-five-20260827/h100-harmony4d-lane{0,1}-profile.json`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
