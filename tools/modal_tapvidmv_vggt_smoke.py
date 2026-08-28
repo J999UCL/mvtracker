@@ -18,7 +18,7 @@ import modal
 
 
 APP_NAME = "jeet-mvtracker-tapvidmv-vggt-smoke"
-TAPVIDMV_REVISION = "9c7a2a7fd74cbfe8dd0d0ade8fca6f07e86fd091"
+TAPVIDMV_REVISION = "33e705db42f15995aff6d4f592be306bfdf4d2d2"
 VGGT_OMEGA_REVISION = "39a0cb8af88554f15ddcb5354cd52bde588fa014"
 VGGT_OMEGA_CHECKPOINT_REVISION = "05654241adc2f218dfb089c373a011f8a7040576"
 
@@ -59,6 +59,36 @@ EGOEXO4D_LANES = (
         "iiith_soccer_004_2",
         "iiith_soccer_004_5",
         "iiith_soccer_006_2",
+    ),
+)
+HARMONY4D_H100_LANES = (
+    (
+        "005_ballroom2_human_cleaned",
+        "004_sword",
+        "002_sword",
+        "003_ballroom_human_cleaned",
+        "003_sword_human_cleaned",
+        "006_sword",
+        "008_ballroom2_human_cleaned",
+        "009_sword",
+        "007_ballroom2_human_cleaned",
+        "004_ballroom2_human_cleaned",
+        "004_ballroom_human_cleaned",
+        "024_mma2",
+    ),
+    (
+        "006_ballroom2_human_cleaned",
+        "009_ballroom2_human_cleaned",
+        "002_ballroom_human_cleaned",
+        "002_sword3_human_cleaned",
+        "003_sword3_human_cleaned",
+        "005_sword3",
+        "007_sword",
+        "008_ballroom_human_cleaned",
+        "005_sword",
+        "010_ballroom2_human_cleaned",
+        "002_hugging_human_cleaned",
+        "014_grappling",
     ),
 )
 
@@ -328,17 +358,13 @@ def _gpu_monitor(stop: threading.Event, samples: list[dict]) -> None:
         _log("gpu_status", **sample)
 
 
-@app.function(
-    image=image,
-    gpu="H200",
-    cpu=16,
-    memory=98304,
-    timeout=24 * 60 * 60,
-    max_containers=2,
-    volumes={EVAL_MOUNT: eval_volume},
-    secrets=[wandb_secret],
-)
-def profile_lane(run_name: str, source: str, sequences: list[str], lane: int) -> dict:
+def _profile_lane(
+    run_name: str,
+    source: str,
+    sequences: list[str],
+    lane: int,
+    gpu_name: str,
+) -> dict:
     import wandb
 
     assert sequences
@@ -350,7 +376,8 @@ def profile_lane(run_name: str, source: str, sequences: list[str], lane: int) ->
         job_type="tapvidmv-vggt-omega-cache-lane",
         config={
             **TAGS,
-            "gpu": "H200",
+            "purpose": "evaluation" if gpu_name == "H100" else TAGS["purpose"],
+            "gpu": gpu_name,
             "lane": lane,
             "source": source,
             "sequences": sequences,
@@ -435,8 +462,8 @@ def profile_lane(run_name: str, source: str, sequences: list[str], lane: int) ->
     ]
     result = {
         "inference_seconds": inference_seconds,
-        "h200_seconds": function_seconds,
-        "h200_hours": function_seconds / 3600.0,
+        f"{gpu_name.lower()}_seconds": function_seconds,
+        f"{gpu_name.lower()}_hours": function_seconds / 3600.0,
         "lane": lane,
         "source": source,
         "sequence_count": len(sequences),
@@ -464,7 +491,7 @@ def profile_lane(run_name: str, source: str, sequences: list[str], lane: int) ->
             for sequence in sequences
         ],
     }
-    report_path = RUNS_ROOT / run_name / f"h200-{source}-lane{lane}-profile.json"
+    report_path = RUNS_ROOT / run_name / f"{gpu_name.lower()}-{source}-lane{lane}-profile.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     eval_volume.commit()
@@ -487,13 +514,47 @@ def profile_lane(run_name: str, source: str, sequences: list[str], lane: int) ->
     return result
 
 
+@app.function(
+    image=image,
+    gpu="H200",
+    cpu=16,
+    memory=98304,
+    timeout=24 * 60 * 60,
+    max_containers=2,
+    volumes={EVAL_MOUNT: eval_volume},
+    secrets=[wandb_secret],
+)
+def profile_lane(run_name: str, source: str, sequences: list[str], lane: int) -> dict:
+    return _profile_lane(run_name, source, sequences, lane, "H200")
+
+
+@app.function(
+    image=image,
+    gpu="H100!",
+    cpu=16,
+    memory=98304,
+    timeout=24 * 60 * 60,
+    max_containers=2,
+    volumes={EVAL_MOUNT: eval_volume},
+    secrets=[wandb_secret],
+)
+def profile_h100_lane(run_name: str, source: str, sequences: list[str], lane: int) -> dict:
+    return _profile_lane(run_name, source, sequences, lane, "H100")
+
+
 @app.local_entrypoint()
 def main(stage: str = "full", run_name: str = "") -> None:
     if not run_name:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        prefix = "tapvidmv-vggt-egoexo-h200x2" if stage == "egoexo" else "tapvidmv-vggt-h200-five"
+        if stage == "egoexo":
+            prefix = "tapvidmv-vggt-egoexo-h200x2"
+        elif stage == "harmony":
+            prefix = "tapvidmv-vggt-harmony-h100x2"
+        else:
+            prefix = "tapvidmv-vggt-h200-five"
         run_name = f"{prefix}-{timestamp}"
-    app.set_tags({**TAGS, "run_name": run_name, "stage": stage})
+    purpose = "evaluation" if stage == "harmony" else TAGS["purpose"]
+    app.set_tags({**TAGS, "purpose": purpose, "run_name": run_name, "stage": stage})
     if stage in {"full", "download"}:
         print(download_dataset.remote(run_name))
     if stage in {"full", "profile"}:
@@ -507,5 +568,15 @@ def main(stage: str = "full", run_name: str = "") -> None:
         ]
         for call in calls:
             print(call.get())
-    if stage not in {"full", "download", "profile", "egoexo"}:
+    if stage == "harmony":
+        assert len(HARMONY4D_H100_LANES) == 2
+        assert all(len(lane) == 12 for lane in HARMONY4D_H100_LANES)
+        assert len({sequence for lane in HARMONY4D_H100_LANES for sequence in lane}) == 24
+        calls = [
+            profile_h100_lane.spawn(run_name, "harmony4d", list(sequences), lane)
+            for lane, sequences in enumerate(HARMONY4D_H100_LANES)
+        ]
+        for call in calls:
+            print(call.get())
+    if stage not in {"full", "download", "profile", "egoexo", "harmony"}:
         raise ValueError(f"unsupported stage: {stage}")
