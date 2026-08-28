@@ -2656,3 +2656,31 @@ the first cold sequence; later conversion was fully hidden behind inference.
 - Report: `runs/tapvidmv-vggt-h200-five-20260827/h200-five-sequence-profile.json`
 - Cache root: `runs/tapvidmv-vggt-h200-five-20260827/_reconstruction_cache/vggt_omega/harmony4d`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
+
+## 2026-08-28 — Full EgoExo4D VGGT-Omega cache on two H200s
+
+All 18 EgoExo4D evaluation sequences were split into two disjoint nine-sequence
+lanes and converted concurrently with ordinary VGGT-Omega. Each H200 kept one
+model resident, skipped the packaged reference depth, used bounded nvJPEG
+decode plus the benchmark endpoint resize, and prefetched one sequence. The
+split contained 3,272 frames, three views per sequence, and 35 VGGT-Omega
+forwards: 18 on lane 0 and 17 on lane 1 because `cmu_soccer15_5` fits in one
+297-image forward.
+
+Lane 0 finished in 1,496.04 H200-seconds and lane 1 in 1,409.70 H200-seconds,
+for a 1,496.04-second wall-clock makespan (24 minutes 56 seconds) and 0.8071
+total H200-hours. Weighted across 286 ten-second samples, mean utilization was
+87.32%, mean power was 617.13 W, and peak memory was 74,454 MiB. Total exposed
+load wait was 25.99 seconds: 24.69 seconds came from the two cold first
+sequences, while every later handoff together exposed only 1.30 seconds.
+
+All 18 sequence caches and both lane reports were verified on the evaluation
+Volume after both writers committed.
+
+- Implementation: `817e1d8`
+- Modal: https://modal.com/apps/ucl-prism/main/ap-7MUG8vRN3XKOLx5mmYcy1z
+- Lane 0 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/68rxzs9s
+- Lane 1 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-modal-profiling/runs/on3xk07w
+- Reports: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/h200-egoexo4d-lane{0,1}-profile.json`
+- Cache root: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/_reconstruction_cache/vggt_omega/egoexo4d`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
