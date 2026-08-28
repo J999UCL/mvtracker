@@ -2684,3 +2684,38 @@ Volume after both writers committed.
 - Reports: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/h200-egoexo4d-lane{0,1}-profile.json`
 - Cache root: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/_reconstruction_cache/vggt_omega/egoexo4d`
 - Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=profiling`
+
+## 2026-08-28 — 5K MVTracker EgoExo4D evaluation with cached VGGT-Omega
+
+The completed 5K continual-training checkpoint was evaluated on all 18
+EgoExo4D sequences through the TAPVid-MV benchmark repository at commit
+`33e705db42f15995aff6d4f592be306bfdf4d2d2`. Two exact H100 prediction lanes
+processed nine disjoint sequences each using the existing VGGT-Omega cache.
+The official evaluator then processed the same two subsets concurrently with
+depth scalings `median_on_queries,median`, world scalings
+`median,median_on_queries`, and resolution 512. No qualitative previews were
+generated. The benchmark report builder aggregated all 18 results.
+
+Prediction lane 0 took 341.91 seconds and lane 1 took 331.21 seconds, for a
+341.91-second makespan and 0.1870 total H100-hours. Peak memory was 12,375 MiB
+and 13,487 MiB; mean sampled utilization was 16.21% and 17.31%. Metric lanes
+took 793.59 and 615.57 seconds, and the report took 24.53 seconds. Volume
+verification found all 18 prediction directories, all 18 `metrics.json` files,
+and the aggregate report.
+
+Headline aggregate scores on the report's 0--100 scale were TAP-Vid 2D AJ
+48.7 and PTS 69.7; camera-space 3D AJ 33.6 and PTS 49.3 with query-frame median
+depth scaling; and world-space PTS 50.9 with query-frame median scaling.
+
+- Checkpoint SHA256: `05ed6589fdc3bb9419b0f023a0380d7c973994794ea7d101df0f9c866eacb1cf`
+- TAPVid-MV implementation: `33e705d`
+- Modal: https://modal.com/apps/ucl-prism/main/ap-jn5aZKdbYJsp8x7mI0rkfQ
+- Prediction lane 0 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-external-evaluation/runs/kp1d0red
+- Prediction lane 1 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-external-evaluation/runs/9f1kq76e
+- Metric lane 0 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-external-evaluation/runs/k8tgxnni
+- Metric lane 1 W&B: https://wandb.ai/jeetucl-ucl/mvtracker-external-evaluation/runs/q9axmfax
+- Report W&B: https://wandb.ai/jeetucl-ucl/mvtracker-external-evaluation/runs/0hien9is
+- Predictions: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/reconstruction__mvtracker__vggt_omega/egoexo4d`
+- Metrics: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/previews/reconstruction__mvtracker__vggt_omega/egoexo4d`
+- Report: `runs/tapvidmv-vggt-egoexo-h200x2-20260828/report/index.html`
+- Billing tags: `owner=jeet`, `project=mvtracker`, `purpose=evaluation`
