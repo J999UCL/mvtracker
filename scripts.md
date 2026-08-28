@@ -590,6 +590,16 @@ modal run --detach --timestamps tools/modal_tapvidmv_vggt_smoke.py \
   --stage profile --run-name <run-name>
 ```
 
+To cache all 18 EgoExo4D sequences with exactly nine sequences on each of two
+concurrent H200 lanes:
+
+```bash
+cd /Users/jeetthakwani/dev/PointTracking/mvtracker
+export MVTRACKER_MODAL_COMMIT="$(git rev-parse HEAD)"
+modal run --timestamps tools/modal_tapvidmv_vggt_smoke.py \
+  --stage egoexo --run-name <run-name>
+```
+
 For incremental monitored bursts, use the bounded entrypoint below. Each call
 persists its burst before returning; increase the window or batch only after
 the previous call completes and its artifact is present.

@@ -37,6 +37,30 @@ PROFILE_SEQUENCES = (
     "001_sword3_human_cleaned",
     "001_sword_human_cleaned",
 )
+EGOEXO4D_LANES = (
+    (
+        "cmu_soccer03_1",
+        "cmu_soccer03_2",
+        "cmu_soccer06_2",
+        "cmu_soccer06_3",
+        "cmu_soccer06_5",
+        "cmu_soccer06_6",
+        "cmu_soccer07_1",
+        "cmu_soccer07_2",
+        "cmu_soccer07_3",
+    ),
+    (
+        "cmu_soccer08_1",
+        "cmu_soccer08_3",
+        "cmu_soccer09_1",
+        "cmu_soccer14_5",
+        "cmu_soccer15_5",
+        "iiith_soccer_002_2",
+        "iiith_soccer_004_2",
+        "iiith_soccer_004_5",
+        "iiith_soccer_006_2",
+    ),
+)
 
 SOURCES = (
     ("droid", f"{BUCKET_ROOT}/droid", "tapvidmv/"),
@@ -66,7 +90,7 @@ TAGS = {
     "owner": "jeet",
     "project": "mvtracker",
     "purpose": "profiling",
-    "experiment": "tapvidmv-vggt-h200-five-sequence-profile",
+    "experiment": "tapvidmv-vggt-cache-profile",
 }
 
 github_secret = modal.Secret.from_name(
@@ -310,24 +334,26 @@ def _gpu_monitor(stop: threading.Event, samples: list[dict]) -> None:
     cpu=16,
     memory=98304,
     timeout=24 * 60 * 60,
-    max_containers=1,
+    max_containers=2,
     volumes={EVAL_MOUNT: eval_volume},
     secrets=[wandb_secret],
 )
-def profile_five(run_name: str) -> dict:
+def profile_lane(run_name: str, source: str, sequences: list[str], lane: int) -> dict:
     import wandb
 
+    assert sequences
     function_started = time.perf_counter()
     run = wandb.init(
         project="mvtracker-modal-profiling",
-        name=f"{run_name}-h200",
+        name=f"{run_name}-lane{lane}",
         group=run_name,
-        job_type="tapvidmv-vggt-omega-five-sequence-profile",
+        job_type="tapvidmv-vggt-omega-cache-lane",
         config={
             **TAGS,
             "gpu": "H200",
-            "source": PROFILE_SOURCE,
-            "sequences": PROFILE_SEQUENCES,
+            "lane": lane,
+            "source": source,
+            "sequences": sequences,
             "image_backend": "torchvision_nvjpeg_cuda_endpoint_cpu",
             "load_optional_depth": False,
             "keep_vggt_model": True,
@@ -349,9 +375,9 @@ def profile_five(run_name: str) -> dict:
         "--tapvidmv_predictions",
         str(prediction_root),
         "--data_sources_to_predict",
-        PROFILE_SOURCE,
+        source,
         "--sequences",
-        ",".join(PROFILE_SEQUENCES),
+        ",".join(sequences),
         "--resolution",
         "512",
         "--skip_optional_depth",
@@ -364,7 +390,7 @@ def profile_five(run_name: str) -> dict:
     stop = threading.Event()
     monitor = threading.Thread(target=_gpu_monitor, args=(stop, samples), daemon=True)
     monitor.start()
-    _log("inference_started", command=command)
+    _log("inference_started", lane=lane, source=source, sequences=sequences, command=command)
     inference_started = time.perf_counter()
     try:
         process = subprocess.Popen(
@@ -411,7 +437,9 @@ def profile_five(run_name: str) -> dict:
         "inference_seconds": inference_seconds,
         "h200_seconds": function_seconds,
         "h200_hours": function_seconds / 3600.0,
-        "sequence_count": len(PROFILE_SEQUENCES),
+        "lane": lane,
+        "source": source,
+        "sequence_count": len(sequences),
         "conversion_seconds_sum": sum(event["seconds"] for event in conversion_events),
         "load_seconds_sum": sum(event["seconds"] for event in load_events),
         "inference_seconds_sum": sum(event["inference_seconds"] for event in prediction_events),
@@ -432,11 +460,11 @@ def profile_five(run_name: str) -> dict:
         ),
         "profile_events": profile_events,
         "cache_paths": [
-            str(RUNS_ROOT / run_name / "_reconstruction_cache/vggt_omega" / PROFILE_SOURCE / f"{sequence}.npz")
-            for sequence in PROFILE_SEQUENCES
+            str(RUNS_ROOT / run_name / "_reconstruction_cache/vggt_omega" / source / f"{sequence}.npz")
+            for sequence in sequences
         ],
     }
-    report_path = RUNS_ROOT / run_name / "h200-five-sequence-profile.json"
+    report_path = RUNS_ROOT / run_name / f"h200-{source}-lane{lane}-profile.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     eval_volume.commit()
@@ -463,11 +491,21 @@ def profile_five(run_name: str) -> dict:
 def main(stage: str = "full", run_name: str = "") -> None:
     if not run_name:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_name = f"tapvidmv-vggt-h200-five-{timestamp}"
+        prefix = "tapvidmv-vggt-egoexo-h200x2" if stage == "egoexo" else "tapvidmv-vggt-h200-five"
+        run_name = f"{prefix}-{timestamp}"
     app.set_tags({**TAGS, "run_name": run_name, "stage": stage})
     if stage in {"full", "download"}:
         print(download_dataset.remote(run_name))
     if stage in {"full", "profile"}:
-        print(profile_five.remote(run_name))
-    if stage not in {"full", "download", "profile"}:
+        print(profile_lane.remote(run_name, PROFILE_SOURCE, list(PROFILE_SEQUENCES), 0))
+    if stage == "egoexo":
+        assert len(EGOEXO4D_LANES) == 2 and all(len(lane) == 9 for lane in EGOEXO4D_LANES)
+        assert len({sequence for lane in EGOEXO4D_LANES for sequence in lane}) == 18
+        calls = [
+            profile_lane.spawn(run_name, "egoexo4d", list(sequences), lane)
+            for lane, sequences in enumerate(EGOEXO4D_LANES)
+        ]
+        for call in calls:
+            print(call.get())
+    if stage not in {"full", "download", "profile", "egoexo"}:
         raise ValueError(f"unsupported stage: {stage}")
